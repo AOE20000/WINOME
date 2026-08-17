@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/org/winome/theme">
+    <file>gnome-shell-dark.css</file>
+    <file>gnome-shell-gtk4.css</file>
+  </gresource>
+</gresources>

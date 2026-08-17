@@ -1,0 +1,10 @@
+﻿// SPDX-License-Identifier: GPL-2.0-or-later
+// Origin: GNOME Shell <https://github.com/GNOME/gnome-shell> (GPL-2.0-or-later)
+// Modified for WINOME, 2026-08-16.
+$variant: 'dark';
+$contrast: "high";
+
+@import "gnome-shell-sass/_high-contrast-colors"; //use gtk colors
+@import "gnome-shell-sass/_drawing";
+@import "gnome-shell-sass/_common";
+@import "gnome-shell-sass/_widgets";

@@ -1,0 +1,44 @@
+# WINOME — Third-Party Notices
+
+WINOME 整体以 GNU General Public License v2.0（GPL-2.0）发布。
+本文件列出 WINOME 所包含、修改或派生自的第三方组件及其原始许可信息。
+
+## 上游组件
+
+| 组件 | 版本/来源提交 | 许可证 | 上游仓库 | 用途 |
+|------|--------------|--------|----------|------|
+| GNOME Shell | 51.beta (`a23b436f`) | GPL-2.0-or-later | https://github.com/GNOME/gnome-shell.git | UI 结构与布局算法参考、主题 CSS |
+| WinOverview | `b36d7f4` (2020-04-28) | GPL-2.0 | https://github.com/valinet/WinOverview.git | GNOME Activities（Overview）复刻 |
+
+`extracted/GMONE-Shell/` 与 `extracted/WinOverview/` 分别派生自上述项目，按其原始许可
+纳入 WINOME 整体：
+
+- GNOME Shell 为 GPL-2.0-or-later，WINOME 依其 "or any later version" 条款以 GPL-2.0 使用。
+- WinOverview 上游 LICENSE 为 GPL-2.0，与 WINOME 整体的 GPL-2.0 一致。
+
+## 致谢
+
+以下项目启发了 WINOME 的界面隐藏与事件钩子实现，但 WINOME 的相关代码均为独立重写，
+不包含其代码，故不构成法律意义上的派生作品：
+
+| 项目 | 版本/来源提交 | 许可证 | 上游仓库 | 启发内容 |
+|------|--------------|--------|----------|----------|
+| Seelen-UI | 2.8.3 (`a1c01ec9`) | AGPL-3.0-or-later | https://github.com/eythaann/Seelen-UI.git | 隐藏原生任务栏、事件钩子防重现的思路 |
+
+## 其他第三方代码
+
+`st-compat/` 目录中的 libcroco 代码为 LGPL-2.1，GNOME Shell St 代码为 LGPL-2.1-or-later；
+LGPL-2.1 与 GPL-2.0 兼容，可并入 WINOME 整体，但需保留各文件的原始版权声明。
+
+## 修改声明
+
+各提取目录中附有 `NOTICE` 文件，标明对上游源码的修改内容与修改日期（GPL-2.0 §2(a) 要求）。
+
+- `../extracted/GMONE-Shell/NOTICE.md`
+- `../extracted/WinOverview/NOTICE`
+
+## 许可证全文
+
+- GPL-2.0 全文见 `LICENSE`。
+- GPL-2.0 全文另见上游 `../upstream/gnome-shell/COPYING` 与 `../upstream/WinOverview/LICENSE`。
+- LGPL-2.1 全文见 `../upstream/gnome-shell/COPYING.LESSER`（若存在）。

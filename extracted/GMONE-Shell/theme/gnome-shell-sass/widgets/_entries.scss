@@ -1,0 +1,23 @@
+﻿// SPDX-License-Identifier: GPL-2.0-or-later
+// Origin: GNOME Shell <https://github.com/GNOME/gnome-shell> (GPL-2.0-or-later)
+// Modified for WINOME, 2026-08-16.
+/* Entries */
+
+StEntry {
+  @extend %entry;
+
+  StIcon.capslock-warning {
+    icon-size: $scalable_icon_size;
+    warning-color: $warning_color;
+    padding: 0 $base_margin;
+  }
+
+  StIcon.peek-password {
+    icon-size: $scalable_icon_size;
+    padding: 0 $base_margin;
+  }
+
+  StLabel.hint-text {
+    margin-left: $base_margin * 2;
+  }
+}

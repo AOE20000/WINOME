@@ -1,0 +1,27 @@
+# Build artifacts
+build/
+_build/
+meson-logs/
+
+# Compiled binaries
+*.exe
+*.dll
+*.a
+*.lib
+*.o
+*.obj
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+
+# MSYS2 / Meson
+*.ninja
+*.ninja_deps
+*.ninja_log
+
+# Upstream reference clones (kept as working copies, not published)
+upstream/

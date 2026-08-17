@@ -1,0 +1,3 @@
+# WINOME Meson options.
+# NOTE: buildtype/debug are built-in Meson options and are declared in
+# meson.build default_options, not here.

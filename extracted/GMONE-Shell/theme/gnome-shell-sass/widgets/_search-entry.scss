@@ -1,0 +1,18 @@
+﻿// SPDX-License-Identifier: GPL-2.0-or-later
+// Origin: GNOME Shell <https://github.com/GNOME/gnome-shell> (GPL-2.0-or-later)
+// Modified for WINOME, 2026-08-16.
+// Search entry
+.search-entry {
+  border-radius: $forced_circular_radius;
+  margin-top: $base_padding * 2;
+  margin-bottom: $base_padding;
+  width: 24em;
+
+  @extend %system_entry;
+
+  .search-entry-icon {
+    icon-size: $scalable_icon_size;
+    margin-top: 2px; // center vertically
+    padding: 0 $base_margin;
+  }
+}

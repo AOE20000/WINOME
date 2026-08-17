@@ -1,0 +1,24 @@
+# NOTICE — 修改声明
+
+本目录的代码派生自 [WinOverview](https://github.com/valinet/WinOverview)（GPL-2.0，
+上游提交 `b36d7f4`，2020-04-28），遵循 GPL-2.0 条款发布，与 WINOME 整体的
+GPL-2.0 许可一致。
+
+## 修改内容
+
+本目录从 WinOverview 提取了 GNOME Activities（概览）的实现代码，仅保留源码文件，并进行了
+以下修改：
+
+1. **移除构建脚手架**：删除 `.rc`、`resource.h`、`.vcxproj`、`.sln` 等工程文件，仅保留
+   `.cpp` / `.h` 源码。
+2. **保留目录结构**：`constants.h` 被守护进程与 DLL 共用，相对路径保持不变。
+3. **保留未文档化 API 调用**：`CreateWindowInBand`、`NtUserBuildHwndList` 等原始实现未作改动。
+
+## 修改日期
+
+2026-08-16
+
+## 原始许可
+
+原项目许可为 GPL-2.0，全文见上游仓库 `LICENSE` 文件或本仓库根目录的
+`THIRD-PARTY-NOTICES`。所有原始版权声明保留于各源文件。

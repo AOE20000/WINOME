@@ -1,0 +1,12 @@
+﻿// SPDX-License-Identifier: GPL-2.0-or-later
+// Origin: GNOME Shell <https://github.com/GNOME/gnome-shell> (GPL-2.0-or-later)
+// Modified for WINOME, 2026-08-16.
+/* OVERVIEW */
+
+.secondary-monitor-workspaces {
+  spacing: $base_padding * 2;
+}
+
+#overviewGroup {
+  background-color: $system_base_color;
+}

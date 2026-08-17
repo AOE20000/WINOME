@@ -1,0 +1,32 @@
+﻿/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* Origin: GNOME Shell <https://github.com/GNOME/gnome-shell> (GPL-2.0-or-later) */
+/* Modified for WINOME, 2026-08-16. */
+.Leader {
+    stroke-width: .5 !important;
+    stroke: #535353;
+    fill: none !important;
+}
+
+.Button {
+    stroke-width: .25;
+    stroke: #ededed;
+    fill: #ededed;
+}
+
+.Ring {
+    stroke-width: .5 !important;
+    stroke: #535353 !important;
+    fill: none !important;
+}
+
+.Label {
+    stroke: none !important;
+    stroke-width: .1 !important;
+    fill: transparent !important;
+}
+
+.TouchStrip, .TouchRing {
+    stroke-width: .1 !important;
+    stroke: #ededed !important;
+    fill: #535353 !important;
+}
