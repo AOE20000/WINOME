@@ -2,6 +2,10 @@
 
 本文档详解 WinOverview 概览的实现机制，对应提取后的三个组件。
 
+> **WINOME 修改**：本文描述上游原版架构。WINOME 对其的改动（显示最小化窗口、
+> 概览让出顶栏条带、排除 WINOME 面板、`extern "C"` 导出、静态链接运行时、
+> 关闭动画互斥重试等）见 [WINOME/README.md](../WINOME/README.md)「概览与面板的协作」。
+
 ## 1. 守护进程（WinOverview / WinOverview.cpp）
 
 职责：**监听全局按键，触发概览；概览运行期间转发系统级事件**。

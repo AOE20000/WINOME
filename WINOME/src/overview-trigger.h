@@ -13,6 +13,10 @@ namespace winome {
 // loop.
 void start_overview_trigger();
 
+// Open the Activities overview if it is not already running (used by the panel
+// Activities button and the top-left hot corner).
+void open_overview();
+
 // Toggle the Activities overview (used by the panel Activities button).
 void toggle_overview();
 

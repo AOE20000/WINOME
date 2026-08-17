@@ -14,6 +14,7 @@
 #include "shell-panel.h"
 #include "win-event-hook.h"
 #include "fullscreen-watcher.h"
+#include "hot-corner.h"
 
 // The host runs as a GUI application (no console window). Route diagnostics
 // to a log file so startup errors are still visible.
@@ -81,6 +82,9 @@ position_panel (GtkWidget *panel)
   // Auto-hide the panel while a fullscreen window or the lock screen is
   // active; it stays visible everywhere else, including over the overview.
   winome::start_fullscreen_watcher (hwnd);
+
+  // GNOME-style top-left hot corner opens the overview.
+  winome::start_hot_corner (hwnd);
 }
 
 static void

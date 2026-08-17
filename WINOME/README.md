@@ -21,32 +21,60 @@ ninja -C build
 - [x] Phase 0：宿主进程骨架 + 顶部面板占位（GTK4），可编译运行
 - [x] 隐藏原生任务栏（`src/native-taskbar.cpp`，独立实现）
 - [x] 桌面层嵌入 WorkerW（`src/desktop-layer.cpp`，独立实现）
-- [x] 事件钩子防止任务栏/通知中心/XAML 浮窗重现（`src/win-event-hook.cpp`，独立实现）
-- [x] 接入 WinOverview 概览（Win+W 触发，`src/overview-trigger.cpp` + `overview/` 编译 DLL/Launcher）
+- [x] 事件钩子防止任务栏/通知中心/XAML 浮窗重现（`src/win-event-hook.cpp`；**保留全屏 Alt-Tab/任务视图切换器**）
+- [x] 接入 WinOverview 概览（**Win 键** / **左上角热角**触发，`src/overview-trigger.cpp` + `src/hot-corner.cpp` + `overview/` 编译 DLL/Launcher）
+- [x] 概览增强：显示**最小化窗口**（恢复矩形、无离屏飞入）、排除 WINOME 面板、让出顶栏条带（面板保持可见）
 - [x] 面板：置顶全宽顶栏，GNOME 主题精确复刻（Activities 圆点按钮 + 时钟 + 状态区图标 + 悬停/点击动画）
+- [x] 面板保留工作区（`SPI_SETWORKAREA`）：最大化/全屏应用停在面板下方（像任务栏保留底部）
+- [x] 面板全屏自动隐藏（`src/fullscreen-watcher.cpp`）：真全屏/锁屏隐藏，桌面/最大化/概览/Alt-Tab 切换器下保持显示
+- [x] 面板隐藏于 Alt-Tab 与任务栏（`WS_EX_TOOLWINDOW`，GDK 重置后周期性重断言）
+- [x] 宿主为 GUI 程序（`win_subsystem: 'windows'`），stdout/stderr 写入 `%TEMP%\winome.log`
 - [x] 快速设置面板：GNOME 完整布局——电量+操作按钮顶行、音量/亮度滑块（整行，accent 进度 + 白色圆手柄）、8 个开关（WLAN/蓝牙/电源模式/夜间模式/深色主题/勿扰/键盘/飞行模式，带 `>` 二级菜单箭头）
 - [x] 真实数据源：电量（`GetSystemPowerStatus`）、音量（WASAPI `IAudioEndpointVolume`，滑块实时调节 + 图标动态）、网络（`InternetGetConnectedState`）、锁屏（`LockWorkStation`）
 - [x] 时钟 UTF-8 修复（改用 `GDateTime`，避免 strftime 的 GBK `%p` 触发 Pango 报错）
+- [x] 快捷键/热区：Win = 概览、**左上角热角** = 打开概览、Win+Tab = 开始菜单、其余 Win 组合键/Alt+Tab 透传、Esc = 关闭概览
 - [ ] 日历面板完整实现（`dateMenu.js`）
 - [ ] 关机菜单（挂起/重启/关机/注销）、亮度/网络/蓝牙真实数据
-- [ ] 网络/蓝牙真实数据
+
+## 快捷键
+
+| 按键 | 行为 |
+|------|------|
+| **Win**（单独按下松开） | 切换概览 |
+| **鼠标移到左上角热角** | 打开概览（`src/hot-corner.cpp`，主显示器左上角，带 2s 冷却） |
+| **Win+Tab** | 打开开始菜单 |
+| **Win+E / Win+R / Win+D …** | 透传给 Windows（组合键保留） |
+| **Win+Alt+Tab** | 任务视图（透传） |
+| **Alt+Tab** | 切换窗口（透传，切换器不被抑制） |
+| **Esc** | 关闭概览 |
+
+> Win 键实现：钩子吞掉 Win keydown 阻止系统打开开始菜单；裸 Win 在 keyup 判定后切换概览；检测到组合键时重新注入带标记的 Win（`dwExtraInfo`），系统照常处理 Win+E 等；Win+Tab 用 `SendInput` 合成裸 Win 打开开始菜单。
 
 ## 架构说明
 
 宿主进程（`winome.exe`）启动时：
 
-1. `set_process_dpi_aware()` — 每显示器 DPI 感知 v2
-2. `enable_privilege(SeTcbPrivilege)` — 提权（隐藏任务栏需要）
-3. `NativeTaskbar::hide()` — `SHAppBarMessage(ABM_SETSTATE)` + `ShowWindowAsync(SW_HIDE)`，事件驱动看守线程应对 Explorer 重建
-4. `start_win_event_hook()` — `SetWinEventHook` 分别注册 `EVENT_OBJECT_CREATE/SHOW/UNCLOAKED`，任务栏/通知中心/XAML 浮窗重现时再次隐藏
-5. `start_overview_trigger()` — `WH_KEYBOARD_LL` 钩子监听 **Win+W**：在 explorer.exe 内 `WinExec` 启动 `WinOverviewLauncher.exe`（普通权限），由 launcher 拉起 RuntimeBroker 并注入 `WinOverview.dll` 渲染概览；Esc 关闭
-6. 创建 GTK4 面板窗口（置顶全宽顶栏，时钟/Activities/快速设置），`SetWindowPos(HWND_TOPMOST)` 定位到工作区顶部
-7. 退出时 `NativeTaskbar::restore()` — 仅当本进程隐藏过才恢复
+1. `setup_log_file()` — 重定向 stdout/stderr 到 `%TEMP%\winome.log`（GUI 程序，无终端窗口）
+2. `set_process_dpi_aware()` — 每显示器 DPI 感知 v2
+3. `enable_privilege(SeTcbPrivilege)` — 提权（隐藏任务栏需要）
+4. `NativeTaskbar::hide()` — `SHAppBarMessage(ABM_SETSTATE)` + `ShowWindowAsync(SW_HIDE)`，事件驱动看守线程应对 Explorer 重建
+5. `start_win_event_hook()` — `SetWinEventHook` 分别注册 `EVENT_OBJECT_CREATE/SHOW/UNCLOAKED`：任务栏/通知中心/非全屏 XAML 浮窗重现时再次隐藏；**全屏 XAML island（Alt-Tab/任务视图切换器）放行**
+6. `start_overview_trigger()` — `WH_KEYBOARD_LL` 钩子：裸 **Win** 切换概览、Win+Tab 打开开始菜单、其余 Win 组合键/Alt+Tab 透传；在 explorer.exe 内 `WinExec` 启动 `WinOverviewLauncher.exe`（普通权限），由 launcher 拉起 RuntimeBroker 并注入 `WinOverview.dll` 渲染概览；Esc 关闭
+7. 创建 GTK4 面板窗口（置顶全宽顶栏，时钟/Activities/快速设置）：`SetWindowPos(HWND_TOPMOST)` 定位到**主显示器原点**；`WS_EX_TOOLWINDOW` 使其隐藏于 Alt-Tab/任务栏；`SPI_SETWORKAREA` 保留顶栏条带（应用停在面板下方）；`start_fullscreen_watcher()` 每 400ms 检查前台窗口（真全屏/锁屏隐藏面板，同时重断言 `WS_EX_TOOLWINDOW`）；`start_hot_corner()` 每 100ms 轮询光标，进入左上角热角打开概览
+8. 退出时恢复工作区与 `NativeTaskbar::restore()` — 仅当本进程隐藏过才恢复
 
 构建产物（`build/` 下）：
 - `src/winome.exe` — 宿主进程
 - `overview/WinOverview.dll` — 概览渲染 DLL（注入 RuntimeBroker）
 - `overview/WinOverviewLauncher.exe` — 注入启动器
+
+### 概览与面板的协作（`extracted/WinOverview/` 的 WINOME 修改）
+
+- **概览让出顶栏条带**：概览窗按标题 `WINOME Shell` 找到面板，若面板可见则其所在显示器概览窗起点下移一个面板高度（`realArea.top += panelHeight`），面板自然露出在上方。面板隐藏（全屏自动隐藏）时概览恢复全屏。
+- **排除 WINOME 面板**：`EnumWindowsProc` 用 `IsWinomeHostWindow` 过滤——匹配标题 `WINOME Shell`（跨完整性可读）+ 进程名 `winome.exe` 兜底，面板/弹层不会成为缩略图。
+- **最小化窗口**：去掉 `!IsIconic` 过滤；最小化窗口用 `GetWindowPlacement().rcNormalPosition` 作为矩形（`GetWindowRect` 对最小化返回离屏坐标）、按恢复矩形归属显示器；无离屏飞入动画（直接出现在槽位）；点击时先 `SW_RESTORE` 再 `SetForegroundWindow`。
+- **DLL 运行时**：MinGW 运行时静态链接（`-static-libgcc -Bstatic -lstdc++ -lwinpthread`），DLL 只依赖系统 DLL——注入 RuntimeBroker 时其搜索路径（继承自 explorer）找不到 MSYS2 的 bin。
+- **导出与关闭**：`overview_main` 用 `extern "C"` 导出（C++ 名称修饰会导致 launcher 的 `GetProcAddress` 返回 NULL）；关闭动画若与开场动画互斥则用 `SetTimer` 延迟重试，避免概览关不掉。
 
 主题处理（`src/theme/meson.build` + `tools/` + `st-compat/`）：
 

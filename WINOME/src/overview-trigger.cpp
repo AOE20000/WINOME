@@ -294,6 +294,11 @@ void start_overview_trigger() {
   std::thread(trigger_thread_main).detach();
 }
 
+void open_overview() {
+  if (!g_running)
+    start_overview();
+}
+
 void toggle_overview() {
   if (!g_running)
     start_overview();

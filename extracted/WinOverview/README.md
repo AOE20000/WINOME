@@ -3,6 +3,11 @@
 本目录是从 [WinOverview](https://github.com/…) 项目中提取的 **GNOME Activities（概览）** 实现代码，
 仅包含源代码文件（.cpp / .h），不含 `.rc`、`resource.h`、`.vcxproj`、`.sln` 等构建脚手架。
 
+> **WINOME 修改**：本目录代码经 WINOME 深度改动——详见
+> [WINOME/README.md 概览与面板的协作](../WINOME/README.md)，包括：显示最小化窗口、
+> 概览让出顶栏条带、排除 WINOME 面板、`overview_main` 以 `extern "C"` 导出、
+> MinGW 运行时静态链接、关闭动画互斥重试等。以下描述为上游原版行为，部分已被 WINOME 覆盖。
+
 ## 项目简介
 
 WinOverview 是 GNOME Activities（Overview / 概览）在 Microsoft Windows 上的复刻实现：
