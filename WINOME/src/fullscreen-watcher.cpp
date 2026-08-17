@@ -117,6 +117,25 @@ gboolean fullscreen_tick(gpointer user_data) {
   if ((ex & WS_EX_TOOLWINDOW) == 0)
     SetWindowLongPtrW(panel, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW);
 
+  // Hiding the taskbar makes the shell asynchronously recompute the work area
+  // to the full screen, which can revert the panel-strip reservation set at
+  // startup. Re-assert it, but only when it currently differs, so stable
+  // states do not trigger needless relayouts.
+  RECT panel_rect;
+  if (GetWindowRect(panel, &panel_rect)) {
+    HMONITOR mon = MonitorFromWindow(panel, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = {sizeof(mi)};
+    RECT current;
+    if (mon != nullptr && GetMonitorInfo(mon, &mi) &&
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &current, 0)) {
+      RECT work = mi.rcMonitor;
+      work.top += (panel_rect.bottom - panel_rect.top);
+      if (current.top != work.top || current.left != work.left ||
+          current.right != work.right || current.bottom != work.bottom)
+        SystemParametersInfoW(SPI_SETWORKAREA, 0, &work, 0);
+    }
+  }
+
   bool hide = should_hide_panel(GetForegroundWindow());
   if (hide != hidden) {
     hidden = hide;
