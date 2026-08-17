@@ -596,9 +596,9 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 									}
 								}
 							}
-							SetForegroundWindow(animation->hWnd);
 							if (IsIconic(animation->hWnd))
 								ShowWindow(animation->hWnd, SW_RESTORE);
+							SetForegroundWindow(animation->hWnd);
 							DoAnimate(TRUE, ANIMTYPE_PREVIEW, info, FALSE);
 							for (UINT z = 0; z < monitors.size(); ++z)
 							{
