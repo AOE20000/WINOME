@@ -6,21 +6,24 @@
 #include <Windows.h>
 #include <algorithm>
 #include <math.h>
+#include <type_traits>
 
 // MinGW does not provide the min/max macros in C++ mode (unlike MSVC), so
 // provide generic overloads that match the mixed-type call sites below.
+// NOTE: the trailing return type MUST be decayed. With lvalue operands
+// `decltype(a < b ? a : b)` deduces a reference type, returning a dangling
+// reference to a by-value parameter; GCC >= 16 miscompiles that under -O2.
 template <typename A, typename B>
-static inline auto min(A a, B b) -> decltype(a < b ? a : b) {
+static inline auto min(A a, B b) -> std::decay_t<decltype(a < b ? a : b)> {
   return a < b ? a : b;
 }
-template <typename A, typename B>
-static inline auto max(A a, B b) -> decltype(a > b ? a : b) {
-  return a > b ? a : b;
-}
-// GNOME Math.min(a, b, c) semantics used at computeScaleAndSpace.
 template <typename A, typename B, typename C>
-static inline auto min(A a, B b, C c) -> decltype(min(a, b) < c ? min(a, b) : c) {
+static inline auto min(A a, B b, C c) -> std::decay_t<decltype(min(a, b) < c ? min(a, b) : c)> {
   return min(min(a, b), c);
+}
+template <typename A, typename B>
+static inline auto max(A a, B b) -> std::decay_t<decltype(a > b ? a : b)> {
+  return a > b ? a : b;
 }
 
 #include "constants.h"

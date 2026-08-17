@@ -34,6 +34,14 @@ HWND bkgHwnd = NULL;
 
 std::vector<MonitorInfo> monitors;
 
+// If the animation mutex is busy (an earlier animation is still running, e.g.
+// the opening animation when the user closes right away), defer the close and
+// retry shortly after. Blocking here would deadlock the message loop because
+// WM_THREAD_DONE (which releases the mutex) is delivered to this same thread.
+static void DeferClose (HWND hWnd) {
+  SetTimer (hWnd, 1, 50, NULL);
+}
+
 void DetectSearchDismiss(
 	HWINEVENTHOOK hWinEventHook,
 	DWORD event,
@@ -270,11 +278,15 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 			}
 			if (wParam == 3)
 			{
-				return DoAnimate(FALSE, ANIMTYPE_MAIN_FADE, info, FALSE);
+				if (!DoAnimate(FALSE, ANIMTYPE_MAIN_FADE, info, FALSE))
+					DeferClose(hWnd);
+				return TRUE;
 			}
 			if (info->focusHWnd == hWnd || wParam == 2 || !isOneInSearch)
 			{
-				return DoAnimate(FALSE, ANIMTYPE_PREVIEW, info, FALSE);
+				if (!DoAnimate(FALSE, ANIMTYPE_PREVIEW, info, FALSE))
+					DeferClose(hWnd);
+				return TRUE;
 			}
 			return 0;
 		}
@@ -358,6 +370,14 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		break;
 	}
 	
+	case WM_TIMER:
+		if (wParam == 1)
+		{
+			KillTimer(hWnd, 1);
+			PostMessage(hWnd, WM_CLOSE, 0, 0);
+		}
+		break;
+
 	case WM_THREAD_DONE:
 		CloseHandle(info->hAnimThread);
 		info->hAnimThread = NULL;
@@ -678,7 +698,7 @@ HWND CreateWin(RECT rect, LPVOID info)
 	return hwndParent;
 }
 
-__declspec(dllexport) DWORD WINAPI overview_main(LPVOID lpParam)
+extern "C" __declspec(dllexport) DWORD WINAPI overview_main(LPVOID lpParam)
 {
 	if (running) {
 		return 0;

@@ -32,6 +32,13 @@ shared_library('WinOverview',
   dependencies: ov_win32_libs,
   include_directories: ov_lib_inc,
   cpp_args: ['-DWIN32_LEAN_AND_MEAN', '-DUNICODE', '-D_UNICODE'],
+  # Statically link the MinGW runtimes so the DLL only depends on system DLLs:
+  # the DLL is loaded inside RuntimeBroker.exe, whose DLL search path (inherited
+  # from explorer.exe) never sees the MSYS2 bin/ directory. Keep both libstdc++
+  # and winpthread under -Bstatic so libstdc++'s pthread mutex stubs resolve to
+  # the static winpthread instead of the runtime DLL.
+  link_args: ['-static-libgcc', '-Wl,-Bstatic', '-lstdc++', '-lwinpthread',
+              '-Wl,-Bdynamic'],
   name_prefix: '',
   install: false,
 )

@@ -110,7 +110,9 @@ DWORD WINAPI run(LPVOID) {
 
       char module_path[_MAX_PATH];
       GetModuleFileNameA(GetModuleHandle(nullptr), module_path, _MAX_PATH);
-      // Host lives in build/src/; the launcher + DLL are in build/overview/.
+      // Host lives in build/src/winome.exe; the launcher + DLL are in
+      // build/overview/. Remove the file name, then the src/ directory.
+      PathRemoveFileSpecA(module_path);   // .../build/src/winome.exe -> .../build/src
       PathRemoveFileSpecA(module_path);   // .../build/src -> .../build
       launcher_path[0] = '\"';
       strcat_s(launcher_path, module_path);
