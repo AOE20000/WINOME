@@ -32,9 +32,11 @@ ninja -C build
 - [x] 快速设置面板：GNOME 完整布局——电量+操作按钮顶行、音量/亮度滑块（整行，accent 进度 + 白色圆手柄）、8 个开关（WLAN/蓝牙/电源模式/夜间模式/深色主题/勿扰/键盘/飞行模式，带 `>` 二级菜单箭头）
 - [x] 真实数据源：电量（`GetSystemPowerStatus`）、音量（WASAPI `IAudioEndpointVolume`，滑块实时调节 + 图标动态）、网络（`InternetGetConnectedState`）、锁屏（`LockWorkStation`）
 - [x] 时钟 UTF-8 修复（改用 `GDateTime`，避免 strftime 的 GBK `%p` 触发 Pango 报错）
-- [x] 快捷键/热区：Win = 概览、**左上角热角** = 打开概览、Win+Tab = 开始菜单、其余 Win 组合键/Alt+Tab 透传、Esc = 关闭概览
-- [ ] 日历面板完整实现（`dateMenu.js`）
-- [ ] 关机菜单（挂起/重启/关机/注销）、亮度/网络/蓝牙真实数据
+- [x] 快捷键：Win = 概览、**左上角热角** = 打开概览、Win+Tab = 开始菜单、其余 Win 组合键/Alt+Tab 透传、Esc = 关闭概览
+- [x] 快速设置/日历弹出窗**已临时移除**（待重构；widget 代码保留在 `quick-settings.cpp` / `calendar.cpp`）
+- [ ] 快速设置面板重构（电量/音量/亮度 + 8 个开关）、关机菜单
+- [ ] 日历面板重构（`dateMenu.js`）
+- [ ] 网络/蓝牙真实数据
 
 ## 快捷键
 
