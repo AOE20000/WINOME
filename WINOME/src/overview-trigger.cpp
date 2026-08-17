@@ -1,12 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Origin: WinOverview <https://github.com/valinet/WinOverview> (GPL-2.0-or-later)
-// Modified for WINOME, 2026-08-16. Ported daemon trigger into the host;
-// hotkey changed to Win+W.
+// Modified for WINOME, 2026-08-16. Ported daemon trigger into the host.
 //
 // The overview renders inside RuntimeBroker.exe via an injected DLL. The
-// daemon (here: the host) listens for the Win+W hotkey and starts
+// daemon (here: the host) listens for the Win key and starts
 // WinOverviewLauncher.exe inside explorer.exe via WinExec, so the launcher
 // runs with ordinary (non-elevated) privileges.
+//
+// Hotkey handling:
+//   - Win (pressed and released alone)      -> toggle the Activities overview
+//   - Win+Tab                               -> open the Start menu
+//   - Win+<anything else> (E, R, D, ...)    -> forwarded unchanged to Windows
+//   - Esc                                   -> close the overview
+// The Win keydown is swallowed so the system does not open the Start menu;
+// when another key follows, the Win keydown is re-injected (tagged) so the
+// combination still reaches the system, and a tagged Win keyup releases it.
 
 #include "overview-trigger.h"
 
@@ -29,10 +37,34 @@ namespace {
 constexpr wchar_t kOverviewClassName[] = L"ActivitiesOverviewWindowClassFull";
 constexpr UINT kWMAskMouse = WM_USER + 0x0002;
 
+// Marks synthetic Win keypresses this hook injects (via dwExtraInfo) so they
+// are passed through to the system instead of being re-processed by the hook.
+constexpr ULONG_PTR kSyntheticWinExtra = 0x574E4F31;  // "WNO1"
+
 BOOL g_running = FALSE;
 BOOL g_win_down = FALSE;
+BOOL g_win_alone = FALSE;
+BOOL g_win_injected = FALSE;
 HHOOK g_keyboard_hook = nullptr;
 HHOOK g_mouse_hook = nullptr;
+
+// Inject a Win keypress (keydown or keyup) into the input stream, tagged so
+// LowLevelKeyboardProc ignores it. Used to (a) re-inject the consumed Win
+// keydown so Win+<key> combinations still reach the system, and (b) open the
+// Start menu with a bare Win press.
+void inject_win_key(bool key_up) {
+  INPUT input = {};
+  input.type = INPUT_KEYBOARD;
+  input.ki.wVk = VK_LWIN;
+  input.ki.dwExtraInfo = kSyntheticWinExtra;
+  input.ki.dwFlags = key_up ? KEYEVENTF_KEYUP : 0;
+  SendInput(1, &input, sizeof(INPUT));
+}
+
+void open_start_menu() {
+  inject_win_key(false);
+  inject_win_key(true);
+}
 
 typedef NTSTATUS(WINAPI* NtUserBuildHwndListFn)(
     HDESK in_hDesk, HWND in_hWndNext, BOOL in_EnumChildren,
@@ -190,26 +222,59 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
   if (nCode == HC_ACTION) {
     KBDLLHOOKSTRUCT* state = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
 
-    if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-      if (state->vkCode == VK_LWIN || state->vkCode == VK_RWIN) {
+    // Synthetic Win presses injected below: pass them through untouched so the
+    // system sees the Start menu / Win+<key> we deliberately re-created.
+    if (state->dwExtraInfo == kSyntheticWinExtra)
+      return CallNextHookEx(nullptr, nCode, wParam, lParam);
+
+    const bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+    const bool up = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+
+    if (state->vkCode == VK_LWIN || state->vkCode == VK_RWIN) {
+      if (down) {
+        // Swallow the Win keydown so Windows does not open the Start menu.
+        // If another key follows, the Win keydown is re-injected for Win+<key>.
         g_win_down = TRUE;
-      } else if (state->vkCode == 'W' && g_win_down) {
-        // Win+W toggles the overview. Consume the keystroke so Windows does
-        // not also open its own widgets panel underneath the overview.
-        if (!g_running)
-          start_overview();
-        else
-          close_overview();
+        g_win_alone = TRUE;
+        g_win_injected = FALSE;
         return 1;
-      } else {
-        g_win_down = FALSE;
       }
-    } else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
-      if (state->vkCode == VK_LWIN || state->vkCode == VK_RWIN) {
+      if (up) {
         g_win_down = FALSE;
-      } else if (state->vkCode == VK_ESCAPE && g_running) {
-        close_overview();
+        const bool bare = g_win_alone;
+        g_win_alone = FALSE;
+        if (g_win_injected) {
+          // Release the synthetic Win keydown that enabled the Win+<key> combo.
+          inject_win_key(true);
+          g_win_injected = FALSE;
+        }
+        if (bare) {
+          // A bare Win press opens/closes the Activities overview.
+          if (!g_running)
+            start_overview();
+          else
+            close_overview();
+        }
+        return 1;
       }
+    }
+
+    if (down && g_win_down) {
+      // A key pressed while Win is held: this is a combo, not a bare Win.
+      g_win_alone = FALSE;
+      if (state->vkCode == VK_TAB) {
+        // Win+Tab normally opens Task View; open the Start menu instead.
+        open_start_menu();
+        return 1;
+      }
+      if (!g_win_injected) {
+        // Re-inject the swallowed Win keydown so the system processes Win+key
+        // (Win+E, Win+R, ...) as usual.
+        inject_win_key(false);
+        g_win_injected = TRUE;
+      }
+    } else if (up && state->vkCode == VK_ESCAPE && g_running) {
+      close_overview();
     }
   }
   return CallNextHookEx(nullptr, nCode, wParam, lParam);
