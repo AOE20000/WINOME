@@ -1,6 +1,7 @@
 winome_sources = files(
   'main.cpp',
   'shell-panel.cpp',
+  'fonts.cpp',
   'native-taskbar.cpp',
   'desktop-layer.cpp',
   'host-utils.cpp',
@@ -32,12 +33,12 @@ subdir('theme')
 resources = gnome.compile_resources('winome-resources',
   'theme/winome.gresource.xml',
   source_dir: meson.current_build_dir() / 'theme',
-  dependencies: [gnome_shell_gtk4_css, gnome_shell_dark_css],
+  dependencies: [gnome_shell_gtk4_css, gnome_shell_dark_css, cantarell_fonts],
 )
 
 executable('winome',
   [winome_sources, resources],
-  dependencies: [gtk4_dep, shell32_dep, user32_dep, gdi32_dep, psapi_dep, shlwapi_dep, advapi32_dep, ole32_dep, wininet_dep, stcompat_dep],
+  dependencies: [gtk4_dep, fontconfig_dep, pangoft2_dep, shell32_dep, user32_dep, gdi32_dep, psapi_dep, shlwapi_dep, advapi32_dep, ole32_dep, wininet_dep, stcompat_dep],
   include_directories: [winome_src_inc, include_directories('.')],
   cpp_args: ['-DUNICODE', '-D_UNICODE'],
   install: true,

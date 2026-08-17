@@ -11,6 +11,8 @@ project('winome', ['c', 'cpp'],
 )
 
 gtk4_dep = dependency('gtk4', version: '>= 4.0')
+fontconfig_dep = dependency('fontconfig')
+pangoft2_dep = dependency('pangoft2')
 
 cc = meson.get_compiler('cpp')
 

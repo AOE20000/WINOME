@@ -20,6 +20,7 @@
 #include "quick-settings.h"
 #include "system-status.h"
 #include "overview-trigger.h"
+#include "fonts.h"
 
 #include <time.h>
 #include <string.h>
@@ -769,6 +770,9 @@ winome_shell_panel_new (void)
 
   // Refresh network / volume / battery icons periodically.
   g_timeout_add_seconds (2, refresh_status, status);
+
+  // Give the panel its own font map so the bundled Cantarell font is used.
+  winome::install_bundled_fonts (panel);
 
   load_css (panel);
 

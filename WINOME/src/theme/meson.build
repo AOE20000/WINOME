@@ -33,3 +33,19 @@ gnome_shell_gtk4_css = custom_target('gnome-shell-gtk4.css',
   depend_files: [meson.source_root() / 'tools' / 'convert-st-css.py'],
   build_by_default: true,
 )
+
+# Bundled Cantarell fonts (GNOME's default UI font), embedded in GResource so
+# the panel can use them without the fonts being installed on the system.
+cantarell_fonts = []
+foreach font : [
+    'Cantarell-Regular-5.ttf',
+    'Cantarell-Bold-2.ttf',
+    'Cantarell-Oblique-4.ttf',
+    'Cantarell-BoldOblique-3.ttf',
+  ]
+  cantarell_fonts += configure_file(
+    input: 'fonts' / font,
+    output: font,
+    copy: true,
+  )
+endforeach

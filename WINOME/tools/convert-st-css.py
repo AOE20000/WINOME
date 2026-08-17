@@ -314,11 +314,11 @@ popover.quick-settings-popover > contents {
   border-radius: 18px;
 }
 
-/* Panel font: match the St theme context default ("Sans 11", 11pt), so every
-   em value in the stylesheet (panel height, workspace-dot, paddings) resolves
-   to the same pixel size as GNOME Shell computes it. */
+/* Panel font: the bundled Cantarell (GNOME's default UI font) at 11pt, so
+   every em value in the stylesheet (panel height, workspace-dot, paddings)
+   resolves to the same pixel size as GNOME Shell computes it. */
 #panel {
-  font: 11pt "Sans";
+  font: 11pt "Cantarell";
 }
 
 /* .panel-button horizontal padding mirrors -natural-hpadding: 12px (the St

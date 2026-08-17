@@ -3,5 +3,9 @@
   <gresource prefix="/org/winome/theme">
     <file>gnome-shell-dark.css</file>
     <file>gnome-shell-gtk4.css</file>
+    <file>Cantarell-Regular-5.ttf</file>
+    <file>Cantarell-Bold-2.ttf</file>
+    <file>Cantarell-Oblique-4.ttf</file>
+    <file>Cantarell-BoldOblique-3.ttf</file>
   </gresource>
 </gresources>
