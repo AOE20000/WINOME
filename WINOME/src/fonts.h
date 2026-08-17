@@ -8,8 +8,12 @@
 
 namespace winome {
 
-// Extract the bundled Cantarell fonts (embedded in GResource) and give the
-// given toplevel window its own fontconfig-based Pango font map so the panel
+// The shared fontconfig-based Pango font map with the bundled Cantarell fonts
+// registered (created lazily on first use). The panel and its popovers are
+// separate toplevel windows, so each must be given this map explicitly.
+PangoFontMap *bundled_font_map (void);
+
+// Apply the bundled Cantarell font map to the given toplevel window so its
 // text renders in Cantarell (GNOME's default UI font). Must be called before
 // the window is shown.
 void install_bundled_fonts (GtkWidget *window);

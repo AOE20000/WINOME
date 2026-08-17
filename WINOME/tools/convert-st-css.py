@@ -259,59 +259,67 @@ GTK4_BUTTON_OVERRIDE = """
   box-shadow: inset 0 0 0 2px rgba(134, 181, 239, 0.800);
 }
 .quick-toggle > box {
-  padding: 0 12px;
+  /* Native: .quick-toggle > StBoxLayout { padding: 0 12px; } plus the :ltr
+     rule (dropped by the conversion) adding 15px on the left. */
+  padding: 0 12px 0 15px;
 }
-.quick-toggle .quick-toggle-icon {
-  margin-right: 8px;
+/* The inner toggle of a has-menu toggle shrinks to its content width (native
+   sets min-width: auto, which the conversion drops because GTK4 rejects
+   'auto'), while keeping the 3.273em capsule height. */
+.quick-toggle-has-menu .quick-toggle {
+  min-width: 0;
 }
-
-/* Quick slider: GNOME accent-colored progress + round white handle.
-   GTK4's GtkScale nodes: scale > trough > [highlight] + slider. */
-.quick-slider scale {
-  min-height: 20px;
+/* Native has-menu inner-toggle box: padding-right 0.6135em (9px). */
+.quick-toggle-has-menu .quick-toggle > box {
+  padding-right: 9px;
 }
-.quick-slider scale trough {
-  min-height: 4px;
-  border-radius: 999px;
-  background-color: rgba(255, 255, 255, 0.15);
-  border: none;
+/* Both toggle styles are fixed to exactly 12em: native uses
+   min-width/max-width: 12em, but the conversion drops max-width. Without it
+   a has-menu toggle (inner toggle + separator + menu button) or a long title
+   grows past 12em and misaligns the grid. */
+.quick-toggle,
+.quick-toggle-has-menu {
+  max-width: 12em;
 }
-.quick-slider scale highlight {
-  border-radius: 999px;
-  background-color: #3584e4;
-}
-.quick-slider scale slider {
-  min-width: 18px;
-  min-height: 18px;
-  border-radius: 999px;
-  background-color: #ffffff;
-  border: none;
-  box-shadow: none;
-}
-
-/* Icon buttons (battery/volume/brightness round buttons) use the GNOME
-   %button dark-grey fill, matching status/system.js bottom action buttons. */
-.icon-button,
-.icon-button.flat {
-  background-color: #48484c;
-  color: #ffffff;
-  border-radius: 999px;
-  border: none;
-}
-.icon-button:hover,
-.icon-button.flat:hover {
-  background-color: #525256;
-}
-.icon-button:active,
-.icon-button.flat:active {
-  background-color: #5e5e64;
+/* GtkButton adds its own padding on top of the GNOME padding. Native has no
+   padding on the buttons themselves (it lives in the inner box), so strip it;
+   otherwise a has-menu toggle renders wider/taller than a plain toggle. */
+.quick-toggle-has-menu {
+  padding: 0;
 }
 
-/* The quick-settings / calendar popover: GNOME dark card background. */
+/* Quick slider: rendered by the custom WinomeQuickSlider widget (GNOME
+   trough rgba(255,255,255,0.15), accent #3584e4 highlight, 18px white
+   handle). The .slider-bin padding/radius comes from the converted theme. */
+
+/* Icon buttons (battery/volume/brightness round buttons) use the GNOME %button
+   dark-grey fill; their exact colors and circular radius come from the
+   converted stylesheet (evaluated bit-exactly via st-css-eval). */
+
+/* The quick-settings / calendar popover: GNOME dark card background, matching
+   .popup-menu-content.quick-settings (background + 1px border + drop shadow;
+   border-radius is .quick-settings' 36px, which overrides popup-menu-content's
+   20px). The popover is a separate toplevel window, so re-assert the panel
+   font here for the same em resolution as GNOME (Cantarell 11pt, applied via
+   the shared font map). GTK4's GtkPopover adds a default margin around the
+   contents node, so also remove it to avoid a ring of empty card around the
+   content. */
 popover.quick-settings-popover > contents {
   background-color: #36363a;
   color: #ffffff;
-  border-radius: 18px;
+  border-radius: 36px;
+  border: 1px solid #424247;
+  box-shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.2);
+  font: 11pt "Cantarell";
+  padding: 0;
+}
+/* The calendar popover keeps its own radius (.datemenu-popover). */
+popover.quick-settings-popover.datemenu-popover > contents {
+  border-radius: 30px;
+}
+/* The quick-settings box itself adds the GNOME 18px padding. */
+.quick-settings {
+  padding: 18px;
 }
 
 /* Panel font: the bundled Cantarell (GNOME's default UI font) at 11pt, so

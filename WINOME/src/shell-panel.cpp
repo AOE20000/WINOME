@@ -18,6 +18,7 @@
 #include "shell-panel.h"
 #include "st-engine.h"
 #include "system-status.h"
+#include "quick-settings.h"
 #include "overview-trigger.h"
 #include "fonts.h"
 
@@ -384,6 +385,130 @@ update_clock (gpointer data)
   return G_SOURCE_CONTINUE;
 }
 
+// --- Panel popovers ---------------------------------------------------------
+//
+// Both the clock (calendar) and status area (quick settings) open a GtkPopover
+// anchored below the panel button, like gnome-shell's PanelMenu.Button.
+
+static void
+on_click_popover (GtkButton *button G_GNUC_UNUSED, gpointer popover)
+{
+  // Toggle, like PanelMenu.Button._clickGesture in gnome-shell.
+  if (gtk_widget_get_visible (GTK_WIDGET (popover)))
+    gtk_popover_popdown (GTK_POPOVER (popover));
+  else
+    gtk_popover_popup (GTK_POPOVER (popover));
+}
+
+// GNOME keeps a panel button highlighted (:active) while its menu is open;
+// GTK4 clears :active when the mouse is released. The stylesheet defines an
+// "open" class with the same fill; toggle it with the popover.
+static void
+on_popover_show (GtkWidget *popover G_GNUC_UNUSED, gpointer button)
+{
+  gtk_widget_add_css_class (GTK_WIDGET (button), "open");
+}
+
+// GTK4's popover grab window on Windows leaves the anchor button's :hover
+// (PRELIGHT) state stale: after the popover closes, the button keeps its
+// highlight even when the mouse leaves, because the backend's leave tracking
+// is not re-armed. Track the real pointer ourselves for a short while after
+// the popover closes and clear the stale hover when it leaves the button.
+static gboolean
+clear_stale_hover (gpointer data)
+{
+  GtkWidget *b = GTK_WIDGET (data);
+  GtkNative *native = gtk_widget_get_native (b);
+  if (native == nullptr)
+    return G_SOURCE_REMOVE;
+  GdkSurface *surface = gtk_native_get_surface (native);
+  if (surface == nullptr)
+    return G_SOURCE_REMOVE;
+
+  GdkDisplay *display = gdk_display_get_default ();
+  GdkSeat *seat = gdk_display_get_default_seat (display);
+  GdkDevice *device = gdk_seat_get_pointer (seat);
+  if (device == nullptr)
+    return G_SOURCE_REMOVE;
+
+  double px = 0, py = 0;
+  GdkSurface *under = gdk_device_get_surface_at_position (device, &px, &py);
+
+  GtkWidget *root = GTK_WIDGET (gtk_widget_get_root (b));
+  if (root == nullptr)
+    return G_SOURCE_REMOVE;
+
+  gboolean inside = FALSE;
+  if (under == surface) {
+    graphene_rect_t bounds;
+    if (gtk_widget_compute_bounds (b, root, &bounds)) {
+      inside = px >= bounds.origin.x &&
+               px <= bounds.origin.x + bounds.size.width &&
+               py >= bounds.origin.y &&
+               py <= bounds.origin.y + bounds.size.height;
+    }
+  }
+
+  if (!inside) {
+    gtk_widget_unset_state_flags (b, GTK_STATE_FLAG_PRELIGHT);
+    return G_SOURCE_REMOVE;
+  }
+  return G_SOURCE_CONTINUE;
+}
+
+static void
+on_popover_hide (GtkWidget *popover G_GNUC_UNUSED, gpointer button)
+{
+  GtkWidget *b = GTK_WIDGET (button);
+  gtk_widget_remove_css_class (b, "open");
+
+  // GTK4's popover grab on Windows leaves the anchor button's :hover
+  // (PRELIGHT) state stale after the popover closes. Clear it immediately and
+  // keep monitoring the real pointer until it leaves the button.
+  gtk_widget_unset_state_flags (b, GTK_STATE_FLAG_PRELIGHT);
+  GtkWidget *p = gtk_widget_get_parent (b);
+  while (p) {
+    gtk_widget_unset_state_flags (p, GTK_STATE_FLAG_PRELIGHT);
+    p = gtk_widget_get_parent (p);
+  }
+
+  g_timeout_add (200, clear_stale_hover, b);
+}
+
+static void
+connect_popover_open_state (GtkWidget *popover, GtkWidget *button)
+{
+  g_signal_connect (popover, "show", G_CALLBACK (on_popover_show), button);
+  g_signal_connect (popover, "hide", G_CALLBACK (on_popover_hide), button);
+}
+
+// A popover anchored below the given panel button, using the GNOME dark card
+// background (popover.quick-settings-popover in the GTK4 stylesheet).
+static GtkWidget *
+make_panel_popover (GtkWidget *button, GtkWidget *child)
+{
+  GtkWidget *popover;
+
+  popover = gtk_popover_new ();
+  gtk_popover_set_child (GTK_POPOVER (popover), child);
+  gtk_widget_add_css_class (popover, "quick-settings-popover");
+  gtk_popover_set_has_arrow (GTK_POPOVER (popover), FALSE);
+  gtk_popover_set_position (GTK_POPOVER (popover), GTK_POS_BOTTOM);
+  gtk_popover_set_offset (GTK_POPOVER (popover), -8, -8);
+  gtk_widget_set_parent (popover, button);
+
+  // The popover is a separate toplevel window: give it the same Cantarell font
+  // map as the panel so the em-based stylesheet values resolve identically.
+  gtk_widget_set_font_map (popover, winome::bundled_font_map ());
+
+  g_object_set_data (G_OBJECT (button), "popover", popover);
+  g_signal_connect (button, "clicked", G_CALLBACK (on_click_popover),
+                    popover);
+  connect_popover_open_state (popover, button);
+
+  return popover;
+}
+
 // DateMenuButton: .panel-button.clock-display > .clock-display-box > .clock.
 // In GNOME the hover/active highlight lives on the .clock child (an St.Widget).
 // GtkLabel does not paint its CSS background in GTK4, so the .clock "label" is
@@ -422,8 +547,9 @@ create_clock_button (void)
   g_timeout_add_seconds (1, update_clock, clock_label);
   update_clock (clock_label);
 
-  // The calendar popover is intentionally not wired up yet; quick-settings.h
-  // keeps the widget code for the upcoming refactor.
+  // The clock opens the date/calendar popover (like DateMenuButton).
+  GtkWidget *popover = make_panel_popover (button, winome_calendar_new ());
+  gtk_widget_add_css_class (popover, "datemenu-popover");
 
   return button;
 }
@@ -586,8 +712,8 @@ create_quick_settings (PanelStatus *st)
 
   gtk_button_set_child (GTK_BUTTON (button), status_box);
 
-  // The quick-settings popover is intentionally not wired up yet;
-  // quick-settings.h keeps the widget code for the upcoming refactor.
+  // The status area opens the quick settings popover.
+  make_panel_popover (button, winome_quick_settings_new ());
 
   return button;
 }

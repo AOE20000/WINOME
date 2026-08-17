@@ -83,9 +83,16 @@ fonts_cache_dir (void)
   return dir;
 }
 
-void
-install_bundled_fonts (GtkWidget *window)
+PangoFontMap *
+bundled_font_map (void)
 {
+  static PangoFontMap *map = NULL;
+  static gboolean initialized = FALSE;
+
+  if (initialized)
+    return map;
+  initialized = TRUE;
+
   char *dir = fonts_cache_dir ();
   g_mkdir_with_parents (dir, 0700);
 
@@ -108,13 +115,19 @@ install_bundled_fonts (GtkWidget *window)
 
   // A fontconfig-based map renders via FreeType (cairo) instead of DirectWrite,
   // so it picks up the fonts above immediately, without a font-collection scan.
-  PangoFontMap *font_map =
-      pango_cairo_font_map_new_for_font_type (CAIRO_FONT_TYPE_FT);
-  if (PANGO_IS_FC_FONT_MAP (font_map)) {
-    pango_fc_font_map_set_config (PANGO_FC_FONT_MAP (font_map), config);
+  map = pango_cairo_font_map_new_for_font_type (CAIRO_FONT_TYPE_FT);
+  if (PANGO_IS_FC_FONT_MAP (map))
+    pango_fc_font_map_set_config (PANGO_FC_FONT_MAP (map), config);
+
+  return map;
+}
+
+void
+install_bundled_fonts (GtkWidget *window)
+{
+  PangoFontMap *font_map = bundled_font_map ();
+  if (font_map != NULL)
     gtk_widget_set_font_map (window, font_map);
-  }
-  g_object_unref (font_map);
 }
 
 }  // namespace winome

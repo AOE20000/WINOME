@@ -29,13 +29,12 @@ ninja -C build
 - [x] 面板全屏自动隐藏（`src/fullscreen-watcher.cpp`）：真全屏/锁屏隐藏，桌面/最大化/概览/Alt-Tab 切换器下保持显示
 - [x] 面板隐藏于 Alt-Tab 与任务栏（`WS_EX_TOOLWINDOW`，GDK 重置后周期性重断言）
 - [x] 宿主为 GUI 程序（`win_subsystem: 'windows'`），stdout/stderr 写入 `%TEMP%\winome.log`
-- [x] 快速设置面板：GNOME 完整布局——电量+操作按钮顶行、音量/亮度滑块（整行，accent 进度 + 白色圆手柄）、8 个开关（WLAN/蓝牙/电源模式/夜间模式/深色主题/勿扰/键盘/飞行模式，带 `>` 二级菜单箭头）
+- [x] 快速设置面板：GNOME 完整布局——电量+操作按钮顶行、音量/亮度滑块（整行，accent 进度 + 白色圆手柄）、8 个开关（WLAN/蓝牙/电源模式/夜间模式/深色主题/勿扰/键盘/飞行模式，菜单型开关带 `>` 分隔 + 二级箭头，accent 选中态）
 - [x] 真实数据源：电量（`GetSystemPowerStatus`）、音量（WASAPI `IAudioEndpointVolume`，滑块实时调节 + 图标动态）、网络（`InternetGetConnectedState`）、锁屏（`LockWorkStation`）
 - [x] 时钟 UTF-8 修复（改用 `GDateTime`，避免 strftime 的 GBK `%p` 触发 Pango 报错）
 - [x] 快捷键：Win = 概览、**左上角热角** = 打开概览、Win+Tab = 开始菜单、其余 Win 组合键/Alt+Tab 透传、Esc = 关闭概览
-- [x] 快速设置/日历弹出窗**已临时移除**（待重构；widget 代码保留在 `quick-settings.cpp` / `calendar.cpp`）
-- [ ] 快速设置面板重构（电量/音量/亮度 + 8 个开关）、关机菜单
-- [ ] 日历面板重构（`dateMenu.js`）
+- [x] 快速设置/日历弹出窗重新接入（点击状态区打开快速设置、点击时钟打开日历；GtkPopover 锚定顶栏，复用面板 Cantarell 字体映射）
+- [ ] 二级菜单（WLAN 网络/蓝牙设备/电源模式/关机）、日历面板重构、网络/蓝牙真实数据
 - [ ] 网络/蓝牙真实数据
 
 ## 快捷键
