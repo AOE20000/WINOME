@@ -110,6 +110,13 @@ gboolean fullscreen_tick(gpointer user_data) {
   HWND panel = static_cast<HWND>(user_data);
   static bool hidden = false;
 
+  // GDK re-applies its own extended styles on configure events, which would
+  // drop WS_EX_TOOLWINDOW (needed to keep the panel out of Alt-Tab and the
+  // taskbar). Re-assert it every tick.
+  LONG_PTR ex = GetWindowLongPtrW(panel, GWL_EXSTYLE);
+  if ((ex & WS_EX_TOOLWINDOW) == 0)
+    SetWindowLongPtrW(panel, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW);
+
   bool hide = should_hide_panel(GetForegroundWindow());
   if (hide != hidden) {
     hidden = hide;

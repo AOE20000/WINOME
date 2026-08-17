@@ -44,12 +44,6 @@ position_panel (GtkWidget *panel)
   if (hwnd == NULL)
     return;
 
-  // The panel is shell chrome: keep it out of Alt-Tab and the taskbar.
-  LONG_PTR ex_style = GetWindowLongPtrW (hwnd, GWL_EXSTYLE);
-  ex_style &= ~WS_EX_APPWINDOW;
-  ex_style |= WS_EX_TOOLWINDOW;
-  SetWindowLongPtrW (hwnd, GWL_EXSTYLE, ex_style);
-
   // Position the panel at the very top of the primary monitor. It is placed
   // at the monitor origin, NOT inside the work area: below, the work area is
   // shrunk by the panel height so maximized/fullscreen apps treat the strip
@@ -67,6 +61,14 @@ position_panel (GtkWidget *panel)
                 mi.rcMonitor.left, mi.rcMonitor.top,
                 width, height,
                 SWP_SHOWWINDOW);
+
+  // The panel is shell chrome: keep it out of Alt-Tab and the taskbar. Set
+  // this last so GDK's configure handling (triggered above) cannot overwrite
+  // it; fullscreen-watcher re-asserts it periodically for the same reason.
+  LONG_PTR ex_style = GetWindowLongPtrW (hwnd, GWL_EXSTYLE);
+  ex_style &= ~WS_EX_APPWINDOW;
+  ex_style |= WS_EX_TOOLWINDOW;
+  SetWindowLongPtrW (hwnd, GWL_EXSTYLE, ex_style);
 
   // Reserve the panel strip in the primary work area (session-only). Maximized
   // windows and apps that fill the work area now stop below the panel instead
