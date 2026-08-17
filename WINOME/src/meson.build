@@ -42,5 +42,6 @@ executable('winome',
   dependencies: [gtk4_dep, fontconfig_dep, pangoft2_dep, shell32_dep, user32_dep, gdi32_dep, psapi_dep, shlwapi_dep, advapi32_dep, ole32_dep, wininet_dep, stcompat_dep],
   include_directories: [winome_src_inc, include_directories('.')],
   cpp_args: ['-DUNICODE', '-D_UNICODE'],
+  win_subsystem: 'windows',
   install: true,
 )

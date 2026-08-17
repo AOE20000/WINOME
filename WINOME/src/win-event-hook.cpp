@@ -69,6 +69,26 @@ bool belongs_to_process(HWND hwnd, const wchar_t* name) {
   return base == name;
 }
 
+// True when @hwnd covers its entire monitor: the Alt-Tab/Task View switcher
+// is a fullscreen XAML island that must NOT be suppressed like the small
+// Explorer flyouts.
+bool covers_its_monitor(HWND hwnd) {
+  RECT r;
+  if (!GetWindowRect(hwnd, &r))
+    return false;
+
+  HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO mi = {sizeof(mi)};
+  if (!GetMonitorInfo(mon, &mi))
+    return false;
+
+  constexpr int kTolerance = 8;
+  return r.left <= mi.rcMonitor.left + kTolerance &&
+         r.top <= mi.rcMonitor.top + kTolerance &&
+         r.right >= mi.rcMonitor.right - kTolerance &&
+         r.bottom >= mi.rcMonitor.bottom - kTolerance;
+}
+
 // Hides @hwnd and, if it is an XAML island, its input/content bridge
 // children as well, so Explorer cannot show a partially-recreated flyout.
 void suppress_window(HWND hwnd) {
@@ -120,7 +140,9 @@ void on_window_event(DWORD event, HWND hwnd) {
         break;
       }
 
-      if (cls == kXamlIslandClass)
+      // Suppress XAML islands (flyouts, notification center) EXCEPT the
+      // fullscreen Alt-Tab/Task View switcher, which must keep working.
+      if (cls == kXamlIslandClass && !covers_its_monitor(hwnd))
         suppress_window(hwnd);
       break;
     }

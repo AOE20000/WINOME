@@ -61,6 +61,19 @@ bool covers_monitor(HWND hwnd) {
          r.bottom >= mi.rcMonitor.bottom - kTolerance;
 }
 
+// The Explorer desktop surfaces cover the whole monitor but are not
+// fullscreen apps: clicking the desktop foregrounds a WorkerW/Progman window
+// and must not hide the panel.
+bool is_desktop_window(HWND hwnd) {
+  wchar_t cls[256] = {0};
+  if (GetClassNameW(hwnd, cls, 256) == 0)
+    return false;
+  return wcscmp(cls, L"Progman") == 0 ||
+         wcscmp(cls, L"WorkerW") == 0 ||
+         wcscmp(cls, L"SHELLDLL_DefView") == 0 ||
+         wcscmp(cls, L"SysListView32") == 0;
+}
+
 // Should the panel be hidden while @fg is the foreground window?
 bool should_hide_panel(HWND fg) {
   if (fg == nullptr)
@@ -70,9 +83,16 @@ bool should_hide_panel(HWND fg) {
   if (belongs_to_process(fg, L"winome.exe"))
     return false;
 
-  // The overview is a fullscreen overlay, but the panel must stay visible.
+  // The desktop is not a fullscreen app.
+  if (is_desktop_window(fg))
+    return false;
+
+  // The overview and the Alt-Tab/Task View switcher are fullscreen overlays,
+  // but the panel must stay visible above them.
   wchar_t cls[256] = {0};
-  if (GetClassNameW(fg, cls, 256) > 0 && wcscmp(cls, kOverviewClass) == 0)
+  if (GetClassNameW(fg, cls, 256) > 0 &&
+      (wcscmp(cls, kOverviewClass) == 0 ||
+       wcscmp(cls, L"XamlExplorerHostIslandWindow") == 0))
     return false;
 
   // Lock screen: hide the panel so it does not float over it.

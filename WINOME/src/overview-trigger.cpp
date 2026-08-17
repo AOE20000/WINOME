@@ -234,9 +234,14 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
       if (down) {
         // Swallow the Win keydown so Windows does not open the Start menu.
         // If another key follows, the Win keydown is re-injected for Win+<key>.
-        g_win_down = TRUE;
-        g_win_alone = TRUE;
-        g_win_injected = FALSE;
+        // Only the first keydown initializes the state: holding Win generates
+        // auto-repeat keydowns that must not reset it (otherwise a Win+<key>
+        // combo pressed with the key held would be mistaken for a bare Win).
+        if (!g_win_down) {
+          g_win_down = TRUE;
+          g_win_alone = TRUE;
+          g_win_injected = FALSE;
+        }
         return 1;
       }
       if (up) {
@@ -262,7 +267,10 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (down && g_win_down) {
       // A key pressed while Win is held: this is a combo, not a bare Win.
       g_win_alone = FALSE;
-      if (state->vkCode == VK_TAB) {
+      // Only a plain Win+Tab (no Alt) is remapped. With Alt held, Tab arrives
+      // as WM_SYSKEYDOWN (Win+Alt+Tab = Task View); that and every other
+      // unrelated hotkey fall through to CallNextHookEx unchanged below.
+      if (state->vkCode == VK_TAB && wParam == WM_KEYDOWN) {
         // Win+Tab normally opens Task View; open the Start menu instead.
         open_start_menu();
         return 1;
@@ -277,6 +285,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
       close_overview();
     }
   }
+  // Everything else (Alt+Tab, Ctrl+Esc, print-screen, ...) is passed through
+  // untouched: the hook only ever consumes Win, Win+Tab, and Esc-while-open.
   return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
 

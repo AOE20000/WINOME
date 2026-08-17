@@ -6,6 +6,7 @@
 #include <gdk/win32/gdkwin32.h>
 
 #include <windows.h>
+#include <cstdio>
 
 #include "host-utils.h"
 #include "native-taskbar.h"
@@ -13,6 +14,20 @@
 #include "shell-panel.h"
 #include "win-event-hook.h"
 #include "fullscreen-watcher.h"
+
+// The host runs as a GUI application (no console window). Route diagnostics
+// to a log file so startup errors are still visible.
+static void
+setup_log_file (void)
+{
+  char path[MAX_PATH];
+  if (GetTempPathA (MAX_PATH, path) == 0)
+    return;
+  strcat_s (path, "winome.log");
+  // Append keeps previous sessions' logs; nothing is shown on screen.
+  freopen (path, "a", stdout);
+  freopen (path, "a", stderr);
+}
 
 // Primary monitor bounds captured when the panel is positioned; restored in
 // on_shutdown so the shell recalculates the work area around the taskbar.
@@ -28,6 +43,12 @@ position_panel (GtkWidget *panel)
   HWND hwnd = static_cast<HWND> (gdk_win32_surface_get_handle (surface));
   if (hwnd == NULL)
     return;
+
+  // The panel is shell chrome: keep it out of Alt-Tab and the taskbar.
+  LONG_PTR ex_style = GetWindowLongPtrW (hwnd, GWL_EXSTYLE);
+  ex_style &= ~WS_EX_APPWINDOW;
+  ex_style |= WS_EX_TOOLWINDOW;
+  SetWindowLongPtrW (hwnd, GWL_EXSTYLE, ex_style);
 
   // Position the panel at the very top of the primary monitor. It is placed
   // at the monitor origin, NOT inside the work area: below, the work area is
@@ -88,6 +109,10 @@ on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
 int
 main (int argc, char **argv)
 {
+  // Route stdout/stderr to a log file first: this process is a GUI app and
+  // must never pop a console window.
+  setup_log_file ();
+
   // Initialize Windows integration before creating the GTK app.
   winome::set_process_dpi_aware ();
   winome::enable_privilege (L"SeTcbPrivilege");
