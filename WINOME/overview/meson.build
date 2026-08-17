@@ -44,6 +44,9 @@ shared_library('WinOverview',
 )
 
 # Launcher executable (started inside explorer.exe by the host).
+# win_subsystem 'windows' is required: meson otherwise appends
+# -Wl,--subsystem,console after -mwindows, making the launcher a console app
+# whose window pops up on every overview trigger.
 executable('WinOverviewLauncher',
   files(
     extracted_root / 'WinOverviewLauncher' / 'WinOverviewLauncher.cpp',
@@ -51,6 +54,7 @@ executable('WinOverviewLauncher',
   dependencies: ov_win32_libs,
   include_directories: ov_lib_inc,
   cpp_args: ['-DWIN32_LEAN_AND_MEAN', '-DUNICODE', '-D_UNICODE'],
-  link_args: ['-mwindows', '-municode'],
+  link_args: ['-municode'],
+  win_subsystem: 'windows',
   install: false,
 )

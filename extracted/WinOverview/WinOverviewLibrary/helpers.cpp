@@ -113,6 +113,48 @@ BOOL IsAltTabWindow(
     return TRUE;
 }
 
+// True if the window belongs to the WINOME host (winome.exe). The host's top
+// panel is shell chrome and must never appear as an overview tile.
+//
+// The host runs elevated, so RuntimeBroker (medium integrity) cannot open its
+// process to read the image name; match the panel window title instead (window
+// text is readable across integrity levels). The process-name check is kept as
+// a fallback for when the host happens to run non-elevated.
+static bool IsWinomeHostWindow(
+    _In_ HWND hwnd
+    )
+{
+    wchar_t title[64];
+    if (GetWindowTextW(hwnd, title, 64) > 0 &&
+        _wcsicmp(title, L"WINOME Shell") == 0)
+        return true;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0)
+        return false;
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hProcess == NULL)
+        return false;
+
+    wchar_t name[MAX_PATH];
+    DWORD size = MAX_PATH;
+    BOOL ok = QueryFullProcessImageNameW(hProcess, 0, name, &size);
+    CloseHandle(hProcess);
+    if (!ok || size == 0)
+        return false;
+
+    for (DWORD i = size; i-- > 0; )
+    {
+        if (name[i] == L'\\' || name[i] == L'/')
+        {
+            return _wcsicmp(name + i + 1, L"winome.exe") == 0;
+        }
+    }
+    return _wcsicmp(name, L"winome.exe") == 0;
+}
+
 BOOL CALLBACK EnumWindowsProc(
     _In_ HWND   hwnd,
     _Out_ LPARAM lParam
@@ -125,7 +167,7 @@ BOOL CALLBACK EnumWindowsProc(
     BOOL isCloacked;
     DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &isCloacked, sizeof(BOOL));
 
-    if (IsAltTabWindow(hwnd) && !isCloacked && !IsIconic(hwnd) && MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) == params->monitor.hMonitor) {
+    if (IsAltTabWindow(hwnd) && !isCloacked && !IsIconic(hwnd) && !IsWinomeHostWindow(hwnd) && MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) == params->monitor.hMonitor) {
         WindowInfo info;
         info.hwnd = hwnd;
         GetWindowRect(hwnd, &info.rect);
@@ -184,7 +226,9 @@ void GetWallpaperWindows(
     )
 {
     HWND progman = FindWindow(L"Progman", NULL);
-    SendMessageTimeout(progman, 0x052C, 0, 0, SMTO_NORMAL, 1000, nullptr);
+    // Bounded timeout: SendMessageTimeout is on the overview open critical
+    // path, and a busy Progman must not delay the overview by a full second.
+    SendMessageTimeout(progman, 0x052C, 0, 0, SMTO_NORMAL, 200, nullptr);
     EnumWindows(GetWallpaperHwnd, reinterpret_cast<LPARAM>(monitors));
 }
 

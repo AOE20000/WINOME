@@ -758,10 +758,33 @@ extern "C" __declspec(dllexport) DWORD WINAPI overview_main(LPVOID lpParam)
 	SIZE_T monitorNo, slotNo;
 	BOOL atLeastOneWindow = FALSE;
 
+	// The WINOME top panel is a normal (non-band) top-most window, so the
+	// overview cannot be raised below it. Instead, leave the panel's strip
+	// visible by starting the overview window below it on the panel's monitor.
+	// A hidden panel (fullscreen auto-hide) means a full-screen overview.
+	HMONITOR panelMonitor = NULL;
+	int panelHeight = 0;
+	{
+		HWND panel = FindWindowW(NULL, L"WINOME Shell");
+		if (panel != NULL && IsWindowVisible(panel))
+		{
+			RECT pr;
+			if (GetWindowRect(panel, &pr))
+			{
+				panelMonitor = MonitorFromRect(&pr, MONITOR_DEFAULTTONEAREST);
+				panelHeight = pr.bottom - pr.top;
+			}
+		}
+	}
+
 	GetMonitors(&monitors);
 	for (monitorNo = 0; monitorNo < monitors.size(); ++monitorNo) {
 		monitors.at(monitorNo).realArea = monitors.at(monitorNo).rcWork;
-		monitors.at(monitorNo).area = monitors.at(monitorNo).rcWork;
+		if (monitors.at(monitorNo).hMonitor == panelMonitor && panelHeight > 0)
+		{
+			monitors.at(monitorNo).realArea.top += panelHeight;
+		}
+		monitors.at(monitorNo).area = monitors.at(monitorNo).realArea;
 		// normalize area - move its origin to (0, 0) as we use these for displaying inside the window,
 		// whose origin is always at (0, 0) no matter its physical coordinates (where it is on the displays)
 		monitors.at(monitorNo).area.right -= monitors.at(monitorNo).area.left + AREA_BORDER * 2;

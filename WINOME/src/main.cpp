@@ -12,6 +12,7 @@
 #include "overview-trigger.h"
 #include "shell-panel.h"
 #include "win-event-hook.h"
+#include "fullscreen-watcher.h"
 
 static void
 position_panel (GtkWidget *panel)
@@ -36,6 +37,10 @@ position_panel (GtkWidget *panel)
                 work_area.left, work_area.top,
                 width, winome_shell_panel_height (),
                 SWP_SHOWWINDOW);
+
+  // Auto-hide the panel while a fullscreen window or the lock screen is
+  // active; it stays visible everywhere else, including over the overview.
+  winome::start_fullscreen_watcher (hwnd);
 }
 
 static void

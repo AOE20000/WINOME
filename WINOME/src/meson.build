@@ -7,6 +7,7 @@ winome_sources = files(
   'host-utils.cpp',
   'win-event-hook.cpp',
   'overview-trigger.cpp',
+  'fullscreen-watcher.cpp',
   'system-status.cpp',
   'quick-settings.cpp',
   'calendar.cpp',

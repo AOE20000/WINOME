@@ -194,11 +194,13 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
       if (state->vkCode == VK_LWIN || state->vkCode == VK_RWIN) {
         g_win_down = TRUE;
       } else if (state->vkCode == 'W' && g_win_down) {
-        // Win+W toggles the overview.
+        // Win+W toggles the overview. Consume the keystroke so Windows does
+        // not also open its own widgets panel underneath the overview.
         if (!g_running)
           start_overview();
         else
           close_overview();
+        return 1;
       } else {
         g_win_down = FALSE;
       }
