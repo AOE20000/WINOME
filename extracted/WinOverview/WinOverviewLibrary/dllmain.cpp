@@ -597,6 +597,8 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 								}
 							}
 							SetForegroundWindow(animation->hWnd);
+							if (IsIconic(animation->hWnd))
+								ShowWindow(animation->hWnd, SW_RESTORE);
 							DoAnimate(TRUE, ANIMTYPE_PREVIEW, info, FALSE);
 							for (UINT z = 0; z < monitors.size(); ++z)
 							{
@@ -841,6 +843,15 @@ extern "C" __declspec(dllexport) DWORD WINAPI overview_main(LPVOID lpParam)
 					&initialCentre,
 					&finalCentre
 					);
+
+				if (IsIconic(slots.at(slotNo).window.hwnd))
+				{
+					// Minimized windows have no on-screen position to fly from;
+					// show them in place at their slot, at final size.
+					initialRect = finalRect;
+					initialCentre = finalCentre;
+					slots.at(slotNo).scale = 1.0;
+				}
 
 				AddAnimation(
 					monitors.at(monitorNo).animation,

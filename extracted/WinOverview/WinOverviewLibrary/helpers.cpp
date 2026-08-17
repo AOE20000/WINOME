@@ -167,11 +167,26 @@ BOOL CALLBACK EnumWindowsProc(
     BOOL isCloacked;
     DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &isCloacked, sizeof(BOOL));
 
-    if (IsAltTabWindow(hwnd) && !isCloacked && !IsIconic(hwnd) && !IsWinomeHostWindow(hwnd) && MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) == params->monitor.hMonitor) {
-        WindowInfo info;
-        info.hwnd = hwnd;
-        GetWindowRect(hwnd, &info.rect);
-        if (info.rect.right - info.rect.left != 0 || info.rect.bottom - info.rect.top != 0) {
+    if (IsAltTabWindow(hwnd) && !isCloacked && !IsWinomeHostWindow(hwnd)) {
+        // Minimized windows have no on-screen rectangle: GetWindowRect returns
+        // the iconic (-32000,-32000) position and MonitorFromWindow returns
+        // NULL. Use the restored placement rect so the tile has real dimensions
+        // and belongs to the right monitor.
+        RECT rect;
+        if (IsIconic(hwnd)) {
+            WINDOWPLACEMENT wp = {sizeof(wp)};
+            if (!GetWindowPlacement(hwnd, &wp))
+                return TRUE;
+            rect = wp.rcNormalPosition;
+        } else {
+            GetWindowRect(hwnd, &rect);
+        }
+        if (rect.right - rect.left != 0 || rect.bottom - rect.top != 0) {
+            if (MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) != params->monitor.hMonitor)
+                return TRUE;
+            WindowInfo info;
+            info.hwnd = hwnd;
+            info.rect = rect;
             // normalize coordinates
             info.rect.right -= (params->monitor.realArea.left);
             info.rect.bottom -= (params->monitor.realArea.top);

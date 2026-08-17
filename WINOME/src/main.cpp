@@ -14,6 +14,10 @@
 #include "win-event-hook.h"
 #include "fullscreen-watcher.h"
 
+// Primary monitor bounds captured when the panel is positioned; restored in
+// on_shutdown so the shell recalculates the work area around the taskbar.
+static RECT g_primary_monitor = {0, 0, 0, 0};
+
 static void
 position_panel (GtkWidget *panel)
 {
@@ -25,18 +29,31 @@ position_panel (GtkWidget *panel)
   if (hwnd == NULL)
     return;
 
-  // Position the panel as a top-most, full-width top bar across the primary
-  // work area (the taskbar is hidden, so the work area spans the full screen).
-  RECT work_area;
-  if (!SystemParametersInfoW (SPI_GETWORKAREA, 0, &work_area, 0))
+  // Position the panel at the very top of the primary monitor. It is placed
+  // at the monitor origin, NOT inside the work area: below, the work area is
+  // shrunk by the panel height so maximized/fullscreen apps treat the strip
+  // under the panel as the top of the screen, exactly like the taskbar
+  // reserves the bottom.
+  HMONITOR monitor = MonitorFromWindow (hwnd, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO mi = {sizeof (mi)};
+  if (!GetMonitorInfoW (monitor, &mi))
     return;
 
-  int width = work_area.right - work_area.left;
+  int width = mi.rcMonitor.right - mi.rcMonitor.left;
+  int height = winome_shell_panel_height ();
 
   SetWindowPos (hwnd, HWND_TOPMOST,
-                work_area.left, work_area.top,
-                width, winome_shell_panel_height (),
+                mi.rcMonitor.left, mi.rcMonitor.top,
+                width, height,
                 SWP_SHOWWINDOW);
+
+  // Reserve the panel strip in the primary work area (session-only). Maximized
+  // windows and apps that fill the work area now stop below the panel instead
+  // of sliding their title bars underneath it.
+  g_primary_monitor = mi.rcMonitor;
+  RECT work = mi.rcMonitor;
+  work.top += height;
+  SystemParametersInfoW (SPI_SETWORKAREA, 0, &work, 0);
 
   // Auto-hide the panel while a fullscreen window or the lock screen is
   // active; it stays visible everywhere else, including over the overview.
@@ -59,6 +76,11 @@ static void
 on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
              gpointer G_GNUC_UNUSED user_data)
 {
+  // Release the panel-strip work area reservation before restoring the
+  // taskbar, so the shell recalculates the normal work area around it.
+  if (g_primary_monitor.right > g_primary_monitor.left)
+    SystemParametersInfoW (SPI_SETWORKAREA, 0, &g_primary_monitor, 0);
+
   // Restore the native taskbar on exit (only if we hid it).
   winome::NativeTaskbar::restore ();
 }

@@ -187,7 +187,19 @@ inline void ComputeSlotCoordinates(
 	_Out_ POINT* finalCentre
 	)
 {
-	GetWindowRect(hWnd, initialRect);
+	// Minimized windows have no on-screen position: GetWindowRect returns the
+	// iconic (-32000,-32000) spot, which would size the slot from a tiny bogus
+	// rect. Use the restored placement rect instead.
+	if (IsIconic(hWnd))
+	{
+		WINDOWPLACEMENT wp = {sizeof(wp)};
+		GetWindowPlacement(hWnd, &wp);
+		*initialRect = wp.rcNormalPosition;
+	}
+	else
+	{
+		GetWindowRect(hWnd, initialRect);
+	}
 	initialRect->right -= (realArea.left);
 	initialRect->bottom -= (realArea.top);
 	initialRect->left -= (realArea.left);
