@@ -283,14 +283,6 @@ GTK4_BUTTON_OVERRIDE = """
 .quick-toggle-has-menu .quick-toggle-menu-button {
   border-radius: 0 999px 999px 0;
 }
-/* Both toggle styles are fixed to exactly 12em: native uses
-   min-width/max-width: 12em, but the conversion drops max-width. Without it
-   a has-menu toggle (inner toggle + separator + menu button) or a long title
-   grows past 12em and misaligns the grid. */
-.quick-toggle,
-.quick-toggle-has-menu {
-  max-width: 12em;
-}
 /* GtkButton adds its own padding on top of the GNOME padding. Native has no
    padding on the buttons themselves (it lives in the inner box), so strip it;
    otherwise a has-menu toggle renders wider/taller than a plain toggle. */
@@ -306,25 +298,30 @@ GTK4_BUTTON_OVERRIDE = """
    dark-grey fill; their exact colors and circular radius come from the
    converted stylesheet (evaluated bit-exactly via st-css-eval). */
 
-/* The quick-settings / calendar popover: GNOME dark card background, matching
-   .popup-menu-content.quick-settings (background + 1px border + drop shadow;
-   border-radius is .quick-settings' 36px, which overrides popup-menu-content's
-   20px). The popover is a separate toplevel window, so re-assert the panel
-   font here for the same em resolution as GNOME (Cantarell 11pt, applied via
-   the shared font map). GTK4's GtkPopover adds a default margin around the
-   contents node, so also remove it to avoid a ring of empty card around the
-   content. */
-popover.quick-settings-popover > contents {
+/* The quick-settings / calendar popovers are custom borderless toplevels
+   (see shell-panel.cpp): the window is transparent and a wrapper card carries
+   the GNOME dark background, matching .popup-menu-content.quick-settings
+   (background + 1px border + drop shadow; border-radius is .quick-settings'
+   36px, which overrides popup-menu-content's 20px). The shadow-wrap leaves
+   room for the drop shadow. The popover is a separate toplevel window, so the
+   Cantarell 11pt font is re-asserted here for the same em resolution as GNOME
+   (applied via the shared font map). */
+window.quick-settings-popover-window {
+  background-color: transparent;
+}
+.quick-settings-popover-shadow-wrap {
+  padding: 6px;
+}
+.quick-settings-popover-card {
   background-color: #36363a;
   color: #ffffff;
   border-radius: 36px;
   border: 1px solid #424247;
   box-shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.2);
   font: 11pt "Cantarell";
-  padding: 0;
 }
 /* The calendar popover keeps its own radius (.datemenu-popover). */
-popover.quick-settings-popover.datemenu-popover > contents {
+.quick-settings-popover-card.datemenu-card {
   border-radius: 30px;
 }
 /* The quick-settings box itself adds the GNOME 18px padding. */
@@ -337,6 +334,14 @@ popover.quick-settings-popover.datemenu-popover > contents {
    resolves to the same pixel size as GNOME Shell computes it. */
 #panel {
   font: 11pt "Cantarell";
+}
+
+/* Transparent panel over the Activities overview, matching native
+   #panel:overview (the :overview pseudo-class is dropped by the conversion;
+   the host toggles this class on the panel window via the overview state
+   callback). The panel strip then shows the overview behind it, GNOME style. */
+#panel.overview {
+  background-color: transparent;
 }
 
 /* .panel-button horizontal padding mirrors -natural-hpadding: 12px (the St

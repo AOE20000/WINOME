@@ -33,7 +33,8 @@ ninja -C build
 - [x] 真实数据源：电量（`GetSystemPowerStatus`）、音量（WASAPI `IAudioEndpointVolume`，滑块实时调节 + 图标动态）、网络（`InternetGetConnectedState`）、锁屏（`LockWorkStation`）
 - [x] 时钟 UTF-8 修复（改用 `GDateTime`，避免 strftime 的 GBK `%p` 触发 Pango 报错）
 - [x] 快捷键：Win = 概览、**左上角热角** = 打开概览、Win+Tab = 开始菜单、其余 Win 组合键/Alt+Tab 透传、Esc = 关闭概览
-- [x] 快速设置/日历弹出窗重新接入（点击状态区打开快速设置、点击时钟打开日历；GtkPopover 锚定顶栏，复用面板 Cantarell 字体映射）
+- [x] 快速设置/日历弹出窗重新接入（点击状态区打开快速设置、点击时钟打开日历）：自绘无边框顶层窗口，右侧对齐/时钟居中、面板下方 8px + 屏幕侧边 12px 稳定间隙；WH_MOUSE_LL 钩子处理外部点击关闭；打开时置顶（概览上方）；概览打开时自动关闭弹出窗、面板/弹出窗上的点击不转发给概览
+- [x] 概览层级集成：概览打开时面板加 `.overview` 类使顶栏底色透明（`#panel.overview { background-color: transparent }`，对应原生 `#panel:overview`），顶栏与弹出窗浮于概览之上且可交互
 - [ ] 二级菜单（WLAN 网络/蓝牙设备/电源模式/关机）、日历面板重构、网络/蓝牙真实数据
 - [ ] 网络/蓝牙真实数据
 

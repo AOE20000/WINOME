@@ -21,6 +21,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <shlwapi.h>
+#include <glib.h>
 
 #include <string>
 #include <thread>
@@ -47,6 +48,35 @@ BOOL g_win_alone = FALSE;
 BOOL g_win_injected = FALSE;
 HHOOK g_keyboard_hook = nullptr;
 HHOOK g_mouse_hook = nullptr;
+
+// State-change callback, marshaled to the main thread.
+OverviewStateCallback g_state_cb = nullptr;
+void *g_state_cb_data = nullptr;
+
+struct OverviewStateData {
+  gboolean active;
+};
+
+static gboolean
+emit_overview_state (gpointer data)
+{
+  OverviewStateData *d = static_cast<OverviewStateData *>(data);
+  if (g_state_cb != nullptr)
+    g_state_cb (d->active != FALSE, g_state_cb_data);
+  g_free (d);
+  return G_SOURCE_REMOVE;
+}
+
+// Notify the state-change callback on the main thread. start_overview /
+// close_overview can be called from the hook thread (Win key) or the main
+// thread (Activities button), so always marshal through the default context.
+static void
+notify_overview_state (bool active)
+{
+  OverviewStateData *d = g_new (OverviewStateData, 1);
+  d->active = active;
+  g_main_context_invoke (nullptr, emit_overview_state, d);
+}
 
 // Inject a Win keypress (keydown or keyup) into the input stream, tagged so
 // LowLevelKeyboardProc ignores it. Used to (a) re-inject the consumed Win
@@ -182,6 +212,7 @@ void start_overview() {
   g_running = TRUE;
   CreateThread(nullptr, 0, run, nullptr, 0, nullptr);
   g_mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, nullptr, 0);
+  notify_overview_state(TRUE);
 }
 
 void close_overview() {
@@ -191,6 +222,7 @@ void close_overview() {
     g_mouse_hook = nullptr;
   }
   g_running = FALSE;
+  notify_overview_state(FALSE);
 }
 
 void trigger_thread_main() {
@@ -204,15 +236,51 @@ void trigger_thread_main() {
   }
 }
 
+// True when the given screen point is over one of our own windows (the panel
+// and its popovers). Clicks there are handled by the shell itself and must not
+// be forwarded to the overview as blank-space clicks.
+static bool
+point_over_winome_window (const POINT &pt)
+{
+  HWND hwnd = WindowFromPoint (pt);
+  if (hwnd == nullptr)
+    return false;
+
+  DWORD pid = 0;
+  GetWindowThreadProcessId (hwnd, &pid);
+  if (pid == 0)
+    return false;
+
+  HANDLE process = OpenProcess (PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (process == nullptr)
+    return false;
+
+  wchar_t path[MAX_PATH] = {0};
+  DWORD len = MAX_PATH;
+  bool ok = QueryFullProcessImageNameW (process, 0, path, &len) != 0;
+  CloseHandle (process);
+  if (!ok)
+    return false;
+
+  std::wstring full (path);
+  size_t sep = full.find_last_of (L'\\');
+  return (sep != std::wstring::npos ? full.substr (sep + 1) : full) ==
+         L"winome.exe";
+}
+
 }  // namespace
 
 // Low-level mouse hook: forward mouse-up events to the overview window so it
 // can decide whether the click was on blank space (close) or a thumbnail.
-LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {  if (g_running) {
+// Clicks over our own windows (the panel / popovers) are never forwarded: they
+// are interactive over the overview and must not be treated as blank space.
+LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+  if (g_running) {
     if (wParam == WM_LBUTTONUP || wParam == WM_RBUTTONUP) {
       MSLLHOOKSTRUCT* info = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
-      send_message_to_overview(kWMAskMouse, TRUE,
-                               MAKELPARAM(info->pt.x, info->pt.y));
+      if (!point_over_winome_window(info->pt))
+        send_message_to_overview(kWMAskMouse, TRUE,
+                                 MAKELPARAM(info->pt.x, info->pt.y));
     }
   }
   return CallNextHookEx(nullptr, nCode, wParam, lParam);
@@ -304,6 +372,16 @@ void toggle_overview() {
     start_overview();
   else
     close_overview();
+}
+
+bool overview_active() {
+  return g_running != FALSE;
+}
+
+void set_overview_change_callback(OverviewStateCallback callback,
+                                  void *user_data) {
+  g_state_cb = callback;
+  g_state_cb_data = user_data;
 }
 
 }  // namespace winome

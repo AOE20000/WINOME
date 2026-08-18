@@ -22,6 +22,8 @@
 #include "overview-trigger.h"
 #include "fonts.h"
 
+#include <gdk/win32/gdkwin32.h>
+
 #include <time.h>
 #include <string.h>
 #include <math.h>
@@ -387,27 +389,29 @@ update_clock (gpointer data)
 
 // --- Panel popovers ---------------------------------------------------------
 //
-// Both the clock (calendar) and status area (quick settings) open a GtkPopover
-// anchored below the panel button, like gnome-shell's PanelMenu.Button.
+// The quick-settings and calendar menus are custom borderless toplevels,
+// positioned below the panel with a stable gap and kept clear of the screen
+// edges. A low-level mouse hook closes them on clicks outside the popover
+// (clicks on the anchor button itself are left to its toggle handler), and
+// they are raised above the Activities overview.
 
-static void
-on_click_popover (GtkButton *button G_GNUC_UNUSED, gpointer popover)
-{
-  // Toggle, like PanelMenu.Button._clickGesture in gnome-shell.
-  if (gtk_widget_get_visible (GTK_WIDGET (popover)))
-    gtk_popover_popdown (GTK_POPOVER (popover));
-  else
-    gtk_popover_popup (GTK_POPOVER (popover));
-}
+#define POPOVER_TOP_GAP    8    // gap below the panel
+#define POPOVER_SIDE_GAP   12   // gap from the right screen edge
+#define POPOVER_SCREEN_GAP 8    // minimum gap from the other screen edges
 
-// GNOME keeps a panel button highlighted (:active) while its menu is open;
-// GTK4 clears :active when the mouse is released. The stylesheet defines an
-// "open" class with the same fill; toggle it with the popover.
-static void
-on_popover_show (GtkWidget *popover G_GNUC_UNUSED, gpointer button)
-{
-  gtk_widget_add_css_class (GTK_WIDGET (button), "open");
-}
+typedef struct {
+  GtkWidget *window;
+  GtkWidget *button;
+  GtkWidget *wrap;         // shadow-wrap around the card
+  GtkWidget *card;
+  gboolean open;
+  gboolean centered;       // calendar: center on the button (quick settings right-aligns)
+  RECT anchor_rect;        // the button's screen rect, for the close hook
+} PanelPopover;
+
+static GList *g_open_popovers = NULL;
+static HHOOK g_popover_mouse_hook = NULL;
+static gboolean g_overview_hooked = FALSE;
 
 // GTK4's popover grab window on Windows leaves the anchor button's :hover
 // (PRELIGHT) state stale: after the popover closes, the button keeps its
@@ -456,57 +460,302 @@ clear_stale_hover (gpointer data)
   return G_SOURCE_CONTINUE;
 }
 
-static void
-on_popover_hide (GtkWidget *popover G_GNUC_UNUSED, gpointer button)
+static HWND
+panel_popover_hwnd (PanelPopover *pp)
 {
-  GtkWidget *b = GTK_WIDGET (button);
-  gtk_widget_remove_css_class (b, "open");
+  GdkSurface *surface = gtk_native_get_surface (GTK_NATIVE (pp->window));
+  if (surface == nullptr)
+    return nullptr;
+  return static_cast<HWND> (gdk_win32_surface_get_handle (surface));
+}
 
-  // GTK4's popover grab on Windows leaves the anchor button's :hover
-  // (PRELIGHT) state stale after the popover closes. Clear it immediately and
-  // keep monitoring the real pointer until it leaves the button.
-  gtk_widget_unset_state_flags (b, GTK_STATE_FLAG_PRELIGHT);
-  GtkWidget *p = gtk_widget_get_parent (b);
+// The anchor button's screen rect (used to keep the popover open when the user
+// clicks the button again, and to center the calendar on the clock).
+static void
+panel_popover_anchor_rect (PanelPopover *pp)
+{
+  GtkWidget *root = GTK_WIDGET (gtk_widget_get_root (pp->button));
+  if (root == nullptr)
+    return;
+  GdkSurface *surface = gtk_native_get_surface (GTK_NATIVE (root));
+  if (surface == nullptr)
+    return;
+  HWND panel_hwnd = static_cast<HWND> (gdk_win32_surface_get_handle (surface));
+  if (panel_hwnd == nullptr)
+    return;
+
+  RECT pr;
+  GetWindowRect (panel_hwnd, &pr);
+
+  graphene_rect_t b;
+  if (gtk_widget_compute_bounds (pp->button, root, &b)) {
+    pp->anchor_rect.left = pr.left + (LONG) b.origin.x;
+    pp->anchor_rect.top = pr.top + (LONG) b.origin.y;
+    pp->anchor_rect.right = pp->anchor_rect.left + (LONG) b.size.width;
+    pp->anchor_rect.bottom = pp->anchor_rect.top + (LONG) b.size.height;
+  }
+}
+
+// Compute the popover's top-left corner (screen coordinates, physical px).
+// Returns FALSE if the geometry could not be determined.
+static gboolean
+panel_popover_geometry (PanelPopover *pp, int width, int height,
+                        int *out_x, int *out_y)
+{
+  GtkWidget *root = GTK_WIDGET (gtk_widget_get_root (pp->button));
+  GdkSurface *ps = gtk_native_get_surface (GTK_NATIVE (root));
+  RECT pr = {};
+  if (ps == nullptr ||
+      !GetWindowRect (static_cast<HWND> (gdk_win32_surface_get_handle (ps)),
+                      &pr))
+    return FALSE;
+
+  HWND hwnd = panel_popover_hwnd (pp);
+  HMONITOR mon = MonitorFromWindow (hwnd, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO mi = {};
+  mi.cbSize = sizeof (mi);
+  if (!GetMonitorInfoW (mon, &mi))
+    return FALSE;
+  RECT wa = mi.rcMonitor;
+
+  // Right-align for the quick settings; center on the clock for the calendar.
+  int x;
+  if (pp->centered) {
+    x = (pp->anchor_rect.left + pp->anchor_rect.right) / 2 - width / 2;
+  } else {
+    x = wa.right - width - POPOVER_SIDE_GAP;
+  }
+  // A stable gap below the panel (the panel spans the monitor top).
+  int y = pr.bottom + POPOVER_TOP_GAP;
+
+  // Clamp inside the monitor, preserving the side gaps.
+  int x_min = wa.left + POPOVER_SCREEN_GAP;
+  int x_max = MAX (x_min, wa.right - width - POPOVER_SCREEN_GAP);
+  int y_min = pr.bottom + POPOVER_TOP_GAP;
+  int y_max = MAX (y_min, wa.bottom - height - POPOVER_SCREEN_GAP);
+  *out_x = CLAMP (x, x_min, x_max);
+  *out_y = CLAMP (y, y_min, y_max);
+  return TRUE;
+}
+
+static void
+panel_popover_close (PanelPopover *pp)
+{
+  if (!pp->open)
+    return;
+
+  pp->open = FALSE;
+  gtk_widget_set_visible (pp->window, FALSE);
+  gtk_widget_remove_css_class (pp->button, "open");
+
+  // Stop floating above everything once closed.
+  HWND hwnd = panel_popover_hwnd (pp);
+  if (hwnd != nullptr)
+    SetWindowPos (hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                  SWP_NOMOVE | SWP_NOSIZE);
+
+  g_open_popovers = g_list_remove (g_open_popovers, pp);
+
+  // Clear the stale :hover GTK leaves on the anchor button on Windows.
+  gtk_widget_unset_state_flags (pp->button, GTK_STATE_FLAG_PRELIGHT);
+  GtkWidget *p = gtk_widget_get_parent (pp->button);
   while (p) {
     gtk_widget_unset_state_flags (p, GTK_STATE_FLAG_PRELIGHT);
     p = gtk_widget_get_parent (p);
   }
-
-  g_timeout_add (200, clear_stale_hover, b);
+  g_timeout_add (200, clear_stale_hover, pp->button);
 }
 
 static void
-connect_popover_open_state (GtkWidget *popover, GtkWidget *button)
+panel_popover_open (PanelPopover *pp)
 {
-  g_signal_connect (popover, "show", G_CALLBACK (on_popover_show), button);
-  g_signal_connect (popover, "hide", G_CALLBACK (on_popover_hide), button);
+  if (pp->open)
+    return;
+
+  pp->open = TRUE;
+  gtk_widget_add_css_class (pp->button, "open");
+  panel_popover_anchor_rect (pp);
+
+  // Size the window to the wrap's natural size (the card plus the shadow
+  // margin), in logical px.
+  int nat_w, nat_h;
+  gtk_widget_measure (pp->wrap, GTK_ORIENTATION_HORIZONTAL, -1,
+                      nullptr, &nat_w, nullptr, nullptr);
+  gtk_widget_measure (pp->wrap, GTK_ORIENTATION_VERTICAL, -1,
+                      nullptr, &nat_h, nullptr, nullptr);
+  gtk_window_set_default_size (GTK_WINDOW (pp->window), nat_w, nat_h);
+
+  // Realize so the HWND exists, then place it at its final rect before
+  // showing, so it never appears at GTK's default placement.
+  gtk_widget_realize (pp->window);
+  GdkSurface *surface = gtk_native_get_surface (GTK_NATIVE (pp->window));
+  HWND hwnd = surface != nullptr
+      ? static_cast<HWND> (gdk_win32_surface_get_handle (surface))
+      : nullptr;
+  if (hwnd != nullptr) {
+    // Shell chrome: keep the popover out of Alt-Tab and the taskbar.
+    LONG_PTR ex = GetWindowLongPtrW (hwnd, GWL_EXSTYLE);
+    ex &= ~WS_EX_APPWINDOW;
+    ex |= WS_EX_TOOLWINDOW;
+    SetWindowLongPtrW (hwnd, GWL_EXSTYLE, ex);
+
+    int scale = gdk_surface_get_scale_factor (surface);
+    int px_w = nat_w * scale;
+    int px_h = nat_h * scale;
+    int x = 0, y = 0;
+    if (panel_popover_geometry (pp, px_w, px_h, &x, &y)) {
+      // Show + raise + activate so the popover is interactive (Esc, clicks).
+      SetWindowPos (hwnd, HWND_TOPMOST, x, y, px_w, px_h,
+                    SWP_SHOWWINDOW);
+    }
+  }
+
+  gtk_widget_set_visible (pp->window, TRUE);
+
+  g_open_popovers = g_list_append (g_open_popovers, pp);
 }
 
-// A popover anchored below the given panel button, using the GNOME dark card
-// background (popover.quick-settings-popover in the GTK4 stylesheet).
-static GtkWidget *
-make_panel_popover (GtkWidget *button, GtkWidget *child)
+static void
+on_click_popover (GtkButton *button G_GNUC_UNUSED, gpointer data)
 {
-  GtkWidget *popover;
+  PanelPopover *pp = static_cast<PanelPopover *>(data);
+  if (pp->open)
+    panel_popover_close (pp);
+  else
+    panel_popover_open (pp);
+}
 
-  popover = gtk_popover_new ();
-  gtk_popover_set_child (GTK_POPOVER (popover), child);
-  gtk_widget_add_css_class (popover, "quick-settings-popover");
-  gtk_popover_set_has_arrow (GTK_POPOVER (popover), FALSE);
-  gtk_popover_set_position (GTK_POPOVER (popover), GTK_POS_BOTTOM);
-  gtk_popover_set_offset (GTK_POPOVER (popover), -8, -8);
-  gtk_widget_set_parent (popover, button);
+static gboolean
+on_popover_key (GtkEventControllerKey *controller G_GNUC_UNUSED,
+                guint keyval,
+                guint keycode G_GNUC_UNUSED,
+                GdkModifierType state G_GNUC_UNUSED,
+                gpointer data)
+{
+  PanelPopover *pp = static_cast<PanelPopover *>(data);
+  if (keyval == GDK_KEY_Escape) {
+    panel_popover_close (pp);
+    return GDK_EVENT_STOP;
+  }
+  return GDK_EVENT_PROPAGATE;
+}
+
+// Low-level mouse hook (installed on the main thread, where the GTK Win32
+// backend pumps messages): close open popovers on any mouse-down outside the
+// popover window itself and outside its anchor button.
+static LRESULT CALLBACK
+popover_mouse_hook_proc (int nCode, WPARAM wParam, LPARAM lParam)
+{
+  if (nCode == HC_ACTION &&
+      (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN ||
+       wParam == WM_MBUTTONDOWN)) {
+    MSLLHOOKSTRUCT *ms = reinterpret_cast<MSLLHOOKSTRUCT *>(lParam);
+    POINT pt = ms->pt;
+
+    GList *l = g_open_popovers;
+    while (l != nullptr) {
+      PanelPopover *pp = static_cast<PanelPopover *>(l->data);
+      GList *next = l->next;
+
+      HWND hwnd = panel_popover_hwnd (pp);
+      RECT r;
+      gboolean inside = FALSE;
+      if (hwnd != nullptr && GetWindowRect (hwnd, &r)) {
+        inside = PtInRect (&r, pt) != FALSE;
+        // Clicks on the anchor button are handled by its toggle handler.
+        if (!inside && PtInRect (&pp->anchor_rect, pt))
+          inside = TRUE;
+      }
+      if (!inside)
+        panel_popover_close (pp);
+
+      l = next;
+    }
+  }
+  return CallNextHookEx (nullptr, nCode, wParam, lParam);
+}
+
+static void
+ensure_popover_mouse_hook (void)
+{
+  if (g_popover_mouse_hook == nullptr)
+    g_popover_mouse_hook = SetWindowsHookExW (WH_MOUSE_LL,
+                                              popover_mouse_hook_proc,
+                                              nullptr, 0);
+}
+
+// When the Activities overview opens it takes over the screen: make the panel
+// transparent (GNOME style) and close any open popover so it does not float
+// over the overview.
+static void
+on_overview_state_changed (bool active, void *user_data)
+{
+  GtkWidget *panel = GTK_WIDGET (user_data);
+
+  if (active) {
+    gtk_widget_add_css_class (panel, "overview");
+    while (g_open_popovers != nullptr) {
+      PanelPopover *pp = static_cast<PanelPopover *>(g_open_popovers->data);
+      panel_popover_close (pp);
+    }
+  } else {
+    gtk_widget_remove_css_class (panel, "overview");
+  }
+}
+
+// Register the overview state callback once, with the panel window as data.
+static void
+connect_overview_state (GtkWidget *panel)
+{
+  if (g_overview_hooked)
+    return;
+  g_overview_hooked = TRUE;
+  winome::set_overview_change_callback (on_overview_state_changed, panel);
+}
+
+// A popover anchored to the given panel button: a borderless toplevel card
+// (the GNOME dark card background from the GTK4 stylesheet). @centered centers
+// the card on the button (calendar); otherwise it right-aligns near the status
+// area (quick settings).
+static GtkWidget *
+make_panel_popover (GtkWidget *button, GtkWidget *child, gboolean centered)
+{
+  PanelPopover *pp = g_new0 (PanelPopover, 1);
+  pp->button = button;
+  pp->centered = centered;
+
+  pp->window = gtk_window_new ();
+  gtk_window_set_decorated (GTK_WINDOW (pp->window), FALSE);
+  gtk_window_set_resizable (GTK_WINDOW (pp->window), FALSE);
+  gtk_widget_add_css_class (pp->window, "quick-settings-popover-window");
+
+  // Shadow-wrap + card: the transparent wrapper leaves room for the card's
+  // drop shadow, the card carries the GNOME dark background.
+  GtkWidget *wrap = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_add_css_class (wrap, "quick-settings-popover-shadow-wrap");
+  pp->wrap = wrap;
+  pp->card = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_add_css_class (pp->card, "quick-settings-popover-card");
+  if (centered)
+    gtk_widget_add_css_class (pp->card, "datemenu-card");
+  gtk_box_append (GTK_BOX (pp->card), child);
+  gtk_box_append (GTK_BOX (wrap), pp->card);
+  gtk_window_set_child (GTK_WINDOW (pp->window), wrap);
 
   // The popover is a separate toplevel window: give it the same Cantarell font
   // map as the panel so the em-based stylesheet values resolve identically.
-  gtk_widget_set_font_map (popover, winome::bundled_font_map ());
+  gtk_widget_set_font_map (pp->window, winome::bundled_font_map ());
 
-  g_object_set_data (G_OBJECT (button), "popover", popover);
-  g_signal_connect (button, "clicked", G_CALLBACK (on_click_popover),
-                    popover);
-  connect_popover_open_state (popover, button);
+  g_object_set_data (G_OBJECT (button), "popover", pp);
+  g_signal_connect (button, "clicked", G_CALLBACK (on_click_popover), pp);
 
-  return popover;
+  GtkEventController *keys = gtk_event_controller_key_new ();
+  g_signal_connect (keys, "key-pressed", G_CALLBACK (on_popover_key), pp);
+  gtk_widget_add_controller (pp->window, keys);
+
+  ensure_popover_mouse_hook ();
+
+  return pp->window;
 }
 
 // DateMenuButton: .panel-button.clock-display > .clock-display-box > .clock.
@@ -547,9 +796,9 @@ create_clock_button (void)
   g_timeout_add_seconds (1, update_clock, clock_label);
   update_clock (clock_label);
 
-  // The clock opens the date/calendar popover (like DateMenuButton).
-  GtkWidget *popover = make_panel_popover (button, winome_calendar_new ());
-  gtk_widget_add_css_class (popover, "datemenu-popover");
+  // The clock opens the date/calendar popover (like DateMenuButton), centered
+  // below the clock.
+  make_panel_popover (button, winome_calendar_new (), TRUE);
 
   return button;
 }
@@ -712,8 +961,9 @@ create_quick_settings (PanelStatus *st)
 
   gtk_button_set_child (GTK_BUTTON (button), status_box);
 
-  // The status area opens the quick settings popover.
-  make_panel_popover (button, winome_quick_settings_new ());
+  // The status area opens the quick settings popover, right-aligned near the
+  // status area.
+  make_panel_popover (button, winome_quick_settings_new (), FALSE);
 
   return button;
 }
@@ -782,6 +1032,9 @@ winome_shell_panel_new (void)
   winome::install_bundled_fonts (panel);
 
   load_css (panel);
+
+  // Make the panel transparent (and close popovers) while the overview is open.
+  connect_overview_state (panel);
 
   return panel;
 }
