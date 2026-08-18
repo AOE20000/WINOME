@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only
 // Origin: WinOverview <https://github.com/valinet/WinOverview> (GPL-2.0-or-later)
 // Modified for WINOME, 2026-08-16.
 #pragma once
@@ -26,3 +26,8 @@
 #define CLASS_NAME L"ActivitiesOverviewWindowClassFull"
 #define CLASS_NAME_SIMPLE L"ActivitiesOverviewWindowClassSimple"
 #define CLASS_NAME_BKG L"ActivitiesOverviewWindowClassBkg"
+
+// Named event signaled when the overview finishes closing. The host
+// (winome.exe) creates and waits on it; the DLL signals it right before
+// terminating so the host can restore the panel without polling.
+#define OVERVIEW_CLOSED_EVENT_NAME L"Local\\WinomeOverviewClosed"

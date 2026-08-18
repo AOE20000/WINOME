@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-only
 // Origin: WinOverview <https://github.com/valinet/WinOverview> (GPL-2.0-or-later)
 // Modified for WINOME, 2026-08-16.
 // dllmain.cpp : Defines the entry point for the DLL application.
@@ -40,6 +40,18 @@ std::vector<MonitorInfo> monitors;
 // WM_THREAD_DONE (which releases the mutex) is delivered to this same thread.
 static void DeferClose (HWND hWnd) {
   SetTimer (hWnd, 1, 50, NULL);
+}
+
+// Signal the host (winome.exe) that the overview is done closing, right before
+// this process is terminated. The host waits on the named event instead of
+// polling for the overview window, so every termination path must notify.
+void NotifyHostOverviewClosed() {
+  HANDLE hEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE,
+                             OVERVIEW_CLOSED_EVENT_NAME);
+  if (hEvent) {
+    SetEvent(hEvent);
+    CloseHandle(hEvent);
+  }
 }
 
 void DetectSearchDismiss(
@@ -257,6 +269,7 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 	case WM_CLOSE:
 		if (wParam == 99)
 		{
+			NotifyHostOverviewClosed();
 			HANDLE myself;
 			myself = OpenProcess(PROCESS_ALL_ACCESS, false, GetCurrentProcessId());
 			TerminateProcess(myself, 0);
@@ -389,6 +402,7 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 			case ANIMTYPE_PREVIEW:
 			{
 				EndAnimateUpdate(info);
+				NotifyHostOverviewClosed();
 				HANDLE myself;
 				myself = OpenProcess(PROCESS_ALL_ACCESS, false, GetCurrentProcessId());
 				TerminateProcess(myself, 0);
@@ -948,6 +962,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI overview_main(LPVOID lpParam)
 		ip.ki.dwFlags = KEYEVENTF_KEYUP;
 		SendInput(1, &ip, sizeof(INPUT));
 
+		NotifyHostOverviewClosed();
 		exit(0);
 	}
 

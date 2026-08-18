@@ -21,6 +21,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <shlwapi.h>
+#include <sddl.h>
 #include <glib.h>
 
 #include <string>
@@ -38,6 +39,11 @@ namespace {
 constexpr wchar_t kOverviewClassName[] = L"ActivitiesOverviewWindowClassFull";
 constexpr UINT kWMAskMouse = WM_USER + 0x0002;
 
+// Named event the overview DLL signals when it is done closing (matched in
+// WinOverviewLibrary/constants.h). The host waits on this instead of guessing
+// whether the overview window still exists.
+constexpr wchar_t kOverviewClosedEventName[] = L"Local\\WinomeOverviewClosed";
+
 // Marks synthetic Win keypresses this hook injects (via dwExtraInfo) so they
 // are passed through to the system instead of being re-processed by the hook.
 constexpr ULONG_PTR kSyntheticWinExtra = 0x574E4F31;  // "WNO1"
@@ -48,6 +54,9 @@ BOOL g_win_alone = FALSE;
 BOOL g_win_injected = FALSE;
 HHOOK g_keyboard_hook = nullptr;
 HHOOK g_mouse_hook = nullptr;
+
+// The named event the overview signals on close; created once and reused.
+HANDLE g_overview_closed_event = nullptr;
 
 // State-change callback, marshaled to the main thread.
 OverviewStateCallback g_state_cb = nullptr;
@@ -146,18 +155,59 @@ void send_message_to_overview(UINT message, WPARAM wparam, LPARAM lparam) {
   }
 }
 
+// Create (once) the named event the overview DLL signals when it finishes
+// closing. The host is elevated, but the overview DLL runs at medium integrity
+// inside RuntimeBroker.exe; a default-created event carries a High integrity
+// label that a medium process cannot open, so it must be created with a Low
+// label.
+static void
+ensure_overview_closed_event (void)
+{
+  if (g_overview_closed_event != nullptr)
+    return;
+
+  PSECURITY_DESCRIPTOR sd = nullptr;
+  // DACL: Everyone gets EVENT_ALL_ACCESS (0x001F0003). SACL: mandatory label
+  // "Low" (LW, S-1-16-4096) with NoWriteUp, so any process in the session may
+  // open and signal the event.
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW (
+        L"D:(A;;0x001F0003;;;WD)S:(ML;;NW;;;LW)",
+        SDDL_REVISION_1, &sd, nullptr))
+    return;
+
+  SECURITY_ATTRIBUTES sa = { sizeof (sa), sd, FALSE };
+  g_overview_closed_event =
+    CreateEventW (&sa, TRUE, FALSE, kOverviewClosedEventName);
+  LocalFree (sd);
+}
+
+// Tear down after the overview closes: drop the mouse hook, clear the running
+// flag and tell observers (the panel) so it restores its background color.
+// Idempotent; run() is the only caller, but it stays safe if invoked twice.
+static void
+finalize_overview_close (void)
+{
+  if (g_mouse_hook != nullptr) {
+    UnhookWindowsHookEx (g_mouse_hook);
+    g_mouse_hook = nullptr;
+  }
+  g_running = FALSE;
+  notify_overview_state (FALSE);
+}
+
 // Start WinOverviewLauncher.exe inside explorer.exe so the overview runs at
 // ordinary integrity level (RuntimeBroker cannot be launched from an elevated
 // process directly).
 DWORD WINAPI run(LPVOID) {
   char launcher_path[_MAX_PATH + 16] = {0};
+  bool launched = false;
 
   PROCESSENTRY32 entry{};
   entry.dwSize = sizeof(entry);
 
   HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
   if (snapshot == INVALID_HANDLE_VALUE) {
-    g_running = FALSE;
+    finalize_overview_close ();
     return 1;
   }
 
@@ -194,6 +244,7 @@ DWORD WINAPI run(LPVOID) {
         if (thread != nullptr) {
           WaitForSingleObject(thread, INFINITE);
           CloseHandle(thread);
+          launched = true;
         }
         VirtualFreeEx(process, remote, 0, MEM_RELEASE);
       }
@@ -204,11 +255,27 @@ DWORD WINAPI run(LPVOID) {
 
   CloseHandle(snapshot);
 
-  g_running = FALSE;
+  if (!launched) {
+    finalize_overview_close ();
+    return 1;
+  }
+
+  // The launcher is up. The overview DLL signals kOverviewClosedEventName right
+  // before it terminates (on Win/Esc close, a thumbnail click, or a blank-space
+  // click), so block here until it notifies us — no window polling. g_running
+  // stays TRUE while we wait, keeping the Win/Esc close paths live and the
+  // panel transparent until the overview is truly gone.
+  if (g_overview_closed_event != nullptr)
+    WaitForSingleObject (g_overview_closed_event, INFINITE);
+
+  finalize_overview_close ();
   return 0;
 }
 
 void start_overview() {
+  ensure_overview_closed_event ();
+  if (g_overview_closed_event != nullptr)
+    ResetEvent (g_overview_closed_event);
   g_running = TRUE;
   CreateThread(nullptr, 0, run, nullptr, 0, nullptr);
   g_mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, nullptr, 0);
@@ -216,13 +283,9 @@ void start_overview() {
 }
 
 void close_overview() {
+  // Ask the overview to close; it notifies us (the named event) once its close
+  // animation finishes, which wakes run() and finalizes the state change.
   send_message_to_overview(WM_CLOSE, 0, 0);
-  if (g_mouse_hook != nullptr) {
-    UnhookWindowsHookEx(g_mouse_hook);
-    g_mouse_hook = nullptr;
-  }
-  g_running = FALSE;
-  notify_overview_state(FALSE);
 }
 
 void trigger_thread_main() {
