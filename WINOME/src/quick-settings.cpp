@@ -115,6 +115,133 @@ typedef struct {
   GtkWidget *menu_button_part; // the .quick-toggle-menu-button node
 } MenuToggleParts;
 
+// --- Menu toggle content layout ----------------------------------------------
+//
+// The QuickMenuToggle's inner box. GtkBox over-allocates the menu button by
+// 2px vertically (a GtkBoxLayout allocation quirk), leaving a 1px step at the
+// join; this custom widget lays the three parts out at exactly the box height.
+
+typedef struct {
+  GtkWidget parent_instance;
+  GtkWidget *toggle_part;
+  GtkWidget *separator;
+  GtkWidget *menu_button;
+} WinomeMenuToggleContent;
+
+typedef struct {
+  GtkWidgetClass parent_class;
+} WinomeMenuToggleContentClass;
+
+#define WINOME_TYPE_MENU_TOGGLE_CONTENT (winome_menu_toggle_content_get_type ())
+#define WINOME_MENU_TOGGLE_CONTENT(obj) (G_TYPE_CHECK_INSTANCE_CAST ((obj), \
+    WINOME_TYPE_MENU_TOGGLE_CONTENT, WinomeMenuToggleContent))
+
+G_DEFINE_TYPE (WinomeMenuToggleContent, winome_menu_toggle_content, GTK_TYPE_WIDGET)
+
+static void
+winome_menu_toggle_content_measure (GtkWidget *widget,
+                                    GtkOrientation orientation,
+                                    int for_size G_GNUC_UNUSED,
+                                    int *minimum, int *natural,
+                                    int *minimum_baseline, int *natural_baseline)
+{
+  WinomeMenuToggleContent *self = WINOME_MENU_TOGGLE_CONTENT (widget);
+
+  if (minimum_baseline)
+    *minimum_baseline = -1;
+  if (natural_baseline)
+    *natural_baseline = -1;
+
+  if (orientation == GTK_ORIENTATION_HORIZONTAL) {
+    int min = 0, nat = 0;
+    int m, n;
+    gtk_widget_measure (self->toggle_part, GTK_ORIENTATION_HORIZONTAL, -1,
+                        &m, &n, NULL, NULL);
+    min += m; nat += n;
+    gtk_widget_measure (self->separator, GTK_ORIENTATION_HORIZONTAL, -1,
+                        &m, &n, NULL, NULL);
+    min += m; nat += n;
+    gtk_widget_measure (self->menu_button, GTK_ORIENTATION_HORIZONTAL, -1,
+                        &m, &n, NULL, NULL);
+    min += m; nat += n;
+    *minimum = min;
+    *natural = nat;
+  } else {
+    int m1, n1, m2, n2, m3, n3;
+    gtk_widget_measure (self->toggle_part, GTK_ORIENTATION_VERTICAL, -1,
+                        &m1, &n1, NULL, NULL);
+    gtk_widget_measure (self->separator, GTK_ORIENTATION_VERTICAL, -1,
+                        &m2, &n2, NULL, NULL);
+    gtk_widget_measure (self->menu_button, GTK_ORIENTATION_VERTICAL, -1,
+                        &m3, &n3, NULL, NULL);
+    *minimum = MAX (MAX (m1, m2), m3);
+    *natural = MAX (MAX (n1, n2), n3);
+  }
+}
+
+static void
+winome_menu_toggle_content_size_allocate (GtkWidget *widget,
+                                          int width, int height, int baseline)
+{
+  WinomeMenuToggleContent *self = WINOME_MENU_TOGGLE_CONTENT (widget);
+  int sep_w, menu_w;
+
+  gtk_widget_measure (self->separator, GTK_ORIENTATION_HORIZONTAL, -1,
+                      NULL, &sep_w, NULL, NULL);
+  gtk_widget_measure (self->menu_button, GTK_ORIENTATION_HORIZONTAL, -1,
+                      NULL, &menu_w, NULL, NULL);
+
+  GtkAllocation alloc;
+  alloc.y = 0;
+  alloc.height = height;
+
+  alloc.x = 0;
+  alloc.width = MAX (0, width - sep_w - menu_w);
+  gtk_widget_size_allocate (self->toggle_part, &alloc, -1);
+
+  alloc.x = alloc.width;
+  alloc.width = sep_w;
+  gtk_widget_size_allocate (self->separator, &alloc, -1);
+
+  alloc.x += sep_w;
+  alloc.width = menu_w;
+  gtk_widget_size_allocate (self->menu_button, &alloc, -1);
+}
+
+static void
+winome_menu_toggle_content_init (WinomeMenuToggleContent *self G_GNUC_UNUSED)
+{
+}
+
+static void
+winome_menu_toggle_content_class_init (WinomeMenuToggleContentClass *klass)
+{
+  GtkWidgetClass *widget_class = GTK_WIDGET_CLASS (klass);
+
+  widget_class->measure = winome_menu_toggle_content_measure;
+  widget_class->size_allocate = winome_menu_toggle_content_size_allocate;
+  gtk_widget_class_set_css_name (widget_class, "box");
+}
+
+static GtkWidget *
+menu_toggle_content_new (GtkWidget *toggle_part, GtkWidget *separator,
+                         GtkWidget *menu_button)
+{
+  WinomeMenuToggleContent *self =
+      static_cast<WinomeMenuToggleContent *> (g_object_new (
+          winome_menu_toggle_content_get_type (), NULL));
+
+  self->toggle_part = toggle_part;
+  self->separator = separator;
+  self->menu_button = menu_button;
+
+  gtk_widget_set_parent (toggle_part, GTK_WIDGET (self));
+  gtk_widget_set_parent (separator, GTK_WIDGET (self));
+  gtk_widget_set_parent (menu_button, GTK_WIDGET (self));
+
+  return GTK_WIDGET (self);
+}
+
 static void
 sync_menu_toggle_checked (GtkToggleButton *button, gpointer user_data)
 {
@@ -137,7 +264,7 @@ make_quick_menu_toggle (const char *icon_name, const char *title,
                         const char *subtitle)
 {
   GtkWidget *button;
-  GtkWidget *box;
+  GtkWidget *content;
   GtkWidget *toggle_part;
   GtkWidget *content_box;
   GtkWidget *icon;
@@ -152,11 +279,9 @@ make_quick_menu_toggle (const char *icon_name, const char *title,
   button = gtk_toggle_button_new ();
   gtk_widget_add_css_class (button, "quick-toggle-has-menu");
   gtk_widget_set_focus_on_click (button, FALSE);
-
-  box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
-  gtk_widget_set_valign (box, GTK_ALIGN_FILL);
-  gtk_widget_set_halign (box, GTK_ALIGN_FILL);
-  gtk_button_set_child (GTK_BUTTON (button), box);
+  // Clip the inner parts to the capsule so the menu button's small allocation
+  // overflow (a GtkBox quirk) cannot poke out above/below the capsule.
+  gtk_widget_set_overflow (button, GTK_OVERFLOW_HIDDEN);
 
   // The toggle part. A plain box (not a nested button) so clicks land on the
   // outer toggle button; it carries the .quick-toggle capsule background and
@@ -164,9 +289,7 @@ make_quick_menu_toggle (const char *icon_name, const char *title,
   toggle_part = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
   gtk_widget_add_css_class (toggle_part, "quick-toggle");
   gtk_widget_add_css_class (toggle_part, "button");
-  gtk_widget_set_hexpand (toggle_part, TRUE);
   gtk_widget_set_valign (toggle_part, GTK_ALIGN_FILL);
-  gtk_box_append (GTK_BOX (box), toggle_part);
 
   // Content box: matches `.quick-toggle > box` in the stylesheet (the 9px
   // spacing + ltr padding live here). Vertically centered in the capsule.
@@ -206,21 +329,24 @@ make_quick_menu_toggle (const char *icon_name, const char *title,
   separator = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class (separator, "quick-toggle-separator");
   gtk_widget_set_size_request (separator, 1, -1);
-  gtk_widget_set_valign (separator, GTK_ALIGN_FILL);
-  gtk_box_append (GTK_BOX (box), separator);
 
   // The ">" menu button area (.icon-button fill + go-next arrow), filling the
   // capsule height like native (y_expand).
   menu_button = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
   gtk_widget_add_css_class (menu_button, "quick-toggle-menu-button");
   gtk_widget_add_css_class (menu_button, "icon-button");
-  gtk_widget_set_valign (menu_button, GTK_ALIGN_FILL);
   arrow = gtk_image_new_from_icon_name ("go-next-symbolic");
   gtk_image_set_pixel_size (GTK_IMAGE (arrow), QUICK_ICON_SIZE);
   gtk_widget_set_valign (arrow, GTK_ALIGN_CENTER);
   gtk_widget_set_halign (arrow, GTK_ALIGN_CENTER);
   gtk_box_append (GTK_BOX (menu_button), arrow);
-  gtk_box_append (GTK_BOX (box), menu_button);
+
+  // Custom content layout: lays the three parts out at exactly the allocated
+  // height (GtkBox over-allocates the menu button by 2px).
+  content = menu_toggle_content_new (toggle_part, separator, menu_button);
+  gtk_widget_set_valign (content, GTK_ALIGN_FILL);
+  gtk_widget_set_halign (content, GTK_ALIGN_FILL);
+  gtk_button_set_child (GTK_BUTTON (button), content);
 
   parts = g_new0 (MenuToggleParts, 1);
   parts->toggle_part = toggle_part;

@@ -273,6 +273,16 @@ GTK4_BUTTON_OVERRIDE = """
 .quick-toggle-has-menu .quick-toggle > box {
   padding-right: 9px;
 }
+/* The has-menu toggle is one continuous capsule split by the 1px separator:
+   the left .quick-toggle is rounded only on its outer (left) corners and the
+   ">" .quick-toggle-menu-button only on its right, so their join is square.
+   Native does this with the :ltr rules, which the conversion drops. */
+.quick-toggle-has-menu .quick-toggle {
+  border-radius: 999px 0 0 999px;
+}
+.quick-toggle-has-menu .quick-toggle-menu-button {
+  border-radius: 0 999px 999px 0;
+}
 /* Both toggle styles are fixed to exactly 12em: native uses
    min-width/max-width: 12em, but the conversion drops max-width. Without it
    a has-menu toggle (inner toggle + separator + menu button) or a long title
