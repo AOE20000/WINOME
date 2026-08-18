@@ -1,6 +1,6 @@
 # WINOME
 
-<img width="1920" height="1080" alt="图片" src="https://github.com/user-attachments/assets/17c73590-3301-4c21-b017-2999d4076b44" />
+<img width="1920" height="1080" alt="图片" src="https://github.com/user-attachments/assets/a371dc45-d85c-4df9-a968-6b7e69996730" />
 
 在 Microsoft Windows 上用 Windows 原生功能支撑的 GNOME Shell UI 复刻。
 
