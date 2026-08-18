@@ -344,6 +344,13 @@ window.quick-settings-popover-window {
   background-color: transparent;
 }
 
+/* In-host Activities overview toplevel (layering: popover > panel >
+   overview > apps > wallpaper). Placeholder dark backdrop; the wallpaper
+   dimming and workspace UI land with the overview UI pass. */
+window.winome-overview {
+  background-color: rgba(0, 0, 0, 0.85);
+}
+
 /* .panel-button horizontal padding mirrors -natural-hpadding: 12px (the St
    property is dropped by the conversion). Strip the default button padding
    and focus ring so only the GNOME highlight (translated to background-color)

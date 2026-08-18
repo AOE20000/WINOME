@@ -20,9 +20,11 @@
 #include "system-status.h"
 #include "quick-settings.h"
 #include "overview-trigger.h"
+#include "overview.h"
 #include "fonts.h"
 
 #include <gdk/win32/gdkwin32.h>
+#include <dwmapi.h>
 
 #include <time.h>
 #include <string.h>
@@ -166,7 +168,7 @@ static void
 on_activities_clicked (GtkButton *button G_GNUC_UNUSED,
                        gpointer user_data G_GNUC_UNUSED)
 {
-  winome::toggle_overview ();
+  winome::toggle_overview ("activities-button");
 }
 
 static GtkWidget *
@@ -407,6 +409,7 @@ typedef struct {
   gboolean open;
   gboolean centered;       // calendar: center on the button (quick settings right-aligns)
   RECT anchor_rect;        // the button's screen rect, for the close hook
+  gint raise_attempts;     // post-map re-assert counter (GDK re-lates late)
 } PanelPopover;
 
 static GList *g_open_popovers = NULL;
@@ -539,11 +542,12 @@ panel_popover_geometry (PanelPopover *pp, int width, int height,
 }
 
 static void
-panel_popover_close (PanelPopover *pp)
+panel_popover_close (PanelPopover *pp, const char *reason)
 {
   if (!pp->open)
     return;
 
+  g_print ("[pop] close (%s)\n", reason);
   pp->open = FALSE;
   gtk_widget_set_visible (pp->window, FALSE);
   gtk_widget_remove_css_class (pp->button, "open");
@@ -566,13 +570,82 @@ panel_popover_close (PanelPopover *pp)
   g_timeout_add (200, clear_stale_hover, pp->button);
 }
 
+// After GTK maps the popover, re-assert the shell-chrome ex styles, the
+// topmost z-order AND the anchor-derived position. GTK4's deferred map can
+// both demote the window out of the topmost band (hiding it below the
+// topmost Activities overview) and reposition the window to GTK's own
+// cached geometry — so the current rectangle must never be trusted, only
+// the anchor geometry. Re-runs for a short while because GDK may still
+// reconfigure right after the map.
+static gboolean
+popover_raise_idle (gpointer data)
+{
+  PanelPopover *pp = static_cast<PanelPopover *> (data);
+  if (!pp->open)
+    return G_SOURCE_REMOVE;
+
+  HWND hwnd = panel_popover_hwnd (pp);
+  if (hwnd != nullptr) {
+    LONG_PTR ex = GetWindowLongPtrW (hwnd, GWL_EXSTYLE);
+    LONG_PTR want = (ex & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+    if (want != ex)
+      SetWindowLongPtrW (hwnd, GWL_EXSTYLE, want);
+
+    RECT before = {0, 0, 0, 0};
+    GetWindowRect (hwnd, &before);
+    BOOL cloaked = FALSE;
+    DwmGetWindowAttribute (hwnd, DWMWA_CLOAKED, &cloaked, sizeof (cloaked));
+
+    // Recompute the position from the anchor; keep the current size (GTK
+    // has negotiated it by now).
+    int w = before.right - before.left;
+    int h = before.bottom - before.top;
+    int x = before.left, y = before.top;
+    if (pp->raise_attempts < 3)
+      g_print ("[pop] raise#%d rect=%ld,%ld %dx%d vis=%d cloak=%d\n",
+               pp->raise_attempts, before.left, before.top, w, h,
+               (int)IsWindowVisible (hwnd), (int)cloaked);
+    if (w > 0 && h > 0 && panel_popover_geometry (pp, w, h, &x, &y)) {
+      SetWindowPos (hwnd, HWND_TOPMOST, x, y, w, h,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+    }
+  }
+
+  // Keep the full shell order (this popover > panel > overview) once right
+  // after the map; fullscreen-watcher re-asserts it every 400ms thereafter, so
+  // there is no need to churn SWP_FRAMECHANGED on the panel/overview every
+  // 100ms for a full second (that churn made the popover flicker against the
+  // overview while opening).
+  if (pp->raise_attempts == 0)
+    winome::overview_restack ();
+
+  if (++pp->raise_attempts < 10) {
+    g_timeout_add (100, popover_raise_idle, pp);
+    return G_SOURCE_REMOVE;
+  }
+  return G_SOURCE_REMOVE;
+}
+
+// The popover must be raised AFTER GDK's map sequence completes: GTK4 defers
+// the map to the main loop, and GDK's first-map positioning runs after any
+// SetWindowPos issued from panel_popover_open(), which otherwise leaves the
+// window below the topmost Activities overview.
+static void
+on_popover_map (GtkWidget *widget, gpointer data)
+{
+  (void)widget;
+  g_idle_add (popover_raise_idle, data);
+}
+
 static void
 panel_popover_open (PanelPopover *pp)
 {
   if (pp->open)
     return;
 
+  g_print ("[pop] open\n");
   pp->open = TRUE;
+  pp->raise_attempts = 0;
   gtk_widget_add_css_class (pp->button, "open");
   panel_popover_anchor_rect (pp);
 
@@ -605,12 +678,19 @@ panel_popover_open (PanelPopover *pp)
     int x = 0, y = 0;
     if (panel_popover_geometry (pp, px_w, px_h, &x, &y)) {
       // Show + raise + activate so the popover is interactive (Esc, clicks).
+      // SWP_FRAMECHANGED so the ex-style changes above take effect on the
+      // banding immediately.
       SetWindowPos (hwnd, HWND_TOPMOST, x, y, px_w, px_h,
-                    SWP_SHOWWINDOW);
+                    SWP_SHOWWINDOW | SWP_FRAMECHANGED);
     }
   }
 
   gtk_widget_set_visible (pp->window, TRUE);
+
+  // Re-assert the topmost placement after GTK's map completes (see
+  // popover_raise_idle): the first map demotes the window out of the
+  // topmost band, hiding it below the overview.
+  g_idle_add (popover_raise_idle, pp);
 
   g_open_popovers = g_list_append (g_open_popovers, pp);
 }
@@ -618,11 +698,24 @@ panel_popover_open (PanelPopover *pp)
 static void
 on_click_popover (GtkButton *button G_GNUC_UNUSED, gpointer data)
 {
-  PanelPopover *pp = static_cast<PanelPopover *>(data);
-  if (pp->open)
-    panel_popover_close (pp);
-  else
-    panel_popover_open (pp);
+  PanelPopover *pp = static_cast<PanelPopover *> (data);
+
+  g_print ("[pop] on_click open=%d overview=%d\n", (int)pp->open,
+           (int)winome::overview_active ());
+
+  if (pp->open) {
+    panel_popover_close (pp, "toggle");
+    return;
+  }
+
+  // Native GNOME: a panel-button click during the Activities overview first
+  // exits the overview, then opens the menu above the desktop. Without this the
+  // popover floats over the overview and the two fight for the topmost band
+  // (the source of the quick-settings toggle loop / flash).
+  if (winome::overview_active ())
+    winome::close_overview ("popover-button-click");
+
+  panel_popover_open (pp);
 }
 
 static gboolean
@@ -632,9 +725,9 @@ on_popover_key (GtkEventControllerKey *controller G_GNUC_UNUSED,
                 GdkModifierType state G_GNUC_UNUSED,
                 gpointer data)
 {
-  PanelPopover *pp = static_cast<PanelPopover *>(data);
+  PanelPopover *pp = static_cast<PanelPopover *> (data);
   if (keyval == GDK_KEY_Escape) {
-    panel_popover_close (pp);
+    panel_popover_close (pp, "escape");
     return GDK_EVENT_STOP;
   }
   return GDK_EVENT_PROPAGATE;
@@ -667,7 +760,7 @@ popover_mouse_hook_proc (int nCode, WPARAM wParam, LPARAM lParam)
           inside = TRUE;
       }
       if (!inside)
-        panel_popover_close (pp);
+        panel_popover_close (pp, "outside-click");
 
       l = next;
     }
@@ -692,11 +785,12 @@ on_overview_state_changed (bool active, void *user_data)
 {
   GtkWidget *panel = GTK_WIDGET (user_data);
 
+  g_print ("[panel] overview state -> %d\n", (int)active);
   if (active) {
     gtk_widget_add_css_class (panel, "overview");
     while (g_open_popovers != nullptr) {
       PanelPopover *pp = static_cast<PanelPopover *>(g_open_popovers->data);
-      panel_popover_close (pp);
+      panel_popover_close (pp, "overview-open");
     }
   } else {
     gtk_widget_remove_css_class (panel, "overview");
@@ -748,6 +842,9 @@ make_panel_popover (GtkWidget *button, GtkWidget *child, gboolean centered)
 
   g_object_set_data (G_OBJECT (button), "popover", pp);
   g_signal_connect (button, "clicked", G_CALLBACK (on_click_popover), pp);
+
+  // Raise above the (topmost) overview only after GDK's map completes.
+  g_signal_connect (pp->window, "map", G_CALLBACK (on_popover_map), pp);
 
   GtkEventController *keys = gtk_event_controller_key_new ();
   g_signal_connect (keys, "key-pressed", G_CALLBACK (on_popover_key), pp);
@@ -986,6 +1083,18 @@ load_css (GtkWidget *panel G_GNUC_UNUSED)
     GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 
   g_object_unref (provider);
+}
+
+// HWND of the topmost open popover, or NULL. The list is prepended on open,
+// so the LAST element is the most recently opened (topmost) popover.
+void *
+winome_shell_panel_top_popover_hwnd (void)
+{
+  if (g_open_popovers == nullptr)
+    return nullptr;
+  GList *last = g_list_last (g_open_popovers);
+  PanelPopover *pp = static_cast<PanelPopover *> (last->data);
+  return panel_popover_hwnd (pp);
 }
 
 // --- Panel entry point ------------------------------------------------------

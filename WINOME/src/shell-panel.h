@@ -13,3 +13,8 @@ GtkWidget *winome_shell_panel_new (void);
 // 2.2em }) using the St theme context font. Matches gnome-shell's 32px bar at
 // scale 1.
 int winome_shell_panel_height (void);
+
+// HWND of the topmost open popover (quick settings / calendar), or NULL when
+// none is open. Used to enforce the layering contract popover > panel >
+// overview from overview_restack().
+void *winome_shell_panel_top_popover_hwnd (void);

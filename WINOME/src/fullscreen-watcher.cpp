@@ -6,6 +6,8 @@
 // fullscreen only when it covers its entire monitor.
 
 #include "fullscreen-watcher.h"
+#include "overview-trigger.h"
+#include "overview.h"
 
 #include <windows.h>
 #include <glib.h>
@@ -15,8 +17,6 @@
 namespace winome {
 
 namespace {
-
-constexpr wchar_t kOverviewClass[] = L"ActivitiesOverviewWindowClassFull";
 
 bool belongs_to_process(HWND hwnd, const wchar_t* name) {
   DWORD pid = 0;
@@ -79,7 +79,14 @@ bool should_hide_panel(HWND fg) {
   if (fg == nullptr)
     return false;
 
-  // Our own windows (the panel itself, popovers) never hide the panel.
+  // The panel always stays visible over the Activities overview (the
+  // overview window itself does not take focus, so @fg may still be a
+  // fullscreen app).
+  if (winome::overview_active())
+    return false;
+
+  // Our own windows (the panel itself, popovers, the overview) never hide
+  // the panel.
   if (belongs_to_process(fg, L"winome.exe"))
     return false;
 
@@ -87,12 +94,11 @@ bool should_hide_panel(HWND fg) {
   if (is_desktop_window(fg))
     return false;
 
-  // The overview and the Alt-Tab/Task View switcher are fullscreen overlays,
-  // but the panel must stay visible above them.
+  // The Alt-Tab/Task View switcher is a fullscreen overlay, but the panel
+  // must stay visible above it.
   wchar_t cls[256] = {0};
   if (GetClassNameW(fg, cls, 256) > 0 &&
-      (wcscmp(cls, kOverviewClass) == 0 ||
-       wcscmp(cls, L"XamlExplorerHostIslandWindow") == 0))
+      wcscmp(cls, L"XamlExplorerHostIslandWindow") == 0)
     return false;
 
   // Lock screen: hide the panel so it does not float over it.
@@ -116,6 +122,11 @@ gboolean fullscreen_tick(gpointer user_data) {
   LONG_PTR ex = GetWindowLongPtrW(panel, GWL_EXSTYLE);
   if ((ex & WS_EX_TOOLWINDOW) == 0)
     SetWindowLongPtrW(panel, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW);
+
+  // Same idea for z-order: GDK/Windows reshuffle the topmost band, which
+  // can leave the overview above the panel or a popover buried under the
+  // overview. Re-assert popover > panel > overview every tick.
+  winome::overview_restack ();
 
   // Hiding the taskbar makes the shell asynchronously recompute the work area
   // to the full screen, which can revert the panel-strip reservation set at

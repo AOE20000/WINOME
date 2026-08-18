@@ -17,5 +17,4 @@ pangoft2_dep = dependency('pangoft2')
 cc = meson.get_compiler('cpp')
 
 subdir('st-compat')
-subdir('overview')
 subdir('src')

@@ -11,6 +11,7 @@
 #include "host-utils.h"
 #include "native-taskbar.h"
 #include "overview-trigger.h"
+#include "overview.h"
 #include "shell-panel.h"
 #include "win-event-hook.h"
 #include "fullscreen-watcher.h"
@@ -78,6 +79,9 @@ position_panel (GtkWidget *panel)
   RECT work = mi.rcMonitor;
   work.top += height;
   SystemParametersInfoW (SPI_SETWORKAREA, 0, &work, 0);
+
+  // Create the in-host Activities overview, z-ordered below the panel.
+  winome::overview_init (hwnd);
 
   // Auto-hide the panel while a fullscreen window or the lock screen is
   // active; it stays visible everywhere else, including over the overview.

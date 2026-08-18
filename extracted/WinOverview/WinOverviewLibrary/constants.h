@@ -26,8 +26,3 @@
 #define CLASS_NAME L"ActivitiesOverviewWindowClassFull"
 #define CLASS_NAME_SIMPLE L"ActivitiesOverviewWindowClassSimple"
 #define CLASS_NAME_BKG L"ActivitiesOverviewWindowClassBkg"
-
-// Named event signaled when the overview finishes closing. The host
-// (winome.exe) creates and waits on it; the DLL signals it right before
-// terminating so the host can restore the panel without polling.
-#define OVERVIEW_CLOSED_EVENT_NAME L"Local\\WinomeOverviewClosed"

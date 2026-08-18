@@ -49,7 +49,8 @@ gboolean hot_corner_tick(gpointer user_data) {
 
   if (in && !in_corner && now_ms - last_trigger_ms >= kCooldownMs) {
     last_trigger_ms = now_ms;
-    open_overview();
+    g_print("[hot] corner trigger\n");
+    open_overview("hot-corner");
   }
   in_corner = in;
   return G_SOURCE_CONTINUE;
