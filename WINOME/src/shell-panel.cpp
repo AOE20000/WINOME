@@ -415,6 +415,9 @@ typedef struct {
 static GList *g_open_popovers = NULL;
 static HHOOK g_popover_mouse_hook = NULL;
 static gboolean g_overview_hooked = FALSE;
+// Monotonic time of the last popover dismissal by an outside click while the
+// overview was open (see popover_mouse_hook_proc).
+static gint64 g_popover_outside_close_us = 0;
 
 // GTK4's popover grab window on Windows leaves the anchor button's :hover
 // (PRELIGHT) state stale: after the popover closes, the button keeps its
@@ -708,13 +711,10 @@ on_click_popover (GtkButton *button G_GNUC_UNUSED, gpointer data)
     return;
   }
 
-  // Native GNOME: a panel-button click during the Activities overview first
-  // exits the overview, then opens the menu above the desktop. Without this the
-  // popover floats over the overview and the two fight for the topmost band
-  // (the source of the quick-settings toggle loop / flash).
-  if (winome::overview_active ())
-    winome::close_overview ("popover-button-click");
-
+  // Native GNOME: panel menus opened during the Activities overview float
+  // ABOVE the overview (popover > panel > overview); the overview stays
+  // visible behind them. popover_raise_idle + overview_restack() keep the
+  // layering stable, so no overview close here.
   panel_popover_open (pp);
 }
 
@@ -759,8 +759,14 @@ popover_mouse_hook_proc (int nCode, WPARAM wParam, LPARAM lParam)
         if (!inside && PtInRect (&pp->anchor_rect, pt))
           inside = TRUE;
       }
-      if (!inside)
+      if (!inside) {
+        // GNOME's menu grab consumes an outside click: it dismisses the menu
+        // only. When the overview is open underneath, mark the dismissal so
+        // the overview ignores the matching mouse-up instead of closing.
+        if (winome::overview_active ())
+          g_popover_outside_close_us = g_get_monotonic_time ();
         panel_popover_close (pp, "outside-click");
+      }
 
       l = next;
     }
@@ -1095,6 +1101,17 @@ winome_shell_panel_top_popover_hwnd (void)
   GList *last = g_list_last (g_open_popovers);
   PanelPopover *pp = static_cast<PanelPopover *> (last->data);
   return panel_popover_hwnd (pp);
+}
+
+// See shell-panel.h: TRUE for ~350ms after a popover was dismissed by an
+// outside click while the overview was open — the overview must swallow the
+// matching click (GNOME's menu grab consumes it).
+int
+winome_shell_panel_popover_just_closed (void)
+{
+  if (g_popover_outside_close_us == 0)
+    return FALSE;
+  return (g_get_monotonic_time () - g_popover_outside_close_us) < 350 * 1000;
 }
 
 // --- Panel entry point ------------------------------------------------------

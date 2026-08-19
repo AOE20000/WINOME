@@ -18,3 +18,9 @@ int winome_shell_panel_height (void);
 // none is open. Used to enforce the layering contract popover > panel >
 // overview from overview_restack().
 void *winome_shell_panel_top_popover_hwnd (void);
+
+// TRUE for a short window after a popover was dismissed by a click outside
+// itself while the Activities overview was open. In GNOME that click is
+// consumed by the menu grab: it closes the menu only, so the overview must
+// ignore it instead of closing too (windowPreview/overview click handling).
+int winome_shell_panel_popover_just_closed (void);

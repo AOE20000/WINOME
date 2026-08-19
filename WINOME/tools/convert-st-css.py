@@ -345,10 +345,30 @@ window.quick-settings-popover-window {
 }
 
 /* In-host Activities overview toplevel (layering: popover > panel >
-   overview > apps > wallpaper). Placeholder dark backdrop; the wallpaper
-   dimming and workspace UI land with the overview UI pass. */
+   overview > apps > wallpaper). The dark backdrop is painted by the
+   #overviewGroup child itself; the window only needs the GNOME UI font so
+   every em value (search-entry 24em width, caption, dash) resolves exactly
+   like St's "Sans 11" at 96dpi. */
 window.winome-overview {
-  background-color: rgba(0, 0, 0, 0.85);
+  background-color: transparent;
+  font: 11pt "Cantarell";
+}
+
+/* The overview chrome windows (window-close button, hover app icon) are
+   borderless transparent toplevels layered above the DWM thumbnails. */
+window.winome-overview-chrome {
+  background-color: transparent;
+  font: 11pt "Cantarell";
+}
+
+/* Search entry: GNOME renders the hint text at the entry's dimmed color
+   (StLabel.hint-text, alpha 0.7) and the magnifier at the scalable icon size
+   (1.091em = 16px), with 4px padding either side (icon padding rule). */
+.search-entry placeholder {
+  color: rgba(250, 250, 251, 0.7);
+}
+.search-entry image {
+  -gtk-icon-size: 16px;
 }
 
 /* .panel-button horizontal padding mirrors -natural-hpadding: 12px (the St

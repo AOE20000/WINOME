@@ -812,6 +812,14 @@ winome_dash_class_init (WinomeDashClass *klass)
 
 }  // namespace
 
+// Exported for the overview window-preview hover chrome (windowPreview.js
+// shows the window's application icon at ICON_SIZE 64 logical px on hover).
+GdkTexture *
+winome_window_app_icon (HWND hwnd, int size)
+{
+  return app_icon_for (hwnd, window_exe_path (hwnd), size);
+}
+
 GtkWidget *
 overview_dash_new (GtkWidget *root_fixed)
 {

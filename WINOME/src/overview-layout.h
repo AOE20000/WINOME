@@ -35,12 +35,20 @@ struct OvSlot {
 //   @monitor_rect: full monitor bounds (window scale uses its height).
 //   @workarea:     scale-fit target (upstream _workarea).
 //   @box:          the actual picker area slots must fit (upstream container
-//                  box: between the search entry and the dash).
-// All three are in the same coordinate space (overview client px).
+//                  box: the workspace actor's allocation, i.e. the centered
+//                  aspect-preserving box, NOT the full-width container).
+//   @row_spacing/@column_spacing: effective spacing in the same px space,
+//                  i.e. (.window-picker spacing 6 + chrome oversize) scaled
+//                  (WorkspaceLayout._adjustSpacingAndPadding adds the window
+//                  chrome oversize — close button half-height / icon
+//                  overhang / active-size increment — to the theme spacing).
+// All rects are in the same coordinate space (overview client px).
 void overview_compute_slots(const std::vector<OvWindowInfo> &windows,
                             const RECT &monitor_rect,
                             const RECT &workarea,
                             const RECT &box,
+                            double row_spacing,
+                            double column_spacing,
                             std::vector<OvSlot> *slots);
 
 }  // namespace winome

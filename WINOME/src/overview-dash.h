@@ -37,4 +37,9 @@ void overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor,
 int overview_dash_get_width (GtkWidget *dash);
 int overview_dash_get_height (GtkWidget *dash);
 
+// Application icon for a window at (at least) @size PHYSICAL px (WM_GETICON /
+// class icon / IShellItemImageFactory on the exe), for the overview
+// window-preview hover chrome (windowPreview.js ICON_SIZE 64 logical).
+GdkTexture *winome_window_app_icon (HWND hwnd, int size);
+
 }  // namespace winome

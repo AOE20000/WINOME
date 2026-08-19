@@ -19,10 +19,6 @@ namespace {
 constexpr double kWindowPreviewMaximumScale = 0.95;
 constexpr double kLayoutScaleWeight = 1.0;
 constexpr double kLayoutSpaceWeight = 0.1;
-// .window-picker { spacing: 6px } (upstream reads it from the theme node;
-// WorkspaceLayout._onStyleChanged overrides the 20px default with this).
-constexpr double kRowSpacing = 6;
-constexpr double kColumnSpacing = 6;
 
 double
 lerp (double start, double end, double t)
@@ -46,6 +42,10 @@ struct Layout {
   double gridHeight = 0;
   double scale = 0;
   double space = 0;
+  // Effective spacing (theme 6px + chrome oversize), set by the caller of
+  // the strategy entry point.
+  double rowSpacing = 0;
+  double columnSpacing = 0;
 };
 
 // _computeWindowScale: lerp(1.5, 1, bboxHeight / monitor.height)
@@ -63,7 +63,7 @@ compute_row_sizes (Layout *layout)
 {
   for (Row &row : layout->rows) {
     row.width = row.fullWidth * layout->scale +
-                (row.windows.size () - 1) * kColumnSpacing;
+                (row.windows.size () - 1) * layout->columnSpacing;
     row.height = row.fullHeight * layout->scale;
   }
 }
@@ -162,8 +162,8 @@ compute_scale_and_space (Layout *layout, const RECT &area)
 {
   double aw = area.right - area.left;
   double ah = area.bottom - area.top;
-  double hspacing = (layout->maxColumns - 1) * kColumnSpacing;
-  double vspacing = (layout->numRows - 1) * kRowSpacing;
+  double hspacing = (layout->maxColumns - 1) * layout->columnSpacing;
+  double vspacing = (layout->numRows - 1) * layout->rowSpacing;
 
   double spaced_width = aw - hspacing;
   double spaced_height = ah - vspacing;
@@ -216,7 +216,7 @@ compute_window_slots (Layout *layout, const RECT &area, double monitor_height,
   for (const Row &row : rows)
     height_without_spacing += row.height;
 
-  double vertical_spacing = (rows.size () - 1) * kRowSpacing;
+  double vertical_spacing = (rows.size () - 1) * layout->rowSpacing;
   double additional_vertical_scale =
       std::min (1.0, (ah - vertical_spacing) / height_without_spacing);
 
@@ -224,7 +224,7 @@ compute_window_slots (Layout *layout, const RECT &area, double monitor_height,
   double y = 0;
 
   for (Row &row : rows) {
-    double horizontal_spacing = (row.windows.size () - 1) * kColumnSpacing;
+    double horizontal_spacing = (row.windows.size () - 1) * layout->columnSpacing;
     double width_without_spacing = row.width - horizontal_spacing;
     double additional_horizontal_scale =
         std::min (1.0, (aw - horizontal_spacing) / width_without_spacing);
@@ -246,7 +246,7 @@ compute_window_slots (Layout *layout, const RECT &area, double monitor_height,
             std::max (ah - (height_without_spacing + vertical_spacing), 0.0) /
                 2 +
             y;
-    y += row.height * row.additionalScale + kRowSpacing;
+    y += row.height * row.additionalScale + layout->rowSpacing;
   }
 
   compensation /= 2;
@@ -290,7 +290,7 @@ compute_window_slots (Layout *layout, const RECT &area, double monitor_height,
       slot.window = *window;
       slots->push_back (slot);
 
-      x += cell_w + kColumnSpacing;
+      x += cell_w + layout->columnSpacing;
     }
   }
 }
@@ -300,7 +300,8 @@ compute_window_slots (Layout *layout, const RECT &area, double monitor_height,
 void
 overview_compute_slots (const std::vector<OvWindowInfo> &windows,
                         const RECT &monitor_rect, const RECT &workarea,
-                        const RECT &box, std::vector<OvSlot> *slots)
+                        const RECT &box, double row_spacing,
+                        double column_spacing, std::vector<OvSlot> *slots)
 {
   slots->clear ();
   if (windows.empty ())
@@ -313,6 +314,8 @@ overview_compute_slots (const std::vector<OvWindowInfo> &windows,
   Layout last;
   last.scale = 0;
   last.space = 0;
+  last.rowSpacing = row_spacing;
+  last.columnSpacing = column_spacing;
   bool have_last = false;
   int last_num_columns = -1;
 
@@ -325,6 +328,8 @@ overview_compute_slots (const std::vector<OvWindowInfo> &windows,
       break;
 
     Layout layout;
+    layout.rowSpacing = row_spacing;
+    layout.columnSpacing = column_spacing;
     compute_layout (windows, num_rows, monitor_height, &layout);
     compute_scale_and_space (&layout, workarea);
 
