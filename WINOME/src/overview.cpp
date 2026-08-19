@@ -53,11 +53,13 @@
 #include "overview.h"
 #include "overview-layout.h"
 #include "overview-dash.h"
+#include "overview-thumbs.h"
 #include "overview-trigger.h"
 #include "shell-panel.h"
 #include "st-engine.h"
 #include "system-status.h"
 #include "fonts.h"
+#include "virtual-desktop.h"
 
 #include <gtk/gtk.h>
 #include <gdk/win32/gdkwin32.h>
@@ -98,6 +100,9 @@ constexpr double kWindowPickerSpacing = 6.0;
 // overviewControls.js ratios.
 constexpr double kVerticalSpacingRatio = 0.02;
 constexpr double kThumbnailsAdjustTop = 0.6;
+constexpr double kThumbnailsAdjustBottom = 0.4;  // THUMBNAILS_SPACING_ADJ_
+                                                  // USTMENT_BOTTOM
+constexpr double kMaxThumbnailScale = 0.05;      // MAX_THUMBNAIL_SCALE
 constexpr double kDashMaxHeightRatio = 0.16;
 
 // Overview.ANIMATION_TIME: opening EASE_OUT_SINE, closing EASE_OUT_QUAD.
@@ -114,8 +119,14 @@ GtkWidget *g_root = nullptr;      // GtkFixed named "overviewGroup"
 GtkWidget *g_search = nullptr;    // GtkEntry.search-entry
 GtkWidget *g_ws_bg = nullptr;     // workspace-background widget
 GtkWidget *g_dash = nullptr;      // overview dash
+GtkWidget *g_thumbs = nullptr;    // .workspace-thumbnails row
 GtkWidget *g_caption = nullptr;   // .window-caption hover pill
 GdkTexture *g_wallpaper = nullptr;
+
+// Virtual desktops (virtual-desktop.cpp), refreshed on every placement.
+std::vector<vd::DesktopInfo> g_desktops;
+int g_desktop_active = -1;   // index of the desktop the layout was built for
+guint g_desktop_poll = 0;    // external-switch watch while visible
 
 // Workspace-background geometry (physical px, overview client space) and the
 // animated corner radius (logical px).
@@ -152,10 +163,20 @@ std::vector<SlotEntry> g_slots;
 
 int g_hover_index = -1;
 
+// Mini window previews inside the workspace thumbnails (WorkspaceThumbnail
+// clones): one DWM thumbnail per (desktop, window) pair, laid out at the
+// window's porthole position scaled into the pill.
+struct MiniSlot {
+  HTHUMBNAIL thumb;
+  RECT rect;
+};
+std::vector<MiniSlot> g_mini_slots;
+
 // Layout (physical px, overview client space).
 int g_monitor_w = 0, g_monitor_h = 0;
 int g_dash_top = 0;             // top of the dash band (click exclusion)
 RECT g_search_rect = {0, 0, 0, 0}; // physical; clicks here belong to the entry
+RECT g_thumbs_rect = {0, 0, 0, 0}; // physical; clicks here belong to the thumbs row
 RECT g_ws_box = {0, 0, 0, 0};   // physical workspace box (slot layout area)
 
 struct Animation {
@@ -196,9 +217,12 @@ static void set_hover (int index, bool immediate = false);
 static void hover_layout_chrome (void);
 static void schedule_hover_idle_hide (void);
 static void apply_thumb_rect (SlotEntry &e, const RECT &rect, BYTE opacity);
+static void destroy_mini_previews (void);
+static void set_mini_opacity (BYTE opacity);
 static void rebuild_now (void);
 static void start_open_animation (void);
 static void finish_hide (void);
+static gboolean desktop_poll_cb (gpointer user_data);
 static void chrome_hide (void);
 static void icon_hide (void);
 
@@ -354,6 +378,15 @@ struct EnumContext {
   HMONITOR monitor;
   RECT monitor_rect;
   std::vector<OvWindowInfo> *windows;
+  // Desktop-aware filtering (virtual-desktop.cpp). When the virtual desktop
+  // API is reachable, membership replaces the cloak filter: a window belongs
+  // in the picker when it is on the CURRENT desktop — this shows suspended
+  // (cloaked) apps on the active desktop exactly like Meta's workspace
+  // windows, and pinned windows too.
+  bool vd_filter = false;
+  // Include cloaked windows (every desktop): used for the thumbnail
+  // mini-previews, which bucket windows by their desktop GUID afterwards.
+  bool include_cloaked = false;
 };
 
 BOOL CALLBACK
@@ -361,8 +394,16 @@ collect_windows (HWND hwnd, LPARAM lparam)
 {
   EnumContext *ctx = reinterpret_cast<EnumContext *> (lparam);
 
-  if (is_our_process (hwnd) || is_cloaked (hwnd) || !is_alt_tab_window (hwnd))
+  if (is_our_process (hwnd) || !is_alt_tab_window (hwnd))
     return TRUE;
+
+  if (ctx->vd_filter) {
+    if (!vd::window_on_current (hwnd))
+      return TRUE;
+  } else if (!ctx->include_cloaked) {
+    if (is_cloaked (hwnd))
+      return TRUE;
+  }
 
   RECT r = window_rect (hwnd);
   if (r.right - r.left <= 0 || r.bottom - r.top <= 0)
@@ -1155,12 +1196,119 @@ create_previews (bool at_start_rects)
   }
 }
 
+// --- thumbnail mini-previews ------------------------------------------------------
+
+void
+destroy_mini_previews (void)
+{
+  for (MiniSlot &m : g_mini_slots)
+    if (m.thumb != nullptr)
+      DwmUnregisterThumbnail (m.thumb);
+  g_mini_slots.clear ();
+}
+
+void
+set_mini_opacity (BYTE opacity)
+{
+  for (MiniSlot &m : g_mini_slots) {
+    if (m.thumb == nullptr)
+      continue;
+    DWM_THUMBNAIL_PROPERTIES props = {};
+    props.dwFlags = DWM_TNP_VISIBLE | DWM_TNP_RECTDESTINATION |
+                    DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
+    props.fVisible = TRUE;
+    props.opacity = opacity;
+    props.rcDestination = m.rect;
+    props.fSourceClientAreaOnly = FALSE;
+    DwmUpdateThumbnailProperties (m.thumb, &props);
+  }
+}
+
+// One DWM thumbnail per (desktop, window) pair inside the pills
+// (WorkspaceThumbnail clones the windows of each workspace). Windows on
+// other desktops are cloaked, but their thumbnails still render (the same
+// mechanism the native Task View uses); registration failures just leave
+// that pill wallpaper-only. @initial_opacity starts the fade-in during the
+// open animation.
+void
+create_mini_previews (HMONITOR monitor, const RECT &monitor_rect,
+                      int thumbs_x, int thumbs_y, BYTE initial_opacity)
+{
+  destroy_mini_previews ();
+  if (g_overview_hwnd == nullptr || g_desktops.empty () ||
+      overview_thumbs_get_height (g_thumbs) <= 0)
+    return;
+
+  // Every alt-tab window on the monitor, cloaked ones included; bucketed
+  // by desktop afterwards.
+  std::vector<OvWindowInfo> all;
+  EnumContext ctx{monitor, monitor_rect, &all, false, true};
+  EnumWindows (collect_windows, reinterpret_cast<LPARAM> (&ctx));
+
+  // Pre-resolve each window's desktop once.
+  std::vector<int> window_desktop (all.size (), -1);
+  for (size_t i = 0; i < all.size (); ++i)
+    window_desktop[i] = vd::window_desktop_index (all[i].hwnd);
+
+  int scale = gtk_widget_get_scale_factor (g_window);
+  int panel = g_panel_height;
+
+  for (int d = 0; d < (int)g_desktops.size (); ++d) {
+    GdkRectangle pill;
+    if (!overview_thumbs_get_rect (g_thumbs, d, &pill))
+      continue;
+
+    // Pill origin in overview client space (physical px).
+    double ox = (double)thumbs_x * scale + pill.x * scale;
+    double oy = (double)thumbs_y * scale + pill.y * scale;
+    // Porthole px -> pill px (physical).
+    double s = overview_thumbs_get_scale (g_thumbs) * scale;
+
+    for (size_t i = 0; i < all.size (); ++i) {
+      if (window_desktop[i] != d)
+        continue;
+
+      // Clip the window rect to the porthole (the workarea) before scaling.
+      RECT r = all[i].rect;
+      RECT porthole = {0, panel, g_monitor_w, g_monitor_h};
+      RECT c;
+      c.left = std::max (r.left, porthole.left);
+      c.top = std::max (r.top, porthole.top);
+      c.right = std::min (r.right, porthole.right);
+      c.bottom = std::min (r.bottom, porthole.bottom);
+      if (c.right - c.left <= 0 || c.bottom - c.top <= 0)
+        continue;
+
+      MiniSlot m;
+      m.thumb = nullptr;
+      m.rect.left = (LONG)(ox + (c.left - porthole.left) * s);
+      m.rect.top = (LONG)(oy + (c.top - porthole.top) * s);
+      m.rect.right = (LONG)(ox + (c.right - porthole.left) * s);
+      m.rect.bottom = (LONG)(oy + (c.bottom - porthole.top) * s);
+      if (m.rect.right - m.rect.left < 1 || m.rect.bottom - m.rect.top < 1)
+        continue;
+
+      HTHUMBNAIL thumb = nullptr;
+      if (SUCCEEDED (DwmRegisterThumbnail (g_overview_hwnd, all[i].hwnd,
+                                           &thumb)) &&
+          thumb != nullptr) {
+        m.thumb = thumb;
+        g_mini_slots.push_back (m);
+      }
+    }
+  }
+
+  set_mini_opacity (initial_opacity);
+}
+
 // --- layout ----------------------------------------------------------------------
 
 struct PlacedGeometry {
   int search_x, search_y;      // logical
   int search_w, search_h;      // logical
   int dash_x, dash_y;          // logical
+  int thumbs_x, thumbs_y;      // logical
+  int thumbs_h;                // physical (0 = hidden)
   RECT ws_box;                 // physical workspace box (slots + background)
 };
 
@@ -1177,6 +1325,7 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
 
   int spacing = (int)(wa_h * kVerticalSpacingRatio + 0.5);
   int thumb_adjust = (int)(spacing * kThumbnailsAdjustTop + 0.5);
+  int thumb_adjust_bottom = (int)(spacing * kThumbnailsAdjustBottom + 0.5);
 
   // Search entry.
   GtkRequisition search_nat;
@@ -1193,17 +1342,33 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
   int search_total =
       (kSearchMarginTop + kSearchMarginBottom) * scale + search_h * scale;
 
+  // Workspace thumbnails (ThumbnailsBox, shown for >1 desktop). The row is
+  // capped at MAX_THUMBNAIL_SCALE of the workarea height
+  // (ControlsManagerLayout), full width, content centered.
+  int thumbs_h = 0;  // physical
+  if (g_desktops.size () > 1) {
+    int box_h = (int)(wa_h * kMaxThumbnailScale) / scale;  // logical
+    overview_thumbs_repopulate (g_thumbs, (int)g_desktops.size (),
+                                g_desktop_active, box_h, (double)mw / scale,
+                                (double)mw, (double)wa_h, g_wallpaper);
+    thumbs_h = overview_thumbs_get_height (g_thumbs) * scale;
+  } else {
+    overview_thumbs_repopulate (g_thumbs, 0, -1, 0, 0, 0, 0, nullptr);
+  }
+
   // Dash (16% cap, ControlsManagerLayout DASH_MAX_HEIGHT_RATIO).
   int dash_max = (int)(wa_h * kDashMaxHeightRatio + 0.5);
   overview_dash_repopulate (g_dash, monitor, dash_max / scale);
   int dash_w = overview_dash_get_width (g_dash) * scale;
   int dash_h = std::min (overview_dash_get_height (g_dash) * scale, dash_max);
 
-  // Picker container box (ControlsManagerLayout WINDOW_PICKER, no
-  // thumbnails box on a single-workspace system).
+  // Picker container box (ControlsManagerLayout WINDOW_PICKER): the
+  // thumbnails row sits between the search entry and the workspace box,
+  // which yields to thumbnailsHeight + round(spacing * 0.4) on both edges.
   RECT box;
   box.left = 0;
-  box.top = panel_height + search_total + thumb_adjust;
+  box.top = panel_height + search_total + thumb_adjust + thumbs_h +
+            thumb_adjust_bottom;
   box.right = mw;
   box.bottom = panel_height + wa_h - dash_h - spacing;
 
@@ -1225,6 +1390,11 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
   out->search_y = (panel_height + kSearchMarginTop * scale) / scale;
   out->dash_x = (mw - dash_w) / 2 / scale;
   out->dash_y = (panel_height + wa_h - dash_h) / scale;
+  out->thumbs_h = thumbs_h;
+  out->thumbs_x =
+      thumbs_h > 0 ? (mw / scale - overview_thumbs_get_width (g_thumbs)) / 2
+                   : 0;
+  out->thumbs_y = (panel_height + search_total + thumb_adjust) / scale;
 
   g_monitor_w = mw;
   g_monitor_h = mh;
@@ -1274,12 +1444,29 @@ position_widgets (const PlacedGeometry &geo, bool opening)
 
   gtk_fixed_move (GTK_FIXED (g_root), g_dash, geo.dash_x, geo.dash_y);
 
-  // Search band in PHYSICAL px (click exclusion compares physical coords).
+  // Thumbnails row (invisible for a single desktop; the widget's natural
+  // size collapses to 0 in that case).
+  gtk_fixed_move (GTK_FIXED (g_root), g_thumbs, geo.thumbs_x, geo.thumbs_y);
+  gtk_widget_set_visible (g_thumbs, geo.thumbs_h > 0);
+
+  // Search band + thumbnails row in PHYSICAL px (click exclusion compares
+  // physical coords). The thumbs row spans the widget's full natural width,
+  // centered like the widget itself.
   int scale = gtk_widget_get_scale_factor (g_window);
   g_search_rect.left = geo.search_x * scale;
   g_search_rect.top = geo.search_y * scale;
   g_search_rect.right = (geo.search_x + geo.search_w) * scale;
   g_search_rect.bottom = (geo.search_y + geo.search_h) * scale;
+
+  if (geo.thumbs_h > 0) {
+    int thumbs_w = overview_thumbs_get_width (g_thumbs);
+    g_thumbs_rect.left = geo.thumbs_x * scale;
+    g_thumbs_rect.top = geo.thumbs_y * scale;
+    g_thumbs_rect.right = (geo.thumbs_x + thumbs_w) * scale;
+    g_thumbs_rect.bottom = (geo.thumbs_y * scale) + geo.thumbs_h;
+  } else {
+    g_thumbs_rect = {0, 0, 0, 0};
+  }
 
   gtk_widget_set_visible (g_search, TRUE);
   gtk_widget_set_visible (g_ws_bg, TRUE);
@@ -1342,6 +1529,14 @@ place_overview_locked (bool opening)
 
   load_wallpaper ();
 
+  // Virtual desktops (single-desktop systems keep the classic layout).
+  g_desktops = vd::desktops ();
+  g_desktop_active = g_desktops.empty () ? -1 : vd::current_index ();
+  if (g_desktop_active < 0)
+    g_desktops.clear ();
+  g_print ("[ov] desktops=%zu active=%d\n", g_desktops.size (),
+           g_desktop_active);
+
   // Geometry (ControlsManagerLayout + WorkspacesView workspace box).
   PlacedGeometry geo;
   if (!compute_geometry (monitor, mi.rcMonitor, panel_height, &geo))
@@ -1354,9 +1549,12 @@ place_overview_locked (bool opening)
   gtk_widget_set_name (g_root, "overviewGroup");
 
   // Windows -> slots (workspace.js strategy inside the workspace box, with
-  // the chrome-oversize-adjusted spacing).
+  // the chrome-oversize-adjusted spacing). With the virtual desktop API
+  // reachable, the picker shows the CURRENT desktop's windows by membership
+  // (pinned + suspended included), not by visibility alone.
   std::vector<OvWindowInfo> windows;
-  EnumContext ctx{monitor, mi.rcMonitor, &windows};
+  EnumContext ctx{monitor, mi.rcMonitor, &windows, !g_desktops.empty (),
+                  false};
   EnumWindows (collect_windows, reinterpret_cast<LPARAM> (&ctx));
 
   RECT workarea = {0, panel_height, w, h};
@@ -1402,17 +1600,27 @@ place_overview_locked (bool opening)
   // Thumbnails start at the windows' real positions and fly into the slots;
   // a relayout (window closed etc.) snaps to the final rects.
   create_previews (opening);
-  restack_locked ();
-  if (opening)
-    start_open_animation ();
-  else
-    for (SlotEntry &s : g_slots)
-      apply_thumb_rect (s, s.rect, 255);
 
+  // Mini window previews inside the workspace thumbnail pills.
+  create_mini_previews (monitor, mi.rcMonitor, geo.thumbs_x, geo.thumbs_y,
+                        opening ? 0 : 255);
+
+  // Remember which desktop this layout belongs to (the poll below relayouts
+  // when the desktop changed elsewhere, e.g. Win+Ctrl+Left/Right).
+  g_desktop_active = g_desktops.empty () ? -1 : vd::current_index ();
   g_print ("[ov] placed %dx%d slots=%zu ws=%ldx%ld dash=%d\n", w, h,
            g_slots.size (), (long)(geo.ws_box.right - geo.ws_box.left),
            (long)(geo.ws_box.bottom - geo.ws_box.top),
            overview_dash_get_width (g_dash));
+
+  restack_locked ();
+  if (opening)
+    start_open_animation ();
+  else {
+    for (SlotEntry &s : g_slots)
+      apply_thumb_rect (s, s.rect, 255);
+    gtk_widget_set_opacity (g_thumbs, 1.0);
+  }
   dump_zorder ("placed");
 }
 
@@ -1525,6 +1733,16 @@ anim_tick (gpointer user_data)
   apply_bg_rect (bg);
   g_bg_radius = g_bg_radius_target * (anim.closing ? (1.0 - e) : e);
 
+  // The thumbnails row fades with the transition (its mini previews are DWM
+  // thumbnails compositing ABOVE the window, so they fade by opacity —
+  // upstream eases expandFraction the same way over the 250ms transition).
+  bool thumbs_visible = gtk_widget_get_visible (g_thumbs);
+  if (thumbs_visible) {
+    double f = anim.closing ? (1.0 - e) : e;
+    gtk_widget_set_opacity (g_thumbs, f);
+    set_mini_opacity ((BYTE)(255 * f));
+  }
+
   if (anim.closing) {
     // Fly back out: slot -> real window rect, controls go away.
     double k = 1.0 - e;
@@ -1557,6 +1775,10 @@ anim_tick (gpointer user_data)
     anim.source = 0;
     for (SlotEntry &s : g_slots)
       apply_thumb_rect (s, s.rect, 255);
+    if (thumbs_visible) {
+      gtk_widget_set_opacity (g_thumbs, 1.0);
+      set_mini_opacity (255);
+    }
     // overlayEnabled flips true at stateAdjustment === 1: re-evaluate the
     // hover under the pointer (windowPreview.js checks has-pointer).
     if (g_overview_hwnd != nullptr) {
@@ -1603,12 +1825,18 @@ finish_hide (void)
 {
   set_hover (-1, true);
   destroy_previews ();
+  destroy_mini_previews ();
+  if (g_desktop_poll != 0) {
+    g_source_remove (g_desktop_poll);
+    g_desktop_poll = 0;
+  }
   // The side controls stay VISIBLE at their end-of-close geometry (the
   // background rests on the full work area, radius 0): the window keeps its
   // fullscreen size while hidden, so the first frame of the next open shows
   // the wallpaper-covered work area — GNOME's t=0 — instead of a bare
   // #222226 flash while the placement idle is still pending.
   g_bg_radius = 0.0;
+  gtk_widget_set_opacity (g_thumbs, 1.0);
   if (g_window != nullptr && gtk_widget_get_visible (g_window))
     gtk_widget_set_visible (g_window, FALSE);
 }
@@ -1686,9 +1914,29 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
     g_print ("[ov] click (%d,%d) ignored (search entry)\n", px, py);
     return;
   }
+  // The workspace thumbnails row handles its own input (clicking a pill
+  // switches desktop; the overview stays open, exactly like upstream).
+  if (g_thumbs_rect.right > g_thumbs_rect.left &&
+      pt.x >= g_thumbs_rect.left && pt.x < g_thumbs_rect.right &&
+      pt.y >= g_thumbs_rect.top && pt.y < g_thumbs_rect.bottom) {
+    g_print ("[ov] click (%d,%d) ignored (thumbs row)\n", px, py);
+    return;
+  }
 
-  g_print ("[ov] click (%d,%d) blank -> close\n", px, py);
-  close_overview ("ov-click-blank");
+  // Every other region is excluded: only clicks INSIDE the workspace box
+  // (the desktop frame) count as a "blank" click that dismisses the
+  // overview. The area outside it — the sides, the band between the search
+  // entry and the workspace box, above the dash — does nothing, so stray
+  // clicks can never close the overview by accident (GNOME keeps those
+  // regions inert; the cover pane handles the dismissal semantics).
+  if (pt.x >= g_ws_box.left && pt.x < g_ws_box.right &&
+      pt.y >= g_ws_box.top && pt.y < g_ws_box.bottom) {
+    g_print ("[ov] click (%d,%d) blank inside workspace -> close\n", px, py);
+    close_overview ("ov-click-blank");
+    return;
+  }
+
+  g_print ("[ov] click (%d,%d) ignored (outside workspace)\n", px, py);
 }
 
 void
@@ -1711,6 +1959,46 @@ on_overview_map (GtkWidget *widget, gpointer user_data)
   // paint, so the first frame is the placed overview, not a dark flash.
   g_idle_add_full (G_PRIORITY_HIGH_IDLE, overview_place_opening_idle, nullptr,
                    nullptr);
+
+  // Watch for desktop switches made elsewhere while the overview is open
+  // (Win+Ctrl+Left/Right); the overview relayouts to the new desktop.
+  if (g_desktop_poll == 0)
+    g_desktop_poll = g_timeout_add (400, desktop_poll_cb, nullptr);
+}
+
+// ThumbnailsBox click action -> Workspace.activate: switch the desktop and
+// relayout (the overview stays open, exactly like upstream).
+void
+on_thumb_clicked (int index, void *user_data)
+{
+  (void)user_data;
+  g_print ("[ov] thumb click -> desktop %d (current %d)\n", index,
+           g_desktop_active);
+  if (index < 0 || index == g_desktop_active)
+    return;
+  if (vd::switch_to (index)) {
+    rebuild_now ();
+  } else {
+    g_print ("[ov] desktop switch failed\n");
+  }
+}
+
+// Relayout when the active desktop changed outside the overview.
+gboolean
+desktop_poll_cb (gpointer user_data)
+{
+  (void)user_data;
+  if (g_window == nullptr || !gtk_widget_get_visible (g_window)) {
+    g_desktop_poll = 0;
+    return G_SOURCE_REMOVE;
+  }
+  int cur = g_desktops.empty () ? -1 : vd::current_index ();
+  if (cur >= 0 && cur != g_desktop_active) {
+    g_print ("[ov] desktop changed %d -> %d (external)\n", g_desktop_active,
+             cur);
+    rebuild_now ();
+  }
+  return G_SOURCE_CONTINUE;
 }
 
 // Relayout without animation (window closed via the chrome button etc.).
@@ -1750,6 +2038,13 @@ overview_init (HWND panel_hwnd)
   g_window = gtk_window_new ();
   gtk_window_set_title (GTK_WINDOW (g_window), "WINOME Overview");
   gtk_window_set_decorated (GTK_WINDOW (g_window), FALSE);
+  // Fullscreen from surface creation: GDK sizes a fresh window against the
+  // WORK AREA (monitor minus the reserved panel strip), and growing it to
+  // the monitor size afterwards exposes a bottom strip of exactly panel
+  // height before the first paint of the new size (the desktop wallpaper
+  // flashing through). A fullscreen surface is created monitor-sized, so
+  // the later SetWindowPos in place_overview_locked only fixes z-order.
+  gtk_window_fullscreen (GTK_WINDOW (g_window));
   gtk_widget_add_css_class (g_window, "winome-overview");
   // GNOME's UI font (the theme's em values resolve against Sans 11).
   install_bundled_fonts (g_window);
@@ -1777,6 +2072,29 @@ overview_init (HWND panel_hwnd)
   gtk_fixed_put (GTK_FIXED (g_root), g_search, 0, 0);
   gtk_widget_set_visible (g_search, FALSE);
 
+  // Z-ORDER mirrors ControlsManager.add_child():
+  // [searchEntryBin, appDisplay, dash, searchController, thumbnailsBox,
+  //  workspacesDisplay] — the workspaces display (workspace background +
+  // window clones) is the LAST child, i.e. it renders ON TOP of the dash
+  // and the search entry. During the state transition the interpolating
+  // wallpaper rect covers them and they emerge from behind its shrinking
+  // edges — drawing the dash above the moving rect instead is exactly the
+  // "fighting" look this avoids. (The window clones are DWM thumbnails,
+  // composited above everything anyway, matching the topmost
+  // workspacesDisplay.) The caption stays topmost, above the background.
+  g_dash = overview_dash_new (g_root);
+  gtk_fixed_put (GTK_FIXED (g_root), g_dash, 0, 0);
+  gtk_widget_set_visible (g_dash, FALSE);
+
+  // .workspace-thumbnails — one wallpaper pill per virtual desktop, above
+  // the dash and below the workspace background (the thumbnailsBox position
+  // in ControlsManager.add_child). Invisible until repopulated with >1
+  // desktop during placement.
+  g_thumbs = overview_thumbs_new ();
+  overview_thumbs_set_click_cb (g_thumbs, on_thumb_clicked, nullptr);
+  gtk_fixed_put (GTK_FIXED (g_root), g_thumbs, 0, 0);
+  gtk_widget_set_visible (g_thumbs, FALSE);
+
   // .workspace-background — wallpaper in an animated rounded clip (+ CSS
   // shadow), on the workarea-aspect workspace box.
   g_ws_bg = (GtkWidget *)g_object_new (winome_workspace_bg_get_type (),
@@ -1784,11 +2102,6 @@ overview_init (HWND panel_hwnd)
   gtk_widget_add_css_class (g_ws_bg, "workspace-background");
   gtk_fixed_put (GTK_FIXED (g_root), g_ws_bg, 0, 0);
   gtk_widget_set_visible (g_ws_bg, FALSE);
-
-  // Dash.
-  g_dash = overview_dash_new (g_root);
-  gtk_fixed_put (GTK_FIXED (g_root), g_dash, 0, 0);
-  gtk_widget_set_visible (g_dash, FALSE);
 
   // .window-caption hover pill.
   g_caption = gtk_label_new ("");

@@ -10,6 +10,8 @@ winome_sources = files(
   'overview.cpp',
   'overview-layout.cpp',
   'overview-dash.cpp',
+  'overview-thumbs.cpp',
+  'virtual-desktop.cpp',
   'fullscreen-watcher.cpp',
   'hot-corner.cpp',
   'system-status.cpp',

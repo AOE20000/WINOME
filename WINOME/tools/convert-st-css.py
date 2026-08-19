@@ -345,12 +345,15 @@ window.quick-settings-popover-window {
 }
 
 /* In-host Activities overview toplevel (layering: popover > panel >
-   overview > apps > wallpaper). The dark backdrop is painted by the
-   #overviewGroup child itself; the window only needs the GNOME UI font so
-   every em value (search-entry 24em width, caption, dash) resolves exactly
-   like St's "Sans 11" at 96dpi. */
+   overview > apps > wallpaper). Opaque #222226, exactly like the native
+   #overviewGroup: the overview is dark everywhere outside the wallpaper
+   rect, so any region not yet rendered by GTK (e.g. a frame between a
+   surface resize and the first paint) shows the overview's own color
+   instead of the desktop behind it. The font mirrors the St theme context
+   so every em value (search-entry 24em width, caption, dash) resolves
+   exactly like St's "Sans 11" at 96dpi. */
 window.winome-overview {
-  background-color: transparent;
+  background-color: #222226;
   font: 11pt "Cantarell";
 }
 
