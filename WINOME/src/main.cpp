@@ -4,9 +4,11 @@
 
 #include <gtk/gtk.h>
 #include <gdk/win32/gdkwin32.h>
+#include <epoxy/gl.h>
 
 #include <windows.h>
 #include <cstdio>
+#include <cstring>
 
 #include "host-utils.h"
 #include "native-taskbar.h"
@@ -34,6 +36,56 @@ setup_log_file (void)
 // Primary monitor bounds captured when the panel is positioned; restored in
 // on_shutdown so the shell recalculates the work area around the taskbar.
 static RECT g_primary_monitor = {0, 0, 0, 0};
+
+// Log which GSK renderer GTK selects for a realized surface. GSK_DEBUG logs
+// do not reach winome.log, so query the renderer type directly instead:
+// gsk_renderer_new_for_surface walks the same selection path GTK uses for
+// the real renderer (display + GSK_RENDERER env), so the type name reflects
+// what is actually painting the windows. "GskGLRenderer" means GPU (OpenGL
+// on the hardware ICD); "GskCairoRenderer" means software. This MSYS2 GTK
+// build ships only these two (d3d11 is not compiled in).
+static void
+log_gsk_renderer (GtkWidget *widget)
+{
+  GdkSurface *surface = gtk_native_get_surface (GTK_NATIVE (widget));
+  if (surface == nullptr)
+    return;
+  GskRenderer *renderer = gsk_renderer_new_for_surface (surface);
+  if (renderer == nullptr)
+    return;
+
+  const char *type = G_OBJECT_TYPE_NAME (renderer);
+  const char *want = g_getenv ("GSK_RENDERER");
+  g_print ("[gpu] GSK_RENDERER env=%s renderer=%s\n",
+           want != nullptr ? want : "(unset)", type);
+
+  // If GTK picked the GL renderer, identify the underlying GL
+  // implementation: a hardware ICD (NVIDIA/Intel/AMD) means the widgets are
+  // genuinely GPU-accelerated, while llvmpipe/Microsoft GDI Generic means
+  // software rendering.
+  if (strstr (type, "GL") != nullptr) {
+    GError *error = nullptr;
+    GdkGLContext *ctx = gdk_surface_create_gl_context (surface, &error);
+    if (ctx != nullptr) {
+      gdk_gl_context_make_current (ctx);
+      const guchar *vendor = glGetString (GL_VENDOR);
+      const guchar *r = glGetString (GL_RENDERER);
+      const guchar *v = glGetString (GL_VERSION);
+      g_print ("[gpu] GL vendor=%s renderer=%s version=%s\n",
+               vendor ? (const char *)vendor : "?",
+               r ? (const char *)r : "?",
+               v ? (const char *)v : "?");
+      g_object_unref (ctx);
+    } else {
+      g_print ("[gpu] gl-context failed: %s\n",
+               error != nullptr ? error->message : "?");
+      if (error != nullptr)
+        g_error_free (error);
+    }
+  }
+
+  g_object_unref (renderer);
+}
 
 static void
 position_panel (GtkWidget *panel)
@@ -98,6 +150,7 @@ on_activate (GtkApplication      *app,
   GtkWidget *panel = winome_shell_panel_new ();
 
   gtk_window_set_application (GTK_WINDOW (panel), app);
+  g_signal_connect (panel, "realize", G_CALLBACK (log_gsk_renderer), nullptr);
   gtk_widget_set_visible (panel, TRUE);
 
   position_panel (panel);

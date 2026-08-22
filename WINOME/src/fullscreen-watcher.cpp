@@ -18,6 +18,11 @@ namespace winome {
 
 namespace {
 
+// Whether the panel is currently hidden by a fullscreen window / lock
+// screen. Read by panel_hidden() so the hot corner can stay inactive while
+// the panel is not visible.
+bool g_panel_hidden = false;
+
 bool belongs_to_process(HWND hwnd, const wchar_t* name) {
   DWORD pid = 0;
   GetWindowThreadProcessId(hwnd, &pid);
@@ -114,7 +119,6 @@ bool should_hide_panel(HWND fg) {
 
 gboolean fullscreen_tick(gpointer user_data) {
   HWND panel = static_cast<HWND>(user_data);
-  static bool hidden = false;
 
   // GDK re-applies its own extended styles on configure events, which would
   // drop WS_EX_TOOLWINDOW (needed to keep the panel out of Alt-Tab and the
@@ -148,14 +152,20 @@ gboolean fullscreen_tick(gpointer user_data) {
   }
 
   bool hide = should_hide_panel(GetForegroundWindow());
-  if (hide != hidden) {
-    hidden = hide;
+  if (hide != g_panel_hidden) {
+    g_panel_hidden = hide;
     ShowWindow(panel, hide ? SW_HIDE : SW_SHOWNOACTIVATE);
   }
   return G_SOURCE_CONTINUE;
 }
 
 }  // namespace
+
+bool
+panel_hidden (void)
+{
+  return g_panel_hidden;
+}
 
 void start_fullscreen_watcher(HWND panel_hwnd) {
   // Re-evaluate immediately so a fullscreen app already focused hides the
