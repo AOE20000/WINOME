@@ -23,7 +23,16 @@ PowerShell 中也可以直接调用（`E:\msys64\ucrt64\bin` 已加入用户 PAT
 
 ## Meson 构建示例
 
-WINOME 主工程在 `WINOME/` 目录下：
+WINOME 主工程在 `WINOME/` 目录下，推荐用根目录的交互式构建程序：
+
+```bash
+./build.sh            # 交互式菜单（生产/测试/调试三方案）
+./build.sh release    # 生产：release + LTO + NDEBUG -> WINOME/build-release/
+./build.sh test       # 测试：debugoptimized         -> WINOME/build/
+./build.sh debug      # 调试：-O0 -g                  -> WINOME/build-debug/
+```
+
+也可手动调用 meson（等价于测试方案）：
 
 ```bash
 cd WINOME

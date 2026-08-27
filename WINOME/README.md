@@ -11,6 +11,21 @@
 
 ## 构建（MSYS2 UCRT64）
 
+统一使用仓库根目录的交互式构建程序 `../build.sh`：
+
+```bash
+./build.sh            # 交互式菜单（显示各方案产物状态）
+./build.sh release    # 生产：release + LTO + NDEBUG  -> build-release/
+./build.sh test       # 测试：debugoptimized (项目默认) -> build/
+./build.sh debug      # 调试：debug -O0 -g              -> build-debug/
+./build.sh run        # 运行最近构建的 winome.exe
+./build.sh clean      # 清理全部构建目录
+```
+
+三方案使用**独立构建目录**，切换互不触发重编；LTO 安全（COM 接口走运行时 `vcall` 裸函数指针，链接器无法去虚拟化）。中文用户名环境下脚本自动处理 gcc 临时目录编码问题。
+
+手动构建（等价于测试方案）：
+
 ```bash
 meson setup build
 ninja -C build
@@ -153,6 +168,15 @@ ninja -C build
 - **widget 树复刻 GNOME**：Activities = `.panel-button` 按钮内含 `workspace-dot` 圆点；时钟 = `.panel-button.clock-display` 按钮内含 `.clock` label（高亮在子元素上）；状态区 = `.panel-button` 按钮内含 `.panel-status-indicators-box` + 图标。时钟/图标继承按钮的白色前景。
 - **`gtk_widget_set_focus_on_click(FALSE)`**：GNOME 的 `:focus`/`:hover` 共用高亮，但 GTK4 点击会让按钮持续 `:focus` 导致高亮"粘住"，必须禁用点击聚焦。
 - **St 属性运行时查询**：`status_icon_size()`/`status_indicators_spacing()` 通过 St 引擎按 `#panel .panel-button .system-status-icon` 等复合选择器查询 icon-size/spacing，替代硬编码。
+
+## 性能
+
+- **动画走帧时钟**：概览开合动画（`anim_tick`）与悬停缩放/淡入动画（`hover_anim_tick`）使用 `gtk_widget_add_tick_callback`（GdkFrameClock），与显示器 vblank 对齐——替代固定 16ms `g_timeout_add` 定时器，消除与刷新率的节拍错位；动画结束回调自动停止，空闲零开销
+- **z-order 重排漂移门控**：400ms 周期性重断言（fullscreen-watcher）前先经 `zorder_drifted()` 用 `GetWindow(GW_HWNDPREV)` 校验 popover > panel > chrome > overview 链——链完整时直接返回，不再无条件发送 `SWP_FRAMECHANGED`（每次都强制 `WM_NCCALCSIZE` 往返并重排 topmost 带）；漂移时行为与旧逻辑一致
+- **状态图标跳过无谓重绘**：网络/音量/电池图标（2s 轮询）经 `set_icon_name_if_changed` 保护——`gtk_image_set_from_icon_name` 即使名字未变也会使渲染节点失效排队重绘
+- **悬停标题药丸位置守卫**：`hover_layout_chrome` 中 `gtk_fixed_move` 即使坐标不变也会排队整容器 relayout，fade-only 帧跳过
+- **GPU 渲染**：GTK 默认按表面智能选择渲染器，关键窗口（概览/面板）由 OpenGL (ngl) 在硬件 GPU 上绘制；`[gpu]` 诊断日志输出渲染器类型与 GL 厂商供排查
+- **内存基线 ~500MB 属正常**：Pango fontmap 启动时枚举全系统字体构建内存数据库（290 族 ≈450MB），约 6 秒爬升后终身稳定驻留，非泄漏；已实测与渲染器（cairo 同价）、动画 tick、窗口数均无关。减小字体库（卸载不用的字体）可线性降低该基线
 
 ## 权限要求
 

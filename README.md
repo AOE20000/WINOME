@@ -17,6 +17,7 @@
 ├── extracted/       # 从上游提取、经 WINOME 修改的模块（去掉了上游 git）
 │   ├── WinOverview/   # 概览（DLL 注入 + DWM 缩略图 + workspace.js 布局）
 │   └── GMONE-Shell/   # Shell 外观（Sass 主题 + SVG）+ 布局/日期/动画算法
+├── build.sh         # 交互式构建程序（生产/测试/调试方案）
 ├── ENV.md           # 开发环境说明（MSYS2 UCRT64 + GTK4）
 └── LICENSE / README.md
 ```
@@ -29,12 +30,31 @@
 
 ## 构建（MSYS2 UCRT64）
 
+推荐使用根目录的交互式构建程序：
+
+```bash
+./build.sh          # 交互式菜单
+./build.sh release  # 或直接指定方案
+```
+
+| 方案 | 配置 | 构建目录 | 说明 |
+|------|------|----------|------|
+| `release` 生产 | release + LTO + NDEBUG | `build-release/` | 最小体积、最快指令（约 1.3MB） |
+| `test` 测试 | debugoptimized | `build/` | 项目默认，保留 `g_print` 诊断日志 |
+| `debug` 调试 | debug（-O0 -g） | `build-debug/` | GDB 友好 |
+
+其他子命令：`./build.sh run`（运行最近构建）、`./build.sh clean`（清理全部构建目录）。三方案独立目录，切换互不触发重编。
+
+也可手动构建（等价于测试方案）：
+
 ```bash
 cd WINOME
 meson setup build
 ninja -C build
 ./build/src/winome.exe
 ```
+
+> **内存说明**：进程稳定占用约 500MB 属正常——GTK4/Pango 启动时枚举全系统字体构建内存数据库（与安装的字体数量成正比），约 6 秒爬升至平台期后终身稳定，不是泄漏，与本仓库代码无关。
 
 ## 当前状态
 
