@@ -950,13 +950,24 @@ typedef struct {
   GtkWidget *battery_label;
 } PanelStatus;
 
+// gtk_image_set_from_icon_name invalidates the render node even when the
+// name did not change; the 2s status poll would otherwise queue needless
+// panel redraws for every tick.
+static void
+set_icon_name_if_changed (GtkImage *image, const char *name)
+{
+  if (g_strcmp0 (gtk_image_get_icon_name (image), name) == 0)
+    return;
+  gtk_image_set_from_icon_name (image, name);
+}
+
 static void
 update_network_icon (GtkWidget *icon)
 {
   bool connected = false;
   winome::get_network_connected (&connected);
 
-  gtk_image_set_from_icon_name (
+  set_icon_name_if_changed (
       GTK_IMAGE (icon),
       connected ? "network-wireless-signal-good-symbolic"
                 : "network-wireless-offline-symbolic");
@@ -980,7 +991,7 @@ update_volume_icon (GtkWidget *icon)
   else
     name = "audio-volume-high-symbolic";
 
-  gtk_image_set_from_icon_name (GTK_IMAGE (icon), name);
+  set_icon_name_if_changed (GTK_IMAGE (icon), name);
 }
 
 static void
@@ -999,12 +1010,12 @@ update_battery_icon (PanelStatus *st)
       snprintf (name, sizeof (name), "battery-level-%d%s-symbolic",
                 fill, battery.charging ? "-charging" : "");
 
-    gtk_image_set_from_icon_name (GTK_IMAGE (st->battery_icon), name);
+    set_icon_name_if_changed (GTK_IMAGE (st->battery_icon), name);
   } else {
     // No battery/UPS: like status/system.js, show the power icon instead.
     gtk_widget_set_visible (st->battery_box, TRUE);
-    gtk_image_set_from_icon_name (GTK_IMAGE (st->battery_icon),
-                                  "system-shutdown-symbolic");
+    set_icon_name_if_changed (GTK_IMAGE (st->battery_icon),
+                               "system-shutdown-symbolic");
   }
 
   // Percentage label: only shown when org.gnome.desktop.interface

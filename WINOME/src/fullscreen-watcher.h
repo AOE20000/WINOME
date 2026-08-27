@@ -14,4 +14,8 @@ namespace winome {
 // genuine fullscreen windows and the lock screen hide it.
 void start_fullscreen_watcher(HWND panel_hwnd);
 
+// True while the panel is hidden (a fullscreen window or the lock screen is
+// active). The hot corner lives on the panel, so it must be inactive then.
+bool panel_hidden(void);
+
 }  // namespace winome

@@ -34,6 +34,7 @@ ole32_dep = cc.find_library('ole32', required: true)
 wininet_dep = cc.find_library('wininet', required: true)
 dwmapi_dep = cc.find_library('dwmapi', required: true)
 version_dep = cc.find_library('version', required: true)
+epoxy_dep = dependency('epoxy', required: true)
 
 gnome = import('gnome')
 
@@ -47,7 +48,7 @@ resources = gnome.compile_resources('winome-resources',
 
 executable('winome',
   [winome_sources, resources],
-  dependencies: [gtk4_dep, fontconfig_dep, pangoft2_dep, shell32_dep, user32_dep, gdi32_dep, psapi_dep, shlwapi_dep, advapi32_dep, ole32_dep, wininet_dep, dwmapi_dep, version_dep, stcompat_dep],
+  dependencies: [gtk4_dep, fontconfig_dep, pangoft2_dep, shell32_dep, user32_dep, gdi32_dep, psapi_dep, shlwapi_dep, advapi32_dep, ole32_dep, wininet_dep, dwmapi_dep, version_dep, stcompat_dep, epoxy_dep],
   include_directories: [winome_src_inc, include_directories('.')],
   cpp_args: ['-DUNICODE', '-D_UNICODE'],
   win_subsystem: 'windows',

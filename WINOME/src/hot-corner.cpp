@@ -4,6 +4,7 @@
 // primary monitor opens the Activities overview.
 
 #include "hot-corner.h"
+#include "fullscreen-watcher.h"
 #include "overview-trigger.h"
 
 #include <windows.h>
@@ -29,6 +30,16 @@ gboolean hot_corner_tick(gpointer user_data) {
   POINT pt;
   if (!GetCursorPos(&pt))
     return G_SOURCE_CONTINUE;
+
+  // The hot corner lives on the panel: while the panel is hidden (a
+  // fullscreen window or the lock screen is active) the corner must not
+  // trigger. Reset the entry state so an overview does not pop open when the
+  // fullscreen ends while the cursor is still sitting in the corner (GNOME
+  // requires re-entering the corner).
+  if (winome::panel_hidden()) {
+    in_corner = false;
+    return G_SOURCE_CONTINUE;
+  }
 
   guint64 now_ms = g_get_monotonic_time() / 1000;
 

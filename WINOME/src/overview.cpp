@@ -848,7 +848,17 @@ hover_layout_chrome (void)
       (disp.bottom + (kWindowIconSize * (1.0 - kIconOverlap) +
                       kIconTitleSpacing) * scale) /
       scale;
-  gtk_fixed_move (GTK_FIXED (g_root), g_caption, (int)x, (int)y);
+  // gtk_fixed_move queues a container relayout even when nothing moved;
+  // during fade-only frames the pill position is stable — skip it.
+  static bool s_caption_pos_valid = false;
+  static int s_caption_x = 0, s_caption_y = 0;
+  if (!s_caption_pos_valid || (int)x != s_caption_x ||
+      (int)y != s_caption_y) {
+    gtk_fixed_move (GTK_FIXED (g_root), g_caption, (int)x, (int)y);
+    s_caption_x = (int)x;
+    s_caption_y = (int)y;
+    s_caption_pos_valid = true;
+  }
   gtk_widget_set_opacity (g_caption, g_caption_opacity);
   if (g_caption_opacity > 0.01)
     gtk_widget_set_visible (g_caption, TRUE);
@@ -860,16 +870,20 @@ hover_layout_chrome (void)
   }
 }
 
-// 16ms driver for the hover scale + caption fade animations.
+// Frame-clock driver for the hover scale + caption fade animations: locked
+// to the display refresh instead of a fixed 16ms timer beating against it.
 gboolean
-hover_anim_tick (gpointer user_data)
+hover_anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
 {
+  (void)widget;
   (void)user_data;
-  gint64 now = g_get_monotonic_time ();
+  gint64 now = gdk_frame_clock_get_frame_time (clock);
 
   bool active = false;
   for (ScaleAnim &anim : g_scale_anims) {
     double t = (now - anim.start_us) / 1000.0 / (double)kWindowScaleMs;
+    if (t < 0.0)
+      t = 0.0;   // frame timestamp can predate the anim start
     if (t > 1.0)
       t = 1.0;
     double e = ease_out_quad (t);
@@ -902,6 +916,8 @@ hover_anim_tick (gpointer user_data)
                    ? (now - g_caption_anim_start) / 1000.0 /
                          (double)g_caption_anim_ms
                    : 1.0;
+    if (t < 0.0)
+      t = 0.0;
     if (t > 1.0)
       t = 1.0;
     double e = ease_out_quad (t);
@@ -929,7 +945,8 @@ void
 hover_anim_ensure (void)
 {
   if (g_scale_anim_source == 0)
-    g_scale_anim_source = g_timeout_add (16, hover_anim_tick, nullptr);
+    g_scale_anim_source = gtk_widget_add_tick_callback (
+        g_window, hover_anim_tick, nullptr, nullptr);
 }
 
 void
@@ -1042,7 +1059,7 @@ set_hover (int index, bool immediate)
     cancel_hover_idle ();
     g_scale_anims.clear ();
     if (g_scale_anim_source != 0) {
-      g_source_remove (g_scale_anim_source);
+      gtk_widget_remove_tick_callback (g_window, g_scale_anim_source);
       g_scale_anim_source = 0;
     }
     // Snap any scaled preview back to its slot rect.
@@ -1670,11 +1687,50 @@ dump_zorder (const char *tag)
                : "BROKEN");
 }
 
+// Verify the popover > panel > chrome windows > overview chain is already
+// in order: the periodic 400ms tick and the popover-raise retries then no-op
+// instead of re-sending SWP_FRAMECHANGED SetWindowPos calls, each of which
+// forces a WM_NCCALCSIZE round-trip and reshuffles the topmost band.
+static bool
+zorder_drifted (void)
+{
+  HWND chain[5];
+  int n = 0;
+  HWND popover = static_cast<HWND> (winome_shell_panel_top_popover_hwnd ());
+  if (popover != nullptr)
+    chain[n++] = popover;
+  chain[n++] = g_panel_hwnd;
+  if (g_chrome_hwnd != nullptr && IsWindow (g_chrome_hwnd) &&
+      IsWindowVisible (g_chrome_hwnd))
+    chain[n++] = g_chrome_hwnd;
+  if (g_icon_hwnd != nullptr && IsWindow (g_icon_hwnd) &&
+      IsWindowVisible (g_icon_hwnd))
+    chain[n++] = g_icon_hwnd;
+  if (g_overview_hwnd != nullptr && IsWindow (g_overview_hwnd) &&
+      IsWindowVisible (g_overview_hwnd))
+    chain[n++] = g_overview_hwnd;
+
+  // Every entry must sit directly below its predecessor — that is exactly
+  // what the SetWindowPos sequence below produces.
+  for (int i = 1; i < n; ++i)
+    if (GetWindow (chain[i], GW_HWNDPREV) != chain[i - 1])
+      return true;
+  // Without a popover the panel must be the very top window; with one open
+  // whatever sits above the popover (foreign topmost windows) is not ours to
+  // police.
+  if (chain[0] == g_panel_hwnd)
+    return GetWindow (g_panel_hwnd, GW_HWNDPREV) != nullptr;
+  return false;
+}
+
 // Re-assert popover > panel > chrome windows > overview > apps.
 static void
 restack_locked (void)
 {
   if (g_panel_hwnd == nullptr || !IsWindow (g_panel_hwnd))
+    return;
+
+  if (!zorder_drifted ())
     return;
 
   HWND popover = static_cast<HWND> (winome_shell_panel_top_popover_hwnd ());
@@ -1714,13 +1770,18 @@ restack_locked (void)
 // --- animation ---------------------------------------------------------------------
 
 gboolean
-anim_tick (gpointer user_data)
+anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
 {
+  (void)widget;
   (void)user_data;
   Animation &anim = g_anim;
 
-  gint64 now = g_get_monotonic_time ();
+  // Frame clock keeps the 250ms transition locked to the compositor's
+  // cadence (a fixed 16ms timer beats against the display refresh).
+  gint64 now = gdk_frame_clock_get_frame_time (clock);
   double t = (now - anim.start_us) / 1000.0 / (double)anim.duration_ms;
+  if (t < 0.0)
+    t = 0.0;   // frame timestamp can predate the anim start
   if (t > 1.0)
     t = 1.0;
 
@@ -1805,13 +1866,14 @@ void
 start_animation (bool closing, guint duration_ms)
 {
   if (g_anim.source != 0) {
-    g_source_remove (g_anim.source);
+    gtk_widget_remove_tick_callback (g_window, g_anim.source);
     g_anim.source = 0;
   }
   g_anim.closing = closing;
   g_anim.duration_ms = duration_ms;
   g_anim.start_us = g_get_monotonic_time ();
-  g_anim.source = g_timeout_add (16, anim_tick, nullptr);
+  g_anim.source =
+      gtk_widget_add_tick_callback (g_window, anim_tick, nullptr, nullptr);
 }
 
 void
