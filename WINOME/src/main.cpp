@@ -18,6 +18,8 @@
 #include "win-event-hook.h"
 #include "fullscreen-watcher.h"
 #include "hot-corner.h"
+#include "ws-osd.h"
+#include "virtual-desktop.h"
 
 // The host runs as a GUI application (no console window). Route diagnostics
 // to a log file so startup errors are still visible.
@@ -36,6 +38,33 @@ setup_log_file (void)
 // Primary monitor bounds captured when the panel is positioned; restored in
 // on_shutdown so the shell recalculates the work area around the taskbar.
 static RECT g_primary_monitor = {0, 0, 0, 0};
+
+// Pin all of this process's top-level windows to every virtual desktop
+// ("show on all desktops", like the taskbar). Without this the shell chrome
+// belongs to one desktop: it slides away with it on Win+Ctrl+Left/Right and
+// only reappears when the periodic z-order re-assert pulls it onto the new
+// desktop. Runs late (COM services are lazy; on a deadlocking explorer RPC
+// the first call blocks up to the module's 8s timeout before self-disabling
+// — keep that off the startup path) and sweeps every visible window created
+// so far; windows realized later pin themselves in their realize handlers.
+static BOOL CALLBACK
+pin_enum_proc (HWND hwnd, LPARAM lParam)
+{
+  (void)lParam;
+  DWORD pid = 0;
+  GetWindowThreadProcessId (hwnd, &pid);
+  if (pid == GetCurrentProcessId () && IsWindowVisible (hwnd))
+    winome::vd::pin_window (hwnd);
+  return TRUE;
+}
+
+static gboolean
+pin_shell_windows (gpointer user_data)
+{
+  (void)user_data;
+  EnumWindows (pin_enum_proc, 0);
+  return G_SOURCE_REMOVE;
+}
 
 // Log which GSK renderer GTK selects for a realized surface. GSK_DEBUG logs
 // do not reach winome.log, so query the renderer type directly instead:
@@ -154,6 +183,9 @@ on_activate (GtkApplication      *app,
   gtk_widget_set_visible (panel, TRUE);
 
   position_panel (panel);
+
+  // Workspace-switch OSD (workspaceSwitcherPopup.js) + desktop poll.
+  winome::ws_osd_init ();
 }
 
 static void

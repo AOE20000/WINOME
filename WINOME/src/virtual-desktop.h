@@ -46,5 +46,11 @@ bool window_on_current (HWND hwnd);
 // Switch to the desktop by index; FALSE on failure.
 bool switch_to (int index);
 
+// Pin @hwnd to ALL virtual desktops ("show this window on every desktop",
+// like the taskbar): the window then stays put during desktop switches
+// instead of sliding away with its owning desktop. FALSE when the pin
+// services are unreachable (older builds, explorer-side failure).
+bool pin_window (HWND hwnd);
+
 }  // namespace vd
 }  // namespace winome

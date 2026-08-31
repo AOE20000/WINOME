@@ -43,6 +43,10 @@ struct WinomeThumbs {
   int active = -1;
   double scale = 0;  // pill px per porthole px
 
+  // Continuous indicator position (workspacesView.js _scrollAdjustment.value
+  // while a workspace switch animates): -1 = snap to `active`.
+  double indicator_value = -1.0;
+
   GdkTexture *wallpaper = nullptr;
 
   double spacing = kSpacingFallback;
@@ -143,17 +147,33 @@ winome_thumbs_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
   }
 
   // .workspace-thumbnail-indicator: 3px accent frame allocated AROUND the
-  // active pill (inflated by the border widths, radius 8).
-  if (self->active >= 0 && self->active < (int)self->pills.size ()) {
-    const ThumbRect &pill = self->pills[self->active];
-    double b = self->indicator_width;
+  // active pill (inflated by the border widths, radius 8). While a workspace
+  // switch animates, `indicator_value` slides the frame between the two
+  // adjacent pills — upstream reads the scroll adjustment in vfunc_allocate
+  // (indicatorUpperWs/indicatorLowerWs) so the frame tracks the eased
+  // scroll position instead of snapping.
+  double pos = self->indicator_value;
+  if (pos < 0)
+    pos = self->active;
+  if (pos >= 0 && pos < (int)self->pills.size ()) {
+    int lo = (int)pos;
+    int hi = std::min (lo + 1, (int)self->pills.size () - 1);
+    double f = pos - lo;
+    const ThumbRect &a = self->pills[lo];
+    const ThumbRect &b = self->pills[hi];
+    double x = a.x + (b.x - a.x) * f;
+    double y = a.y + (b.y - a.y) * f;
+    double w = a.w + (b.w - a.w) * f;
+    double h = a.h + (b.h - a.h) * f;
+    double bwidth = self->indicator_width;
     graphene_rect_t rect;
-    graphene_rect_init (&rect, (float)(pill.x - b), (float)(pill.y - b),
-                        (float)(pill.w + 2 * b), (float)(pill.h + 2 * b));
+    graphene_rect_init (&rect, (float)(x - bwidth), (float)(y - bwidth),
+                        (float)(w + 2 * bwidth), (float)(h + 2 * bwidth));
     GskRoundedRect outline;
     gsk_rounded_rect_init_from_rect (&outline, &rect,
                                      (float)self->indicator_radius);
-    float widths[4] = {(float)b, (float)b, (float)b, (float)b};
+    float widths[4] = {(float)bwidth, (float)bwidth, (float)bwidth,
+                       (float)bwidth};
     GdkRGBA colors[4] = {self->indicator_color, self->indicator_color,
                          self->indicator_color, self->indicator_color};
     gtk_snapshot_append_border (snapshot, &outline, widths, colors);
@@ -338,6 +358,17 @@ double
 overview_thumbs_get_scale (GtkWidget *thumbs)
 {
   return WINOME_THUMBS (thumbs)->scale;
+}
+
+// Slide the accent indicator to a continuous workspace position during the
+// switch animation (ThumbnailsBox follows the eased scroll adjustment);
+// pass a negative value to snap back to the discrete active pill.
+void
+overview_thumbs_set_indicator_value (GtkWidget *thumbs, double value)
+{
+  WinomeThumbs *self = WINOME_THUMBS (thumbs);
+  self->indicator_value = value;
+  gtk_widget_queue_draw (thumbs);
 }
 
 void

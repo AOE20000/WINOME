@@ -30,4 +30,14 @@ void overview_restack();
 void overview_show_async();
 void overview_hide_async();
 
+// TRUE while the overview window is mapped. The workspace-switch OSD only
+// shows for switches made OUTSIDE the overview (GNOME: the popup is driven
+// by mutter's switch actions, never from the overview's own controls).
+int overview_is_open();
+
+// Number of virtual desktops of the last layout (0 when the virtual
+// desktop module is unavailable). The OSD uses it to size its indicator
+// row without re-enumerating the COM interface on every poll.
+int overview_workspace_count();
+
 }  // namespace winome

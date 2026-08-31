@@ -187,6 +187,19 @@ struct Animation {
 };
 Animation g_anim;
 
+// Workspace-switch animation (workspacesView.js _scrollToActive:
+// WORKSPACE_SWITCH_TIME 250ms EASE_OUT_CUBIC on the scroll adjustment —
+// the whole workspace strip slides horizontally while the previous
+// desktop's previews slide out and the new one slides in; the thumbnail
+// indicator rides the same eased value). `g_leaving` keeps the previous
+// desktop's DWM thumbnails alive for the outgoing slide.
+constexpr guint kSwitchMs = 250;  // WORKSPACE_SWITCH_TIME
+std::vector<SlotEntry> g_leaving;
+guint g_switch_source = 0;
+gint64 g_switch_start_us = 0;
+int g_switch_from = -1, g_switch_to = -1;
+int g_switch_width = 0;  // slide distance: workspace box width
+
 // --- hover chrome animation ---------------------------------------------------
 
 // Per-slot uniform scale animations (at most one slot above 1.0 at a time:
@@ -238,6 +251,24 @@ double
 ease_out_sine (double t)
 {
   return std::sin (t * G_PI / 2.0);
+}
+
+// Clutter.AnimationMode.EASE_OUT_CUBIC (workspace switch scroll).
+double
+ease_out_cubic (double t)
+{
+  double u = 1.0 - t;
+  return 1.0 - u * u * u;
+}
+
+// Horizontal slide of a physical-px rect.
+RECT
+translate_rect_x (const RECT &r, LONG dx)
+{
+  RECT out = r;
+  out.left += dx;
+  out.right += dx;
+  return out;
 }
 
 RECT
@@ -1510,6 +1541,7 @@ apply_ex_styles (HWND hwnd)
 
 static void dump_zorder (const char *tag);
 static void restack_locked (void);
+static void switch_finish (void);
 
 // Rebuild slots, thumbnails and widget positions for the current monitor.
 // Must run after the overview window is mapped (GDK's first-map sequence
@@ -1520,6 +1552,11 @@ place_overview_locked (bool opening)
   if (g_window == nullptr || g_panel_hwnd == nullptr ||
       !gtk_widget_get_visible (g_window))
     return;
+
+  // A plain relayout (window closed etc.) ends any in-flight workspace
+  // switch instantly: the rebuilt slots are the new truth.
+  if (g_switch_source != 0)
+    switch_finish ();
 
   HMONITOR monitor = MonitorFromWindow (g_panel_hwnd, MONITOR_DEFAULTTONEAREST);
   MONITORINFO mi = {sizeof (mi)};
@@ -1862,9 +1899,130 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
   return G_SOURCE_CONTINUE;
 }
 
+// --- workspace switch animation ---------------------------------------------------
+
+// Cancel an in-flight switch, destroying the outgoing previews without
+// snapping (the overview itself is closing).
+static void
+switch_cancel (void)
+{
+  if (g_switch_source != 0) {
+    gtk_widget_remove_tick_callback (g_window, g_switch_source);
+    g_switch_source = 0;
+  }
+  for (SlotEntry &l : g_leaving)
+    if (l.thumb != nullptr)
+      DwmUnregisterThumbnail (l.thumb);
+  g_leaving.clear ();
+}
+
+// Snap-finish an in-flight switch with the overview still on screen.
+static void
+switch_finish (void)
+{
+  bool was_running = g_switch_source != 0 || !g_leaving.empty ();
+  switch_cancel ();
+  if (!was_running || g_window == nullptr || !gtk_widget_get_visible (g_window))
+    return;
+  apply_bg_rect (g_bg_final);
+  overview_thumbs_set_indicator_value (g_thumbs, -1.0);
+  for (SlotEntry &s : g_slots)
+    apply_thumb_rect (s, s.rect, 255);
+}
+
+static gboolean
+switch_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
+{
+  (void)widget;
+  (void)user_data;
+  double t = (gdk_frame_clock_get_frame_time (clock) - g_switch_start_us) /
+             1000.0 / (double)kSwitchMs;
+  if (t < 0.0)
+    t = 0.0;
+  if (t > 1.0)
+    t = 1.0;
+  double e = ease_out_cubic (t);
+
+  // The strip slides towards the target: the new desktop slides in from the
+  // direction of its index, the previous one slides out the other way, the
+  // workspace background box travels along, and the thumbnail indicator
+  // rides the same eased value.
+  int dir = (g_switch_to > g_switch_from) ? 1 : -1;
+  int width = g_switch_width > 0 ? g_switch_width
+                                  : (g_ws_box.right - g_ws_box.left);
+  LONG in_off = (LONG)(dir * (1.0 - e) * width);
+  LONG out_off = (LONG)(-dir * e * width);
+
+  for (SlotEntry &s : g_slots)
+    apply_thumb_rect (s, translate_rect_x (s.rect, in_off), 255);
+  for (SlotEntry &l : g_leaving)
+    apply_thumb_rect (l, translate_rect_x (l.rect, out_off), 255);
+  apply_bg_rect (translate_rect_x (g_bg_final, in_off));
+  overview_thumbs_set_indicator_value (
+      g_thumbs, g_switch_from + (g_switch_to - g_switch_from) * e);
+
+  if (t >= 1.0) {
+    switch_finish ();
+    return G_SOURCE_REMOVE;
+  }
+  return G_SOURCE_CONTINUE;
+}
+
+// Animated workspace switch (WorkspacesView._scrollToActive: the previews of
+// the previous desktop slide out while the new desktop's slide in, 250ms
+// EASE_OUT_CUBIC). Falls back to the plain relayout when the relayout did
+// not land on @to.
+static void
+switch_workspace_animated (int to)
+{
+  if (g_window == nullptr || !gtk_widget_get_visible (g_window))
+    return;
+  if (g_desktops.empty () || to < 0 || to >= (int)g_desktops.size ())
+    return;
+  if (g_anim.source != 0)
+    return;  // open/close animation in flight; the next poll relayouts
+  if (to == g_desktop_active)
+    return;
+
+  // Finish a previous in-flight switch instantly (rapid pill clicks).
+  switch_finish ();
+
+  int from = g_desktop_active;
+
+  // Hand the current previews (with their live DWM thumbnails) to the
+  // outgoing group; they keep rendering while sliding out.
+  for (SlotEntry &e : g_slots)
+    g_leaving.push_back (std::move (e));
+  g_slots.clear ();
+  g_scaled_slot = -1;
+  g_scaled_value = 1.0;
+
+  // Rebuild for the new desktop; the first tick offsets everything to the
+  // slide-in start so no final-position frame flashes. An empty slot list
+  // is a valid result (switching to an empty desktop).
+  place_overview_locked (false);
+  if (to != g_desktop_active) {
+    for (SlotEntry &l : g_leaving)
+      if (l.thumb != nullptr)
+        DwmUnregisterThumbnail (l.thumb);
+    g_leaving.clear ();
+    return;
+  }
+
+  g_switch_from = from;
+  g_switch_to = to;
+  g_switch_width = g_ws_box.right - g_ws_box.left;
+  g_switch_start_us = g_get_monotonic_time ();
+  g_switch_source =
+      gtk_widget_add_tick_callback (g_window, switch_tick, nullptr, nullptr);
+  g_print ("[ov] workspace switch %d -> %d (animated)\n", from, to);
+}
+
 void
 start_animation (bool closing, guint duration_ms)
 {
+  if (g_switch_source != 0)
+    switch_finish ();
   if (g_anim.source != 0) {
     gtk_widget_remove_tick_callback (g_window, g_anim.source);
     g_anim.source = 0;
@@ -1887,6 +2045,7 @@ finish_hide (void)
 {
   set_hover (-1, true);
   destroy_previews ();
+  switch_cancel ();
   destroy_mini_previews ();
   if (g_desktop_poll != 0) {
     g_source_remove (g_desktop_poll);
@@ -2039,7 +2198,7 @@ on_thumb_clicked (int index, void *user_data)
   if (index < 0 || index == g_desktop_active)
     return;
   if (vd::switch_to (index)) {
-    rebuild_now ();
+    switch_workspace_animated (index);
   } else {
     g_print ("[ov] desktop switch failed\n");
   }
@@ -2058,7 +2217,7 @@ desktop_poll_cb (gpointer user_data)
   if (cur >= 0 && cur != g_desktop_active) {
     g_print ("[ov] desktop changed %d -> %d (external)\n", g_desktop_active,
              cur);
-    rebuild_now ();
+    switch_workspace_animated (cur);
   }
   return G_SOURCE_CONTINUE;
 }
@@ -2214,6 +2373,7 @@ overview_hide (void)
   set_hover (-1, true);
   if (g_window == nullptr || !gtk_widget_get_visible (g_window)) {
     destroy_previews ();
+    switch_cancel ();
     return;
   }
   // Animate out, then unmap from finish_hide().
@@ -2224,6 +2384,18 @@ void
 overview_restack (void)
 {
   restack_locked ();
+}
+
+int
+overview_is_open (void)
+{
+  return g_window != nullptr && gtk_widget_get_visible (g_window) ? 1 : 0;
+}
+
+int
+overview_workspace_count (void)
+{
+  return (int)g_desktops.size ();
 }
 
 void

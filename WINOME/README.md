@@ -55,6 +55,8 @@ ninja -C build
 - [x] 概览开合动画：`Overview.ANIMATION_TIME` 250ms（开 EASE_OUT_SINE / 关 EASE_OUT_QUAD）；窗口从真实位置飞入槽位，最小化窗口从角落展开 + 淡入；布局 idle 用 `G_PRIORITY_HIGH_IDLE` 抢在重绘前执行，杜绝首帧黑闪
 - [x] **Windows 虚拟桌面兼容**（`src/virtual-desktop.cpp`，移植 VirtualDesktopAccessor-rust）：Win11 22621/24H2 COM 接口（ImmersiveShell → IVirtualDesktopManagerInternal），枚举/切换桌面、窗口归属查询
 - [x] **工作区缩略图**（`src/overview-thumbs.cpp`，workspaceThumbnail.js 移植）：>1 桌面时显示壁纸药丸行（4px 圆角 + 活动桌面 3px accent 指示器），药丸内含各桌面窗口的 DWM 迷你预览；点击切换桌面（概览保持打开），Win+Ctrl+←/→ 外部切换时 400ms 轮询跟随重排
+- [x] **工作区切换动画**（workspacesView.js `_scrollToActive` 移植）：概览内切换桌面时新旧桌面预览同步横向滑动（250ms EASE_OUT_CUBIC），背景盒随行、缩略图指示器连续插值滑动
+- [x] **工作区切换 OSD**（`src/ws-osd.cpp`，workspaceSwitcherPopup.js 移植）：概览外 Win+Ctrl+←/→ 切换时主屏底部显示 GNOME 风格圆点指示器（100ms 淡入 / 600ms 常驻 / 100ms 淡出）
 - [x] 概览内可打开快速设置/日历（弹出窗浮于概览之上，关闭弹窗的外部点击不再连带关闭概览——对应 GNOME 菜单 grab 吞点击）
 - [x] 性能优化：动画走帧时钟（vblank 对齐）、z-order 重排漂移门控、状态图标跳过无谓重绘、悬停药丸位置守卫、发布构建 LTO + NDEBUG（详见下方「性能」章节）
 - [ ] 二级菜单（WLAN 网络/蓝牙设备/电源模式/关机）、日历面板重构、网络/蓝牙真实数据
@@ -117,6 +119,11 @@ ninja -C build
 ### 工作区缩略图（`src/overview-thumbs.cpp`）
 
 `workspaceThumbnail.js` ThumbnailsBox 的视觉移植：每桌面一枚 4px 圆角壁纸药丸（cover 渲染），活动桌面套 3px accent（#3584e4）8px 圆角指示器；缩放 `min(hScale, vScale, 0.05)`；主题值（spacing/padding 6px、#46464e）经 St 引擎查询。药丸内的窗口迷你预览 = 窗口矩形裁剪到工作区后按药丸缩放系数放置的 DWM 缩略图。点击药丸 → `SwitchDesktop` → 概览原地重排（概览保持打开，GNOME 行为）。
+
+### 工作区切换动画与 OSD
+
+- **概览内切换**（`overview.cpp` `switch_workspace_animated`，workspacesView.js `_scrollToActive` 移植）：点击药丸或外部切换（Win+Ctrl+←/→）时，旧桌面的 DWM 预览移入离场组继续渲染，新桌面重建后两侧同步滑动——**250ms EASE_OUT_CUBIC**（`WORKSPACE_SWITCH_TIME`）：新组从目标方向滑入、旧组反向滑出、工作区背景盒随行平移、缩略图 accent 指示器在两个药丸间连续插值（`overview_thumbs_set_indicator_value`，对应 upstream 读取 scroll adjustment 的 `indicatorUpperWs/indicatorLowerWs` 插值）。完成时销毁离场缩略图并 snap。开/合动画进行中会推迟切换（下轮 400ms 轮询补上）；窗口关闭等普通重排会立即 snap 进行中的切换
+- **概览外 OSD**（`src/ws-osd.cpp`，workspaceSwitcherPopup.js 移植）：Win+Ctrl+←/→ 在概览外切换桌面时，主显示器底部中央（4em 边距）显示胶囊形 OSD——`%osd_panel`（lighten(#222226,5%) 底、1px transparentize(white,0.98) 边、999px 圆角）内一排 32px 单元的圆点指示器：活动桌面 10.67px 实心白点、其余 5.33px 半透明白点（`.ws-switcher-indicator` 的 active padding/margin 差异）。**100ms EASE_OUT_QUAD 淡入 → 600ms 常驻（`DISPLAY_TIMEOUT`）→ 100ms 淡出**；连续切换重置计时且不重播淡入。概览打开期间不触发（upstream 仅 mutter 的切换动作驱动此弹窗）。切换检测为 400ms 轮询 `current_index`（桌面计数每 ~5s 刷新一次）；首次 COM 枚举延迟到启动 2 秒后，避开 explorer RPC 死锁（非管理员）时的 8s 超时阻塞
 
 ### 概览与面板的协作（本进程实现）
 

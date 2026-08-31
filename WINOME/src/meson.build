@@ -12,6 +12,7 @@ winome_sources = files(
   'overview-dash.cpp',
   'overview-thumbs.cpp',
   'virtual-desktop.cpp',
+  'ws-osd.cpp',
   'fullscreen-watcher.cpp',
   'hot-corner.cpp',
   'system-status.cpp',

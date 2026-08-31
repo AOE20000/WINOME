@@ -47,6 +47,11 @@ gboolean overview_thumbs_get_rect (GtkWidget *thumbs, int index,
 // coordinate (x, y) lands at pill-local (x * scale, y * scale).
 double overview_thumbs_get_scale (GtkWidget *thumbs);
 
+// Continuous indicator position while a workspace switch animates
+// (ThumbnailsBox tracks the eased scroll adjustment, sliding the accent
+// frame between the adjacent pills). Negative snaps back to `active`.
+void overview_thumbs_set_indicator_value (GtkWidget *thumbs, double value);
+
 // Click callback: fired with the pill index.
 void overview_thumbs_set_click_cb (GtkWidget *thumbs,
                                    void (*cb) (int index, void *data),

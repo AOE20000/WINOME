@@ -62,6 +62,21 @@ constexpr GUID kIID_IObjectArray = {
     0x92CA9DCD, 0x5622, 0x4BBA,
     {0xA8, 0x05, 0x5E, 0x9F, 0x54, 0x1B, 0xD8, 0xC9}};
 
+// Pinning windows to all desktops (Win11): IVirtualDesktopPinnedApps off the
+// ImmersiveShell provider (service CLSID_VirtualDesktopPinnedApps), fed an
+// IApplicationView resolved through IApplicationViewCollection (queried with
+// its own IID as the service id). Method order verified against
+// MScholtes/VirtualDesktop11.cs and Ciantic/VirtualDesktopAccessor.
+constexpr GUID kCLSID_VirtualDesktopPinnedApps = {
+    0xB5A399E7, 0x1C87, 0x46B8,
+    {0x88, 0xE9, 0xFC, 0x57, 0x47, 0xB1, 0x71, 0xBD}};
+constexpr GUID kIID_IVirtualDesktopPinnedApps = {
+    0x4CE81583, 0x1E4C, 0x4632,
+    {0xA6, 0x21, 0x07, 0xA5, 0x35, 0x43, 0x14, 0x8F}};
+constexpr GUID kIID_IApplicationViewCollection = {
+    0x1841C6D7, 0x4F9D, 0x42C0,
+    {0xAF, 0x41, 0x87, 0x47, 0x53, 0x8F, 0x10, 0xE5}};
+
 // --- raw vtable calls ----------------------------------------------------------
 
 // slot 3 = IUnknown::QueryInterface/AddRef/Release are 0/1/2 for every
@@ -86,6 +101,8 @@ constexpr int kSlotSwitchDesktop = 9;
 constexpr int kSlotGetId = 4;          // IVirtualDesktop
 constexpr int kSlotGetCount = 3;       // IObjectArray
 constexpr int kSlotGetAt = 4;
+constexpr int kSlotGetViewForHwnd = 6; // IApplicationViewCollection
+constexpr int kSlotPinView = 7;        // IVirtualDesktopPinnedApps
 
 // Call method @slot on COM interface @iface. The function pointer is read
 // from the object's vtable at runtime — GCC cannot devirtualize this.
@@ -114,6 +131,7 @@ struct Job {
     WindowDesktopIndex,
     WindowOnCurrent,
     SwitchTo,
+    PinWindow,
   } op;
 
   std::vector<DesktopInfo> out_desktops;
@@ -126,10 +144,14 @@ struct Job {
 
 // COM state — only ever touched on the worker thread.
 struct ComState {
-  void *provider = nullptr;   // IServiceProvider
-  void *internal = nullptr;   // IVirtualDesktopManagerInternal
-  void *manager = nullptr;    // IVirtualDesktopManager
+  void *provider = nullptr;        // IServiceProvider
+  void *internal = nullptr;        // IVirtualDesktopManagerInternal
+  void *manager = nullptr;         // IVirtualDesktopManager
+  void *pinned_apps = nullptr;     // IVirtualDesktopPinnedApps
+  void *view_collection = nullptr; // IApplicationViewCollection
   bool disabled = false;
+  bool pin_disabled = false;  // pin services unreachable; pin only, not the
+                              // rest of the module
 
   void
   release ()
@@ -141,6 +163,14 @@ struct ComState {
     if (manager != nullptr) {
       vrelease (manager);
       manager = nullptr;
+    }
+    if (view_collection != nullptr) {
+      vrelease (view_collection);
+      view_collection = nullptr;
+    }
+    if (pinned_apps != nullptr) {
+      vrelease (pinned_apps);
+      pinned_apps = nullptr;
     }
     // provider deliberately leaked at process exit: releasing it after
     // combase's TLS teardown crashes (upstream hit this too).
@@ -249,6 +279,74 @@ struct ComState {
       if (IsEqualGUID (info.id, id))
         return info.index;
     return -1;
+  }
+
+  // Resolve the pin services lazily: a build without them keeps the rest of
+  // the module working (only pinning fails).
+  bool
+  ensure_pin_services ()
+  {
+    if (pinned_apps != nullptr && view_collection != nullptr)
+      return true;
+    if (pin_disabled || disabled || provider == nullptr)
+      return false;
+
+    if (pinned_apps == nullptr) {
+      void *obj = nullptr;
+      HRESULT hr = vcall<HRESULT> (provider, kSlotQueryService,
+                                   &kCLSID_VirtualDesktopPinnedApps,
+                                   &kIID_IVirtualDesktopPinnedApps, &obj);
+      if (FAILED (hr) || obj == nullptr) {
+        pin_disabled = true;
+        return false;
+      }
+      pinned_apps = obj;
+    }
+
+    if (view_collection == nullptr) {
+      // Queried with its own IID as the service id (upstream does this).
+      void *obj = nullptr;
+      HRESULT hr = vcall<HRESULT> (provider, kSlotQueryService,
+                                   &kIID_IApplicationViewCollection,
+                                   &kIID_IApplicationViewCollection, &obj);
+      if (FAILED (hr) || obj == nullptr) {
+        pin_disabled = true;
+        return false;
+      }
+      view_collection = obj;
+    }
+    return true;
+  }
+
+  // Pin a window to ALL virtual desktops (the taskbar's "show this window on
+  // every desktop"): it then stays put during desktop switches instead of
+  // sliding away with its owning desktop and being pulled back by our
+  // z-order re-assertions.
+  bool
+  pin_window (HWND hwnd)
+  {
+    if (!ensure () || !ensure_pin_services ())
+      return false;
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      void *view = nullptr;
+      HRESULT hr = vcall<HRESULT> (view_collection, kSlotGetViewForHwnd, hwnd,
+                                   &view);
+      if (FAILED (hr) || view == nullptr) {
+        if (recoverable (hr) && attempt == 0) {
+          release ();
+          if (!ensure () || !ensure_pin_services ())
+            return false;
+          continue;
+        }
+        return false;
+      }
+      bool ok = SUCCEEDED (
+          vcall<HRESULT> (pinned_apps, kSlotPinView, view));
+      vrelease (view);
+      return ok;
+    }
+    return false;
   }
 };
 
@@ -375,6 +473,10 @@ run_on_worker (Job *job)
           vrelease (arr);
           break;
         }
+        case Job::Op::PinWindow: {
+          job->ok = g_com.pin_window (job->in_hwnd);
+          break;
+        }
         }
 
         lock.lock ();
@@ -463,6 +565,19 @@ switch_to (int index)
 {
   Job *job = new Job{Job::Op::SwitchTo};
   job->in_index = index;
+  run_on_worker (job);
+  bool out = job->ok;
+  delete job;
+  return out;
+}
+
+bool
+pin_window (HWND hwnd)
+{
+  if (hwnd == nullptr)
+    return false;
+  Job *job = new Job{Job::Op::PinWindow};
+  job->in_hwnd = hwnd;
   run_on_worker (job);
   bool out = job->ok;
   delete job;
