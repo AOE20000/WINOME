@@ -56,6 +56,7 @@ ninja -C build
 - [x] **Windows 虚拟桌面兼容**（`src/virtual-desktop.cpp`，移植 VirtualDesktopAccessor-rust）：Win11 22621/24H2 COM 接口（ImmersiveShell → IVirtualDesktopManagerInternal），枚举/切换桌面、窗口归属查询
 - [x] **工作区缩略图**（`src/overview-thumbs.cpp`，workspaceThumbnail.js 移植）：>1 桌面时显示壁纸药丸行（4px 圆角 + 活动桌面 3px accent 指示器），药丸内含各桌面窗口的 DWM 迷你预览；点击切换桌面（概览保持打开），Win+Ctrl+←/→ 外部切换时 400ms 轮询跟随重排
 - [x] 概览内可打开快速设置/日历（弹出窗浮于概览之上，关闭弹窗的外部点击不再连带关闭概览——对应 GNOME 菜单 grab 吞点击）
+- [x] 性能优化：动画走帧时钟（vblank 对齐）、z-order 重排漂移门控、状态图标跳过无谓重绘、悬停药丸位置守卫、发布构建 LTO + NDEBUG（详见下方「性能」章节）
 - [ ] 二级菜单（WLAN 网络/蓝牙设备/电源模式/关机）、日历面板重构、网络/蓝牙真实数据
 - [ ] 概览搜索（应用/窗口检索）
 
@@ -84,7 +85,7 @@ ninja -C build
 4. `NativeTaskbar::hide()` — `SHAppBarMessage(ABM_SETSTATE)` + `ShowWindowAsync(SW_HIDE)`，事件驱动看守线程应对 Explorer 重建
 5. `start_win_event_hook()` — `SetWinEventHook` 分别注册 `EVENT_OBJECT_CREATE/SHOW/UNCLOAKED`：任务栏/通知中心/非全屏 XAML 浮窗重现时再次隐藏；**全屏 XAML island（Alt-Tab/任务视图切换器）放行**
 6. `start_overview_trigger()` — `WH_KEYBOARD_LL` 钩子：裸 **Win** 切换概览、Win+Tab 打开开始菜单、其余 Win 组合键/Alt+Tab 透传（概览在本进程内 GTK 渲染，详见下节）；Esc 关闭
-7. 创建 GTK4 面板窗口（置顶全宽顶栏，时钟/Activities/快速设置）：`SetWindowPos(HWND_TOPMOST)` 定位到**主显示器原点**；`WS_EX_TOOLWINDOW` 使其隐藏于 Alt-Tab/任务栏；`SPI_SETWORKAREA` 保留顶栏条带（应用停在面板下方）；`start_fullscreen_watcher()` 每 400ms 检查前台窗口（真全屏/锁屏隐藏面板，同时重断言 `WS_EX_TOOLWINDOW` 并重排概览层级）+ 轮询虚拟桌面切换；`start_hot_corner()` 每 100ms 轮询光标，进入左上角热角打开概览
+7. 创建 GTK4 面板窗口（置顶全宽顶栏，时钟/Activities/快速设置）：`SetWindowPos(HWND_TOPMOST)` 定位到**主显示器原点**；`WS_EX_TOOLWINDOW` 使其隐藏于 Alt-Tab/任务栏；`SPI_SETWORKAREA` 保留顶栏条带（应用停在面板下方）；`start_fullscreen_watcher()` 每 400ms 检查前台窗口（真全屏/锁屏隐藏面板，同时重断言 `WS_EX_TOOLWINDOW` 并按需重排概览层级——漂移门控，z-order 正确时零开销）+ 轮询虚拟桌面切换；`start_hot_corner()` 每 100ms 轮询光标，进入左上角热角打开概览
 8. 退出时恢复工作区与 `NativeTaskbar::restore()` — 仅当本进程隐藏过才恢复
 
 构建产物（`build/` 下）：
@@ -99,7 +100,7 @@ ninja -C build
 - **DWM 缩略图**：`DwmRegisterThumbnail` 挂在概览顶层窗口上（要求顶层目标），飞入动画 = 逐帧 `DWM_TNP_RECTDESTINATION` 插值；挂起的 UWP（cloaked）窗口按桌面归属过滤后同样渲染
 - **悬停 chrome**（windowPreview.js）：预览中心放大 10px（200ms EASE_OUT_QUAD）；64px 应用图标（WM_GETICON / IShellItemImageFactory，独立透明窗口承载于缩略图之上）、标题胶囊、右上 32px 关闭按钮；离开 750ms 后淡出；关闭按钮发 `WM_CLOSE` 后重排
 - **开合动画**：250ms（开 EASE_OUT_SINE / 关 EASE_OUT_QUAD）；背景在全工作区（圆角 0）与工作区盒（圆角 30）间插值，窗口反向飞回原位，缩略图行淡入淡出；窗口 `gtk_window_fullscreen` 创建（surface 尺寸即显示器，无 resize 增长）；关闭后保留控件几何使重开首帧即壁纸铺满工作区
-- **层级契约**：popover > panel > 概览 chrome 窗口 > 概览窗口 > 应用 > 壁纸，由 fullscreen-watcher 周期重断言；概览窗口 `WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW|WS_EX_TOPMOST`
+- **层级契约**：popover > panel > 概览 chrome 窗口 > 概览窗口 > 应用 > 壁纸，由 fullscreen-watcher 每 400ms 重断言（漂移门控：链完整时跳过 `SetWindowPos`）；概览窗口 `WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW|WS_EX_TOPMOST`
 - **概览内弹出窗**：快速设置/日历可直接在概览上方打开（GNOME 原生行为）；关闭弹窗的外部点击被吞并（菜单 grab 语义），不会连带关闭概览
 
 ### 虚拟桌面（`src/virtual-desktop.cpp`）
