@@ -71,7 +71,8 @@ ninja -C build
 - [x] **Windows 虚拟桌面兼容**：Win11 22621/24H2 COM 接口枚举/切换桌面、窗口归属查询；概览按桌面过滤窗口、工作区缩略图行点击切换桌面
 - [x] **原生概览重写**：overviewControls.js WINDOW_PICKER 布局逐组件移植（搜索栏/工作区背景/窗口网格/dash/悬停 chrome），DWM 缩略图飞入动画
 - [x] 性能优化：动画走帧时钟（`gtk_widget_add_tick_callback`，vblank 对齐）、z-order 重排漂移门控（空闲零 `SetWindowPos` churn）、状态图标跳过无谓重绘、发布构建 LTO + NDEBUG（详见 [WINOME/README.md](WINOME/README.md) 性能章节）
-- [ ] 二级菜单（WLAN/蓝牙/电源模式/关机菜单）、日历面板重构、网络/蓝牙真实数据
+- [x] 快速设置二级菜单：电源模式（节能/均衡/性能，真实切换 Windows 电源方案）与电源菜单（挂起/注销/重启/关机）
+- [ ] 二级菜单（WLAN 网络/蓝牙设备）、日历面板重构、网络/蓝牙真实数据
 - [ ] 概览搜索（应用/窗口检索）
 
 ## 快捷键

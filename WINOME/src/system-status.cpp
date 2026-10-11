@@ -6,6 +6,7 @@
 
 #include <windows.h>
 #include <wininet.h>
+#include <powrprof.h>
 
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
@@ -173,6 +174,13 @@ void lock_screen() {
 
 void log_out() {
   ExitWindowsEx(EWX_LOGOFF, SHTDN_REASON_MAJOR_OTHER);
+}
+
+void suspend_system() {
+  // SetSuspendState: hibernate when the system is laptop-class (hibernation
+  // preserves the session across a battery swap, plain suspend does not).
+  // The call is best-effort — it fails if the policy forbids sleep.
+  SetSuspendState(FALSE, FALSE, FALSE);
 }
 
 void shutdown_system() {

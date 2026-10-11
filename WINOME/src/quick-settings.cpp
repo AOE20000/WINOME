@@ -11,6 +11,7 @@
 
 #include "quick-settings.h"
 #include "system-status.h"
+#include "power-modes.h"
 
 #include <stdio.h>
 #include <math.h>
@@ -94,6 +95,137 @@ make_quick_toggle (const char *icon_name, const char *title,
   return button;
 }
 
+// --- QuickToggleMenu (secondary menu) ----------------------------------------
+//
+// The popover that opens from a `.quick-toggle-menu-button` arrow, matching
+// QuickToggleMenu in quickSettings.js:
+//
+//   super(sourceActor, 'quick-toggle-menu')
+//     .quick-toggle-menu-container   (reactive, x_expand, y_expand:false)
+//       .header                     (optional title, hidden here)
+//       .popup-menu-content         (6px padding, #36363a, 20px radius)
+//         .popup-menu-box
+//           .popup-menu-item         (12px radius, active = lighten(#424247,9%))
+//
+// Both the container and the item classes already exist in
+// gnome-shell-dark.css, so the menu reuses the theme verbatim — no extra CSS.
+//
+// GNOME anchors the menu's top edge to the *bottom of the toggle capsule*
+// (a Clutter.BindConstraint on Y with offset = sourceActor.height), so the
+// menu hangs directly under the row that opened it.
+
+// Build one `.popup-menu-item` row. Items with a callback become clickable.
+static void
+on_quick_menu_item_activated (GtkGestureClick *gesture, int n_press,
+                              double x, double y, gpointer user_data)
+{
+  const WinomeMenuEntry *entry =
+      static_cast<const WinomeMenuEntry *>(user_data);
+
+  (void)gesture;
+  (void)n_press;
+  (void)x;
+  (void)y;
+
+  if (entry->callback != NULL)
+    entry->callback (entry->user_data);
+}
+
+static GtkWidget *
+make_quick_menu_item (const WinomeMenuEntry *entry)
+{
+  GtkWidget *item;
+  GtkWidget *box;
+  GtkWidget *icon = NULL;
+  GtkWidget *label;
+
+  item = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
+  gtk_widget_add_css_class (item, "popup-menu-item");
+  gtk_widget_set_focus_on_click (item, FALSE);
+
+  box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_widget_set_valign (box, GTK_ALIGN_CENTER);
+  gtk_widget_set_halign (box, GTK_ALIGN_START);
+  gtk_widget_set_hexpand (box, TRUE);
+  gtk_box_append (GTK_BOX (item), box);
+
+  if (entry->icon_name != NULL) {
+    icon = gtk_image_new_from_icon_name (entry->icon_name);
+    gtk_image_set_pixel_size (GTK_IMAGE (icon), QUICK_ICON_SIZE);
+    gtk_widget_add_css_class (icon, "popup-menu-icon");
+    gtk_widget_set_valign (icon, GTK_ALIGN_CENTER);
+    gtk_box_append (GTK_BOX (box), icon);
+  }
+
+  label = gtk_label_new (entry->label);
+  gtk_widget_add_css_class (label, "popup-menu-item-label");
+  gtk_label_set_xalign (GTK_LABEL (label), 0.0);
+  gtk_widget_set_valign (label, GTK_ALIGN_CENTER);
+  gtk_widget_set_hexpand (label, TRUE);
+  gtk_box_append (GTK_BOX (box), label);
+
+  // Radio-style active marker, matching `.popup-menu-item:checked` upstream.
+  if (entry->checked) {
+    GtkWidget *ornament = gtk_image_new_from_icon_name ("object-select-symbolic");
+    gtk_image_set_pixel_size (GTK_IMAGE (ornament), QUICK_ICON_SIZE);
+    gtk_widget_add_css_class (ornament, "popup-menu-ornament");
+    gtk_widget_set_valign (ornament, GTK_ALIGN_CENTER);
+    gtk_box_append (GTK_BOX (item), ornament);
+  }
+
+  if (entry->callback != NULL) {
+    GtkGesture *click = gtk_gesture_click_new ();
+
+    gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), 0);
+    // The entries array outlives the widget it builds (the caller owns it for
+    // the lifetime of the panel), so passing the entry pointer is safe.
+    g_signal_connect (click, "pressed",
+                      G_CALLBACK (on_quick_menu_item_activated),
+                      (gpointer) entry);
+    gtk_widget_add_controller (item, GTK_EVENT_CONTROLLER (click));
+  }
+
+  return item;
+}
+
+// Build the popup content for a secondary menu: `.popup-menu` wrapping
+// `.popup-menu-content` (the themed card) and the item list.
+static GtkWidget *
+build_quick_menu (const WinomeMenuEntry *entries, guint n_entries)
+{
+  GtkWidget *menu;
+  GtkWidget *content;
+  GtkWidget *box;
+  guint i;
+
+  menu = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_add_css_class (menu, "popup-menu");
+  // The menu sizes to its contents; .popup-menu-content carries the 20px radius.
+  gtk_widget_set_halign (menu, GTK_ALIGN_START);
+
+  content = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_add_css_class (content, "popup-menu-content");
+  gtk_box_append (GTK_BOX (menu), content);
+
+  box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
+  gtk_widget_add_css_class (box, "popup-menu-box");
+  gtk_box_append (GTK_BOX (content), box);
+
+  for (i = 0; i < n_entries; i++) {
+    GtkWidget *item = make_quick_menu_item (&entries[i]);
+    gtk_box_append (GTK_BOX (box), item);
+  }
+
+  return menu;
+}
+
+GtkWidget *
+winome_quick_menu_new (const WinomeMenuEntry *entries, guint n_entries)
+{
+  g_return_val_if_fail (entries != NULL || n_entries == 0, NULL);
+  return build_quick_menu (entries, n_entries);
+}
+
 // --- QuickMenuToggle ---------------------------------------------------------
 //
 // Toggle with a secondary-menu arrow, matching QuickMenuToggle in
@@ -110,9 +242,21 @@ make_quick_toggle (const char *icon_name, const char *title,
 // inheritance). The separator colors itself via the ancestor selector
 // `.quick-toggle-has-menu:checked .quick-toggle-separator`.
 
+// Called with the freshly built menu popup and the arrow widget to anchor it
+// under. The popup is unref'd by the caller once the handler returns.
+typedef void (*QuickMenuOpenFunc) (GtkWidget *arrow, GtkWidget *menu,
+                                   gpointer user_data);
+// Builds the popup for a toggle's arrow. Returns a new widget (caller frees) or
+// NULL for a toggle with no menu.
+typedef GtkWidget *(*QuickMenuBuilder) (gpointer user_data);
+
 typedef struct {
   GtkWidget *toggle_part;      // the .quick-toggle node
   GtkWidget *menu_button_part; // the .quick-toggle-menu-button node
+  QuickMenuBuilder    menu_builder;      // builds the popup, may be NULL
+  gpointer            menu_builder_data;
+  QuickMenuOpenFunc   menu_open_func;    // anchors the popup, may be NULL
+  gpointer            menu_open_data;
 } MenuToggleParts;
 
 // --- Menu toggle content layout ----------------------------------------------
@@ -259,9 +403,58 @@ sync_menu_toggle_checked (GtkToggleButton *button, gpointer user_data)
   }
 }
 
+// Emitted when the arrow area is clicked. The menu_button is a GtkBox inside the
+// outer GtkToggleButton; the panel anchors the menu there.
+//
+// The click controller is on the arrow and runs before the outer toggle sees
+// the event, so the toggle does not flip — matching GNOME, where `clicked` is
+// bound to the inner St.Button and never reaches the QuickMenuToggle.
+static void
+on_menu_button_pressed (GtkGestureClick *gesture G_GNUC_UNUSED, int n_press,
+                        double x, double y, gpointer user_data)
+{
+  MenuToggleParts *parts = static_cast<MenuToggleParts *>(user_data);
+  QuickMenuBuilder builder =
+      static_cast<QuickMenuBuilder> (parts->menu_builder);
+
+  (void)n_press;
+  (void)x;
+  (void)y;
+
+  if (builder == NULL)
+    return;
+
+  GtkWidget *menu = builder (parts->menu_builder_data);
+  if (menu == NULL)
+    return;
+
+  // The panel takes ownership and anchors the popup under the arrow.
+  QuickMenuOpenFunc open_func =
+      static_cast<QuickMenuOpenFunc> (parts->menu_open_func);
+  if (open_func != NULL)
+    open_func (parts->menu_button_part, menu, parts->menu_open_data);
+
+  g_object_unref (menu);
+}
+
+// Default anchor: keep the popup alive as the arrow's own child so it renders
+// directly under the capsule. The panel later replaces this with a toplevel
+// window anchored in screen coordinates (see shell-panel.cpp).
+static void
+default_quick_menu_open (GtkWidget *arrow, GtkWidget *menu, gpointer user_data)
+{
+  (void)user_data;
+
+  g_object_set_data_full (G_OBJECT (arrow), "quick-menu-popup",
+                          g_object_ref_sink (menu), g_object_unref);
+  gtk_widget_set_visible (menu, TRUE);
+}
+
 static GtkWidget *
 make_quick_menu_toggle (const char *icon_name, const char *title,
-                        const char *subtitle)
+                        const char *subtitle,
+                        QuickMenuBuilder menu_builder,
+                        gpointer menu_builder_data)
 {
   GtkWidget *button;
   GtkWidget *content;
@@ -351,11 +544,28 @@ make_quick_menu_toggle (const char *icon_name, const char *title,
   parts = g_new0 (MenuToggleParts, 1);
   parts->toggle_part = toggle_part;
   parts->menu_button_part = menu_button;
+  parts->menu_builder = menu_builder;
+  parts->menu_builder_data = menu_builder_data;
+  // Until the panel installs its anchor handler, fall back to storing the popup
+  // on the arrow so the plumbing is exercised end to end.
+  parts->menu_open_func = default_quick_menu_open;
   g_object_set_data_full (G_OBJECT (button), "menu-toggle-parts",
                           parts, g_free);
   g_signal_connect (button, "toggled",
                     G_CALLBACK (sync_menu_toggle_checked), parts);
   sync_menu_toggle_checked (GTK_TOGGLE_BUTTON (button), parts);
+
+  // Secondary menu. The arrow area gets its own click controller: clicking it
+  // must open the menu, not flip the outer toggle (GNOME binds `clicked` on
+  // the inner St.Button, which does not propagate to the toggle).
+  if (menu_builder != NULL) {
+    GtkGesture *click = gtk_gesture_click_new ();
+
+    gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), 0);
+    g_signal_connect (click, "pressed",
+                      G_CALLBACK (on_menu_button_pressed), parts);
+    gtk_widget_add_controller (menu_button, GTK_EVENT_CONTROLLER (click));
+  }
 
   return button;
 }
@@ -932,6 +1142,141 @@ winome_quick_settings_grid_attach (GtkWidget *grid, GtkWidget *child,
 
 // --- Panel widget ------------------------------------------------------------
 
+// Power menu (the GNOME power-off / end-session rows reached from the system
+// item): Suspend, Log Out, Restart, Power Off. These act immediately — GNOME's
+// end-session items use the default 'user' session mode, so no confirmation
+// dialog sits between the click and the action.
+typedef enum {
+  POWER_ACTION_SUSPEND,
+  POWER_ACTION_LOGOUT,
+  POWER_ACTION_RESTART,
+  POWER_ACTION_SHUTDOWN
+} PowerAction;
+
+static void
+on_power_action (gpointer user_data)
+{
+  switch (GPOINTER_TO_INT (user_data)) {
+  case POWER_ACTION_SUSPEND:
+    winome::suspend_system ();
+    break;
+  case POWER_ACTION_LOGOUT:
+    winome::log_out ();
+    break;
+  case POWER_ACTION_RESTART:
+    winome::restart_system ();
+    break;
+  case POWER_ACTION_SHUTDOWN:
+    winome::shutdown_system ();
+    break;
+  }
+}
+
+static GtkWidget *
+build_power_menu (gpointer user_data)
+{
+  WinomeMenuEntry items[4];
+
+  (void)user_data;
+
+  items[0].label = tr ("Suspend", "挂起");
+  items[0].icon_name = "media-playback-pause-symbolic";
+  items[0].checked = FALSE;
+  items[0].callback = on_power_action;
+  items[0].user_data = GINT_TO_POINTER (POWER_ACTION_SUSPEND);
+
+  items[1].label = tr ("Log Out", "注销");
+  items[1].icon_name = "system-log-out-symbolic";
+  items[1].checked = FALSE;
+  items[1].callback = on_power_action;
+  items[1].user_data = GINT_TO_POINTER (POWER_ACTION_LOGOUT);
+
+  items[2].label = tr ("Restart", "重启");
+  items[2].icon_name = "system-reboot-symbolic";
+  items[2].checked = FALSE;
+  items[2].callback = on_power_action;
+  items[2].user_data = GINT_TO_POINTER (POWER_ACTION_RESTART);
+
+  items[3].label = tr ("Power Off", "关机");
+  items[3].icon_name = "system-shutdown-symbolic";
+  items[3].checked = FALSE;
+  items[3].callback = on_power_action;
+  items[3].user_data = GINT_TO_POINTER (POWER_ACTION_SHUTDOWN);
+
+  return build_quick_menu (items, G_N_ELEMENTS (items));
+}
+
+// Open handler for the battery capsule: same default anchor as the arrow.
+static void
+on_power_item_clicked (GtkButton *button, gpointer user_data)
+{
+  (void)button;
+  (void)user_data;
+
+  GtkWidget *menu = build_power_menu (NULL);
+  if (menu == NULL)
+    return;
+  default_quick_menu_open (GTK_WIDGET (button), menu, NULL);
+  g_object_unref (menu);
+}
+
+// Per-toggle menu context: the builder callback gets a pointer back to the
+// panel so menu items can refresh it (e.g. after switching power mode).
+typedef struct {
+  GtkWidget *owner;   // the quick settings root
+} WinomePowerEntry;
+
+// Each row needs its own target mode, so wrap it in a tiny heap struct kept
+// alive for the lifetime of the panel (the menu is rebuilt per open).
+typedef struct {
+  WinomePowerMode mode;
+  GtkWidget      *panel;
+} PowerModeTarget;
+
+static void
+on_power_mode_activate (gpointer user_data)
+{
+  PowerModeTarget *t = static_cast<PowerModeTarget *> (user_data);
+  if (winome_power_set_mode (t->mode))
+    winome_quick_settings_refresh (t->panel);
+}
+
+static GtkWidget *
+build_power_mode_menu (gpointer user_data)
+{
+  WinomePowerEntry *entry = static_cast<WinomePowerEntry *> (user_data);
+  WinomeMenuEntry items[WINOME_POWER_MODE_COUNT];
+  PowerModeTarget *targets = g_new0 (PowerModeTarget, WINOME_POWER_MODE_COUNT);
+  WinomePowerMode active = winome_power_get_active ();
+  guint n = 0;
+  int m;
+
+  for (m = 0; m < WINOME_POWER_MODE_COUNT; m++) {
+    WinomePowerMode mode = static_cast<WinomePowerMode> (m);
+    if (!winome_power_mode_available (mode))
+      continue;
+    targets[n].mode = mode;
+    targets[n].panel = entry->owner;
+    items[n].label = winome_power_mode_label (mode);
+    items[n].icon_name = winome_power_mode_icon (mode);
+    items[n].checked = (mode == active);
+    items[n].callback = on_power_mode_activate;
+    items[n].user_data = &targets[n];
+    n++;
+  }
+
+  if (n == 0) {
+    g_free (targets);
+    return NULL;   // no stock plans installed: leave the arrow inert
+  }
+
+  GtkWidget *menu = build_quick_menu (items, n);
+  // Free the targets once the menu is destroyed.
+  g_object_set_data_full (G_OBJECT (menu), "power-mode-targets", targets, g_free);
+
+  return menu;
+}
+
 GtkWidget *
 winome_quick_settings_new (void)
 {
@@ -965,6 +1310,11 @@ winome_quick_settings_new (void)
     gtk_widget_set_focus_on_click (power, FALSE);
     gtk_widget_set_hexpand (power, FALSE);
     gtk_widget_set_vexpand (power, FALSE);
+    // Clicking the battery item opens the power menu (Suspend / Log Out /
+    // Restart / Power Off). GNOME keeps the `.power-item` capsule look, so we
+    // attach a plain click controller instead of using the arrow layout.
+    g_signal_connect (power, "clicked",
+                      G_CALLBACK (on_power_item_clicked), NULL);
     gtk_box_append (GTK_BOX (row), power);
 
     // x_expand spacer: laptop-style layout when a battery is present, pushing
@@ -1008,30 +1358,39 @@ winome_quick_settings_new (void)
   {
     GtkWidget *wlan, *bluetooth, *powermode, *nightlight;
     GtkWidget *darkmode, *dnd, *keyboard, *airplane;
-    int row = 3;
+    WinomePowerEntry power_ctx = { root };
+    // The subtitle mirrors the active plan; fall back to Balanced when the
+    // scheme cannot be read (no PowrProf / only OEM plans).
+    WinomePowerMode detected = winome_power_get_active ();
+    WinomePowerMode active_power =
+        (detected == WINOME_POWER_MODE_COUNT) ? WINOME_POWER_BALANCED
+                                              : detected;
 
+    // WLAN / Bluetooth / Keyboard keep the arrow decoration but no menu yet:
+    // they need the Wlan API and the Bluetooth radio API (phase 2).
     wlan = make_quick_menu_toggle ("network-wireless-symbolic",
                                    tr ("Wi-Fi", "无线网络"),
-                                   tr ("Connected", "已连接"));
+                                   tr ("Connected", "已连接"),
+                                   NULL, NULL);
     gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (wlan), TRUE);
     winome_quick_settings_grid_attach (grid, wlan, 1);
 
     bluetooth = make_quick_menu_toggle ("bluetooth-active-symbolic",
                                         tr ("Bluetooth", "蓝牙"),
-                                        NULL);
+                                        NULL,
+                                        NULL, NULL);
     winome_quick_settings_grid_attach (grid, bluetooth, 1);
-    row++;
 
     powermode = make_quick_menu_toggle ("power-profile-balanced-symbolic",
                                         tr ("Power Mode", "电源模式"),
-                                        tr ("Balanced", "均衡"));
+                                        winome_power_mode_label (active_power),
+                                        build_power_mode_menu, &power_ctx);
     winome_quick_settings_grid_attach (grid, powermode, 1);
 
     nightlight = make_quick_toggle ("night-light-symbolic",
                                     tr ("Night Light", "夜间模式"),
                                     NULL, NULL, NULL);
     winome_quick_settings_grid_attach (grid, nightlight, 1);
-    row++;
 
     darkmode = make_quick_toggle ("dark-mode-symbolic",
                                   tr ("Dark Style", "深色主题"),
@@ -1043,11 +1402,11 @@ winome_quick_settings_new (void)
                              tr ("Do Not Disturb", "勿扰模式"),
                              NULL, NULL, NULL);
     winome_quick_settings_grid_attach (grid, dnd, 1);
-    row++;
 
     keyboard = make_quick_menu_toggle ("input-keyboard-symbolic",
                                        tr ("Keyboard", "键盘"),
-                                       NULL);
+                                       NULL,
+                                       NULL, NULL);
     gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (keyboard), TRUE);
     winome_quick_settings_grid_attach (grid, keyboard, 1);
 

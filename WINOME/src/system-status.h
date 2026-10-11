@@ -48,8 +48,10 @@ bool set_brightness(double fraction);
 // Lock the workstation (matches gnome-shell SystemActions lock screen).
 void lock_screen();
 
-// Sign out / shutdown / restart (Windows equivalents of system actions).
+// Sign out / suspend / shutdown / restart (Windows equivalents of the GNOME
+// system actions exposed by the power menu).
 void log_out();
+void suspend_system();
 void shutdown_system();
 void restart_system();
 

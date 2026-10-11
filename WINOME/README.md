@@ -59,7 +59,8 @@ ninja -C build
 - [x] **工作区切换 OSD**（`src/ws-osd.cpp`，workspaceSwitcherPopup.js 移植）：概览外 Win+Ctrl+←/→ 切换时主屏底部显示 GNOME 风格圆点指示器（100ms 淡入 / 600ms 常驻 / 100ms 淡出）
 - [x] 概览内可打开快速设置/日历（弹出窗浮于概览之上，关闭弹窗的外部点击不再连带关闭概览——对应 GNOME 菜单 grab 吞点击）
 - [x] 性能优化：动画走帧时钟（vblank 对齐）、z-order 重排漂移门控、状态图标跳过无谓重绘、悬停药丸位置守卫、发布构建 LTO + NDEBUG（详见下方「性能」章节）
-- [ ] 二级菜单（WLAN 网络/蓝牙设备/电源模式/关机）、日历面板重构、网络/蓝牙真实数据
+- [x] **快速设置二级菜单**（`quick-settings.cpp` + `power-modes.cpp`）：`.quick-toggle-menu-button` 的 `>` 箭头接上真实点击回调，复用主题已有的 `.popup-menu` / `.popup-menu-item`（20px 圆角卡片 + 12px 条目圆角）渲染二级菜单浮层；**电源模式菜单**（节能/均衡/性能，`PowrProf` 切换 Windows 电源方案，当前方案打勾）与**电源菜单**（挂起/注销/重启/关机，接 `.power-item` 电池胶囊点击）
+- [ ] 二级菜单（WLAN 网络/蓝牙设备，日历面板重构，网络/蓝牙真实数据）
 - [ ] 概览搜索（应用/窗口检索）
 
 ## 快捷键
@@ -104,6 +105,24 @@ ninja -C build
 - **开合动画**：250ms（开 EASE_OUT_SINE / 关 EASE_OUT_QUAD）；背景在全工作区（圆角 0）与工作区盒（圆角 30）间插值，窗口反向飞回原位，缩略图行淡入淡出；窗口 `gtk_window_fullscreen` 创建（surface 尺寸即显示器，无 resize 增长）；关闭后保留控件几何使重开首帧即壁纸铺满工作区
 - **层级契约**：popover > panel > 概览 chrome 窗口 > 概览窗口 > 应用 > 壁纸，由 fullscreen-watcher 每 400ms 重断言（漂移门控：链完整时跳过 `SetWindowPos`）；概览窗口 `WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW|WS_EX_TOPMOST`
 - **概览内弹出窗**：快速设置/日历可直接在概览上方打开（GNOME 原生行为）；关闭弹窗的外部点击被吞并（菜单 grab 语义），不会连带关闭概览
+
+### 快速设置二级菜单（`quick-settings.cpp` + `power-modes.cpp`）
+
+`QuickMenuToggle` 的 `>` 箭头原本只有外观。现状：
+
+- **浮层复用主题既有样式**：`gnome-shell-dark.css` 里 `.popup-menu` / `.popup-menu-content`
+  （6px padding、`#36363a` 底、20px 圆角）/ `.popup-menu-item`（12px 圆角、active 时
+  `lighten(#424247,9%)`）全部齐备，二级菜单直接套用，无需新增 CSS
+- **点击区域独立**：箭头是外层 `GtkToggleButton` 内的 `GtkBox`，挂自己的
+  `GtkGestureClick`（CAPTURE 阶段先于外层 toggle），所以点箭头开菜单**不会**误触发开关
+- **菜单每次打开重建**：`object-select-symbolic` 勾选标记因此始终反映当前电源方案
+- **电源模式**（`power-modes.cpp`，PowrProf）：三档对应 Windows 三个标准电源方案
+  GUID（节能 `a1841308…` / 均衡 `381b4222…` / 性能 `8c5e7fda…`）；均衡在
+  Windows 11 还有一个随机化 GUID（`b9a9a03a…`）一并识别；`PowerEnumerate` 探测
+  方案是否存在，缺失的档位不显示；无法识别时回退显示"均衡"
+- **电源菜单**：挂起（`SetSuspendState`）/ 注销 / 重启 / 关机，挂在 `.power-item`
+  电池胶囊上（GNOME 的电源入口），保持原布局不加 `>` 箭头
+- WLAN / 蓝牙 / 键盘三个箭头暂为装饰，等 Wlan API 与蓝牙 API 接入（见待办）
 
 ### 虚拟桌面（`src/virtual-desktop.cpp`）
 
