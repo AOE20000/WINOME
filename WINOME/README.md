@@ -38,7 +38,7 @@ ninja -C build
 - [x] 隐藏原生任务栏（`src/native-taskbar.cpp`，独立实现）
 - [x] 桌面层嵌入 WorkerW（`src/desktop-layer.cpp`，独立实现）
 - [x] 事件钩子防止任务栏/通知中心/XAML 浮窗重现（`src/win-event-hook.cpp`；**保留全屏 Alt-Tab/任务视图切换器**）
-- [x] 接入 WinOverview 概览（**Win 键** / **左上角热角**触发，`src/overview-trigger.cpp` + `src/hot-corner.cpp` + `overview/` 编译 DLL/Launcher）
+- [x] 接入 WinOverview 概览（**Win 键** / **左上角热角**触发，`src/overview-trigger.cpp` + `src/hot-corner.cpp`）
 - [x] 概览增强：显示**最小化窗口**（恢复矩形、无离屏飞入）、排除 WINOME 面板、让出顶栏条带（面板保持可见）
 - [x] 面板：置顶全宽顶栏，GNOME 主题精确复刻（Activities 圆点按钮 + 时钟 + 状态区图标 + 悬停/点击动画）
 - [x] 面板保留工作区（`SPI_SETWORKAREA`）：最大化/全屏应用停在面板下方（像任务栏保留底部）
@@ -115,6 +115,7 @@ ninja -C build
 - **所有 COM 调用走裸 vtable**（运行时函数指针）：GCC -O2 会对全纯虚接口结构做去虚拟化（本翻译单元无派生类），把调用替换成 `__cxa_pure_virtual`，而 MinGW 链接器把该弱符号解析到垃圾地址 `0x100000000`——运行时跳转到镜像基址下方 256MB（某 DLL 基址）即 SIGSEGV。裸调用无法被去虚拟化
 - **专用 COM 线程**：所有调用 marshalled 到单个工作线程（上游注释："VD COM Objects don't like being called from different threads rapidly"）；主线程等待**完成**（非取走）并带 8s 超时——explorer 端死锁（如低完整性调用方）时放弃并永久禁用模块，概览回退单工作区布局，绝不冻结 UI
 - 不可用环境（旧版本 Windows / explorer 死锁）下安静降级：`desktops()` 返回空，概览布局与单工作区完全一致
+- **窗口固定到所有桌面**（`pin_window`，Win11 `IVirtualDesktopPinnedApps` IID 4CE81583 + `IApplicationViewCollection` IID 1841C6D7，`GetViewForHwnd`→`PinView`）：shell 全部顶层窗口（面板/概览/chrome/弹出窗/OSD）跨桌面常驻——否则 `Win+Ctrl+←/→` 时整个 shell 跟着旧桌面滑走，再被 400ms z-order 重断言拉回新桌面（"跟随移动后才恢复"）。`main.cpp` 启动 3s 后枚举本进程可见窗口统一 pin，并用 `SetWinEventHook(EVENT_OBJECT_SHOW)` 对后续出现的窗口（popover/OSD/概览 chrome）事件驱动补 pin；pin 服务不可达时只禁用 pin，不影响其余 VD 功能
 
 ### 工作区缩略图（`src/overview-thumbs.cpp`）
 

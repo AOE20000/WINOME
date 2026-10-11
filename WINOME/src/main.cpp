@@ -66,6 +66,35 @@ pin_shell_windows (gpointer user_data)
   return G_SOURCE_REMOVE;
 }
 
+// Late windows (popovers, overview chrome, the OSD) pin themselves when
+// shown: EVENT_OBJECT_SHOW for this process's top-level windows. Runs on the
+// GTK main thread (WINEVENT_OUTOFCONTEXT + our message loop).
+static HWINEVENTHOOK g_pin_show_hook = nullptr;
+
+static gboolean
+pin_window_idle (gpointer data)
+{
+  winome::vd::pin_window ((HWND) (guintptr) data);
+  return G_SOURCE_REMOVE;
+}
+
+static void CALLBACK
+pin_show_event_proc (HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG idObject,
+                     LONG idChild, DWORD thread, DWORD time)
+{
+  (void)hook;
+  (void)event;
+  (void)idChild;
+  (void)thread;
+  (void)time;
+  if (idObject != OBJID_WINDOW || hwnd == nullptr)
+    return;
+  if (GetAncestor (hwnd, GA_ROOT) != hwnd)
+    return;  // only top-level windows
+  g_idle_add_full (G_PRIORITY_LOW, pin_window_idle,
+                   (gpointer) (guintptr) hwnd, nullptr);
+}
+
 // Log which GSK renderer GTK selects for a realized surface. GSK_DEBUG logs
 // do not reach winome.log, so query the renderer type directly instead:
 // gsk_renderer_new_for_surface walks the same selection path GTK uses for
@@ -186,14 +215,28 @@ on_activate (GtkApplication      *app,
 
   // Workspace-switch OSD (workspaceSwitcherPopup.js) + desktop poll.
   winome::ws_osd_init ();
+
+  // Pin the shell chrome to all virtual desktops (see pin_shell_windows).
+  // Delayed: the first COM call can block up to the vd module's 8s timeout
+  // when the explorer RPC deadlocks — off the startup path.
+  g_timeout_add (3000, pin_shell_windows, nullptr);
+  g_pin_show_hook = SetWinEventHook (EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW,
+                                     nullptr, pin_show_event_proc,
+                                     GetCurrentProcessId (), 0,
+                                     WINEVENT_OUTOFCONTEXT);
 }
 
 static void
 on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
              gpointer G_GNUC_UNUSED user_data)
 {
+  if (g_pin_show_hook != nullptr) {
+    UnhookWinEvent (g_pin_show_hook);
+    g_pin_show_hook = nullptr;
+  }
+
   // Release the panel-strip work area reservation before restoring the
-  // taskbar, so the shell recalculates the normal work area around it.
+  // taskbar, so the shell recalculates the work area around it.
   if (g_primary_monitor.right > g_primary_monitor.left)
     SystemParametersInfoW (SPI_SETWORKAREA, 0, &g_primary_monitor, 0);
 
