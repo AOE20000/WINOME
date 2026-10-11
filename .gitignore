@@ -25,3 +25,6 @@ Desktop.ini
 
 # Upstream reference clones (kept as working copies, not published)
 upstream/
+
+# WorkBuddy workspace state (project memory / task data)
+.workbuddy/
