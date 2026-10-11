@@ -17,7 +17,10 @@ namespace {
 // renders as a hidden indicator rather than an error.
 struct WlanApi {
   HMODULE dll;
-  DWORD (WINAPI *OpenHandle)(HANDLE, DWORD, PVOID, PVOID, HANDLE *, DWORD *);
+  // Signatures must match wlanapi.h exactly — a mismatched prototype does not
+  // fail to link here (the symbols are resolved at runtime), it shifts the
+  // arguments and the call returns ERROR_INVALID_PARAMETER.
+  DWORD (WINAPI *OpenHandle)(DWORD, PVOID, PDWORD, HANDLE *);
   DWORD (WINAPI *CloseHandle)(HANDLE, PVOID);
   DWORD (WINAPI *EnumInterfaces)(HANDLE, PVOID, PWLAN_INTERFACE_INFO_LIST *);
   DWORD (WINAPI *QueryInterface)(HANDLE, const GUID *, WLAN_INTF_OPCODE,
@@ -91,9 +94,11 @@ ensure_client (HANDLE *out)
   if (g_client == nullptr) {
     DWORD version = 0;
     HANDLE client = nullptr;
-    // The WLAN API is COM-flavoured: negotiate the version on open.
-    if (g_api.OpenHandle (nullptr, 2, nullptr, nullptr, &client, &version)
-        != ERROR_SUCCESS)
+    // WlanOpenHandle(dwClientVersion, pReserved, pdwNegotiatedVersion,
+    //                 phClientHandle) — the negotiated version is an OUTPUT.
+    // Requesting 2 is what Windows 7+ expects; the DLL negotiates downwards
+    // if the service is older.
+    if (g_api.OpenHandle (2, nullptr, &version, &client) != ERROR_SUCCESS)
       return false;
     if (client == nullptr)
       return false;
@@ -104,28 +109,47 @@ ensure_client (HANDLE *out)
   return true;
 }
 
-// Copy a DOT11_SSID into a UTF-8 buffer. Hidden networks report an empty SSID
-// but a non-zero uSSIDLength (the bytes are not a name), so we only decode
-// when the length looks like plausible UTF-8 text.
+// Copy a DOT11_SSID into a UTF-8 buffer.
+//
+// ucSSID is a raw octet string, not text: the 802.11 spec leaves the encoding
+// to the network, and real deployments use UTF-8 (Windows encodes a Chinese
+// SSID that way) as well as Latin-1. uSSIDLength is a BYTE count, so copying
+// the bytes straight into a char buffer works only for ASCII — a 4-character
+// Chinese name is 12 bytes and would be truncated mid-sequence.
+//
+// So: validate as UTF-8 and keep it if valid, otherwise widen the bytes as
+// Latin-1 (which never fails and always yields printable output).
+//
+// Hidden networks have a non-zero uSSIDLength but no usable name; an embedded
+// NUL means those bytes are not a name at all, so leave the buffer empty.
 void
 copy_ssid (const DOT11_SSID &ssid, char *out, size_t out_size)
 {
   out[0] = '\0';
-  if (ssid.uSSIDLength == 0 || ssid.uSSIDLength >= out_size)
+  if (ssid.uSSIDLength == 0 || ssid.uSSIDLength >= 32)
     return;
 
-  bool printable = true;
   for (ULONG i = 0; i < ssid.uSSIDLength; i++) {
-    if (ssid.ucSSID[i] == 0) {
-      printable = false;
-      break;
-    }
+    if (ssid.ucSSID[i] == 0)
+      return;   // hidden network: opaque bytes, not a name
   }
-  if (!printable)
-    return;
 
-  memcpy (out, ssid.ucSSID, ssid.uSSIDLength);
-  out[ssid.uSSIDLength] = '\0';
+  const int len = static_cast<int>(ssid.uSSIDLength);
+  wchar_t wide[33] = {};
+  int wide_len = MultiByteToWideChar (CP_UTF8, 0,
+                                      reinterpret_cast<const char *> (ssid.ucSSID),
+                                      len, wide, 32);
+  if (wide_len <= 0) {
+    // Not valid UTF-8 — widen as Latin-1 so the name is still readable.
+    MultiByteToWideChar (CP_ACP, 0,
+                         reinterpret_cast<const char *> (ssid.ucSSID),
+                         len, wide, 32);
+    wide_len = len;
+  }
+  wide[wide_len] = L'\0';
+
+  WideCharToMultiByte (CP_UTF8, 0, wide, -1, out,
+                       static_cast<int> (out_size), nullptr, nullptr);
 }
 
 // Fetch the interface list; caller frees with WlanFreeMemory.
@@ -242,16 +266,39 @@ winome_wifi_scan (WinomeWifiNetwork **out, guint *out_count)
                                              sizeof (WinomeWifiNetwork));
 
       if (result != nullptr) {
-        char current_ssid[33] = "";
+        char current_ssid[97] = "";
         int current_quality = 0;
         query_connection (client, info->InterfaceGuid, current_ssid,
                           sizeof (current_ssid), &current_quality);
 
+        // One entry per BSSID, so an SSID served by several access points
+        // (roaming candidates, mesh) arrives repeatedly. Merge them, keeping
+        // the strongest signal — that is the row GNOME shows.
         for (DWORD i = 0; i < avail->dwNumberOfItems; i++) {
           const WLAN_AVAILABLE_NETWORK &net = avail->Network[i];
-          WinomeWifiNetwork *slot = &result[count];
+          char name[97] = "";
+          copy_ssid (net.dot11Ssid, name, sizeof (name));
 
-          copy_ssid (net.dot11Ssid, slot->ssid, sizeof (slot->ssid));
+          if (name[0] == '\0')
+            continue;   // hidden network: nothing to show in a list
+
+          bool merged = false;
+          for (DWORD k = 0; k < count; k++) {
+            if (strcmp (result[k].ssid, name) == 0) {
+              if ((int) net.wlanSignalQuality > result[k].signal_quality) {
+                result[k].signal_quality = (int) net.wlanSignalQuality;
+                result[k].secured = net.bSecurityEnabled != 0;
+                result[k].connectable = net.bNetworkConnectable != 0;
+              }
+              merged = true;
+              break;
+            }
+          }
+          if (merged)
+            continue;
+
+          WinomeWifiNetwork *slot = &result[count];
+          memcpy (slot->ssid, name, sizeof (name));
           slot->signal_quality = (int) net.wlanSignalQuality;
           slot->secured = net.bSecurityEnabled != 0;
           slot->connectable = net.bNetworkConnectable != 0;

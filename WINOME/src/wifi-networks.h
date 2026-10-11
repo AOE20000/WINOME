@@ -12,7 +12,10 @@
 #include <glib.h>
 
 typedef struct {
-  char     ssid[33];       // UTF-8 network name, "" when unknown/hidden
+  // UTF-8, NUL-terminated. A 32-byte SSID can expand to 96 bytes when every
+  // byte is multi-byte UTF-8, so this is sized for the worst case; "" when
+  // the network is hidden or its name cannot be decoded.
+  char     ssid[97];
   int      signal_quality; // 0..100
   gboolean connected;      // associated with this network right now
   gboolean secured;        // requires a key
@@ -21,7 +24,7 @@ typedef struct {
 
 // One wireless interface's current association.
 typedef struct {
-  char     ssid[33];
+  char     ssid[97];
   int      signal_quality;
   gboolean connected;      // the radio is associated
   gboolean enabled;        // the interface itself is on (radio not off)

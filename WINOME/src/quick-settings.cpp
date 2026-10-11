@@ -1496,7 +1496,7 @@ winome_quick_settings_new (void)
     // Wi-Fi lists the visible networks (via the Wlan API) and connects on
     // click; Bluetooth and Keyboard keep their arrows but stay inert until the
     // Bluetooth radio API lands.
-    char ssid[33] = "";
+    char ssid[97] = "";
     bool have_name = winome::get_network_name (ssid, sizeof (ssid));
     wlan = make_quick_menu_toggle ("network-wireless-symbolic",
                                    tr ("Wi-Fi", "无线网络"),

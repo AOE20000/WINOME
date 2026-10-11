@@ -149,11 +149,17 @@ ninja -C build
   菜单里按 GNOME 格式渲染 `SSID   72%`，加密网络用锁形图标
 - **切换网络**：`WlanConnect` 用已存 profile 连接，不弹凭据框；关联是异步的，
   由 2s 状态轮询自然刷新，不额外起回调
-- **隐藏网络**：SSID 含 NUL 字节时不解码，`get_network_name` 返回 false，
-  子标题显示 "Not Connected"
-- **无网卡机器**：`WlanOpenHandle` 返回 `ERROR_INVALID_PARAMETER`（87）时整个模块
-  安静失败——Wi-Fi 菜单不出现、指示器隐藏。这条降级路径已在无无线网卡的机器上实测
-  （`wlanapi.dll` 能加载、入口点能解析，但接口枚举为 0）
+- **SSID 编码**：`ucSSID` 是**原始字节**而非文本，802.11 规范不规定编码；实际部署
+  中 UTF-8（Windows 对中文 SSID 就是这么编码）与 Latin-1 都有。`uSSIDLength` 是
+  **字节数**，所以直接 memcpy 只对 ASCII 安全——4 个汉字是 12 字节，会截断成乱码。
+  `copy_ssid` 先按 UTF-8 校验（有效则保留），失败再按 Latin-1 展开（永不失败）；
+  含 NUL 字节则判定为隐藏网络（字节不是名字），留空不显示
+- **SSID 缓冲区 97 字节**：32 字节 SSID 若全为多字节 UTF-8 展开可达 96 字节
+- **同 SSID 去重**：Windows 按 BSSID 返回条目，一个 SSID 被多个 AP
+  （漫游候选、mesh）广播时会出现多行。合并同名，保留最强信号
+- **列表范围受 Windows 扫描缓存影响**：实测同一接口有时返回完整列表（含周边
+  多个网络），有时只返回当前连接的 AP 的若干 BSSID。这是驱动侧行为，
+  `dwFlags` 不影响（文档中该参数为保留位），菜单每次打开重新查询即可
 
 ### 虚拟桌面（`src/virtual-desktop.cpp`）
 
