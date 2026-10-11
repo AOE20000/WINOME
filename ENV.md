@@ -41,6 +41,41 @@ ninja -C build
 ./build/src/winome.exe   # 需管理员权限运行
 ```
 
+### 已知问题：gcc-ar 静默归档失败
+
+现象：`ninja` 报 `FAILED: [code=1] st-compat/libstcompat.a`，**没有任何错误输出**，
+且失败点在链接第一步（归档），后续步骤全部连带中止。
+
+原因：本机（中文用户名路径）`gcc-ar` 覆盖已存在的 `libstcompat.a` 时静默失败。
+与源码无关——逐个 `.obj` 归档都成功、27 个 obj 齐全，只有覆盖写目标 `.a` 时挂。
+
+对策：`build.sh` 已在每次 ninja 之前自动删除该归档（`clean_stale_static_lib`）。
+**若手动调 ninja 遇到同样报错，先 `rm build/st-compat/libstcompat.a` 再重编**，
+不要误判为源码错误。正常归档约 1.4MB，若你的 `.a` 只有十几 KB 基本可以确定已损坏。
+
+### 已知问题：LTO 链接失败（仅 release 方案）
+
+现象：
+
+```
+lto1.exe: fatal error: could not open symbol resolution file: No such file or directory
+lto-wrapper.exe: fatal error: cc returned 1 exit status
+```
+
+原因：LTO 链接时 gcc 把临时目录原样传给原生 `collect2.exe` / `lto1.exe`，
+后者按 **Win32 路径**解析。`build.sh` 早期设的 `TMP=/tmp` 是 MSYS 风格路径，
+原生程序无法解析，在中文用户名下直接失败。只有 `b_lto=true` 的 release 方案受影响，
+`test`（debugoptimized）不走 LTO 所以一直正常——这也是该问题长期没暴露的原因。
+
+对策：`TMP/TEMP/TMPDIR` 必须设为 **Windows 绝对 ASCII 路径**，现默认为 `E:\tmp_winome`。
+可用环境变量覆盖：
+
+```bash
+WINOME_TMP='D:\some\ascii\path' ./build.sh release
+```
+
+手动调 ninja 时同样要带上，否则 LTO 链接必挂。
+
 ## 环境变量（已写入用户级）
 
 - `MSYS2_ROOT=E:\msys64`

@@ -21,8 +21,16 @@ set -euo pipefail
 
 # MSYS2 UCRT64 工具链；中文用户名下 gcc 的临时目录必须重定向到 ASCII 路径，
 # 否则汇编阶段报 "can't create ... .o" (见项目备忘)。
+#
+# 注意 TMP 必须是 **Windows 绝对路径**（E:\...），不能是 MSYS 风格的 /tmp：
+# LTO 链接时 gcc 把临时目录原样传给原生 collect2.exe/lto1.exe，
+# 后者按 Win32 路径解析，收到 "/tmp" 会在中文用户名下报
+#   lto1.exe: fatal error: could not open symbol resolution file
+# 该故障只在 b_lto=true 的 release 方案出现，debugoptimized 不走 LTO 故不受影响。
 export PATH=/ucrt64/bin:$PATH
-export TMP=/tmp TEMP=/tmp TMPDIR=/tmp
+WINOME_TMP="${WINOME_TMP:-E:\\tmp_winome}"
+mkdir -p "$WINOME_TMP" 2>/dev/null || true
+export TMP="$WINOME_TMP" TEMP="$WINOME_TMP" TMPDIR="$WINOME_TMP"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJ="$ROOT/WINOME"
@@ -78,6 +86,23 @@ scheme_status() {
 }
 
 # --- 核心动作 -----------------------------------------------------------------
+
+# gcc-ar 在本机（中文用户名路径）覆盖已存在的 libstcompat.a 时会静默失败：
+# 退出码 1 且没有任何 stderr，ninja 只报 "FAILED: [code=1] st-compat/libstcompat.a"。
+# 症状与源码无关——27 个 .obj 齐全、逐个归档都成功，只有覆盖写目标 .a 时挂。
+# 已在 build/ 与 build-release/ 各复现一次（均为 8/27 的残缺产物，约 14.6KB，
+# 正常应为 1.4MB 量级）。
+#
+# 归档是可再生的中间产物，删掉最省事；在 ninja 之前无条件清掉，避免每次切换
+# 构建方案都要手工 rm。
+clean_stale_static_lib() {
+  local dir=$1 lib="$1/st-compat/libstcompat.a"
+  if [ -f "$lib" ]; then
+    rm -f "$lib"
+    info "已清理陈旧的 st-compat/libstcompat.a（规避 gcc-ar 静默归档失败）"
+  fi
+}
+
 do_build() {
   local key=$1
   scheme_info "$key" || { fail "未知方案: $key"; exit 1; }
@@ -100,6 +125,8 @@ do_build() {
     #  会把 builddir 误判为 sourcedir 而失败)
     (cd "$PROJ" && meson setup --reconfigure "${MESON_OPTS[@]}" "$DIR")
   fi
+
+  clean_stale_static_lib "$dir"
 
   ninja -C "$dir"
 

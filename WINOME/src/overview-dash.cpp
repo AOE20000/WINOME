@@ -207,12 +207,15 @@ window_exe_path (HWND hwnd)
 {
   DWORD pid = 0;
   GetWindowThreadProcessId (hwnd, &pid);
+  // `return {}` rather than `return L""`: GCC's LTO whole-program analysis
+  // misjudges the empty wide literal's length and emits -Wstringop-overread
+  // while inlining the wstring copy. Behaviour is identical.
   if (pid == 0)
-    return L"";
+    return {};
 
   HANDLE process = OpenProcess (PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
   if (process == nullptr)
-    return L"";
+    return {};
 
   wchar_t path[MAX_PATH];
   DWORD size = MAX_PATH;
