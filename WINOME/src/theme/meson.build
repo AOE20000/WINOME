@@ -25,12 +25,12 @@ gnome_shell_gtk4_css = custom_target('gnome-shell-gtk4.css',
   input: files('gnome-shell-dark.css'),
   output: 'gnome-shell-gtk4.css',
   command: [
-    python, meson.source_root() / 'tools' / 'convert-st-css.py',
+    python, meson.project_source_root() / 'tools' / 'convert-st-css.py',
     '@INPUT@', '@OUTPUT@',
   ],
   env: {'ST_CSS_EVAL': st_css_eval.full_path()},
   depends: [st_css_eval],
-  depend_files: [meson.source_root() / 'tools' / 'convert-st-css.py'],
+  depend_files: [meson.project_source_root() / 'tools' / 'convert-st-css.py'],
   build_by_default: true,
 )
 
