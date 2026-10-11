@@ -118,9 +118,22 @@ ninja -C build
   设为 **`GTK_PHASE_CAPTURE`** 并在 `pressed` 里 `gtk_gesture_set_state(CLAIMED)`，
   确保点箭头开菜单**不会**误触发开关
 - **浮层是真窗口**：`winome_shell_panel_open_menu()` 复用快速设置那套自绘顶层窗口
-  （shadow-wrap 卡片 + `WH_MOUSE_LL` 外部点击关闭 + 置顶重断言 + Cantarell 字体表）。
-  定位与快速设置/日历不同：`anchored_menu` 模式下贴锚点**右缘**、位于锚点**正下方**
-  （GNOME 用 Clutter Y 约束绑在胶囊上），并按显示器边界钳制
+  （shadow-wrap 卡片 + `WH_MOUSE_LL` 外部点击关闭 + 置顶重断言 + Cantarell 字体表）
+- **定位照抄 `BoxPointer._reposition()`**（`upstream/js/ui/boxpointer.js:480`）：
+  ```
+  margin  = 4*arrow_border_radius + arrow_border_width + arrow_base = 109
+  resX = anchorCenterX - (margin/2 + (width - margin) * alignment)   // alignment 0.5
+  resX = clamp(resX, workarea.x + arrow_rise,
+                    workarea.x + workarea.width - (arrow_rise + width))
+  resY = anchorBottom + boxpointer_gap                                // 4px
+  ```
+  主题值：`-arrow-rise 10px`、`-boxpointer-gap 4px`、`-arrow-border-radius 22px`、
+  `-arrow-border-width 1px`、`-arrow-base 20px`。
+  ⚠️ **不能简单按锚点右缘对齐**——`margin/2` 有 54px，照右缘放会整体偏出屏幕左缘
+- **卡片只有一层**：上游 `.quick-toggle-menu { @extend %card }`（`#47474c` 底、
+  24px 圆角、`margin: 12px 0 0`）**本身就是卡片**，条目直接放在
+  `.popup-menu-box` 里。若再套一层 `.popup-menu-content` 或
+  `.quick-settings-popover-card`，会出现双层圆角底色（截图里的发灰边框）
 - **锚点取整颗胶囊**：`panel_popover_anchor_rect` 对菜单会向上找到
   `GtkToggleButton`，否则点胶囊别处会立刻把刚开的菜单关掉
 - **菜单每次打开重建**：`object-select-symbolic` 勾选标记因此始终反映当前电源方案

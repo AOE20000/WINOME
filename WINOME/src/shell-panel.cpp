@@ -518,6 +518,27 @@ panel_popover_anchor_rect (PanelPopover *pp)
   }
 }
 
+// BoxPointer metrics, from the theme (popovers.scss / _popovers.scss):
+//   -boxpointer-gap 4px, -arrow-rise 10px,
+//   -arrow-border-radius 22px, -arrow-border-width 1px, -arrow-base 20px
+// which is how BoxPointer._reposition() derives them:
+//
+//   margin  = 4 * arrow_border_radius + arrow_border_width + arrow_base = 109
+//   gap     = boxpointer_gap                                          = 4
+//   padding = arrow_rise                                              = 10
+//
+//   resX = sourceCenterX - (margin/2 + (natWidth - margin) * alignment)
+//   resX = clamp(resX, workarea.x + padding,
+//                     workarea.x + workarea.width - (padding + natWidth))
+//   resY = sourceBottomRight.y + gap
+//
+// alignment 0.5 (the default _arrowAlignment) centres the menu's arrow slot on
+// the anchor's centre; the rest is the room the arrow + shadow needs, which is
+// why right-aligning to the anchor's edge lands ~margin/2 off-screen.
+#define BOXPOINTER_MARGIN  109
+#define BOXPOINTER_GAP     4
+#define BOXPOINTER_PADDING 10
+
 // Compute the popover's top-left corner (screen coordinates, physical px).
 // Returns FALSE if the geometry could not be determined.
 static gboolean
@@ -543,10 +564,11 @@ panel_popover_geometry (PanelPopover *pp, int width, int height,
   // Right-align for the quick settings; center on the clock for the calendar.
   int x;
   if (pp->anchored_menu) {
-    // Secondary menu: flush with the anchor's right edge so it reads as
-    // hanging off the arrow that opened it (upstream binds it to the
-    // capsule with a Clutter constraint on Y only).
-    x = pp->anchor_rect.right - width;
+    // BoxPointer._reposition(): centre the menu's arrow slot on the anchor's
+    // centre, then clamp inside the monitor.
+    const int anchor_center_x = (pp->anchor_rect.left + pp->anchor_rect.right) / 2;
+    x = anchor_center_x -
+        (BOXPOINTER_MARGIN / 2 + (width - BOXPOINTER_MARGIN) / 2);
   } else if (pp->centered) {
     x = (pp->anchor_rect.left + pp->anchor_rect.right) / 2 - width / 2;
   } else {
@@ -555,19 +577,21 @@ panel_popover_geometry (PanelPopover *pp, int width, int height,
 
   int y;
   if (pp->anchored_menu) {
-    // Directly under the anchor (the toggle capsule), not under the panel.
-    y = pp->anchor_rect.bottom;
+    // Directly under the anchor capsule, separated by the boxpointer gap.
+    y = pp->anchor_rect.bottom + BOXPOINTER_GAP;
   } else {
     // A stable gap below the panel (the panel spans the monitor top).
     y = pr.bottom + POPOVER_TOP_GAP;
   }
 
-  // Clamp inside the monitor, preserving the side gaps. A secondary menu is
-  // clamped to the monitor top rather than below the panel, so it may sit
-  // beside the bar when the anchor is high on the screen.
-  int x_min = wa.left + POPOVER_SCREEN_GAP;
-  int x_max = MAX (x_min, wa.right - width - POPOVER_SCREEN_GAP);
-  int y_min = pp->anchored_menu ? wa.top + POPOVER_SCREEN_GAP
+  // Clamp inside the monitor. The menu uses the arrow padding (10px) rather
+  // than the panel-bar gap, matching BoxPointer's own bounds.
+  int x_min = wa.left + (pp->anchored_menu ? BOXPOINTER_PADDING
+                                           : POPOVER_SCREEN_GAP);
+  int x_max = MAX (x_min, wa.right - width -
+                   (pp->anchored_menu ? BOXPOINTER_PADDING
+                                      : POPOVER_SCREEN_GAP));
+  int y_min = pp->anchored_menu ? wa.top + BOXPOINTER_PADDING
                                 : pr.bottom + POPOVER_TOP_GAP;
   int y_max = MAX (y_min, wa.bottom - height - POPOVER_SCREEN_GAP);
   *out_x = CLAMP (x, x_min, x_max);
@@ -936,10 +960,10 @@ winome_shell_panel_open_menu (GtkWidget *anchor, GtkWidget *menu)
   gtk_widget_add_css_class (wrap, "quick-settings-popover-shadow-wrap");
   pp->wrap = wrap;
 
-  pp->card = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
-  gtk_widget_add_css_class (pp->card, "quick-settings-popover-card");
-  gtk_box_append (GTK_BOX (pp->card), menu);
-  gtk_box_append (GTK_BOX (wrap), pp->card);
+  // The menu IS the card upstream (`.quick-toggle-menu { @extend %card }`), so
+  // put it in the shadow-wrap directly. Wrapping it in the quick-settings card
+  // would nest two rounded backgrounds.
+  gtk_box_append (GTK_BOX (wrap), menu);
   gtk_window_set_child (GTK_WINDOW (pp->window), wrap);
 
   // Same font map as the panel so em-based values resolve identically.

@@ -196,22 +196,23 @@ static GtkWidget *
 build_quick_menu (const WinomeMenuEntry *entries, guint n_entries)
 {
   GtkWidget *menu;
-  GtkWidget *content;
   GtkWidget *box;
   guint i;
 
+  // Upstream: `.quick-toggle-menu { @extend %card; border-radius:
+  // $base_border_radius * 3; margin: $base_padding * 2 0 0; }` — the menu
+  // IS the card, not a card wrapped around a .popup-menu-content. Nesting the
+  // content box inside the card paints two rounded backgrounds and reads as a
+  // washed-out double border, so keep a single layer.
   menu = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
-  gtk_widget_add_css_class (menu, "popup-menu");
-  // The menu sizes to its contents; .popup-menu-content carries the 20px radius.
+  gtk_widget_add_css_class (menu, "quick-toggle-menu");
   gtk_widget_set_halign (menu, GTK_ALIGN_START);
 
-  content = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
-  gtk_widget_add_css_class (content, "popup-menu-content");
-  gtk_box_append (GTK_BOX (menu), content);
-
+  // Items live straight in the card's box; `.popup-menu-box` carries the
+  // vertical rhythm between rows.
   box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
   gtk_widget_add_css_class (box, "popup-menu-box");
-  gtk_box_append (GTK_BOX (content), box);
+  gtk_box_append (GTK_BOX (menu), box);
 
   for (i = 0; i < n_entries; i++) {
     GtkWidget *item = make_quick_menu_item (&entries[i]);
