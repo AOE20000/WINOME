@@ -3,6 +3,7 @@
 // Windows data sources for the GNOME-style system status indicators.
 
 #include "system-status.h"
+#include "wifi-networks.h"
 
 #include <windows.h>
 #include <wininet.h>
@@ -125,7 +126,16 @@ bool toggle_mute() {
 }
 
 bool get_network_connected(bool* out) {
-  // Use InternetGetConnectedState to detect any network connectivity.
+  // Prefer the WLAN association when a wireless interface exists: it answers
+  // "is this machine on Wi-Fi", which is what the indicator means. Fall back
+  // to any-connection for desktops with an Ethernet-only link.
+  WinomeWifiStatus wifi;
+  if (winome_wifi_get_status(&wifi) && wifi.enabled) {
+    if (out != nullptr)
+      *out = wifi.connected;
+    return true;
+  }
+
   DWORD flags = 0;
   BOOL connected = InternetGetConnectedState(&flags, 0);
   if (out != nullptr)
@@ -134,24 +144,40 @@ bool get_network_connected(bool* out) {
 }
 
 bool get_network_name(char* out, int out_size) {
-  // A full WLAN SSID query needs the Wlan API; for now report a generic label.
-  bool connected = false;
-  if (!get_network_connected(&connected) || !connected) {
+  if (out != nullptr && out_size > 0)
+    out[0] = '\0';
+
+  WinomeWifiStatus wifi;
+  if (winome_wifi_get_status(&wifi) && wifi.connected) {
+    if (wifi.ssid[0] == '\0')
+      return false;   // associated with a hidden network: no name to show
     if (out != nullptr && out_size > 0)
-      out[0] = '\0';
-    return false;
+      snprintf(out, out_size, "%s", wifi.ssid);
+    return true;
   }
+
+  // Not on Wi-Fi. Fall back to the generic label when some other link is up,
+  // so the menu still says something useful on Ethernet.
+  bool connected = false;
+  if (!get_network_connected(&connected) || !connected)
+    return false;
   if (out != nullptr && out_size > 0)
     snprintf(out, out_size, "%s", "Connected");
   return true;
 }
 
 bool get_wifi_enabled(bool* out) {
-  // A simple approximation: Wi-Fi is considered enabled when a wireless
-  // connection exists. Full radio toggle requires WlanSetInterface which is
-  // out of scope for now.
+  WinomeWifiStatus wifi;
+  if (!winome_wifi_get_status(&wifi)) {
+    // No wireless interface at all (desktop, or wlanapi.dll absent). Report
+    // "enabled" so the toggle keeps its GNOME default-on appearance rather
+    // than claiming the radio is off on a machine that has none.
+    if (out != nullptr)
+      *out = true;
+    return true;
+  }
   if (out != nullptr)
-    *out = true;
+    *out = wifi.enabled;
   return true;
 }
 

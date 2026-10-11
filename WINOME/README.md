@@ -46,7 +46,7 @@ ninja -C build
 - [x] 面板隐藏于 Alt-Tab 与任务栏（`WS_EX_TOOLWINDOW`，GDK 重置后周期性重断言）
 - [x] 宿主为 GUI 程序（`win_subsystem: 'windows'`），stdout/stderr 写入 `%TEMP%\winome.log`
 - [x] 快速设置面板：GNOME 完整布局——电量+操作按钮顶行、音量/亮度滑块（整行，accent 进度 + 白色圆手柄）、8 个开关（WLAN/蓝牙/电源模式/夜间模式/深色主题/勿扰/键盘/飞行模式，菜单型开关带 `>` 分隔 + 二级箭头，accent 选中态）
-- [x] 真实数据源：电量（`GetSystemPowerStatus`）、音量（WASAPI `IAudioEndpointVolume`，滑块实时调节 + 图标动态）、网络（`InternetGetConnectedState`）、锁屏（`LockWorkStation`）
+- [x] 真实数据源：电量（`GetSystemPowerStatus`）、音量（WASAPI `IAudioEndpointVolume`，滑块实时调节 + 图标动态）、网络（**Wlan API**：SSID + 信号强度 + 可见网络枚举/切换，见下方 Wi-Fi 章节）、锁屏（`LockWorkStation`）
 - [x] 时钟 UTF-8 修复（改用 `GDateTime`，避免 strftime 的 GBK `%p` 触发 Pango 报错）
 - [x] 快捷键：Win = 概览、**左上角热角** = 打开概览、Win+Tab = 开始菜单、其余 Win 组合键/Alt+Tab 透传、Esc = 关闭概览
 - [x] 快速设置/日历弹出窗重新接入（点击状态区打开快速设置、点击时钟打开日历）：自绘无边框顶层窗口，右侧对齐/时钟居中、面板下方 8px + 屏幕侧边 12px 稳定间隙；WH_MOUSE_LL 钩子处理外部点击关闭；打开时置顶（概览上方）；概览打开时自动关闭弹出窗、面板/弹出窗上的点击不转发给概览
@@ -60,7 +60,8 @@ ninja -C build
 - [x] 概览内可打开快速设置/日历（弹出窗浮于概览之上，关闭弹窗的外部点击不再连带关闭概览——对应 GNOME 菜单 grab 吞点击）
 - [x] 性能优化：动画走帧时钟（vblank 对齐）、z-order 重排漂移门控、状态图标跳过无谓重绘、悬停药丸位置守卫、发布构建 LTO + NDEBUG（详见下方「性能」章节）
 - [x] **快速设置二级菜单**（`quick-settings.cpp` + `power-modes.cpp`）：`.quick-toggle-menu-button` 的 `>` 箭头接上真实点击回调，复用主题已有的 `.popup-menu` / `.popup-menu-item`（20px 圆角卡片 + 12px 条目圆角）渲染二级菜单浮层；**电源模式菜单**（节能/均衡/性能，`PowrProf` 切换 Windows 电源方案，当前方案打勾）与**电源菜单**（挂起/注销/重启/关机，接 `.power-item` 电池胶囊点击）
-- [ ] 二级菜单（WLAN 网络/蓝牙设备，日历面板重构，网络/蓝牙真实数据）
+- [x] **Wi-Fi 二级菜单**（`quick-settings.cpp` + `wifi-networks.cpp`）：列出可见网络（`SSID   72%` 格式、加密网络用锁形图标、当前网络打勾），点击用已存 profile 连接（`WlanConnect`，不弹凭据框，对应 GNOME 对已保存网络的行为）；开关子标题显示真实 SSID，隐藏网络显示 "Not Connected"
+- [ ] 二级菜单（蓝牙设备，日历面板重构，蓝牙真实数据）
 - [ ] 概览搜索（应用/窗口检索）
 
 ## 快捷键
@@ -123,6 +124,26 @@ ninja -C build
 - **电源菜单**：挂起（`SetSuspendState`）/ 注销 / 重启 / 关机，挂在 `.power-item`
   电池胶囊上（GNOME 的电源入口），保持原布局不加 `>` 箭头
 - WLAN / 蓝牙 / 键盘三个箭头暂为装饰，等 Wlan API 与蓝牙 API 接入（见待办）
+
+### Wi-Fi 数据源（`wifi-networks.cpp`）
+
+系统状态里的网络指示器与 Wi-Fi 二级菜单共用这个模块，基于原生 Wlan API：
+
+- **`wlanapi.dll` 动态加载**：该 DLL 由系统按需加载，无线网卡的机器上才有；直接静态
+  链接会让无网卡机器启动失败（`LoadLibrary` 进不去）。用 `LoadLibraryW` +
+  `GetProcAddress` 解析 `WlanOpenHandle`/`WlanEnumInterfaces`/`WlanQueryInterface`/
+  `WlanGetAvailableNetworkList`/`WlanConnect`/`WlanDisconnect`/`WlanFreeMemory`，
+  缺失时整个模块安静降级（指示器隐藏、箭头菜单不出现）
+- **进程级客户端句柄**：`WlanOpenHandle` 有驱动往返开销且是会话级的，开一次后常驻，
+  不在每次查询时开关
+- **取当前连接**：`WlanQueryInterface(wlan_intf_opcode_current_connection)` 拿
+  `WLAN_CONNECTION_ATTRIBUTES`，SSID + `wlanSignalQuality`（0..100）
+- **枚举可见网络**：`WlanGetAvailableNetworkList`（第三参是保留位，传 0），
+  菜单里按 GNOME 格式渲染 `SSID   72%`，加密网络用锁形图标
+- **切换网络**：`WlanConnect` 用已存 profile 连接，不弹凭据框；关联是异步的，
+  由 2s 状态轮询自然刷新，不额外起回调
+- **隐藏网络**：SSID 含 NUL 字节时不解码，`get_network_name` 返回 false，
+  子标题显示 "Not Connected"
 
 ### 虚拟桌面（`src/virtual-desktop.cpp`）
 

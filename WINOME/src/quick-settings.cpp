@@ -12,6 +12,7 @@
 #include "quick-settings.h"
 #include "system-status.h"
 #include "power-modes.h"
+#include "wifi-networks.h"
 
 #include <stdio.h>
 #include <math.h>
@@ -1241,6 +1242,124 @@ on_power_mode_activate (gpointer user_data)
     winome_quick_settings_refresh (t->panel);
 }
 
+// Wi-Fi secondary menu: the visible networks with the associated one checked.
+// Clicking a row asks Windows to connect using its stored profile; we do not
+// prompt for credentials, matching GNOME's behaviour for saved networks.
+typedef struct {
+  GtkWidget *panel;              // quick settings root, for refresh
+  GPtrArray *networks;           // WinomeWifiNetwork*, owned
+  GPtrArray *labels;             // char* row labels, owned
+  GPtrArray *rows;               // WifiRowTarget*, owned (one per row)
+} WifiMenu;
+
+static void
+wifi_menu_free (gpointer data)
+{
+  WifiMenu *m = static_cast<WifiMenu *>(data);
+  if (m == nullptr)
+    return;
+  if (m->rows != NULL) {
+    for (guint i = 0; i < m->rows->len; i++)
+      g_free (g_ptr_array_index (m->rows, i));
+    g_ptr_array_free (m->rows, TRUE);
+  }
+  if (m->labels != NULL) {
+    for (guint i = 0; i < m->labels->len; i++)
+      g_free (g_ptr_array_index (m->labels, i));
+    g_ptr_array_free (m->labels, TRUE);
+  }
+  if (m->networks != NULL) {
+    for (guint i = 0; i < m->networks->len; i++)
+      g_free (g_ptr_array_index (m->networks, i));
+    g_ptr_array_free (m->networks, TRUE);
+  }
+  g_free (m);
+}
+
+// Row activation: each row gets its own index into the menu's network array so
+// the callback knows which SSID was clicked.
+typedef struct {
+  WifiMenu *menu;
+  guint     index;
+} WifiRowTarget;
+
+// Clicking a row connects; the row target is recycled rather than freed so a
+// menu row can be activated more than once (they are not: the popup is torn
+// down on the next open, and the free func below releases whatever is left).
+static void
+on_wifi_network_activate (gpointer user_data)
+{
+  WifiRowTarget *row = static_cast<WifiRowTarget *> (user_data);
+  if (row == nullptr || row->menu == nullptr || row->menu->networks == nullptr)
+    return;
+  if (row->index >= row->menu->networks->len)
+    return;
+
+  const WinomeWifiNetwork *net = static_cast<const WinomeWifiNetwork *>
+      (g_ptr_array_index (row->menu->networks, row->index));
+
+  // Association is asynchronous — Windows does the work in the background, so
+  // just issue the request and let the 2s status poll pick up the result.
+  winome_wifi_connect (net->ssid);
+}
+
+static GtkWidget *
+build_wifi_menu (gpointer user_data)
+{
+  GtkWidget *panel = GTK_WIDGET (user_data);
+  WinomeWifiNetwork *list = nullptr;
+  guint count = 0;
+
+  if (!winome_wifi_scan (&list, &count) || list == nullptr)
+    return NULL;
+
+  if (count == 0) {
+    winome_wifi_free_networks (list);
+    return NULL;   // radio on, nothing in range: leave the arrow inert
+  }
+
+  WifiMenu *m = g_new0 (WifiMenu, 1);
+  m->panel = panel;
+  m->networks = g_ptr_array_new_with_free_func (g_free);
+  m->labels = g_ptr_array_new_with_free_func (g_free);
+  m->rows = g_ptr_array_new_with_free_func (g_free);
+
+  for (guint i = 0; i < count; i++) {
+    WinomeWifiNetwork *net = g_new0 (WinomeWifiNetwork, 1);
+    *net = list[i];
+    g_ptr_array_add (m->networks, net);
+
+    // GNOME renders "SSID   72%" for network rows.
+    g_ptr_array_add (m->labels,
+                     g_strdup_printf ("%s   %d%%", list[i].ssid,
+                                      list[i].signal_quality));
+  }
+  winome_wifi_free_networks (list);
+
+  WinomeMenuEntry *items = g_new0 (WinomeMenuEntry, count);
+  for (guint i = 0; i < count; i++) {
+    const WinomeWifiNetwork *net =
+        static_cast<const WinomeWifiNetwork *> (g_ptr_array_index (m->networks, i));
+    WifiRowTarget *row = g_new0 (WifiRowTarget, 1);
+
+    row->menu = m;
+    row->index = i;
+    g_ptr_array_add (m->rows, row);
+
+    items[i].label = static_cast<const char *> (g_ptr_array_index (m->labels, i));
+    items[i].icon_name = net->secured ? "network-wireless-secured-symbolic"
+                                      : "network-wireless-symbolic";
+    items[i].checked = net->connected;
+    items[i].callback = on_wifi_network_activate;
+    items[i].user_data = row;
+  }
+
+  GtkWidget *menu = build_quick_menu (items, count);
+  g_object_set_data_full (G_OBJECT (menu), "wifi-menu", m, wifi_menu_free);
+  g_free (items);
+  return menu;
+}
+
 static GtkWidget *
 build_power_mode_menu (gpointer user_data)
 {
@@ -1366,12 +1485,15 @@ winome_quick_settings_new (void)
         (detected == WINOME_POWER_MODE_COUNT) ? WINOME_POWER_BALANCED
                                               : detected;
 
-    // WLAN / Bluetooth / Keyboard keep the arrow decoration but no menu yet:
-    // they need the Wlan API and the Bluetooth radio API (phase 2).
+    // Wi-Fi lists the visible networks (via the Wlan API) and connects on
+    // click; Bluetooth and Keyboard keep their arrows but stay inert until the
+    // Bluetooth radio API lands.
+    char ssid[33] = "";
+    bool have_name = winome::get_network_name (ssid, sizeof (ssid));
     wlan = make_quick_menu_toggle ("network-wireless-symbolic",
                                    tr ("Wi-Fi", "无线网络"),
-                                   tr ("Connected", "已连接"),
-                                   NULL, NULL);
+                                   have_name ? ssid : tr ("Not Connected", "未连接"),
+                                   build_wifi_menu, root);
     gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (wlan), TRUE);
     winome_quick_settings_grid_attach (grid, wlan, 1);
 
