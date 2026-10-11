@@ -24,3 +24,10 @@ void *winome_shell_panel_top_popover_hwnd (void);
 // consumed by the menu grab: it closes the menu only, so the overview must
 // ignore it instead of closing too (windowPreview/overview click handling).
 int winome_shell_panel_popover_just_closed (void);
+
+// Open a secondary menu (QuickToggleMenu) anchored under @anchor — the
+// ".quick-toggle-menu-button" arrow or the .power-item capsule that produced
+// it. @menu is consumed: the caller keeps its own reference if it still needs
+// one. Closes any menu already open, and is closed by the next click outside,
+// exactly like the quick-settings and calendar popovers.
+void winome_shell_panel_open_menu (GtkWidget *anchor, GtkWidget *menu);

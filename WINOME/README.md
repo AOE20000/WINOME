@@ -114,8 +114,15 @@ ninja -C build
 - **浮层复用主题既有样式**：`gnome-shell-dark.css` 里 `.popup-menu` / `.popup-menu-content`
   （6px padding、`#36363a` 底、20px 圆角）/ `.popup-menu-item`（12px 圆角、active 时
   `lighten(#424247,9%)`）全部齐备，二级菜单直接套用，无需新增 CSS
-- **点击区域独立**：箭头是外层 `GtkToggleButton` 内的 `GtkBox`，挂自己的
-  `GtkGestureClick`（CAPTURE 阶段先于外层 toggle），所以点箭头开菜单**不会**误触发开关
+- **点击区域独立**：箭头是外层 `GtkToggleButton` 内的 `GtkBox`，其 `GtkGestureClick`
+  设为 **`GTK_PHASE_CAPTURE`** 并在 `pressed` 里 `gtk_gesture_set_state(CLAIMED)`，
+  确保点箭头开菜单**不会**误触发开关
+- **浮层是真窗口**：`winome_shell_panel_open_menu()` 复用快速设置那套自绘顶层窗口
+  （shadow-wrap 卡片 + `WH_MOUSE_LL` 外部点击关闭 + 置顶重断言 + Cantarell 字体表）。
+  定位与快速设置/日历不同：`anchored_menu` 模式下贴锚点**右缘**、位于锚点**正下方**
+  （GNOME 用 Clutter Y 约束绑在胶囊上），并按显示器边界钳制
+- **锚点取整颗胶囊**：`panel_popover_anchor_rect` 对菜单会向上找到
+  `GtkToggleButton`，否则点胶囊别处会立刻把刚开的菜单关掉
 - **菜单每次打开重建**：`object-select-symbolic` 勾选标记因此始终反映当前电源方案
 - **电源模式**（`power-modes.cpp`，PowrProf）：三档对应 Windows 三个标准电源方案
   GUID（节能 `a1841308…` / 均衡 `381b4222…` / 性能 `8c5e7fda…`）；均衡在
@@ -144,6 +151,9 @@ ninja -C build
   由 2s 状态轮询自然刷新，不额外起回调
 - **隐藏网络**：SSID 含 NUL 字节时不解码，`get_network_name` 返回 false，
   子标题显示 "Not Connected"
+- **无网卡机器**：`WlanOpenHandle` 返回 `ERROR_INVALID_PARAMETER`（87）时整个模块
+  安静失败——Wi-Fi 菜单不出现、指示器隐藏。这条降级路径已在无无线网卡的机器上实测
+  （`wlanapi.dll` 能加载、入口点能解析，但接口枚举为 0）
 
 ### 虚拟桌面（`src/virtual-desktop.cpp`）
 

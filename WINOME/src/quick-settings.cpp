@@ -13,6 +13,7 @@
 #include "system-status.h"
 #include "power-modes.h"
 #include "wifi-networks.h"
+#include "shell-panel.h"
 
 #include <stdio.h>
 #include <math.h>
@@ -411,7 +412,7 @@ sync_menu_toggle_checked (GtkToggleButton *button, gpointer user_data)
 // the event, so the toggle does not flip — matching GNOME, where `clicked` is
 // bound to the inner St.Button and never reaches the QuickMenuToggle.
 static void
-on_menu_button_pressed (GtkGestureClick *gesture G_GNUC_UNUSED, int n_press,
+on_menu_button_pressed (GtkGestureClick *gesture, int n_press,
                         double x, double y, gpointer user_data)
 {
   MenuToggleParts *parts = static_cast<MenuToggleParts *>(user_data);
@@ -421,6 +422,9 @@ on_menu_button_pressed (GtkGestureClick *gesture G_GNUC_UNUSED, int n_press,
   (void)n_press;
   (void)x;
   (void)y;
+
+  // Consume the press so the enclosing toggle never sees it.
+  gtk_gesture_set_state (GTK_GESTURE (gesture), GTK_EVENT_SEQUENCE_CLAIMED);
 
   if (builder == NULL)
     return;
@@ -432,23 +436,23 @@ on_menu_button_pressed (GtkGestureClick *gesture G_GNUC_UNUSED, int n_press,
   // The panel takes ownership and anchors the popup under the arrow.
   QuickMenuOpenFunc open_func =
       static_cast<QuickMenuOpenFunc> (parts->menu_open_func);
+  // The panel takes ownership of the popup (it parents it into the menu
+  // window), so drop our reference here.
   if (open_func != NULL)
     open_func (parts->menu_button_part, menu, parts->menu_open_data);
-
-  g_object_unref (menu);
+  else
+    g_object_unref (menu);
 }
 
-// Default anchor: keep the popup alive as the arrow's own child so it renders
-// directly under the capsule. The panel later replaces this with a toplevel
-// window anchored in screen coordinates (see shell-panel.cpp).
+// The panel owns menu windows: it reuses the popover chrome, screen
+// positioning, outside-click dismissal and topmost reassert, so a menu behaves
+// like the quick settings and calendar popovers.
 static void
 default_quick_menu_open (GtkWidget *arrow, GtkWidget *menu, gpointer user_data)
 {
   (void)user_data;
 
-  g_object_set_data_full (G_OBJECT (arrow), "quick-menu-popup",
-                          g_object_ref_sink (menu), g_object_unref);
-  gtk_widget_set_visible (menu, TRUE);
+  winome_shell_panel_open_menu (arrow, menu);
 }
 
 static GtkWidget *
@@ -563,6 +567,11 @@ make_quick_menu_toggle (const char *icon_name, const char *title,
     GtkGesture *click = gtk_gesture_click_new ();
 
     gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), 0);
+    // CAPTURE, so the arrow's press is consumed before the enclosing
+    // GtkToggleButton can act on it: clicking ">" must open the menu without
+    // flipping the capsule state.
+    gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (click),
+                                                GTK_PHASE_CAPTURE);
     g_signal_connect (click, "pressed",
                       G_CALLBACK (on_menu_button_pressed), parts);
     gtk_widget_add_controller (menu_button, GTK_EVENT_CONTROLLER (click));
@@ -1218,7 +1227,6 @@ on_power_item_clicked (GtkButton *button, gpointer user_data)
   if (menu == NULL)
     return;
   default_quick_menu_open (GTK_WIDGET (button), menu, NULL);
-  g_object_unref (menu);
 }
 
 // Per-toggle menu context: the builder callback gets a pointer back to the

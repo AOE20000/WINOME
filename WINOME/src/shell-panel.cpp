@@ -408,6 +408,9 @@ typedef struct {
   GtkWidget *card;
   gboolean open;
   gboolean centered;       // calendar: center on the button (quick settings right-aligns)
+  // Secondary menu: hang directly under the anchor's right edge instead of
+  // under the panel bar (QuickToggleMenu anchors to the toggle capsule).
+  gboolean anchored_menu;
   RECT anchor_rect;        // the button's screen rect, for the close hook
   gint raise_attempts;     // post-map re-assert counter (GDK re-lates late)
 } PanelPopover;
@@ -475,12 +478,25 @@ panel_popover_hwnd (PanelPopover *pp)
   return static_cast<HWND> (gdk_win32_surface_get_handle (surface));
 }
 
-// The anchor button's screen rect (used to keep the popover open when the user
-// clicks the button again, and to center the calendar on the clock).
+// The anchor's screen rect. For a secondary menu the anchor is the arrow box
+// inside the capsule, but the capsule is what the user considers "the button":
+// widen to the whole QuickMenuToggle so clicking the toggle row does not
+// dismiss a menu the arrow just opened.
 static void
 panel_popover_anchor_rect (PanelPopover *pp)
 {
-  GtkWidget *root = GTK_WIDGET (gtk_widget_get_root (pp->button));
+  GtkWidget *anchor = pp->button;
+  if (pp->anchored_menu) {
+    // Walk up to the toggle button (the capsule), which is what GTK reports
+    // bounds for and what the user aims at.
+    while (anchor != nullptr &&
+           !GTK_IS_TOGGLE_BUTTON (anchor))
+      anchor = gtk_widget_get_parent (anchor);
+    if (anchor == nullptr)
+      anchor = pp->button;
+  }
+
+  GtkWidget *root = GTK_WIDGET (gtk_widget_get_root (anchor));
   if (root == nullptr)
     return;
   GdkSurface *surface = gtk_native_get_surface (GTK_NATIVE (root));
@@ -494,7 +510,7 @@ panel_popover_anchor_rect (PanelPopover *pp)
   GetWindowRect (panel_hwnd, &pr);
 
   graphene_rect_t b;
-  if (gtk_widget_compute_bounds (pp->button, root, &b)) {
+  if (gtk_widget_compute_bounds (anchor, root, &b)) {
     pp->anchor_rect.left = pr.left + (LONG) b.origin.x;
     pp->anchor_rect.top = pr.top + (LONG) b.origin.y;
     pp->anchor_rect.right = pp->anchor_rect.left + (LONG) b.size.width;
@@ -526,18 +542,33 @@ panel_popover_geometry (PanelPopover *pp, int width, int height,
 
   // Right-align for the quick settings; center on the clock for the calendar.
   int x;
-  if (pp->centered) {
+  if (pp->anchored_menu) {
+    // Secondary menu: flush with the anchor's right edge so it reads as
+    // hanging off the arrow that opened it (upstream binds it to the
+    // capsule with a Clutter constraint on Y only).
+    x = pp->anchor_rect.right - width;
+  } else if (pp->centered) {
     x = (pp->anchor_rect.left + pp->anchor_rect.right) / 2 - width / 2;
   } else {
     x = wa.right - width - POPOVER_SIDE_GAP;
   }
-  // A stable gap below the panel (the panel spans the monitor top).
-  int y = pr.bottom + POPOVER_TOP_GAP;
 
-  // Clamp inside the monitor, preserving the side gaps.
+  int y;
+  if (pp->anchored_menu) {
+    // Directly under the anchor (the toggle capsule), not under the panel.
+    y = pp->anchor_rect.bottom;
+  } else {
+    // A stable gap below the panel (the panel spans the monitor top).
+    y = pr.bottom + POPOVER_TOP_GAP;
+  }
+
+  // Clamp inside the monitor, preserving the side gaps. A secondary menu is
+  // clamped to the monitor top rather than below the panel, so it may sit
+  // beside the bar when the anchor is high on the screen.
   int x_min = wa.left + POPOVER_SCREEN_GAP;
   int x_max = MAX (x_min, wa.right - width - POPOVER_SCREEN_GAP);
-  int y_min = pr.bottom + POPOVER_TOP_GAP;
+  int y_min = pp->anchored_menu ? wa.top + POPOVER_SCREEN_GAP
+                                : pr.bottom + POPOVER_TOP_GAP;
   int y_max = MAX (y_min, wa.bottom - height - POPOVER_SCREEN_GAP);
   *out_x = CLAMP (x, x_min, x_max);
   *out_y = CLAMP (y, y_min, y_max);
@@ -861,7 +892,72 @@ make_panel_popover (GtkWidget *button, GtkWidget *child, gboolean centered)
   return pp->window;
 }
 
-// DateMenuButton: .panel-button.clock-display > .clock-display-box > .clock.
+// --- Secondary menus (QuickToggleMenu) ---------------------------------------
+//
+// A quick-toggle's arrow and the .power-item capsule open a small menu instead
+// of the panel popover. It reuses the same machinery — borderless toplevel,
+// shadow-wrapped card, WH_MOUSE_LL outside-click dismissal, topmost reassert —
+// so a menu behaves like every other popover in the shell.
+
+static PanelPopover *g_open_menu = NULL;
+
+static void
+menu_window_destroyed (GtkWidget *widget G_GNUC_UNUSED, gpointer data)
+{
+  PanelPopover *pp = static_cast<PanelPopover *> (data);
+  if (g_open_menu == pp)
+    g_open_menu = NULL;
+  // The menu content is owned by the window's child; dropping the last
+  // reference to it here would strand the WifiMenu context.
+  g_free (pp);
+}
+
+void
+winome_shell_panel_open_menu (GtkWidget *anchor, GtkWidget *menu)
+{
+  if (anchor == NULL || menu == NULL)
+    return;
+
+  // Only one secondary menu at a time (matches GNOME's single menu grab).
+  if (g_open_menu != NULL)
+    panel_popover_close (g_open_menu, "replaced");
+
+  PanelPopover *pp = g_new0 (PanelPopover, 1);
+  pp->button = anchor;
+  pp->anchored_menu = TRUE;
+
+  pp->window = gtk_window_new ();
+  gtk_window_set_decorated (GTK_WINDOW (pp->window), FALSE);
+  gtk_window_set_resizable (GTK_WINDOW (pp->window), FALSE);
+  // Reuse the popover chrome so the menu matches the quick settings card.
+  gtk_widget_add_css_class (pp->window, "quick-settings-popover-window");
+
+  GtkWidget *wrap = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_add_css_class (wrap, "quick-settings-popover-shadow-wrap");
+  pp->wrap = wrap;
+
+  pp->card = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_add_css_class (pp->card, "quick-settings-popover-card");
+  gtk_box_append (GTK_BOX (pp->card), menu);
+  gtk_box_append (GTK_BOX (wrap), pp->card);
+  gtk_window_set_child (GTK_WINDOW (pp->window), wrap);
+
+  // Same font map as the panel so em-based values resolve identically.
+  gtk_widget_set_font_map (pp->window, winome::bundled_font_map ());
+
+  g_signal_connect (pp->window, "map", G_CALLBACK (on_popover_map), pp);
+  g_signal_connect (pp->window, "destroy",
+                    G_CALLBACK (menu_window_destroyed), pp);
+
+  GtkEventController *keys = gtk_event_controller_key_new ();
+  g_signal_connect (keys, "key-pressed", G_CALLBACK (on_popover_key), pp);
+  gtk_widget_add_controller (pp->window, keys);
+
+  ensure_popover_mouse_hook ();
+
+  panel_popover_open (pp);
+  g_open_menu = pp;
+}
 // In GNOME the hover/active highlight lives on the .clock child (an St.Widget).
 // GtkLabel does not paint its CSS background in GTK4, so the .clock "label" is
 // a GtkBox (which does paint it) wrapping the actual text label.
