@@ -520,6 +520,75 @@ def process_declaration(prop, value):
     return [(prop, eval_color_value(value))]
 
 
+# St's `transition-property` defaults to `background-color` when a rule only
+# sets `transition-duration`, so GNOME animates hover fills with the bare
+# `transition-duration: 100ms` seen all over _common.scss (%menuitem,
+# %card_common). GTK4 has no such default and silently ignores the declaration,
+# which is why ported hover states snap instead of fading.
+#
+# The properties below are what GNOME's button/card mixins actually transition;
+# supplying them restores the timing without changing any colour or duration.
+TRANSITION_PROPERTY_DEFAULT = 'background-color, color, border-color, box-shadow'
+
+
+def inject_transition_property(css):
+    """Add the implicit transition-property to blocks that only set a duration.
+
+    Purely textual and block-local: walks each {...} body, and when it finds a
+    `transition-duration` with no `transition-property` (and no `transition`
+    shorthand that already carries one), inserts the default list immediately
+    before the duration so the declarations keep St's reading order.
+    """
+    lines = css.split('\n')
+    out = []
+    block_start = None   # index in `out` of the line holding the opening '{'
+    depth = 0
+    has_duration = False
+    has_property = False
+
+    def close_block(end):
+        """Prepend the default property list to the finished body, if needed."""
+        nonlocal has_duration, has_property
+        if not (has_duration and not has_property):
+            return
+        for i in range(end - 1, block_start, -1):
+            m = re.match(r'^(\s*)transition-duration\s*:', out[i])
+            if m:
+                out.insert(i, '%stransition-property: %s;' % (
+                    m.group(1), TRANSITION_PROPERTY_DEFAULT))
+                break
+        has_duration = False
+        has_property = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        # A body we are collecting: only its declarations matter.
+        if block_start is not None:
+            if re.match(r'^\s*transition-duration\s*:', line):
+                has_duration = True
+            elif re.match(r'^\s*(transition-property|transition)\s*:', line):
+                has_property = True
+            # The body may close on its own line or ride on the last
+            # declaration ("padding: 9px 12px; }").
+            if stripped == '}' or (stripped.endswith('}') and '{' not in stripped
+                                   and stripped not in ('',)):
+                close_block(len(out))
+                block_start = None
+                depth = 0
+            out.append(line)
+            continue
+
+        out.append(line)
+        if stripped.endswith('{'):
+            block_start = len(out) - 1
+            depth = line.count('{') - line.count('}')
+            has_duration = False
+            has_property = False
+
+    return '\n'.join(out)
+
+
 def main():
     if len(sys.argv) < 3:
         print('usage: convert-st-css.py <in.css> <out.css>')
@@ -583,6 +652,8 @@ def main():
     # with the GNOME box-shadow hover highlight, producing a double highlight.
     out += GTK4_BUTTON_OVERRIDE
     out += PANEL_PX_OVERRIDE
+
+    out = inject_transition_property(out)
 
     with open(sys.argv[2], 'w', encoding='utf-8') as f:
         f.write('/* SPDX-License-Identifier: GPL-2.0-only */\n')

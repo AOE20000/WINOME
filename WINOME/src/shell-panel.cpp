@@ -18,6 +18,7 @@
 #include "shell-panel.h"
 #include "st-engine.h"
 #include "system-status.h"
+#include "easing.h"
 #include "quick-settings.h"
 #include "overview-trigger.h"
 #include "overview.h"
@@ -599,6 +600,22 @@ panel_popover_geometry (PanelPopover *pp, int width, int height,
   return TRUE;
 }
 
+// Fade a secondary menu out, then hide its window (quickSettings.js:500
+// fades the box, then collapses the height on completion). The callback holds
+// its own reference on the window and never touches PanelPopover, because the
+// window's destroy handler frees that struct and the animation may outlive a
+// menu the user opened and closed quickly.
+static void
+on_menu_fade_out_done (GtkWidget *window, gpointer data G_GNUC_UNUSED)
+{
+  gtk_widget_set_visible (window, FALSE);
+  // Reset so the next open starts from transparent again.
+  GtkWidget *wrap = gtk_widget_get_first_child (window);
+  if (wrap != nullptr)
+    gtk_widget_set_opacity (wrap, 1.0);
+  g_object_unref (window);
+}
+
 static void
 panel_popover_close (PanelPopover *pp, const char *reason)
 {
@@ -607,8 +624,21 @@ panel_popover_close (PanelPopover *pp, const char *reason)
 
   g_print ("[pop] close (%s)\n", reason);
   pp->open = FALSE;
-  gtk_widget_set_visible (pp->window, FALSE);
   gtk_widget_remove_css_class (pp->button, "open");
+
+  if (pp->anchored_menu) {
+    // Keep the window mapped for the duration of the fade — hiding it first
+    // would make the animation invisible and drop the topmost placement.
+    g_object_ref (pp->window);
+    winome::tween_opacity (pp->wrap, gtk_widget_get_opacity (pp->wrap), 0.0,
+                           winome::QUICK_SETTINGS_ANIMATION_TIME / 2,
+                           winome::Ease::ease_out_quad,
+                           [window = pp->window] {
+                             on_menu_fade_out_done (window, nullptr);
+                           });
+  } else {
+    gtk_widget_set_visible (pp->window, FALSE);
+  }
 
   // Stop floating above everything once closed.
   HWND hwnd = panel_popover_hwnd (pp);
@@ -741,6 +771,18 @@ panel_popover_open (PanelPopover *pp)
       SetWindowPos (hwnd, HWND_TOPMOST, x, y, px_w, px_h,
                     SWP_SHOWWINDOW | SWP_FRAMECHANGED);
     }
+  }
+
+  // Secondary menus animate: quickSettings.js:464 fades the box in over
+  // POPUP_ANIMATION_TIME/2 after the height has been tweened. The window
+  // itself must stay mapped (hiding it would drop it out of the topmost band
+  // and make the next open re-raise), so "closed" is expressed as opacity 0
+  // plus pointer-events: none rather than visibility.
+  if (pp->anchored_menu) {
+    gtk_widget_set_opacity (pp->wrap, 0.0);
+    winome::tween_opacity (pp->wrap, 0.0, 1.0,
+                           winome::QUICK_SETTINGS_ANIMATION_TIME / 2,
+                           winome::Ease::ease_out_cubic);
   }
 
   gtk_widget_set_visible (pp->window, TRUE);

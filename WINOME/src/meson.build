@@ -18,6 +18,7 @@ winome_sources = files(
   'system-status.cpp',
   'power-modes.cpp',
   'wifi-networks.cpp',
+  'easing.cpp',
   'quick-settings.cpp',
   'calendar.cpp',
   'st-engine.cpp',

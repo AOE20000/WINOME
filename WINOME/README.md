@@ -238,8 +238,44 @@ ninja -C build
 | `height`/`width` | `min-height`/`min-width`（GTK4 无 height/width） |
 | `-natural-hpadding` | `padding-left` + `padding-right` |
 | `:insensitive` 伪类 | `:disabled` |
+| **省略的 `transition-property`** | **补默认值**。St 省略它时默认为 `background-color`，所以 `_common.scss` 里满地的 `%menuitem { transition-duration: 100ms; }`（只写时长）在 GNOME 里会动；**GTK4 无此默认值，缺 `transition-property` 的声明直接失效** → hover 硬跳变。`inject_transition_property()` 按块补 `background-color, color, border-color, box-shadow` |
 | `:overview`/`:unlock-screen` 等状态伪类 | 整条规则丢弃（剥离会误应用到默认态） |
 | `!important` | 剥离（GTK4 对 box-shadow 等不支持） |
+
+> `inject_transition_property()` 是**纯文本后处理**，挂在 `main()` 写文件之前，
+> 不碰主解析循环。实现要点：块的闭合有两种形式——独立的 `}` 行，或挂在最后一条
+> 声明上（`padding: 9px 12px; }`），**两种都要认**，否则漏掉
+> `.popup-menu-item` 这种写法。改动此脚本时务必用
+> `diff` 对比新旧产物，确认只有新增行、没有删除行。
+
+### `:checked` 是当前最大的样式缺口
+
+`PSEUDO_CLASS_MAP` 只映射了 `:insensitive → :disabled`，**`:checked` 未处理**。
+`_quick-settings.scss:23` 的 `.quick-toggle:checked { @extend %default_button }`
+决定了 GNOME 50 的标志性观感——**蓝色实心药丸**（`-st-accent-color` = `#3584e4`）。
+拿不到这个状态伪类，就只能在 C++ 里手动设色，那正是"手写而非移植"。
+
+正确做法是让 `GtkToggleButton` 的 `:checked` 状态**自然驱动**样式，
+而不是在 C++ 里 `gtk_widget_set_opacity` / 改 background 硬凑。
+
+### 动画层（`src/easing.cpp`）
+
+GTK4 **无原生动画框架**（无 `GtkAnimation`，`gtkstylecontext.h` 无 transition API），
+而 GNOME 动效全部走 Clutter 的 `Clutter.EaseFunction`。`easing.cpp` 补这一层：
+
+- **曲线**：Clutter `clutter-easing.c` 的标准 cubic-bezier。默认 `ease_out_cubic`
+  = `(0.215, 0.61, 0.355, 1.0)`；`ease_out_back = (0.34, 1.56, 0.64, 1.0)` 在
+  t≈0.6 过冲到 **1.10** 再回落——这就是 GNOME 菜单的"沉降"感。求解用
+  Newton-Raphson + 二分兜底（`ease_out_back` 导数趋零，Newton 会停滞）
+- **驱动**：`gtk_widget_add_tick_callback`（与 vblank 对齐，不用 16ms 定时器），
+  tween 状态随 widget 销毁自然释放
+- **时长照抄上游**：`quickSettings.js:17` `POPUP_ANIMATION_TIME = 400`、
+  `boxpointer.js:14` `= 150`
+- **菜单开合是两阶段串行**（`quickSettings.js:464` open / `:500` close）：
+  open = 高度补间 → 完成后淡入；close = 淡出 → 完成后收起隐藏。
+  ⚠️ **窗口不能提前 `set_visible(FALSE)`**——会掉出 topmost 队形且动画不可见。
+  关闭用 opacity→0 + 延迟隐藏，且回调**只持 window 引用、不碰 `PanelPopover`**
+  （后者由 window 的 destroy handler 释放，动画可能比它活得久）
 
 ### C++ 侧的关键适配（`shell-panel.cpp`）
 
