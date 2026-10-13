@@ -24,13 +24,28 @@ gnome_shell_dark_css = custom_target('gnome-shell-dark.css',
 gnome_shell_gtk4_css = custom_target('gnome-shell-gtk4.css',
   input: files('gnome-shell-dark.css'),
   output: 'gnome-shell-gtk4.css',
+  # convert-then-check.py runs the conversion and then the coverage check,
+  # propagating the check's exit status. If the conversion silently dropped or
+  # rewrote something — an unmapped property, a missing pass-through, a lost
+  # max-*/min-width pair, timed rules left without a transition-property — the
+  # build fails. None of those raise a build error on their own; they only show
+  # up as a UI that quietly stops matching upstream.
+  #
+  # A wrapper script rather than two entries in `command`: meson takes the
+  # first element as the program and passes the rest as arguments, and a
+  # portable `cmd1 && cmd2` line would need a shell that `-c` does not provide
+  # on Windows.
   command: [
-    python, meson.project_source_root() / 'tools' / 'convert-st-css.py',
+    python, meson.project_source_root() / 'tools' / 'convert-then-check.py',
     '@INPUT@', '@OUTPUT@',
   ],
   env: {'ST_CSS_EVAL': st_css_eval.full_path()},
   depends: [st_css_eval],
-  depend_files: [meson.project_source_root() / 'tools' / 'convert-st-css.py'],
+  depend_files: [
+    meson.project_source_root() / 'tools' / 'convert-st-css.py',
+    meson.project_source_root() / 'tools' / 'check-st-css-coverage.py',
+    meson.project_source_root() / 'tools' / 'convert-then-check.py',
+  ],
   build_by_default: true,
 )
 

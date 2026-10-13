@@ -554,12 +554,18 @@ def inject_transition_property(css):
     has_duration = False
     has_property = False
 
-    def close_block(end):
-        """Prepend the default property list to the finished body, if needed."""
+    def close_block():
+        """Insert the default property list into the finished body, if needed.
+
+        Looks back from the end of `out` for the transition-duration line. The
+        caller must have appended the block's final line already: when the block
+        closes on its last declaration ("transition-duration: 400ms; }"), that
+        line is both the duration and the closer.
+        """
         nonlocal has_duration, has_property
         if not (has_duration and not has_property):
             return
-        for i in range(end - 1, block_start, -1):
+        for i in range(len(out) - 1, block_start, -1):
             m = re.match(r'^(\s*)transition-duration\s*:', out[i])
             if m:
                 out.insert(i, '%stransition-property: %s;' % (
@@ -577,14 +583,20 @@ def inject_transition_property(css):
                 has_duration = True
             elif re.match(r'^\s*(transition-property|transition)\s*:', line):
                 has_property = True
+
             # The body may close on its own line or ride on the last
-            # declaration ("padding: 9px 12px; }").
-            if stripped == '}' or (stripped.endswith('}') and '{' not in stripped
-                                   and stripped not in ('',)):
-                close_block(len(out))
+            # declaration ("padding: 9px 12px; }"). Append first so the closer
+            # is part of the block when close_block() searches for the
+            # duration line.
+            closes = (stripped == '}'
+                      or (stripped.endswith('}') and '{' not in stripped
+                          and stripped != ''))
+            out.append(line)
+            if closes:
+                close_block()
                 block_start = None
                 depth = 0
-            out.append(line)
+            continue
             continue
 
         out.append(line)

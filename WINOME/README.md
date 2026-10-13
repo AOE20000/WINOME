@@ -261,6 +261,35 @@ ninja -C build
 | `:overview`/`:unlock-screen` 等状态伪类 | 整条规则丢弃（剥离会误应用到默认态） |
 | `!important` | 剥离（GTK4 对 box-shadow 等不支持） |
 
+### 覆盖率自检（`tools/check-st-css-coverage.py`）
+
+前几轮出过三次静默丢失（`transition-property` 默认值、`max-width` 被映射成
+`min-width`、`box-shadow` 未声明）。它们**都不报任何警告**，只表现为「看着不对劲」。
+这个脚本把「谁记得去查样式表」变成构建步骤，四类检查：
+
+| 检查 | 抓什么 |
+|------|--------|
+| coverage | 上游属性既不在 RENAME/EXPAND/DROP、也不在 `GTK4_NATIVE` → 静默丢弃 |
+| pass-through | 声明为 GTK4 原生却没进产物 → 被吃掉 |
+| semantics | 同时设 `min-width`+`max-width` 的规则，产物缺 `max-width` → 上限丢失 |
+| transitions | 产物里带 `transition-duration` 的规则数 > 带 `transition-property` 的 → hover 硬跳 |
+
+三张表直接从 `convert-st-css.py` 正则读取，**两者不可能不一致**；
+`GTK4_NATIVE` 必须显式列举（而非"未知的都透传"），这样新的 St 专有属性会报缺口。
+
+```sh
+python tools/check-st-css-coverage.py     src/theme/gnome-shell-dark.css build/src/theme/gnome-shell-gtk4.css
+```
+
+非零退出码可直接卡构建。当前结果：
+`OK 83 upstream properties all accounted for; 40 reached the GTK4 stylesheet.`
+
+⚠️ **写检查器时它先漏判了两次，都靠"故意制造缺陷"发现**：
+① `max-width` 被重写成 `min-width` 时，因为 `min-width` 在 `GTK4_NATIVE` 里而被放行
+→ 改为**数量**比较；② `transition-property` 永远有 2 处（转换器的面板硬编码补丁），
+所以存在性检查失效 → 也改为数量比较。
+**任何新检查项都必须用"注入已知缺陷"验证它真能报错。**
+
 > `inject_transition_property()` 是**纯文本后处理**，挂在 `main()` 写文件之前，
 > 不碰主解析循环。实现要点：块的闭合有两种形式——独立的 `}` 行，或挂在最后一条
 > 声明上（`padding: 9px 12px; }`），**两种都要认**，否则漏掉
