@@ -22,9 +22,17 @@ ACCENT_VARS = {
 }
 
 # Properties to map St -> GTK4 (value kept as-is).
+#
+# St's `width`/`height` are minima, so they become GTK4's min-*. The max-* forms
+# must map to max-*, NOT to min-*: mapping them to min- silently deleted the
+# upper bound, so `.quick-toggle { min-width: 12em; max-width: 12em }` — GNOME's
+# fixed-width toggle grid — collapsed into two min-width rules and every capsule
+# grew to fit its label. That is what broke the panel's visual rhythm.
 RENAME = {
     'height': 'min-height',
     'width': 'min-width',
+    'max-height': 'max-height',
+    'max-width': 'max-width',
 }
 
 # -natural-hpadding: X -> padding-left/right: X (expanded to two decls).

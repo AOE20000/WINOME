@@ -1606,6 +1606,13 @@ winome_quick_settings_new (void)
         (detected == WINOME_POWER_MODE_COUNT) ? WINOME_POWER_BALANCED
                                               : detected;
 
+    // Order follows panel.js:381-405. The full-width rows (system item,
+    // volume, brightness) come first, then the half-width toggles in the
+    // sequence GNOME registers them. The order is what produces the panel's
+    // visual grouping — network and bluetooth lead the toggles, the theme
+    // pair sits together, and the keyboard-brightness / rfkill pair lands last
+    // because upstream registers those after night light and DND.
+    //
     // Wi-Fi lists the visible networks (via the Wlan API) and connects on
     // click; Bluetooth and Keyboard keep their arrows but stay inert until the
     // Bluetooth radio API lands.
@@ -1646,6 +1653,7 @@ winome_quick_settings_new (void)
                              NULL, NULL, NULL);
     winome_quick_settings_grid_attach (grid, dnd, 1);
 
+    // keyboard_brightness and rfkill are the last two upstream registers.
     keyboard = make_quick_menu_toggle ("input-keyboard-symbolic",
                                        tr ("Keyboard", "键盘"),
                                        NULL,

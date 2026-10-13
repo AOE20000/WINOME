@@ -130,6 +130,11 @@ ninja -C build
   主题值：`-arrow-rise 10px`、`-boxpointer-gap 4px`、`-arrow-border-radius 22px`、
   `-arrow-border-width 1px`、`-arrow-base 20px`。
   ⚠️ **不能简单按锚点右缘对齐**——`margin/2` 有 54px，照右缘放会整体偏出屏幕左缘
+- **`max-width` 必须映射到 `max-width`**：St 的 `width`/`height` 是下限 → GTK4
+  `min-*`；但 `max-*` **不能**也映射成 `min-*`。映射错的后果很隐蔽：
+  `.quick-toggle { min-width: 12em; max-width: 12em }`（GNOME 的**固定宽度**
+  toggle 网格）会变成两条 `min-width`，上限丢失 → 每个胶囊按文字伸缩 →
+  **面板的视觉节奏（"层次"）垮掉**。修前产物 `max-width` 出现 0 次，修后 5 次。
 - **卡片只有一层**：上游 `.quick-toggle-menu { @extend %card }`（`#47474c` 底、
   24px 圆角、`margin: 12px 0 0`）**本身就是卡片**，条目直接放在
   `.popup-menu-box` 里。若再套一层 `.popup-menu-content` 或
