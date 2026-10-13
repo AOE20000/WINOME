@@ -33,7 +33,20 @@ void winome_quick_settings_refresh (GtkWidget *quick_settings);
 
 // Build a secondary menu popup for a `.quick-toggle-menu-button` arrow, from
 // @n_entries rows of @entries. The returned widget is the themed popup content
-// (.popup-menu > .popup-menu-content > .popup-menu-box > .popup-menu-item);
-// it is not a window — the caller anchors it in a toplevel and positions it
-// under the arrow. Free with g_object_unref when done.
-GtkWidget *winome_quick_menu_new (const WinomeMenuEntry *entries, guint n_entries);
+// (.quick-toggle-menu > .popup-menu-box > .popup-menu-item); it is not a
+// window — the caller anchors it in a toplevel and positions it under the
+// arrow. Free with g_object_unref when done.
+//
+// When @header_icon is non-NULL the menu gets QuickToggleMenu's header (see
+// QuickToggleMenu._init in quickSettings.js:389): a circular icon badge, a
+// title and an optional subtitle, above the rows. Upstream calls setHeader()
+// when a submenu has a summary to show; pass NULL for menus that do not.
+GtkWidget *winome_quick_menu_new_full (const WinomeMenuEntry *entries,
+                                       guint n_entries,
+                                       const char *header_icon,
+                                       const char *header_title,
+                                       const char *header_subtitle,
+                                       gboolean header_active);
+
+GtkWidget *winome_quick_menu_new (const WinomeMenuEntry *entries,
+                                  guint n_entries);

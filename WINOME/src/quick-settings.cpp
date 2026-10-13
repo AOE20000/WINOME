@@ -29,6 +29,10 @@ tr (const char *en, const char *zh)
 // $scalable_icon_size from gnome-shell-sass (1.091em at "Sans 11" -> 16px).
 #define QUICK_ICON_SIZE 16
 
+// $medium_scalable_icon_size = $scalable_icon_size * 1.5 -> 24px. Used by the
+// QuickToggleMenu header badge (`.quick-toggle-menu .header .icon`).
+#define QUICK_HEADER_ICON_SIZE 24
+
 // --- QuickToggle -------------------------------------------------------------
 //
 // Standalone toggle, matching QuickToggle in quickSettings.js:
@@ -190,36 +194,119 @@ make_quick_menu_item (const WinomeMenuEntry *entry)
   return item;
 }
 
-// Build the popup content for a secondary menu: `.popup-menu` wrapping
-// `.popup-menu-content` (the themed card) and the item list.
+// QuickToggleMenu's header (quickSettings.js:389-430): a grid holding a
+// circular icon badge on the left, the title, and an optional subtitle below
+// it. `.quick-toggle-menu .header` in the stylesheet supplies
+// `padding-bottom: 12px`, the badge's `border-radius: 999px` and its
+// `.active` accent fill, so only the structure is needed here.
+//
+//   .header
+//     .header .icon[.active]   24px glyph in a round badge
+//     .header .title            %title_3
+//     .header .subtitle         %caption_heading
 static GtkWidget *
-build_quick_menu (const WinomeMenuEntry *entries, guint n_entries)
+build_quick_menu_header (const char *icon_name, const char *title,
+                         const char *subtitle, gboolean active)
+{
+  GtkWidget *header;
+  GtkWidget *row;
+  GtkWidget *text_col;
+  GtkWidget *icon = NULL;
+  GtkWidget *title_label = NULL;
+  GtkWidget *subtitle_label = NULL;
+
+  if (icon_name == NULL)
+    return NULL;
+
+  header = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_add_css_class (header, "header");
+
+  // Icon and text sit on one row; the subtitle stacks under the title, so the
+  // text column is itself a vertical box.
+  row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
+  gtk_widget_set_valign (row, GTK_ALIGN_CENTER);
+
+  icon = gtk_image_new_from_icon_name (icon_name);
+  gtk_image_set_pixel_size (GTK_IMAGE (icon), QUICK_HEADER_ICON_SIZE);
+  gtk_widget_add_css_class (icon, "icon");
+  if (active)
+    gtk_widget_add_css_class (icon, "active");
+  gtk_widget_set_valign (icon, GTK_ALIGN_CENTER);
+  gtk_box_append (GTK_BOX (row), icon);
+
+  text_col = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_set_valign (text_col, GTK_ALIGN_CENTER);
+  gtk_widget_set_hexpand (text_col, TRUE);
+
+  title_label = gtk_label_new (title != NULL ? title : "");
+  gtk_widget_add_css_class (title_label, "title");
+  gtk_label_set_xalign (GTK_LABEL (title_label), 0.0);
+  gtk_box_append (GTK_BOX (text_col), title_label);
+
+  if (subtitle != NULL && subtitle[0] != '\0') {
+    subtitle_label = gtk_label_new (subtitle);
+    gtk_widget_add_css_class (subtitle_label, "subtitle");
+    gtk_label_set_xalign (GTK_LABEL (subtitle_label), 0.0);
+    gtk_box_append (GTK_BOX (text_col), subtitle_label);
+  }
+
+  gtk_box_append (GTK_BOX (row), text_col);
+  gtk_box_append (GTK_BOX (header), row);
+
+  return header;
+}
+
+// Build the popup content for a secondary menu.
+//
+// Structure mirrors QuickToggleMenu (quickSettings.js:363): the actor is a
+// `.quick-toggle-menu-container` wrapping `this.box`, which is the popup menu
+// box itself — `.quick-toggle-menu` is the *style class of the box*, and it
+// carries the card background (`@extend %card`, `border-radius:
+// $base_border_radius * 3`). Nesting a `.popup-menu-content` inside it paints
+// a second rounded background and reads as a washed-out double border.
+static GtkWidget *
+build_quick_menu_full (const WinomeMenuEntry *entries, guint n_entries,
+                       const char *header_icon, const char *header_title,
+                       const char *header_subtitle, gboolean header_active)
 {
   GtkWidget *menu;
-  GtkWidget *box;
+  GtkWidget *header;
   guint i;
 
-  // Upstream: `.quick-toggle-menu { @extend %card; border-radius:
-  // $base_border_radius * 3; margin: $base_padding * 2 0 0; }` — the menu
-  // IS the card, not a card wrapped around a .popup-menu-content. Nesting the
-  // content box inside the card paints two rounded backgrounds and reads as a
-  // washed-out double border, so keep a single layer.
   menu = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_add_css_class (menu, "popup-menu-box");
   gtk_widget_add_css_class (menu, "quick-toggle-menu");
   gtk_widget_set_halign (menu, GTK_ALIGN_START);
 
-  // Items live straight in the card's box; `.popup-menu-box` carries the
-  // vertical rhythm between rows.
-  box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
-  gtk_widget_add_css_class (box, "popup-menu-box");
-  gtk_box_append (GTK_BOX (menu), box);
+  header = build_quick_menu_header (header_icon, header_title,
+                                    header_subtitle, header_active);
+  if (header != NULL)
+    gtk_box_append (GTK_BOX (menu), header);
 
   for (i = 0; i < n_entries; i++) {
     GtkWidget *item = make_quick_menu_item (&entries[i]);
-    gtk_box_append (GTK_BOX (box), item);
+    gtk_box_append (GTK_BOX (menu), item);
   }
 
   return menu;
+}
+
+static GtkWidget *
+build_quick_menu (const WinomeMenuEntry *entries, guint n_entries)
+{
+  return build_quick_menu_full (entries, n_entries, NULL, NULL, NULL, FALSE);
+}
+
+GtkWidget *
+winome_quick_menu_new_full (const WinomeMenuEntry *entries, guint n_entries,
+                            const char *header_icon,
+                            const char *header_title,
+                            const char *header_subtitle,
+                            gboolean header_active)
+{
+  g_return_val_if_fail (entries != NULL || n_entries == 0, NULL);
+  return build_quick_menu_full (entries, n_entries, header_icon,
+                                header_title, header_subtitle, header_active);
 }
 
 GtkWidget *
@@ -1214,7 +1301,11 @@ build_power_menu (gpointer user_data)
   items[3].callback = on_power_action;
   items[3].user_data = GINT_TO_POINTER (POWER_ACTION_SHUTDOWN);
 
-  return build_quick_menu (items, G_N_ELEMENTS (items));
+  // Header mirrors upstream's setHeader() calls: GNOME labels this menu
+  // "Power Off Menu" with the shutdown glyph in the badge.
+  return build_quick_menu_full (items, G_N_ELEMENTS (items),
+                               "system-shutdown-symbolic",
+                               tr ("Power Off Menu", "关机菜单"), NULL, FALSE);
 }
 
 // Open handler for the battery capsule: same default anchor as the arrow.
@@ -1363,7 +1454,19 @@ build_wifi_menu (gpointer user_data)
     items[i].user_data = row;
   }
 
-  GtkWidget *menu = build_quick_menu (items, count);
+  // Upstream NetworkMenu calls
+  //   menu.setHeader('network-wireless-symbolic', _('Wi-Fi'), subtitle)
+  // where subtitle is "Connected" / "Not Connected" / the wired fallback. The
+  // badge goes blue (.active) once associated.
+  WinomeWifiStatus st;
+  const gboolean associated = winome_wifi_get_status (&st) && st.connected;
+  const char *subtitle = st.ssid[0] != '\0' ? st.ssid
+                                            : tr ("Not Connected", "未连接");
+
+  GtkWidget *menu = build_quick_menu_full (items, count,
+                                           "network-wireless-symbolic",
+                                           tr ("Wi-Fi", "无线网络"),
+                                           subtitle, associated);
   g_object_set_data_full (G_OBJECT (menu), "wifi-menu", m, wifi_menu_free);
   g_free (items);
   return menu;
@@ -1398,7 +1501,16 @@ build_power_mode_menu (gpointer user_data)
     return NULL;   // no stock plans installed: leave the arrow inert
   }
 
-  GtkWidget *menu = build_quick_menu (items, n);
+  // Header: "Power Mode" with the current plan's glyph in the badge, shown
+  // active while a plan is selected. Falls back to Balanced when the scheme
+  // cannot be read.
+  WinomePowerMode shown =
+      (active == WINOME_POWER_MODE_COUNT) ? WINOME_POWER_BALANCED : active;
+
+  GtkWidget *menu = build_quick_menu_full (
+      items, n, winome_power_mode_icon (shown),
+      tr ("Power Mode", "电源模式"), winome_power_mode_label (shown),
+      active != WINOME_POWER_MODE_COUNT);
   // Free the targets once the menu is destroyed.
   g_object_set_data_full (G_OBJECT (menu), "power-mode-targets", targets, g_free);
 

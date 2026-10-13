@@ -137,6 +137,20 @@ ninja -C build
 - **锚点取整颗胶囊**：`panel_popover_anchor_rect` 对菜单会向上找到
   `GtkToggleButton`，否则点胶囊别处会立刻把刚开的菜单关掉
 - **菜单每次打开重建**：`object-select-symbolic` 勾选标记因此始终反映当前电源方案
+- **必须有 header**（`quickSettings.js:389` `QuickToggleMenu._init`）：菜单顶部是
+  `setHeader()` 建的 `.header` 网格——**圆形图标徽章 + 标题 + 副标题**，
+  这正是 GNOME 50 每个二级菜单顶部那个大圆标的来源。样式表里
+  `.quick-toggle-menu .header` 的规则**一直都在**（`.icon` 的
+  `border-radius: 999px` / `padding: 9px` / `.active` 蓝色填充、
+  `.header` 的 `padding-bottom: 12px`），缺的只是 C++ 侧的节点结构。
+  `winome_quick_menu_new_full()` 负责建它；三个菜单分别对应上游的
+  `setHeader('system-shutdown-symbolic', 'Power Off Menu')`、
+  `('network-wireless-symbolic', 'Wi-Fi', <SSID 或 Not Connected>)`、
+  `(<当前方案图标>, 'Power Mode', <当前方案名>)`
+- **菜单 box 自己带卡片样式**：上游 `this.box` 是 popup menu box，
+  `.quick-toggle-menu` 是**它自己的 style class**（含 `@extend %card`）。
+  所以 `popup-menu-box` 和 `quick-toggle-menu` 两个类加在**同一个** GtkBox 上，
+  item 直接作为其子节点——不要再套一层 `.popup-menu-content`（双层圆角）
 - **电源模式**（`power-modes.cpp`，PowrProf）：三档对应 Windows 三个标准电源方案
   GUID（节能 `a1841308…` / 均衡 `381b4222…` / 性能 `8c5e7fda…`）；均衡在
   Windows 11 还有一个随机化 GUID（`b9a9a03a…`）一并识别；`PowerEnumerate` 探测
