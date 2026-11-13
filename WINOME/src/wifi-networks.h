@@ -49,3 +49,6 @@ gboolean winome_wifi_connect (const char *ssid);
 
 // Disconnect the current association (the radio stays on).
 gboolean winome_wifi_disconnect (void);
+
+// Enable or disable the first wireless interface's software radio state.
+gboolean winome_wifi_set_enabled (gboolean enabled);

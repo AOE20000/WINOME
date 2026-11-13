@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <psapi.h>
 
+#include <atomic>
 #include <string>
 #include <thread>
 
@@ -78,7 +79,8 @@ bool covers_its_monitor(HWND hwnd) {
     return false;
 
   HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-  MONITORINFO mi = {sizeof(mi)};
+  MONITORINFO mi{};
+  mi.cbSize = sizeof(mi);
   if (!GetMonitorInfo(mon, &mi))
     return false;
 
@@ -167,7 +169,14 @@ void CALLBACK win_event_proc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
   on_window_event(event, hwnd);
 }
 
+std::thread g_hook_thread;
+std::atomic<DWORD> g_hook_tid{0};
+
 void hook_thread_main() {
+  MSG dummy;
+  PeekMessageW(&dummy, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+  g_hook_tid.store(GetCurrentThreadId(), std::memory_order_release);
+
   // Register each event class of interest separately rather than hooking the
   // entire EVENT_MIN..EVENT_MAX range: we only need creation/show/uncloak
   // notifications for top-level shell windows.
@@ -193,12 +202,22 @@ void hook_thread_main() {
     if (hook != nullptr)
       UnhookWinEvent(hook);
   }
+  g_hook_tid.store(0, std::memory_order_release);
 }
 
 }  // namespace
 
 void start_win_event_hook() {
-  std::thread(hook_thread_main).detach();
+  if (!g_hook_thread.joinable())
+    g_hook_thread = std::thread(hook_thread_main);
+}
+
+void stop_win_event_hook() {
+  DWORD tid = g_hook_tid.exchange(0, std::memory_order_acq_rel);
+  if (tid != 0)
+    PostThreadMessageW(tid, WM_QUIT, 0, 0);
+  if (g_hook_thread.joinable())
+    g_hook_thread.join();
 }
 
 }  // namespace winome

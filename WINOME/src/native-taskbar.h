@@ -21,6 +21,7 @@ class NativeTaskbar {
  public:
   static void hide();
   static void restore();
+  static void force_restore_all();
 
  private:
   static std::vector<HWND> find_taskbars();

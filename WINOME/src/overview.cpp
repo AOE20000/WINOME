@@ -66,6 +66,7 @@
 #include <dwmapi.h>
 
 #include <windows.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <string>
@@ -122,6 +123,7 @@ GtkWidget *g_dash = nullptr;      // overview dash
 GtkWidget *g_thumbs = nullptr;    // .workspace-thumbnails row
 GtkWidget *g_caption = nullptr;   // .window-caption hover pill
 GdkTexture *g_wallpaper = nullptr;
+std::string g_search_query;       // lowercased UTF-8 live search filter
 
 // Virtual desktops (virtual-desktop.cpp), refreshed on every placement.
 std::vector<vd::DesktopInfo> g_desktops;
@@ -340,6 +342,126 @@ hwnd_title_utf8 (HWND hwnd)
   return out;
 }
 
+std::string
+wide_to_utf8 (const wchar_t *ws)
+{
+  if (ws == nullptr || ws[0] == L'\0')
+    return {};
+  int n = WideCharToMultiByte (CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
+  std::string out (n > 0 ? n - 1 : 0, '\0');
+  if (n > 0)
+    WideCharToMultiByte (CP_UTF8, 0, ws, -1, out.data (), n, nullptr, nullptr);
+  return out;
+}
+
+std::string
+utf8_tolower (const std::string &s)
+{
+  if (s.empty ())
+    return {};
+  gchar *down = g_utf8_strdown (s.c_str (), static_cast<gssize> (s.size ()));
+  if (down == nullptr)
+    return {};
+  std::string out (down);
+  g_free (down);
+  return out;
+}
+
+std::string
+hwnd_process_name_utf8 (HWND hwnd)
+{
+  DWORD pid = 0;
+  GetWindowThreadProcessId (hwnd, &pid);
+  if (pid == 0)
+    return {};
+  HANDLE proc = OpenProcess (PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (proc == nullptr)
+    return {};
+  wchar_t buf[MAX_PATH] = L"";
+  DWORD len = MAX_PATH;
+  BOOL ok = QueryFullProcessImageNameW (proc, 0, buf, &len);
+  CloseHandle (proc);
+  if (!ok || len == 0)
+    return {};
+  const wchar_t *base = wcsrchr (buf, L'\\');
+  return wide_to_utf8 (base != nullptr ? base + 1 : buf);
+}
+
+bool
+window_matches_search (HWND hwnd, const std::string &query_lower)
+{
+  if (query_lower.empty ())
+    return true;
+  std::string title = utf8_tolower (hwnd_title_utf8 (hwnd));
+  if (title.find (query_lower) != std::string::npos)
+    return true;
+  std::string proc = utf8_tolower (hwnd_process_name_utf8 (hwnd));
+  return proc.find (query_lower) != std::string::npos;
+}
+
+void
+find_best_lnk_recursive (const std::wstring &dir, const std::string &query_lower,
+                         int *best_score, std::wstring *best_path, int depth)
+{
+  if (depth > 4)
+    return;
+  std::wstring pattern = dir + L"\\*";
+  WIN32_FIND_DATAW ffd {};
+  HANDLE h = FindFirstFileW (pattern.c_str (), &ffd);
+  if (h == INVALID_HANDLE_VALUE)
+    return;
+
+  do {
+    if (wcscmp (ffd.cFileName, L".") == 0 || wcscmp (ffd.cFileName, L"..") == 0)
+      continue;
+    std::wstring full = dir + L"\\" + ffd.cFileName;
+    if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+      find_best_lnk_recursive (full, query_lower, best_score, best_path,
+                               depth + 1);
+      continue;
+    }
+    size_t flen = wcslen (ffd.cFileName);
+    if (flen > 4 && _wcsicmp (ffd.cFileName + flen - 4, L".lnk") == 0) {
+      std::wstring stem (ffd.cFileName, flen - 4);
+      std::string name_lower = utf8_tolower (wide_to_utf8 (stem.c_str ()));
+      size_t pos = name_lower.find (query_lower);
+      if (pos != std::string::npos) {
+        int score = (pos == 0) ? 2 : 1;
+        if (score > *best_score) {
+          *best_score = score;
+          *best_path = std::move (full);
+        }
+      }
+    }
+  } while (FindNextFileW (h, &ffd));
+  FindClose (h);
+}
+
+bool
+launch_matching_start_menu_app (const std::string &query_lower)
+{
+  if (query_lower.empty ())
+    return false;
+  int best_score = 0;
+  std::wstring best_path;
+
+  const wchar_t *vars[] = {L"APPDATA", L"ProgramData"};
+  for (const wchar_t *var : vars) {
+    wchar_t base[MAX_PATH] = L"";
+    if (GetEnvironmentVariableW (var, base, MAX_PATH) > 0) {
+      std::wstring programs = std::wstring (base) +
+                              L"\\Microsoft\\Windows\\Start Menu\\Programs";
+      find_best_lnk_recursive (programs, query_lower, &best_score, &best_path,
+                               0);
+    }
+  }
+  if (best_path.empty ())
+    return false;
+  HINSTANCE res = ShellExecuteW (nullptr, L"open", best_path.c_str (), nullptr,
+                                 nullptr, SW_SHOWNORMAL);
+  return reinterpret_cast<INT_PTR> (res) > 32;
+}
+
 // --- window enumeration (alt-tab eligible, DWM visible bounds) ---------------
 
 bool
@@ -389,7 +511,8 @@ window_rect (HWND hwnd)
 {
   RECT r = {0, 0, 0, 0};
   if (IsIconic (hwnd)) {
-    WINDOWPLACEMENT wp = {sizeof (wp)};
+    WINDOWPLACEMENT wp {};
+    wp.length = sizeof (wp);
     if (GetWindowPlacement (hwnd, &wp)) {
       // rcNormalPosition includes the invisible borders; accept the slight
       // inflation, same trade-off as the extracted WinOverview.
@@ -435,6 +558,10 @@ collect_windows (HWND hwnd, LPARAM lparam)
     if (is_cloaked (hwnd))
       return TRUE;
   }
+
+  if (!ctx->include_cloaked && !g_search_query.empty () &&
+      !window_matches_search (hwnd, g_search_query))
+    return TRUE;
 
   RECT r = window_rect (hwnd);
   if (r.right - r.left <= 0 || r.bottom - r.top <= 0)
@@ -685,7 +812,8 @@ chrome_show_at (const RECT &preview_rect)
 
   int scale = gtk_widget_get_scale_factor (g_window);
   HMONITOR monitor = MonitorFromWindow (g_panel_hwnd, MONITOR_DEFAULTTONEAREST);
-  MONITORINFO mi = {sizeof (mi)};
+  MONITORINFO mi {};
+  mi.cbSize = sizeof (mi);
   GetMonitorInfoW (monitor, &mi);
 
   int size = kCloseButtonSize * scale;
@@ -817,7 +945,8 @@ icon_show_at (const RECT &preview_rect, HWND target)
 
   int scale = gtk_widget_get_scale_factor (g_window);
   HMONITOR monitor = MonitorFromWindow (g_panel_hwnd, MONITOR_DEFAULTTONEAREST);
-  MONITORINFO mi = {sizeof (mi)};
+  MONITORINFO mi {};
+  mi.cbSize = sizeof (mi);
   GetMonitorInfoW (monitor, &mi);
 
   int size = kWindowIconSize * scale;
@@ -1559,7 +1688,8 @@ place_overview_locked (bool opening)
     switch_finish ();
 
   HMONITOR monitor = MonitorFromWindow (g_panel_hwnd, MONITOR_DEFAULTTONEAREST);
-  MONITORINFO mi = {sizeof (mi)};
+  MONITORINFO mi {};
+  mi.cbSize = sizeof (mi);
   if (!GetMonitorInfoW (monitor, &mi))
     return;
 
@@ -2058,6 +2188,8 @@ finish_hide (void)
   // #222226 flash while the placement idle is still pending.
   g_bg_radius = 0.0;
   gtk_widget_set_opacity (g_thumbs, 1.0);
+  if (g_overview_hwnd != nullptr && IsWindow (g_overview_hwnd))
+    apply_ex_styles (g_overview_hwnd);
   if (g_window != nullptr && gtk_widget_get_visible (g_window))
     gtk_widget_set_visible (g_window, FALSE);
 }
@@ -2095,9 +2227,10 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
   // The title pill is reactive upstream and propagates the click to the
   // preview: activate the hovered window.
   if (g_hover_index >= 0 && gtk_widget_get_visible (g_caption)) {
-    double cx = 0.0, cy = 0.0;
-    if (gtk_widget_translate_coordinates (g_root, g_caption, x, y, &cx, &cy) &&
-        gtk_widget_contains (g_caption, cx, cy)) {
+    graphene_point_t src_pt = GRAPHENE_POINT_INIT ((float)x, (float)y);
+    graphene_point_t dst_pt = GRAPHENE_POINT_INIT (0.f, 0.f);
+    if (gtk_widget_compute_point (g_root, g_caption, &src_pt, &dst_pt) &&
+        gtk_widget_contains (g_caption, dst_pt.x, dst_pt.y)) {
       g_print ("[ov] click (%d,%d) hit caption\n", px, py);
       SlotEntry &e = g_slots[g_hover_index];
       if (IsWindow (e.target)) {
@@ -2132,7 +2265,14 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
   }
   if (pt.x >= g_search_rect.left && pt.x < g_search_rect.right &&
       pt.y >= g_search_rect.top && pt.y < g_search_rect.bottom) {
-    g_print ("[ov] click (%d,%d) ignored (search entry)\n", px, py);
+    g_print ("[ov] click (%d,%d) focus search entry\n", px, py);
+    if (g_overview_hwnd != nullptr && IsWindow (g_overview_hwnd)) {
+      LONG_PTR ex = GetWindowLongPtrW (g_overview_hwnd, GWL_EXSTYLE);
+      if (ex & WS_EX_NOACTIVATE)
+        SetWindowLongPtrW (g_overview_hwnd, GWL_EXSTYLE, ex & ~WS_EX_NOACTIVATE);
+      SetForegroundWindow (g_overview_hwnd);
+    }
+    gtk_widget_grab_focus (g_search);
     return;
   }
   // The workspace thumbnails row handles its own input (clicking a pill
@@ -2249,6 +2389,79 @@ hide_idle (gpointer user_data)
   return G_SOURCE_REMOVE;
 }
 
+void
+on_search_changed (GtkEditable *editable, gpointer user_data G_GNUC_UNUSED)
+{
+  const char *text = gtk_editable_get_text (editable);
+  std::string next = utf8_tolower (text != nullptr ? text : "");
+  if (next == g_search_query)
+    return;
+  g_search_query = std::move (next);
+  gtk_entry_set_icon_from_icon_name (GTK_ENTRY (g_search),
+                                     GTK_ENTRY_ICON_SECONDARY,
+                                     g_search_query.empty () ? nullptr
+                                                             : "edit-clear-symbolic");
+  if (g_window != nullptr && gtk_widget_get_visible (g_window))
+    rebuild_now ();
+}
+
+void
+on_search_icon_press (GtkEntry *entry, GtkEntryIconPosition icon_pos,
+                      gpointer user_data G_GNUC_UNUSED)
+{
+  if (icon_pos == GTK_ENTRY_ICON_SECONDARY)
+    gtk_editable_set_text (GTK_EDITABLE (entry), "");
+}
+
+void
+on_search_activate (GtkEntry *entry G_GNUC_UNUSED,
+                    gpointer user_data G_GNUC_UNUSED)
+{
+  if (!g_slots.empty ()) {
+    HWND target = g_slots[0].target;
+    if (IsWindow (target)) {
+      if (IsIconic (target))
+        ShowWindow (target, SW_RESTORE);
+      SetForegroundWindow (target);
+    }
+    close_overview ("search-enter-window");
+    return;
+  }
+  if (!g_search_query.empty () &&
+      launch_matching_start_menu_app (g_search_query)) {
+    close_overview ("search-enter-app");
+  }
+}
+
+gboolean
+on_overview_key_pressed (GtkEventControllerKey *controller G_GNUC_UNUSED,
+                         guint keyval,
+                         guint keycode G_GNUC_UNUSED,
+                         GdkModifierType state,
+                         gpointer user_data G_GNUC_UNUSED)
+{
+  if (keyval == GDK_KEY_Escape) {
+    if (!g_search_query.empty ()) {
+      gtk_editable_set_text (GTK_EDITABLE (g_search), "");
+      return GDK_EVENT_STOP;
+    }
+    close_overview ("escape");
+    return GDK_EVENT_STOP;
+  }
+  if ((state & GDK_CONTROL_MASK) &&
+      (keyval == GDK_KEY_f || keyval == GDK_KEY_F)) {
+    if (g_overview_hwnd != nullptr && IsWindow (g_overview_hwnd)) {
+      LONG_PTR ex = GetWindowLongPtrW (g_overview_hwnd, GWL_EXSTYLE);
+      if (ex & WS_EX_NOACTIVATE)
+        SetWindowLongPtrW (g_overview_hwnd, GWL_EXSTYLE, ex & ~WS_EX_NOACTIVATE);
+      SetForegroundWindow (g_overview_hwnd);
+    }
+    gtk_widget_grab_focus (g_search);
+    return GDK_EVENT_STOP;
+  }
+  return GDK_EVENT_PROPAGATE;
+}
+
 }  // namespace
 
 void
@@ -2290,6 +2503,12 @@ overview_init (HWND panel_hwnd)
       GTK_ENTRY (g_search),
       strcmp (get_system_language (), "zh") == 0 ? "输入以搜索"
                                                  : "Type to search");
+  g_signal_connect (g_search, "changed", G_CALLBACK (on_search_changed),
+                    nullptr);
+  g_signal_connect (g_search, "icon-press", G_CALLBACK (on_search_icon_press),
+                    nullptr);
+  g_signal_connect (g_search, "activate", G_CALLBACK (on_search_activate),
+                    nullptr);
   gtk_fixed_put (GTK_FIXED (g_root), g_search, 0, 0);
   gtk_widget_set_visible (g_search, FALSE);
 
@@ -2349,6 +2568,11 @@ overview_init (HWND panel_hwnd)
   g_signal_connect (click, "released", G_CALLBACK (on_click_released),
                     nullptr);
   gtk_widget_add_controller (g_window, GTK_EVENT_CONTROLLER (click));
+
+  GtkEventController *keys = gtk_event_controller_key_new ();
+  g_signal_connect (keys, "key-pressed", G_CALLBACK (on_overview_key_pressed),
+                    nullptr);
+  gtk_widget_add_controller (g_window, keys);
 }
 
 void
@@ -2356,6 +2580,11 @@ overview_show (void)
 {
   if (g_window == nullptr || g_panel_hwnd == nullptr)
     return;
+
+  if (!g_search_query.empty () && g_search != nullptr) {
+    g_search_query.clear ();
+    gtk_editable_set_text (GTK_EDITABLE (g_search), "");
+  }
 
   if (!gtk_widget_get_visible (g_window)) {
     g_print ("[ov] show (requesting map)\n");

@@ -50,16 +50,18 @@ bool enable_privilege(const wchar_t* name) {
 bool set_process_dpi_aware() {
   HMODULE user32 = GetModuleHandleW(L"user32.dll");
   auto set_context = reinterpret_cast<SetDpiAwarenessContextFn>(
-      user32 != nullptr
-          ? GetProcAddress(user32, "SetProcessDpiAwarenessContext")
-          : nullptr);
+      reinterpret_cast<void *>(
+          user32 != nullptr
+              ? GetProcAddress(user32, "SetProcessDpiAwarenessContext")
+              : nullptr));
   if (set_context != nullptr)
     return set_context(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != FALSE;
 
   HMODULE shcore = LoadLibraryW(L"shcore.dll");
   auto set_awareness = reinterpret_cast<SetProcessDpiAwarenessFn>(
-      shcore != nullptr ? GetProcAddress(shcore, "SetProcessDpiAwareness")
-                        : nullptr);
+      reinterpret_cast<void *>(
+          shcore != nullptr ? GetProcAddress(shcore, "SetProcessDpiAwareness")
+                            : nullptr));
   if (set_awareness == nullptr) {
     if (shcore != nullptr)
       FreeLibrary(shcore);
@@ -69,6 +71,49 @@ bool set_process_dpi_aware() {
   HRESULT hr = set_awareness(PROCESS_PER_MONITOR_DPI_AWARE);
   FreeLibrary(shcore);
   return SUCCEEDED(hr);
+}
+
+std::wstring app_data_dir() {
+  wchar_t base[MAX_PATH] = {0};
+  DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+  std::wstring dir;
+  if (len > 0 && len < MAX_PATH) {
+    dir.assign(base, len);
+  } else {
+    len = GetTempPathW(MAX_PATH, base);
+    if (len > 0 && len < MAX_PATH)
+      dir.assign(base, len);
+  }
+  if (!dir.empty() && dir.back() == L'\\')
+    dir.pop_back();
+  if (!dir.empty())
+    dir += L"\\WINOME";
+  else
+    dir = L"WINOME";
+  CreateDirectoryW(dir.c_str(), nullptr);
+  return dir;
+}
+
+std::string app_data_dir_ascii() {
+  std::wstring dir = app_data_dir();
+  if (dir.empty())
+    return {};
+
+  wchar_t short_buf[MAX_PATH] = {0};
+  DWORD slen = GetShortPathNameW(dir.c_str(), short_buf, MAX_PATH);
+  const std::wstring& chosen =
+      (slen > 0 && slen < MAX_PATH) ? std::wstring(short_buf, slen) : dir;
+
+  int bytes = WideCharToMultiByte(CP_UTF8, 0, chosen.c_str(),
+                                  static_cast<int>(chosen.size()),
+                                  nullptr, 0, nullptr, nullptr);
+  if (bytes <= 0)
+    return {};
+  std::string out(static_cast<size_t>(bytes), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, chosen.c_str(),
+                      static_cast<int>(chosen.size()),
+                      out.data(), bytes, nullptr, nullptr);
+  return out;
 }
 
 }  // namespace winome

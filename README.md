@@ -97,6 +97,7 @@ ninja -C build
 - 系统架构、概览与数据源：[docs/architecture.md](docs/architecture.md)
 - 主题管线、St 引擎与 UI 规范：[docs/theme-and-ui.md](docs/theme-and-ui.md)
 - 硬约束与踩坑备忘：[docs/pitfalls.md](docs/pitfalls.md)
+- 生产级开发计划与路线图：[docs/roadmap.md](docs/roadmap.md)
 
 ## 权限要求
 

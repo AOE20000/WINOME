@@ -8,7 +8,9 @@
 
 #include <windows.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include "host-utils.h"
 #include "native-taskbar.h"
@@ -22,22 +24,165 @@
 #include "virtual-desktop.h"
 
 // The host runs as a GUI application (no console window). Route diagnostics
-// to a log file so startup errors are still visible.
+// to a rotating log file under %LOCALAPPDATA%\WINOME.
 static void
 setup_log_file (void)
 {
-  char path[MAX_PATH];
-  if (GetTempPathA (MAX_PATH, path) == 0)
+  std::wstring dir = winome::app_data_dir ();
+  if (dir.empty ())
     return;
-  strcat_s (path, "winome.log");
-  // Append keeps previous sessions' logs; nothing is shown on screen.
-  freopen (path, "a", stdout);
-  freopen (path, "a", stderr);
+
+  std::wstring log_path = dir + L"\\winome.log";
+  WIN32_FILE_ATTRIBUTE_DATA fad {};
+  if (GetFileAttributesExW (log_path.c_str (), GetFileExInfoStandard, &fad)) {
+    ULONGLONG size = (static_cast<ULONGLONG> (fad.nFileSizeHigh) << 32) |
+                     fad.nFileSizeLow;
+    constexpr ULONGLONG kMaxLogBytes = 5ULL * 1024 * 1024;
+    if (size > kMaxLogBytes) {
+      std::wstring prev_path = dir + L"\\winome.prev.log";
+      MoveFileExW (log_path.c_str (), prev_path.c_str (),
+                   MOVEFILE_REPLACE_EXISTING);
+    }
+  }
+
+  // Append keeps previous sessions' logs up to kMaxLogBytes.
+  _wfreopen (log_path.c_str (), L"a", stdout);
+  _wfreopen (log_path.c_str (), L"a", stderr);
 }
 
 // Primary monitor bounds captured when the panel is positioned; restored in
 // on_shutdown so the shell recalculates the work area around the taskbar.
 static RECT g_primary_monitor = {0, 0, 0, 0};
+
+static std::wstring
+recovery_file_path (void)
+{
+  std::wstring dir = winome::app_data_dir ();
+  if (dir.empty ())
+    return {};
+  return dir + L"\\recovery.dat";
+}
+
+static void
+save_recovery_workarea (const RECT &rc)
+{
+  std::wstring path = recovery_file_path ();
+  if (path.empty () || rc.right <= rc.left || rc.bottom <= rc.top)
+    return;
+
+  HANDLE file = CreateFileW (path.c_str (), GENERIC_WRITE, 0, nullptr,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE)
+    return;
+
+  DWORD written = 0;
+  WriteFile (file, &rc, sizeof (rc), &written, nullptr);
+  CloseHandle (file);
+}
+
+static void
+clear_recovery_file (void)
+{
+  std::wstring path = recovery_file_path ();
+  if (!path.empty ())
+    DeleteFileW (path.c_str ());
+}
+
+static bool
+has_recovery_file (void)
+{
+  std::wstring path = recovery_file_path ();
+  if (path.empty ())
+    return false;
+  return GetFileAttributesW (path.c_str ()) != INVALID_FILE_ATTRIBUTES;
+}
+
+static void
+apply_and_clear_recovery (bool force_taskbar_restore)
+{
+  std::wstring path = recovery_file_path ();
+  bool recovered = false;
+
+  if (!path.empty ()) {
+    HANDLE file = CreateFileW (path.c_str (), GENERIC_READ, FILE_SHARE_READ,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                               nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+      RECT rc {};
+      DWORD read_bytes = 0;
+      if (ReadFile (file, &rc, sizeof (rc), &read_bytes, nullptr) &&
+          read_bytes == sizeof (rc) &&
+          rc.right > rc.left && rc.bottom > rc.top) {
+        SystemParametersInfoW (SPI_SETWORKAREA, 0, &rc, 0);
+        recovered = true;
+      }
+      CloseHandle (file);
+    }
+  }
+
+  if (recovered || force_taskbar_restore)
+    winome::NativeTaskbar::force_restore_all ();
+
+  clear_recovery_file ();
+}
+
+static void
+restore_environment_emergency (void)
+{
+  if (g_primary_monitor.right > g_primary_monitor.left)
+    SystemParametersInfoW (SPI_SETWORKAREA, 0, &g_primary_monitor, 0);
+  winome::NativeTaskbar::restore ();
+  clear_recovery_file ();
+}
+
+static LONG WINAPI
+unhandled_exception_filter (EXCEPTION_POINTERS * /*info*/)
+{
+  restore_environment_emergency ();
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static BOOL WINAPI
+console_ctrl_handler (DWORD ctrl_type)
+{
+  switch (ctrl_type) {
+  case CTRL_C_EVENT:
+  case CTRL_BREAK_EVENT:
+  case CTRL_CLOSE_EVENT:
+  case CTRL_LOGOFF_EVENT:
+  case CTRL_SHUTDOWN_EVENT:
+    restore_environment_emergency ();
+    break;
+  default:
+    break;
+  }
+  return FALSE;
+}
+
+static void
+spawn_watchdog (void)
+{
+  wchar_t exe_path[MAX_PATH] {};
+  DWORD len = GetModuleFileNameW (nullptr, exe_path, MAX_PATH);
+  if (len == 0 || len >= MAX_PATH)
+    return;
+
+  DWORD pid = GetCurrentProcessId ();
+  std::wstring cmd = L"\"";
+  cmd += exe_path;
+  cmd += L"\" --watchdog ";
+  cmd += std::to_wstring (pid);
+
+  STARTUPINFOW si {};
+  si.cb = sizeof (si);
+  PROCESS_INFORMATION pi {};
+  if (CreateProcessW (exe_path, cmd.data (), nullptr, nullptr, FALSE,
+                      CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr,
+                      &si, &pi)) {
+    CloseHandle (pi.hThread);
+    CloseHandle (pi.hProcess);
+  }
+}
 
 // Pin all of this process's top-level windows to every virtual desktop
 // ("show on all desktops", like the taskbar). Without this the shell chrome
@@ -162,7 +307,8 @@ position_panel (GtkWidget *panel)
   // under the panel as the top of the screen, exactly like the taskbar
   // reserves the bottom.
   HMONITOR monitor = MonitorFromWindow (hwnd, MONITOR_DEFAULTTONEAREST);
-  MONITORINFO mi = {sizeof (mi)};
+  MONITORINFO mi {};
+  mi.cbSize = sizeof (mi);
   if (!GetMonitorInfoW (monitor, &mi))
     return;
 
@@ -185,8 +331,11 @@ position_panel (GtkWidget *panel)
   // Reserve the panel strip in the primary work area (session-only). Maximized
   // windows and apps that fill the work area now stop below the panel instead
   // of sliding their title bars underneath it.
-  g_primary_monitor = mi.rcMonitor;
-  RECT work = mi.rcMonitor;
+  if (g_primary_monitor.right <= g_primary_monitor.left) {
+    g_primary_monitor = mi.rcMonitor;
+    save_recovery_workarea (g_primary_monitor);
+  }
+  RECT work = g_primary_monitor;
   work.top += height;
   SystemParametersInfoW (SPI_SETWORKAREA, 0, &work, 0);
 
@@ -235,6 +384,9 @@ on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
     g_pin_show_hook = nullptr;
   }
 
+  winome::stop_overview_trigger ();
+  winome::stop_win_event_hook ();
+
   // Release the panel-strip work area reservation before restoring the
   // taskbar, so the shell recalculates the work area around it.
   if (g_primary_monitor.right > g_primary_monitor.left)
@@ -242,14 +394,59 @@ on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
 
   // Restore the native taskbar on exit (only if we hid it).
   winome::NativeTaskbar::restore ();
+  clear_recovery_file ();
 }
 
 int
 main (int argc, char **argv)
 {
+  // Recovery mode: restore native taskbar and any saved work area, then exit.
+  for (int i = 1; i < argc; ++i) {
+    if (std::string (argv[i]) == "--restore") {
+      apply_and_clear_recovery (true);
+      return 0;
+    }
+    if (std::string (argv[i]) == "--watchdog" && i + 1 < argc) {
+      DWORD pid = static_cast<DWORD> (std::strtoul (argv[i + 1], nullptr, 10));
+      if (pid != 0) {
+        HANDLE proc = OpenProcess (SYNCHRONIZE, FALSE, pid);
+        if (proc != nullptr) {
+          WaitForSingleObject (proc, INFINITE);
+          CloseHandle (proc);
+        }
+        if (has_recovery_file ())
+          apply_and_clear_recovery (true);
+      }
+      return 0;
+    }
+  }
+
+  // Single-instance guard so two shell panels do not fight over the taskbar.
+  HANDLE instance_mutex = CreateMutexW (nullptr, TRUE,
+                                        L"Local\\WINOME_Shell_SingleInstance");
+  if (instance_mutex != nullptr && GetLastError () == ERROR_ALREADY_EXISTS) {
+    CloseHandle (instance_mutex);
+    return 0;
+  }
+
   // Route stdout/stderr to a log file first: this process is a GUI app and
   // must never pop a console window.
   setup_log_file ();
+
+  // Recover taskbar and work area if a prior session terminated abnormally.
+  if (has_recovery_file ())
+    apply_and_clear_recovery (true);
+
+  SetUnhandledExceptionFilter (unhandled_exception_filter);
+  SetConsoleCtrlHandler (console_ctrl_handler, TRUE);
+
+  // Snapshot the clean work area before hiding the taskbar so watchdog can
+  // recover even if the process exits before on_activate completes.
+  RECT initial_work {};
+  if (SystemParametersInfoW (SPI_GETWORKAREA, 0, &initial_work, 0))
+    save_recovery_workarea (initial_work);
+
+  spawn_watchdog ();
 
   // Initialize Windows integration before creating the GTK app.
   winome::set_process_dpi_aware ();
@@ -271,6 +468,8 @@ main (int argc, char **argv)
   int status = g_application_run (G_APPLICATION (app), argc, argv);
 
   g_object_unref (app);
+  if (instance_mutex != nullptr)
+    CloseHandle (instance_mutex);
 
   return status;
 }

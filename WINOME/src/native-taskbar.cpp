@@ -16,7 +16,7 @@ namespace {
 
 constexpr wchar_t kPrimaryTaskbarClass[] = L"Shell_TrayWnd";
 constexpr wchar_t kSecondaryTaskbarClass[] = L"Shell_SecondaryTrayWnd";
-constexpr DWORD kRehideIntervalMs = 50;
+constexpr DWORD kRehideIntervalMs = 500;
 constexpr int kClassBuffer = 256;
 
 // EnumWindows callback: collects every top-level window whose class is one of
@@ -64,11 +64,14 @@ void NativeTaskbar::set_visibility(HWND hwnd, bool visible) {
 
 void NativeTaskbar::keeper_loop() {
   // Park on the stop event, waking periodically to re-assert the hidden
-  // state. Explorer recreates the taskbar window on various shell events, so
-  // we keep re-applying until restore() signals us to stop.
+  // state only if Explorer made a taskbar visible again.
+  bool first_pass = true;
   for (;;) {
-    for (HWND hwnd : find_taskbars())
-      set_visibility(hwnd, false);
+    for (HWND hwnd : find_taskbars()) {
+      if (first_pass || IsWindowVisible(hwnd))
+        set_visibility(hwnd, false);
+    }
+    first_pass = false;
     if (WaitForSingleObject(stop_event_, kRehideIntervalMs) == WAIT_OBJECT_0)
       break;
   }
@@ -106,6 +109,21 @@ void NativeTaskbar::restore() {
     // We never hid the taskbar; leave it alone.
     return;
   }
+
+  if (stop_event_ != nullptr) {
+    SetEvent(stop_event_);
+    if (keeper_thread_.joinable())
+      keeper_thread_.join();
+    CloseHandle(stop_event_);
+    stop_event_ = nullptr;
+  }
+
+  for (HWND hwnd : find_taskbars())
+    set_visibility(hwnd, true);
+}
+
+void NativeTaskbar::force_restore_all() {
+  hidden_.store(false, std::memory_order_release);
 
   if (stop_event_ != nullptr) {
     SetEvent(stop_event_);

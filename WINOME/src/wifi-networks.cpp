@@ -27,6 +27,10 @@ struct WlanApi {
                                  PVOID, PDWORD, PVOID *, PWLAN_OPCODE_VALUE_TYPE);
   DWORD (WINAPI *GetAvailableNetworkList)(HANDLE, const GUID *, DWORD, PVOID,
                                           PWLAN_AVAILABLE_NETWORK_LIST *);
+  DWORD (WINAPI *SetInterface)(HANDLE, const GUID *, WLAN_INTF_OPCODE,
+                               DWORD, const PVOID, PVOID);
+  DWORD (WINAPI *Scan)(HANDLE, const GUID *, const PDOT11_SSID,
+                       const PWLAN_RAW_DATA, PVOID);
   DWORD (WINAPI *Connect)(HANDLE, PVOID, const GUID *, const WCHAR *,
                           DWORD, PVOID, PVOID);
   DWORD (WINAPI *Disconnect)(HANDLE, PVOID, const GUID *);
@@ -62,6 +66,8 @@ load_api ()
   WINOME_LOAD_WLAN (EnumInterfaces, "WlanEnumInterfaces");
   WINOME_LOAD_WLAN (QueryInterface, "WlanQueryInterface");
   WINOME_LOAD_WLAN (GetAvailableNetworkList, "WlanGetAvailableNetworkList");
+  WINOME_LOAD_WLAN (SetInterface, "WlanSetInterface");
+  WINOME_LOAD_WLAN (Scan, "WlanScan");
   WINOME_LOAD_WLAN (Connect, "WlanConnect");
   WINOME_LOAD_WLAN (Disconnect, "WlanDisconnect");
   WINOME_LOAD_WLAN (FreeMemory, "WlanFreeMemory");
@@ -199,6 +205,35 @@ query_connection (HANDLE client, const GUID &guid, char *ssid, size_t ssid_size,
   return true;
 }
 
+// Query current software/hardware radio power state across the interface PHYs.
+bool
+query_radio_enabled (HANDLE client, const GUID &guid, bool fallback)
+{
+  DWORD size = 0;
+  WLAN_OPCODE_VALUE_TYPE type = wlan_opcode_value_type_query_only;
+  WLAN_RADIO_STATE *radio = nullptr;
+
+  if (g_api.QueryInterface (client, &guid, wlan_intf_opcode_radio_state,
+                            nullptr, &size, (PVOID *) &radio, &type)
+      != ERROR_SUCCESS || radio == nullptr)
+    return fallback;
+
+  bool any_on = false;
+  DWORD count = radio->dwNumberOfPhys;
+  if (count > WLAN_MAX_PHY_INDEX)
+    count = WLAN_MAX_PHY_INDEX;
+  for (DWORD i = 0; i < count; ++i) {
+    const WLAN_PHY_RADIO_STATE &phy = radio->PhyRadioState[i];
+    if (phy.dot11SoftwareRadioState == dot11_radio_state_on &&
+        phy.dot11HardwareRadioState != dot11_radio_state_off) {
+      any_on = true;
+      break;
+    }
+  }
+  g_api.FreeMemory (radio);
+  return any_on;
+}
+
 }  // namespace
 
 gboolean
@@ -219,7 +254,9 @@ winome_wifi_get_status (WinomeWifiStatus *out)
 
   const WLAN_INTERFACE_INFO *info = pick_interface (list);
   if (info != nullptr) {
-    out->enabled = (info->isState != wlan_interface_state_not_ready);
+    bool base_enabled = (info->isState != wlan_interface_state_not_ready);
+    out->enabled = query_radio_enabled (client, info->InterfaceGuid,
+                                        base_enabled);
     out->connected =
         (info->isState == wlan_interface_state_connected ||
          info->isState == wlan_interface_state_ad_hoc_network_formed);
@@ -256,6 +293,9 @@ winome_wifi_scan (WinomeWifiNetwork **out, guint *out_count)
 
   const WLAN_INTERFACE_INFO *info = pick_interface (list);
   if (info != nullptr) {
+    if (g_api.Scan != nullptr)
+      g_api.Scan (client, &info->InterfaceGuid, nullptr, nullptr, nullptr);
+
     PWLAN_AVAILABLE_NETWORK_LIST avail = nullptr;
     // The third parameter is documented as reserved (must be 0); the
     // WLAN_AVAILABLE_NETWORK_* flags are dwFlags on the struct, not here.
@@ -377,5 +417,53 @@ winome_wifi_disconnect (void)
            == ERROR_SUCCESS;
     g_api.FreeMemory (list);
   }
+  return ok;
+}
+
+gboolean
+winome_wifi_set_enabled (gboolean enabled)
+{
+  HANDLE client = nullptr;
+  if (!ensure_client (&client) || g_api.SetInterface == nullptr)
+    return FALSE;
+
+  PWLAN_INTERFACE_INFO_LIST list = nullptr;
+  if (!enum_interfaces (client, &list))
+    return FALSE;
+
+  gboolean ok = FALSE;
+  const WLAN_INTERFACE_INFO *info = pick_interface (list);
+  if (info != nullptr) {
+    DWORD num_phys = 1;
+    DWORD size = 0;
+    WLAN_OPCODE_VALUE_TYPE type = wlan_opcode_value_type_query_only;
+    WLAN_RADIO_STATE *radio = nullptr;
+    if (g_api.QueryInterface (client, &info->InterfaceGuid,
+                              wlan_intf_opcode_radio_state, nullptr, &size,
+                              (PVOID *) &radio, &type) == ERROR_SUCCESS &&
+        radio != nullptr) {
+      if (radio->dwNumberOfPhys > 0 &&
+          radio->dwNumberOfPhys <= WLAN_MAX_PHY_INDEX)
+        num_phys = radio->dwNumberOfPhys;
+      g_api.FreeMemory (radio);
+    }
+
+    for (DWORD i = 0; i < num_phys; ++i) {
+      WLAN_PHY_RADIO_STATE phy = {};
+      phy.dwPhyIndex = i;
+      phy.dot11SoftwareRadioState =
+          enabled ? dot11_radio_state_on : dot11_radio_state_off;
+      phy.dot11HardwareRadioState = dot11_radio_state_unknown;
+      if (g_api.SetInterface (client, &info->InterfaceGuid,
+                              wlan_intf_opcode_radio_state, sizeof (phy),
+                              &phy, nullptr) == ERROR_SUCCESS)
+        ok = TRUE;
+    }
+
+    if (enabled && g_api.Scan != nullptr)
+      g_api.Scan (client, &info->InterfaceGuid, nullptr, nullptr, nullptr);
+  }
+
+  g_api.FreeMemory (list);
   return ok;
 }

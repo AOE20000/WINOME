@@ -55,7 +55,8 @@ bool covers_monitor(HWND hwnd) {
     return false;
 
   HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-  MONITORINFO mi = {sizeof(mi)};
+  MONITORINFO mi{};
+  mi.cbSize = sizeof(mi);
   if (!GetMonitorInfo(mon, &mi))
     return false;
 
@@ -140,7 +141,8 @@ gboolean fullscreen_tick(gpointer user_data) {
   RECT panel_rect;
   if (GetWindowRect(panel, &panel_rect)) {
     HMONITOR mon = MonitorFromWindow(panel, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi = {sizeof(mi)};
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
     RECT current;
     if (mon != nullptr && GetMonitorInfo(mon, &mi) &&
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &current, 0)) {

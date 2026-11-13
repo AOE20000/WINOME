@@ -31,3 +31,10 @@ int winome_shell_panel_popover_just_closed (void);
 // one. Closes any menu already open, and is closed by the next click outside,
 // exactly like the quick-settings and calendar popovers.
 void winome_shell_panel_open_menu (GtkWidget *anchor, GtkWidget *menu);
+
+// Close the active secondary menu if it was opened for @anchor, returning
+// TRUE if one was closed.
+gboolean winome_shell_panel_close_menu_for (GtkWidget *anchor);
+
+// Close any active secondary menu.
+void winome_shell_panel_close_menu (void);

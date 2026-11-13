@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-plus
+// SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 WINOME contributors
 // Easing curves and a tiny tween runner, matching Clutter's easing functions.
 
@@ -96,12 +96,27 @@ bezier_solve (const Bezier &b, double x)
 // that is destroyed mid-animation simply drops the callback with its closure.
 struct TweenState {
   GtkWidget *widget = nullptr;
+  guint tick_id = 0;
   TweenTarget target;
   int duration_us = 0;
   Ease ease = Ease::ease_out_cubic;
   gint64 start_us = 0;
   std::function<void()> on_complete;
 };
+
+static const char *
+target_key (TweenTarget::Kind kind)
+{
+  switch (kind) {
+  case TweenTarget::Kind::opacity:
+    return "winome-tween-opacity";
+  case TweenTarget::Kind::width:
+    return "winome-tween-width";
+  case TweenTarget::Kind::height:
+    return "winome-tween-height";
+  }
+  return "winome-tween-unknown";
+}
 
 static void
 tween_state_destroy (gpointer data)
@@ -132,6 +147,8 @@ on_tick (GtkWidget *widget, GdkFrameClock *clock G_GNUC_UNUSED, gpointer data)
   if (st->widget == nullptr)
     return G_SOURCE_REMOVE;
 
+  g_object_ref (widget);
+
   const gint64 now = g_get_monotonic_time ();
   if (st->start_us == 0)
     st->start_us = now;
@@ -147,17 +164,23 @@ on_tick (GtkWidget *widget, GdkFrameClock *clock G_GNUC_UNUSED, gpointer data)
   apply_value (widget, st->target,
                st->target.from + (st->target.to - st->target.from) * eased);
 
-  if (progress < 1.0)
+  if (progress < 1.0) {
+    g_object_unref (widget);
     return G_SOURCE_CONTINUE;
+  }
 
   // Finished: apply the exact target (so no rounding residue) then detach.
   // Move on_complete out before running it because G_SOURCE_REMOVE invokes the
   // tick callback's GDestroyNotify, and cb() itself may destroy widget early.
   apply_value (widget, st->target, st->target.to);
+  const char *key = target_key (st->target.kind);
+  if (GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (widget), key)) == st->tick_id)
+    g_object_set_data (G_OBJECT (widget), key, nullptr);
   st->widget = nullptr;
   auto cb = std::move (st->on_complete);
   if (cb)
     cb ();
+  g_object_unref (widget);
   return G_SOURCE_REMOVE;
 }
 
@@ -201,6 +224,13 @@ tween_property (GtkWidget *widget, const TweenTarget &target,
   // Stop any tween already driving this widget's target so they do not fight.
   // The frame-clock callback is removed with the widget, so a detached widget
   // cannot outlive its tween.
+  const char *key = target_key (target.kind);
+  guint prev_id = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (widget), key));
+  if (prev_id != 0) {
+    gtk_widget_remove_tick_callback (widget, prev_id);
+    g_object_set_data (G_OBJECT (widget), key, nullptr);
+  }
+
   auto *st = new TweenState ();
   st->widget = widget;
   st->target = target;
@@ -208,7 +238,9 @@ tween_property (GtkWidget *widget, const TweenTarget &target,
   st->ease = ease;
   st->on_complete = std::move (on_complete);
 
-  gtk_widget_add_tick_callback (widget, on_tick, st, tween_state_destroy);
+  guint id = gtk_widget_add_tick_callback (widget, on_tick, st, tween_state_destroy);
+  st->tick_id = id;
+  g_object_set_data (G_OBJECT (widget), key, GUINT_TO_POINTER (id));
 }
 
 void

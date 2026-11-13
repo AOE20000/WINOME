@@ -18,6 +18,7 @@
 #include "shell-panel.h"
 #include "st-engine.h"
 #include "system-status.h"
+#include "wifi-networks.h"
 #include "easing.h"
 #include "quick-settings.h"
 #include "overview-trigger.h"
@@ -614,15 +615,24 @@ panel_popover_geometry (PanelPopover *pp, int width, int height,
   return TRUE;
 }
 
-// Fade a secondary menu out, then destroy its one-shot window (quickSettings.js:500
-// fades the box, then destroys the menu). The callback holds its own strong
-// reference on the window via shared_ptr and never touches PanelPopover, because
-// gtk_window_destroy emits "destroy" and frees that struct.
+// Fade a secondary menu out, then destroy its one-shot window on an idle pass
+// (outside GdkFrameClock tick dispatch) so child widgets aren't disposed
+// mid-tick.
+static gboolean
+destroy_menu_window_idle (gpointer data)
+{
+  GtkWidget *window = GTK_WIDGET (data);
+  if (GTK_IS_WINDOW (window))
+    gtk_window_destroy (GTK_WINDOW (window));
+  return G_SOURCE_REMOVE;
+}
+
 static void
 on_menu_fade_out_done (GtkWidget *window)
 {
   gtk_widget_set_visible (window, FALSE);
-  gtk_window_destroy (GTK_WINDOW (window));
+  g_idle_add_full (G_PRIORITY_DEFAULT_IDLE, destroy_menu_window_idle,
+                   g_object_ref (window), g_object_unref);
 }
 
 static void
@@ -856,22 +866,60 @@ on_popover_key (GtkEventControllerKey *controller G_GNUC_UNUSED,
   return GDK_EVENT_PROPAGATE;
 }
 
+static gboolean
+close_outside_popovers_idle (gpointer data)
+{
+  POINT *pt = static_cast<POINT *>(data);
+  if (pt == nullptr)
+    return G_SOURCE_REMOVE;
+
+  GList *snapshot = g_list_copy (g_open_popovers);
+  for (GList *l = snapshot; l != nullptr; l = l->next) {
+    PanelPopover *pp = static_cast<PanelPopover *>(l->data);
+    if (g_list_find (g_open_popovers, pp) == nullptr || !pp->open)
+      continue;
+
+    HWND hwnd = panel_popover_hwnd (pp);
+    RECT r;
+    gboolean inside = FALSE;
+    if (hwnd != nullptr && GetWindowRect (hwnd, &r)) {
+      inside = PtInRect (&r, *pt) != FALSE;
+      if (!inside && PtInRect (&pp->anchor_rect, *pt))
+        inside = TRUE;
+      if (!inside && !pp->anchored_menu && g_open_menu != NULL &&
+          g_open_menu->open) {
+        HWND menu_hwnd = panel_popover_hwnd (g_open_menu);
+        RECT mr;
+        if (menu_hwnd != nullptr && GetWindowRect (menu_hwnd, &mr) &&
+            PtInRect (&mr, *pt))
+          inside = TRUE;
+      }
+    }
+    if (!inside)
+      panel_popover_close (pp, "outside-click");
+  }
+  g_list_free (snapshot);
+  g_free (pt);
+  return G_SOURCE_REMOVE;
+}
+
 // Low-level mouse hook (installed on the main thread, where the GTK Win32
-// backend pumps messages): close open popovers on any mouse-down outside the
-// popover window itself and outside its anchor button.
+// backend pumps messages): check popover bounds synchronously and dispatch
+// dismissal via idle so the hook returns immediately without blocking Windows.
 static LRESULT CALLBACK
 popover_mouse_hook_proc (int nCode, WPARAM wParam, LPARAM lParam)
 {
   if (nCode == HC_ACTION &&
       (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN ||
-       wParam == WM_MBUTTONDOWN)) {
+       wParam == WM_MBUTTONDOWN) &&
+      g_open_popovers != nullptr) {
     MSLLHOOKSTRUCT *ms = reinterpret_cast<MSLLHOOKSTRUCT *>(lParam);
     POINT pt = ms->pt;
+    gboolean any_outside = FALSE;
 
-    GList *snapshot = g_list_copy (g_open_popovers);
-    for (GList *l = snapshot; l != nullptr; l = l->next) {
+    for (GList *l = g_open_popovers; l != nullptr; l = l->next) {
       PanelPopover *pp = static_cast<PanelPopover *>(l->data);
-      if (g_list_find (g_open_popovers, pp) == nullptr || !pp->open)
+      if (!pp->open)
         continue;
 
       HWND hwnd = panel_popover_hwnd (pp);
@@ -894,15 +942,21 @@ popover_mouse_hook_proc (int nCode, WPARAM wParam, LPARAM lParam)
         }
       }
       if (!inside) {
-        // GNOME's menu grab consumes an outside click: it dismisses the menu
-        // only. When the overview is open underneath, mark the dismissal so
-        // the overview ignores the matching mouse-up instead of closing.
-        if (winome::overview_active ())
-          g_popover_outside_close_us = g_get_monotonic_time ();
-        panel_popover_close (pp, "outside-click");
+        any_outside = TRUE;
+        break;
       }
     }
-    g_list_free (snapshot);
+
+    if (any_outside) {
+      // GNOME's menu grab consumes an outside click: it dismisses the menu
+      // only. When the overview is open underneath, mark the dismissal so
+      // the overview ignores the matching mouse-up instead of closing.
+      if (winome::overview_active ())
+        g_popover_outside_close_us = g_get_monotonic_time ();
+      POINT *pt_copy = g_new (POINT, 1);
+      *pt_copy = pt;
+      g_idle_add (close_outside_popovers_idle, pt_copy);
+    }
   }
   return CallNextHookEx (nullptr, nCode, wParam, lParam);
 }
@@ -1063,11 +1117,45 @@ winome_shell_panel_open_menu (GtkWidget *anchor, GtkWidget *menu)
   panel_popover_open (pp);
   g_open_menu = pp;
 }
+
+gboolean
+winome_shell_panel_close_menu_for (GtkWidget *anchor)
+{
+  if (anchor != NULL && g_open_menu != NULL && g_open_menu->open &&
+      g_open_menu->button == anchor) {
+    PanelPopover *menu = g_open_menu;
+    g_open_menu = NULL;
+    panel_popover_close (menu, "toggle");
+    return TRUE;
+  }
+  return FALSE;
+}
+
+void
+winome_shell_panel_close_menu (void)
+{
+  if (g_open_menu != NULL && g_open_menu->open) {
+    PanelPopover *menu = g_open_menu;
+    g_open_menu = NULL;
+    panel_popover_close (menu, "activate");
+  }
+}
+typedef struct PanelStatus {
+  GtkWidget *network_icon;
+  GtkWidget *bluetooth_icon;
+  GtkWidget *volume_icon;
+  GtkWidget *battery_box;
+  GtkWidget *battery_icon;
+  GtkWidget *battery_label;
+  GtkWidget *quick_settings;
+  GtkWidget *date_menu;
+} PanelStatus;
+
 // In GNOME the hover/active highlight lives on the .clock child (an St.Widget).
 // GtkLabel does not paint its CSS background in GTK4, so the .clock "label" is
 // a GtkBox (which does paint it) wrapping the actual text label.
 static GtkWidget *
-create_clock_button (void)
+create_clock_button (PanelStatus *st)
 {
   GtkWidget *button;
   GtkWidget *display_box;
@@ -1102,7 +1190,8 @@ create_clock_button (void)
 
   // The clock opens the date/calendar popover (like DateMenuButton), centered
   // below the clock.
-  make_panel_popover (button, winome_calendar_new (), TRUE);
+  st->date_menu = winome_calendar_new ();
+  make_panel_popover (button, st->date_menu, TRUE);
 
   return button;
 }
@@ -1142,15 +1231,6 @@ make_indicator (GtkWidget **icon_out, const char *icon_name)
 
 // --- Status data ------------------------------------------------------------
 
-typedef struct {
-  GtkWidget *network_icon;
-  GtkWidget *bluetooth_icon;
-  GtkWidget *volume_icon;
-  GtkWidget *battery_box;
-  GtkWidget *battery_icon;
-  GtkWidget *battery_label;
-} PanelStatus;
-
 // gtk_image_set_from_icon_name invalidates the render node even when the
 // name did not change; the 2s status poll would otherwise queue needless
 // panel redraws for every tick.
@@ -1165,13 +1245,50 @@ set_icon_name_if_changed (GtkImage *image, const char *name)
 static void
 update_network_icon (GtkWidget *icon)
 {
-  bool connected = false;
-  winome::get_network_connected (&connected);
+  bool airplane = false;
+  if (winome::get_airplane_mode (&airplane) && airplane) {
+    set_icon_name_if_changed (GTK_IMAGE (icon), "airplane-mode-symbolic");
+    return;
+  }
 
-  set_icon_name_if_changed (
-      GTK_IMAGE (icon),
-      connected ? "network-wireless-signal-good-symbolic"
-                : "network-wireless-offline-symbolic");
+  WinomeWifiStatus wifi = {};
+  if (winome_wifi_get_status (&wifi) && wifi.enabled && wifi.connected) {
+    const char *name;
+    if (wifi.signal_quality >= 80)
+      name = "network-wireless-signal-excellent-symbolic";
+    else if (wifi.signal_quality >= 55)
+      name = "network-wireless-signal-good-symbolic";
+    else if (wifi.signal_quality >= 30)
+      name = "network-wireless-signal-ok-symbolic";
+    else if (wifi.signal_quality > 0)
+      name = "network-wireless-signal-weak-symbolic";
+    else
+      name = "network-wireless-signal-none-symbolic";
+    set_icon_name_if_changed (GTK_IMAGE (icon), name);
+    return;
+  }
+
+  bool connected = false;
+  if (winome::get_network_connected (&connected) && connected) {
+    set_icon_name_if_changed (GTK_IMAGE (icon), "network-wired-symbolic");
+    return;
+  }
+
+  set_icon_name_if_changed (GTK_IMAGE (icon), "network-wireless-offline-symbolic");
+}
+
+static void
+update_bluetooth_icon (GtkWidget *icon)
+{
+  if (icon == nullptr)
+    return;
+
+  bool present = false, enabled = false;
+  winome::get_bluetooth_status (&present, &enabled, nullptr, 0);
+  GtkWidget *parent = gtk_widget_get_parent (icon);
+  if (parent != nullptr)
+    gtk_widget_set_visible (parent, present && enabled);
+  set_icon_name_if_changed (GTK_IMAGE (icon), "bluetooth-active-symbolic");
 }
 
 static void
@@ -1230,8 +1347,13 @@ refresh_status (gpointer data)
   PanelStatus *st = static_cast<PanelStatus *>(data);
 
   update_network_icon (st->network_icon);
+  update_bluetooth_icon (st->bluetooth_icon);
   update_volume_icon (st->volume_icon);
   update_battery_icon (st);
+  if (st->quick_settings != nullptr)
+    winome_quick_settings_refresh (st->quick_settings);
+  if (st->date_menu != nullptr)
+    winome_calendar_refresh (st->date_menu);
 
   return G_SOURCE_CONTINUE;
 }
@@ -1278,7 +1400,8 @@ create_quick_settings (PanelStatus *st)
 
   // The status area opens the quick settings popover, right-aligned near the
   // status area.
-  make_panel_popover (button, winome_quick_settings_new (), FALSE);
+  st->quick_settings = winome_quick_settings_new ();
+  make_panel_popover (button, st->quick_settings, FALSE);
 
   return button;
 }
@@ -1355,15 +1478,15 @@ winome_shell_panel_new (void)
   right_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
   gtk_widget_set_name (right_box, "panelRight");
 
-  gtk_box_append (GTK_BOX (left_box), create_activities_button ());
-  gtk_box_append (GTK_BOX (center_box), create_clock_button ());
-
   status = g_new0 (PanelStatus, 1);
+  gtk_box_append (GTK_BOX (left_box), create_activities_button ());
+  gtk_box_append (GTK_BOX (center_box), create_clock_button (status));
   gtk_box_append (GTK_BOX (right_box), create_quick_settings (status));
 
   winome_panel_layout_set (layout, left_box, center_box, right_box);
 
-  // Refresh network / volume / battery icons periodically.
+  // Refresh network / bluetooth / volume / battery icons immediately and periodically.
+  refresh_status (status);
   g_timeout_add_seconds (2, refresh_status, status);
 
   // Give the panel its own font map so the bundled Cantarell font is used.

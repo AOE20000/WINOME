@@ -47,7 +47,8 @@ gboolean hot_corner_tick(gpointer user_data) {
   // tick is just GetCursorPos + a bounds check (negligible CPU).
   if (now_ms >= next_refresh_ms) {
     HMONITOR mon = MonitorFromWindow(panel, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi = {sizeof(mi)};
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
     if (mon != nullptr && GetMonitorInfo(mon, &mi))
       corner_monitor = mi.rcMonitor;
     next_refresh_ms = now_ms + 1000;

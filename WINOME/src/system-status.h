@@ -45,6 +45,37 @@ bool get_brightness(double* out);
 // Set current screen brightness as 0..1 fraction.
 bool set_brightness(double fraction);
 
+// Get/set Windows dark mode (AppsUseLightTheme / SystemUsesLightTheme).
+bool get_dark_mode(bool* out);
+bool set_dark_mode(bool dark);
+
+struct BluetoothDevice {
+  char name[249];
+  bool connected;
+  bool paired;
+};
+
+// Bluetooth radio state and first connected device name (UTF-8).
+bool get_bluetooth_status(bool* present, bool* enabled,
+                          char* connected_name, int name_size);
+bool set_bluetooth_enabled(bool enabled);
+int get_bluetooth_devices(BluetoothDevice* out, int max_count);
+
+// Windows Night Light (Blue Light Reduction) state.
+bool get_night_light(bool* out);
+bool set_night_light(bool enabled);
+
+// Do Not Disturb (Focus Assist / shell notification suppression) state.
+bool get_do_not_disturb(bool* out);
+bool set_do_not_disturb(bool enabled);
+
+// Airplane Mode (system radio master state).
+bool get_airplane_mode(bool* out);
+bool set_airplane_mode(bool enabled);
+
+// Whether the machine exposes a controllable keyboard backlight.
+bool has_keyboard_backlight();
+
 // Lock the workstation (matches gnome-shell SystemActions lock screen).
 void lock_screen();
 

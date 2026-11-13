@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 WINOME contributors
 //
 // Bundled Cantarell fonts.
@@ -12,6 +12,7 @@
 // milliseconds.
 
 #include "fonts.h"
+#include "host-utils.h"
 
 #include <fontconfig/fontconfig.h>
 #include <pango/pangocairo.h>
@@ -64,23 +65,15 @@ write_resource_to_file (const char *resource_path, const char *dir)
 
 // Pick a writable, ASCII-only directory for the extracted fonts. fontconfig's
 // FreeType loader fails on non-ASCII paths (e.g. a Chinese username in the
-// %TEMP% path), so the app's own directory is used.
+// %TEMP% path), so app_data_dir_ascii() uses an 8.3 short path under
+// %LOCALAPPDATA%\WINOME when available.
 static char *
 fonts_cache_dir (void)
 {
-  wchar_t exe[MAX_PATH];
-  if (GetModuleFileNameW (NULL, exe, MAX_PATH) == 0)
+  std::string base = winome::app_data_dir_ascii ();
+  if (base.empty ())
     return g_strdup ("winome-fonts");
-
-  wchar_t *slash = wcsrchr (exe, L'\\');
-  if (slash != NULL)
-    *slash = 0;
-
-  char *utf8 = g_utf16_to_utf8 (reinterpret_cast<const gunichar2 *> (exe), -1,
-                                NULL, NULL, NULL);
-  char *dir = g_build_filename (utf8, "winome-fonts", NULL);
-  g_free (utf8);
-  return dir;
+  return g_build_filename (base.c_str (), "fonts", NULL);
 }
 
 PangoFontMap *

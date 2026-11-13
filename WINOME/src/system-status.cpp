@@ -4,16 +4,24 @@
 
 #include "system-status.h"
 #include "wifi-networks.h"
+#include "host-utils.h"
 
 #include <windows.h>
+#include <winioctl.h>
 #include <wininet.h>
+#include <bluetoothapis.h>
+#include <shellapi.h>
 #include <powrprof.h>
 
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include <audiopolicy.h>
 
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <stdio.h>
+#include <vector>
 
 namespace winome {
 
@@ -181,16 +189,347 @@ bool get_wifi_enabled(bool* out) {
   return true;
 }
 
+static double s_cached_brightness = 0.5;
+
+namespace {
+
+// Windows LCD device IOCTLs (FILE_DEVICE_VIDEO, functions 0x126..0x128).
+constexpr DWORD kIoctlQuerySupportedBrightness = 0x230498;
+constexpr DWORD kIoctlQueryDisplayBrightness   = 0x23049C;
+constexpr DWORD kIoctlSetDisplayBrightness     = 0x2304A0;
+
+struct DisplayBrightness {
+  BYTE ucDisplayPolicy;
+  BYTE ucACBrightness;
+  BYTE ucDCBrightness;
+};
+
+struct WinomePhysicalMonitor {
+  HANDLE hPhysicalMonitor;
+  WCHAR  szPhysicalMonitorDescription[128];
+};
+
+using FnGetNumPhysMons = BOOL (WINAPI *)(HMONITOR, LPDWORD);
+using FnGetPhysMons    = BOOL (WINAPI *)(HMONITOR, DWORD, WinomePhysicalMonitor *);
+using FnDestroyPhysMon = BOOL (WINAPI *)(DWORD, WinomePhysicalMonitor *);
+using FnGetMonBright   = BOOL (WINAPI *)(HANDLE, LPDWORD, LPDWORD, LPDWORD);
+using FnSetMonBright   = BOOL (WINAPI *)(HANDLE, DWORD);
+
+struct Dxva2Api {
+  bool             loaded = false;
+  FnGetNumPhysMons get_count = nullptr;
+  FnGetPhysMons    get_mons = nullptr;
+  FnDestroyPhysMon destroy_mons = nullptr;
+  FnGetMonBright   get_bright = nullptr;
+  FnSetMonBright   set_bright = nullptr;
+};
+
+template <typename Fn>
+Fn load_fn(HMODULE mod, const char *name) {
+  return reinterpret_cast<Fn>(reinterpret_cast<void *>(GetProcAddress(mod, name)));
+}
+
+const Dxva2Api &dxva2_api() {
+  static Dxva2Api api = []() {
+    Dxva2Api a;
+    HMODULE mod = LoadLibraryW(L"dxva2.dll");
+    if (mod == nullptr)
+      return a;
+    a.get_count = load_fn<FnGetNumPhysMons>(mod, "GetNumberOfPhysicalMonitorsFromHMONITOR");
+    a.get_mons = load_fn<FnGetPhysMons>(mod, "GetPhysicalMonitorsFromHMONITOR");
+    a.destroy_mons = load_fn<FnDestroyPhysMon>(mod, "DestroyPhysicalMonitors");
+    a.get_bright = load_fn<FnGetMonBright>(mod, "GetMonitorBrightness");
+    a.set_bright = load_fn<FnSetMonBright>(mod, "SetMonitorBrightness");
+    a.loaded = a.get_count && a.get_mons && a.destroy_mons &&
+               a.get_bright && a.set_bright;
+    return a;
+  }();
+  return api;
+}
+
+bool get_lcd_brightness(double *out) {
+  HANDLE lcd = CreateFileW(L"\\\\.\\LCD", GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+  if (lcd == INVALID_HANDLE_VALUE)
+    return false;
+
+  DisplayBrightness db {};
+  DWORD returned = 0;
+  BOOL ok = DeviceIoControl(lcd, kIoctlQueryDisplayBrightness, nullptr, 0,
+                            &db, sizeof(db), &returned, nullptr);
+  CloseHandle(lcd);
+  if (!ok)
+    return false;
+
+  BYTE level = db.ucACBrightness;
+  if (db.ucDisplayPolicy == 0x02) {
+    level = db.ucDCBrightness;
+  } else if (db.ucDisplayPolicy != 0x01) {
+    SYSTEM_POWER_STATUS sps {};
+    if (GetSystemPowerStatus(&sps) && sps.ACLineStatus == 0)
+      level = db.ucDCBrightness;
+  }
+
+  *out = std::clamp(static_cast<double>(level) / 100.0, 0.0, 1.0);
+  return true;
+}
+
+bool set_lcd_brightness(double fraction) {
+  HANDLE lcd = CreateFileW(L"\\\\.\\LCD", GENERIC_READ | GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+  if (lcd == INVALID_HANDLE_VALUE)
+    return false;
+
+  int raw_pct = static_cast<int>(std::clamp(fraction, 0.0, 1.0) * 100.0 + 0.5);
+  BYTE target = static_cast<BYTE>(std::clamp(raw_pct, 0, 100));
+
+  BYTE supported[256] {};
+  DWORD returned = 0;
+  if (DeviceIoControl(lcd, kIoctlQuerySupportedBrightness, nullptr, 0,
+                      supported, sizeof(supported), &returned, nullptr) &&
+      returned > 0) {
+    BYTE best = supported[0];
+    int best_dist = std::abs(static_cast<int>(best) - static_cast<int>(target));
+    for (DWORD i = 1; i < returned; ++i) {
+      int dist = std::abs(static_cast<int>(supported[i]) - static_cast<int>(target));
+      if (dist < best_dist) {
+        best = supported[i];
+        best_dist = dist;
+      }
+    }
+    target = best;
+  }
+
+  DisplayBrightness db {};
+  db.ucDisplayPolicy = 0x03; // apply to both AC and DC
+  db.ucACBrightness = target;
+  db.ucDCBrightness = target;
+  BOOL ok = DeviceIoControl(lcd, kIoctlSetDisplayBrightness, &db, sizeof(db),
+                            nullptr, 0, &returned, nullptr);
+  CloseHandle(lcd);
+  return ok != FALSE;
+}
+
+bool get_dxva2_brightness(double *out) {
+  const Dxva2Api &api = dxva2_api();
+  if (!api.loaded)
+    return false;
+
+  HMONITOR mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+  if (mon == nullptr)
+    return false;
+
+  DWORD count = 0;
+  if (!api.get_count(mon, &count) || count == 0)
+    return false;
+
+  std::vector<WinomePhysicalMonitor> mons(count);
+  if (!api.get_mons(mon, count, mons.data()))
+    return false;
+
+  bool result = false;
+  for (DWORD i = 0; i < count; ++i) {
+    DWORD min_b = 0, cur_b = 0, max_b = 0;
+    if (api.get_bright(mons[i].hPhysicalMonitor, &min_b, &cur_b, &max_b) &&
+        max_b > min_b) {
+      *out = std::clamp(
+          static_cast<double>(cur_b - min_b) / static_cast<double>(max_b - min_b),
+          0.0, 1.0);
+      result = true;
+      break;
+    }
+  }
+
+  api.destroy_mons(count, mons.data());
+  return result;
+}
+
+bool set_dxva2_brightness(double fraction) {
+  const Dxva2Api &api = dxva2_api();
+  if (!api.loaded)
+    return false;
+
+  HMONITOR mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+  if (mon == nullptr)
+    return false;
+
+  DWORD count = 0;
+  if (!api.get_count(mon, &count) || count == 0)
+    return false;
+
+  std::vector<WinomePhysicalMonitor> mons(count);
+  if (!api.get_mons(mon, count, mons.data()))
+    return false;
+
+  double clamped = std::clamp(fraction, 0.0, 1.0);
+  bool result = false;
+  for (DWORD i = 0; i < count; ++i) {
+    DWORD min_b = 0, cur_b = 0, max_b = 0;
+    if (api.get_bright(mons[i].hPhysicalMonitor, &min_b, &cur_b, &max_b) &&
+        max_b > min_b) {
+      DWORD val = min_b + static_cast<DWORD>(clamped * (max_b - min_b) + 0.5);
+      if (api.set_bright(mons[i].hPhysicalMonitor, val))
+        result = true;
+    }
+  }
+
+  api.destroy_mons(count, mons.data());
+  return result;
+}
+
+constexpr wchar_t kPersonalizeKey[] =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+constexpr wchar_t kWinomeKey[] = L"Software\\WINOME";
+constexpr wchar_t kNightLightKey[] =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore\\Store\\"
+    L"DefaultAccount\\Current\\default$windows.data.bluelightreduction."
+    L"bluelightreductionstate\\windows.data.bluelightreduction."
+    L"bluelightreductionstate";
+constexpr wchar_t kRadioMgmtKey[] =
+    L"SYSTEM\\CurrentControlSet\\Control\\RadioManagement";
+constexpr wchar_t kRadioStateSubkey[] =
+    L"SYSTEM\\CurrentControlSet\\Control\\RadioManagement\\SystemRadioState";
+
+using FnBtFindFirstRadio  = HBLUETOOTH_RADIO_FIND (WINAPI *)(const BLUETOOTH_FIND_RADIO_PARAMS *, HANDLE *);
+using FnBtFindNextRadio   = WINBOOL (WINAPI *)(HBLUETOOTH_RADIO_FIND, HANDLE *);
+using FnBtFindRadioClose  = WINBOOL (WINAPI *)(HBLUETOOTH_RADIO_FIND);
+using FnBtFindFirstDevice = HBLUETOOTH_DEVICE_FIND (WINAPI *)(const BLUETOOTH_DEVICE_SEARCH_PARAMS *, BLUETOOTH_DEVICE_INFO *);
+using FnBtFindNextDevice  = WINBOOL (WINAPI *)(HBLUETOOTH_DEVICE_FIND, BLUETOOTH_DEVICE_INFO *);
+using FnBtFindDeviceClose = WINBOOL (WINAPI *)(HBLUETOOTH_DEVICE_FIND);
+using FnBtEnableDiscovery = WINBOOL (WINAPI *)(HANDLE, WINBOOL);
+using FnBtEnableIncoming  = WINBOOL (WINAPI *)(HANDLE, WINBOOL);
+
+struct BthApi {
+  bool                loaded = false;
+  FnBtFindFirstRadio  find_first_radio = nullptr;
+  FnBtFindNextRadio   find_next_radio = nullptr;
+  FnBtFindRadioClose  find_radio_close = nullptr;
+  FnBtFindFirstDevice find_first_dev = nullptr;
+  FnBtFindNextDevice  find_next_dev = nullptr;
+  FnBtFindDeviceClose find_dev_close = nullptr;
+  FnBtEnableDiscovery enable_discovery = nullptr;
+  FnBtEnableIncoming  enable_incoming = nullptr;
+};
+
+const BthApi &bth_api() {
+  static BthApi api = []() {
+    BthApi a;
+    HMODULE mod = LoadLibraryW(L"BluetoothApis.dll");
+    if (mod == nullptr)
+      mod = LoadLibraryW(L"bthprops.cpl");
+    if (mod == nullptr)
+      return a;
+
+    a.find_first_radio = load_fn<FnBtFindFirstRadio>(mod, "BluetoothFindFirstRadio");
+    a.find_next_radio  = load_fn<FnBtFindNextRadio>(mod, "BluetoothFindNextRadio");
+    a.find_radio_close = load_fn<FnBtFindRadioClose>(mod, "BluetoothFindRadioClose");
+    a.find_first_dev   = load_fn<FnBtFindFirstDevice>(mod, "BluetoothFindFirstDevice");
+    a.find_next_dev    = load_fn<FnBtFindNextDevice>(mod, "BluetoothFindNextDevice");
+    a.find_dev_close   = load_fn<FnBtFindDeviceClose>(mod, "BluetoothFindDeviceClose");
+    a.enable_discovery = load_fn<FnBtEnableDiscovery>(mod, "BluetoothEnableDiscovery");
+    a.enable_incoming  = load_fn<FnBtEnableIncoming>(mod, "BluetoothEnableIncomingConnections");
+    a.loaded = a.find_first_radio && a.find_radio_close &&
+               a.find_first_dev && a.find_next_dev && a.find_dev_close &&
+               a.enable_discovery && a.enable_incoming;
+    return a;
+  }();
+  return api;
+}
+
+bool read_dword_value(HKEY root, const wchar_t *subkey, const wchar_t *value_name, DWORD *out) {
+  DWORD val = 0;
+  DWORD size = sizeof(val);
+  if (RegGetValueW(root, subkey, value_name, RRF_RT_REG_DWORD, nullptr,
+                   &val, &size) != ERROR_SUCCESS)
+    return false;
+  *out = val;
+  return true;
+}
+
+bool write_dword_value(HKEY root, const wchar_t *subkey, const wchar_t *value_name, DWORD val) {
+  HKEY key = nullptr;
+  if (RegCreateKeyExW(root, subkey, 0, nullptr, 0, KEY_SET_VALUE, nullptr,
+                      &key, nullptr) != ERROR_SUCCESS)
+    return false;
+  LSTATUS st = RegSetValueExW(key, value_name, 0, REG_DWORD,
+                              reinterpret_cast<const BYTE *>(&val), sizeof(val));
+  RegCloseKey(key);
+  return st == ERROR_SUCCESS;
+}
+
+bool reg_key_exists(HKEY root, const wchar_t *subkey) {
+  HKEY key = nullptr;
+  if (RegOpenKeyExW(root, subkey, 0, KEY_READ, &key) == ERROR_SUCCESS) {
+    RegCloseKey(key);
+    return true;
+  }
+  return false;
+}
+
+void wide_to_utf8(const wchar_t *src, char *dst, int dst_size) {
+  if (dst == nullptr || dst_size <= 0)
+    return;
+  dst[0] = '\0';
+  if (src == nullptr || src[0] == L'\0')
+    return;
+  WideCharToMultiByte(CP_UTF8, 0, src, -1, dst, dst_size, nullptr, nullptr);
+}
+
+} // namespace
+
 bool get_brightness(double* out) {
-  // Screen brightness on Windows needs WMI (WmiMonitorBrightness) or
-  // DXVA2 SetMonitorBrightness. For now return 0.5 as a placeholder.
+  double value = s_cached_brightness;
+  if (get_lcd_brightness(&value) || get_dxva2_brightness(&value))
+    s_cached_brightness = value;
   if (out != nullptr)
-    *out = 0.5;
+    *out = value;
   return true;
 }
 
 bool set_brightness(double fraction) {
-  (void)fraction;
+  double clamped = std::clamp(fraction, 0.0, 1.0);
+  s_cached_brightness = clamped;
+  return set_lcd_brightness(clamped) || set_dxva2_brightness(clamped);
+}
+
+bool get_dark_mode(bool* out) {
+  if (out == nullptr)
+    return false;
+  DWORD val = 1;
+  DWORD size = sizeof(val);
+  LSTATUS status = RegGetValueW(HKEY_CURRENT_USER, kPersonalizeKey,
+                                L"AppsUseLightTheme", RRF_RT_REG_DWORD,
+                                nullptr, &val, &size);
+  if (status != ERROR_SUCCESS)
+    return false;
+  *out = (val == 0);
+  return true;
+}
+
+bool set_dark_mode(bool dark) {
+  HKEY key = nullptr;
+  LSTATUS status = RegCreateKeyExW(HKEY_CURRENT_USER, kPersonalizeKey, 0,
+                                   nullptr, 0, KEY_SET_VALUE, nullptr, &key,
+                                   nullptr);
+  if (status != ERROR_SUCCESS)
+    return false;
+
+  DWORD val = dark ? 0 : 1;
+  bool ok_apps = RegSetValueExW(
+      key, L"AppsUseLightTheme", 0, REG_DWORD,
+      reinterpret_cast<const BYTE *>(&val), sizeof(val)) == ERROR_SUCCESS;
+  bool ok_sys = RegSetValueExW(
+      key, L"SystemUsesLightTheme", 0, REG_DWORD,
+      reinterpret_cast<const BYTE *>(&val), sizeof(val)) == ERROR_SUCCESS;
+  RegCloseKey(key);
+
+  if (ok_apps || ok_sys) {
+    SendNotifyMessageW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                       reinterpret_cast<LPARAM>(L"ImmersiveColorSet"));
+    return true;
+  }
   return false;
 }
 
@@ -203,19 +542,19 @@ void log_out() {
 }
 
 void suspend_system() {
-  // SetSuspendState: hibernate when the system is laptop-class (hibernation
-  // preserves the session across a battery swap, plain suspend does not).
-  // The call is best-effort — it fails if the policy forbids sleep.
+  // SetSuspendState requires SeShutdownPrivilege.
+  enable_privilege(L"SeShutdownPrivilege");
   SetSuspendState(FALSE, FALSE, FALSE);
 }
 
 void shutdown_system() {
-  // Requires SE_SHUTDOWN_NAME privilege; best-effort.
+  enable_privilege(L"SeShutdownPrivilege");
   ExitWindowsEx(EWX_POWEROFF | EWX_FORCE,
                 SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER);
 }
 
 void restart_system() {
+  enable_privilege(L"SeShutdownPrivilege");
   ExitWindowsEx(EWX_REBOOT | EWX_FORCE,
                 SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER);
 }
@@ -228,6 +567,281 @@ const char* get_system_language() {
   if (primary == LANG_CHINESE)
     return "zh";
   return "en";
+}
+
+bool get_bluetooth_status(bool* present, bool* enabled,
+                          char* connected_name, int name_size) {
+  if (present != nullptr)
+    *present = false;
+  if (enabled != nullptr)
+    *enabled = false;
+  if (connected_name != nullptr && name_size > 0)
+    connected_name[0] = '\0';
+
+  const BthApi &api = bth_api();
+  if (!api.loaded)
+    return false;
+
+  BLUETOOTH_FIND_RADIO_PARAMS rfp{};
+  rfp.dwSize = sizeof(rfp);
+  HANDLE radio = nullptr;
+  HBLUETOOTH_RADIO_FIND rfind = api.find_first_radio(&rfp, &radio);
+  if (rfind != nullptr) {
+    if (present != nullptr)
+      *present = true;
+    if (enabled != nullptr)
+      *enabled = true;
+
+    if (connected_name != nullptr && name_size > 0 && radio != nullptr) {
+      BLUETOOTH_DEVICE_SEARCH_PARAMS sp{};
+      sp.dwSize = sizeof(sp);
+      sp.fReturnAuthenticated = TRUE;
+      sp.fReturnRemembered = TRUE;
+      sp.fReturnConnected = TRUE;
+      sp.fReturnUnknown = FALSE;
+      sp.fIssueInquiry = FALSE;
+      sp.cTimeoutMultiplier = 0;
+      sp.hRadio = radio;
+
+      BLUETOOTH_DEVICE_INFO dev{};
+      dev.dwSize = sizeof(dev);
+      HBLUETOOTH_DEVICE_FIND dfind = api.find_first_dev(&sp, &dev);
+      if (dfind != nullptr) {
+        do {
+          if (dev.fConnected != 0 && dev.szName[0] != L'\0') {
+            wide_to_utf8(dev.szName, connected_name, name_size);
+            break;
+          }
+          dev.dwSize = sizeof(dev);
+        } while (api.find_next_dev(dfind, &dev));
+        api.find_dev_close(dfind);
+      }
+    }
+
+    if (radio != nullptr)
+      CloseHandle(radio);
+    api.find_radio_close(rfind);
+    return true;
+  }
+
+  // No powered radio handle: check if Bluetooth hardware/devices exist in registry.
+  if (reg_key_exists(HKEY_LOCAL_MACHINE,
+                     L"SYSTEM\\CurrentControlSet\\Services\\BTHPORT\\Parameters\\Devices") ||
+      reg_key_exists(HKEY_LOCAL_MACHINE,
+                     L"SYSTEM\\CurrentControlSet\\Services\\BTHPORT\\Parameters\\Radio Support")) {
+    if (present != nullptr)
+      *present = true;
+    if (enabled != nullptr)
+      *enabled = false;
+    return true;
+  }
+
+  return false;
+}
+
+bool set_bluetooth_enabled(bool enabled) {
+  const BthApi &api = bth_api();
+  if (!api.loaded)
+    return false;
+
+  BLUETOOTH_FIND_RADIO_PARAMS rfp{};
+  rfp.dwSize = sizeof(rfp);
+  HANDLE radio = nullptr;
+  HBLUETOOTH_RADIO_FIND rfind = api.find_first_radio(&rfp, &radio);
+  if (rfind != nullptr) {
+    if (radio != nullptr) {
+      api.enable_incoming(radio, enabled ? TRUE : FALSE);
+      api.enable_discovery(radio, enabled ? TRUE : FALSE);
+      CloseHandle(radio);
+    }
+    api.find_radio_close(rfind);
+    if (!enabled) {
+      ShellExecuteW(nullptr, L"open", L"ms-settings:bluetooth", nullptr, nullptr,
+                    SW_SHOWNORMAL);
+    }
+    return true;
+  }
+
+  if (enabled) {
+    ShellExecuteW(nullptr, L"open", L"ms-settings:bluetooth", nullptr, nullptr,
+                  SW_SHOWNORMAL);
+    return true;
+  }
+  return false;
+}
+
+int get_bluetooth_devices(BluetoothDevice* out, int max_count) {
+  if (out == nullptr || max_count <= 0)
+    return 0;
+
+  const BthApi &api = bth_api();
+  if (!api.loaded)
+    return 0;
+
+  BLUETOOTH_FIND_RADIO_PARAMS rfp{};
+  rfp.dwSize = sizeof(rfp);
+  HANDLE radio = nullptr;
+  HBLUETOOTH_RADIO_FIND rfind = api.find_first_radio(&rfp, &radio);
+  if (rfind == nullptr)
+    return 0;
+
+  int count = 0;
+  if (radio != nullptr) {
+    BLUETOOTH_DEVICE_SEARCH_PARAMS sp{};
+    sp.dwSize = sizeof(sp);
+    sp.fReturnAuthenticated = TRUE;
+    sp.fReturnRemembered = TRUE;
+    sp.fReturnConnected = TRUE;
+    sp.fReturnUnknown = FALSE;
+    sp.fIssueInquiry = FALSE;
+    sp.cTimeoutMultiplier = 0;
+    sp.hRadio = radio;
+
+    BLUETOOTH_DEVICE_INFO dev{};
+    dev.dwSize = sizeof(dev);
+    HBLUETOOTH_DEVICE_FIND dfind = api.find_first_dev(&sp, &dev);
+    if (dfind != nullptr) {
+      do {
+        if (dev.szName[0] != L'\0') {
+          BluetoothDevice &dst = out[count];
+          wide_to_utf8(dev.szName, dst.name, static_cast<int>(sizeof(dst.name)));
+          dst.connected = (dev.fConnected != 0);
+          dst.paired = (dev.fRemembered != 0 || dev.fAuthenticated != 0);
+          ++count;
+        }
+        dev.dwSize = sizeof(dev);
+      } while (count < max_count && api.find_next_dev(dfind, &dev));
+      api.find_dev_close(dfind);
+    }
+    CloseHandle(radio);
+  }
+  api.find_radio_close(rfind);
+  return count;
+}
+
+bool get_night_light(bool* out) {
+  if (out == nullptr)
+    return false;
+
+  BYTE buf[128]{};
+  DWORD size = sizeof(buf);
+  if (RegGetValueW(HKEY_CURRENT_USER, kNightLightKey, L"Data",
+                   RRF_RT_REG_BINARY, nullptr, buf, &size) == ERROR_SUCCESS &&
+      size >= 19 && (buf[18] == 0x15 || buf[18] == 0x13)) {
+    *out = (buf[18] == 0x15);
+    return true;
+  }
+
+  DWORD val = 0;
+  if (read_dword_value(HKEY_CURRENT_USER, kWinomeKey, L"NightLight", &val)) {
+    *out = (val != 0);
+    return true;
+  }
+
+  *out = false;
+  return true;
+}
+
+bool set_night_light(bool enabled) {
+  bool saved = write_dword_value(HKEY_CURRENT_USER, kWinomeKey, L"NightLight",
+                                 enabled ? 1 : 0);
+
+  BYTE buf[128]{};
+  DWORD size = sizeof(buf);
+  if (RegGetValueW(HKEY_CURRENT_USER, kNightLightKey, L"Data",
+                   RRF_RT_REG_BINARY, nullptr, buf, &size) == ERROR_SUCCESS &&
+      size >= 25 && size <= 100 && (buf[18] == 0x15 || buf[18] == 0x13)) {
+    bool currently_on = (buf[18] == 0x15);
+    if (currently_on != enabled) {
+      for (int i = 10; i <= 14; ++i) {
+        if (++buf[i] != 0)
+          break;
+      }
+
+      if (enabled) {
+        buf[18] = 0x15;
+        std::memmove(&buf[25], &buf[23], size - 23);
+        buf[23] = 0x10;
+        buf[24] = 0x00;
+        size += 2;
+      } else if (size >= 27) {
+        buf[18] = 0x13;
+        std::memmove(&buf[23], &buf[25], size - 25);
+        size -= 2;
+      }
+
+      HKEY key = nullptr;
+      if (RegCreateKeyExW(HKEY_CURRENT_USER, kNightLightKey, 0, nullptr, 0,
+                          KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
+        RegSetValueExW(key, L"Data", 0, REG_BINARY, buf, size);
+        RegCloseKey(key);
+        saved = true;
+      }
+    }
+  }
+
+  return saved;
+}
+
+bool get_do_not_disturb(bool* out) {
+  if (out == nullptr)
+    return false;
+
+  DWORD val = 0;
+  if (read_dword_value(HKEY_CURRENT_USER, kWinomeKey, L"DoNotDisturb", &val)) {
+    *out = (val != 0);
+    return true;
+  }
+
+  QUERY_USER_NOTIFICATION_STATE quns = QUNS_ACCEPTS_NOTIFICATIONS;
+  if (SUCCEEDED(SHQueryUserNotificationState(&quns))) {
+    *out = (quns == QUNS_BUSY || quns == QUNS_PRESENTATION_MODE ||
+            quns == QUNS_QUIET_TIME);
+    return true;
+  }
+
+  *out = false;
+  return true;
+}
+
+bool set_do_not_disturb(bool enabled) {
+  return write_dword_value(HKEY_CURRENT_USER, kWinomeKey, L"DoNotDisturb",
+                           enabled ? 1 : 0);
+}
+
+bool get_airplane_mode(bool* out) {
+  if (out == nullptr)
+    return false;
+
+  DWORD val = 0;
+  if (read_dword_value(HKEY_LOCAL_MACHINE, kRadioStateSubkey, nullptr, &val) ||
+      read_dword_value(HKEY_LOCAL_MACHINE, kRadioMgmtKey, L"SystemRadioState", &val)) {
+    *out = (val != 0);
+    return true;
+  }
+
+  if (read_dword_value(HKEY_CURRENT_USER, kWinomeKey, L"AirplaneMode", &val)) {
+    *out = (val != 0);
+    return true;
+  }
+
+  *out = false;
+  return true;
+}
+
+bool set_airplane_mode(bool enabled) {
+  DWORD val = enabled ? 1 : 0;
+  bool ok = write_dword_value(HKEY_CURRENT_USER, kWinomeKey, L"AirplaneMode", val);
+  winome_wifi_set_enabled(enabled ? FALSE : TRUE);
+  if (write_dword_value(HKEY_LOCAL_MACHINE, kRadioStateSubkey, nullptr, val) ||
+      write_dword_value(HKEY_LOCAL_MACHINE, kRadioMgmtKey, L"SystemRadioState", val)) {
+    ok = true;
+  }
+  return ok;
+}
+
+bool has_keyboard_backlight() {
+  return false;
 }
 
 }  // namespace winome

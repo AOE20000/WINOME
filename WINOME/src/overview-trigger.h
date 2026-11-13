@@ -18,6 +18,7 @@ typedef void (*OverviewStateCallback)(bool active, void *user_data);
 // Win+Tab opens the Start menu, Esc closes it; other Win combos are forwarded
 // to Windows). Runs on a background thread with its own message loop.
 void start_overview_trigger();
+void stop_overview_trigger();
 
 // Open the Activities overview if it is not already running (used by the panel
 // Activities button and the top-left hot corner). @source is a short tag for

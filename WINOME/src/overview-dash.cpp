@@ -239,18 +239,6 @@ utf8 (const std::wstring &w)
   return out;
 }
 
-std::wstring
-wide (const char *s)
-{
-  if (s == nullptr)
-    return L"";
-  int n = MultiByteToWideChar (CP_UTF8, 0, s, -1, nullptr, 0);
-  std::wstring out (n > 0 ? n - 1 : 0, L'\0');
-  if (n > 0)
-    MultiByteToWideChar (CP_UTF8, 0, s, -1, out.data (), n);
-  return out;
-}
-
 std::string
 exe_file_description (const std::wstring &exe)
 {
@@ -469,7 +457,8 @@ dash_collect (HWND hwnd, LPARAM lparam)
 
   RECT r = {};
   if (IsIconic (hwnd)) {
-    WINDOWPLACEMENT wp = {sizeof (wp)};
+    WINDOWPLACEMENT wp {};
+    wp.length = sizeof (wp);
     if (GetWindowPlacement (hwnd, &wp))
       r = wp.rcNormalPosition;
   } else {
@@ -534,11 +523,12 @@ place_label (WinomeDash *self, int index)
   double tile_cx = self->tile_rects[index].x + self->tile_rects[index].w / 2;
   double tile_top = self->tile_rects[index].y;
 
-  double origin_x = 0, origin_y = 0;
-  if (gtk_widget_translate_coordinates (GTK_WIDGET (self), self->root_fixed, 0,
-                                        0, &origin_x, &origin_y)) {
-    double cx = origin_x + tile_cx;
-    double top = origin_y + tile_top;
+  graphene_point_t src_pt = GRAPHENE_POINT_INIT (0.f, 0.f);
+  graphene_point_t dst_pt = GRAPHENE_POINT_INIT (0.f, 0.f);
+  if (gtk_widget_compute_point (GTK_WIDGET (self), self->root_fixed,
+                                &src_pt, &dst_pt)) {
+    double cx = dst_pt.x + tile_cx;
+    double top = dst_pt.y + tile_top;
     double x = cx - natural.width / 2.0;
     double y = top - natural.height - kLabelOffset;
     gtk_fixed_move (GTK_FIXED (self->root_fixed), self->label,

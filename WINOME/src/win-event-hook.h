@@ -11,5 +11,6 @@ namespace winome {
 // Keeps the native taskbar / notification center / XAML flyouts hidden when
 // Explorer recreates them.
 void start_win_event_hook();
+void stop_win_event_hook();
 
 }  // namespace winome

@@ -20,6 +20,7 @@
 #include <windows.h>
 #include <glib.h>
 
+#include <atomic>
 #include <thread>
 
 namespace winome {
@@ -90,7 +91,14 @@ void open_start_menu() {
 
 namespace {
 
+std::thread g_trigger_thread;
+std::atomic<DWORD> g_trigger_tid{0};
+
 void trigger_thread_main() {
+  MSG dummy;
+  PeekMessageW(&dummy, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+  g_trigger_tid.store(GetCurrentThreadId(), std::memory_order_release);
+
   g_keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
                                       nullptr, 0);
 
@@ -99,6 +107,12 @@ void trigger_thread_main() {
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
   }
+
+  if (g_keyboard_hook != nullptr) {
+    UnhookWindowsHookEx(g_keyboard_hook);
+    g_keyboard_hook = nullptr;
+  }
+  g_trigger_tid.store(0, std::memory_order_release);
 }
 
 }  // namespace
@@ -176,7 +190,16 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 void start_overview_trigger() {
-  std::thread(trigger_thread_main).detach();
+  if (!g_trigger_thread.joinable())
+    g_trigger_thread = std::thread(trigger_thread_main);
+}
+
+void stop_overview_trigger() {
+  DWORD tid = g_trigger_tid.exchange(0, std::memory_order_acq_rel);
+  if (tid != 0)
+    PostThreadMessageW(tid, WM_QUIT, 0, 0);
+  if (g_trigger_thread.joinable())
+    g_trigger_thread.join();
 }
 
 void open_overview(const char *source) {
