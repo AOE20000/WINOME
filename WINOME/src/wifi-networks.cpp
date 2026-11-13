@@ -131,31 +131,7 @@ ensure_client (HANDLE *out)
 void
 copy_ssid (const DOT11_SSID &ssid, char *out, size_t out_size)
 {
-  out[0] = '\0';
-  if (ssid.uSSIDLength == 0 || ssid.uSSIDLength >= 32)
-    return;
-
-  for (ULONG i = 0; i < ssid.uSSIDLength; i++) {
-    if (ssid.ucSSID[i] == 0)
-      return;   // hidden network: opaque bytes, not a name
-  }
-
-  const int len = static_cast<int>(ssid.uSSIDLength);
-  wchar_t wide[33] = {};
-  int wide_len = MultiByteToWideChar (CP_UTF8, 0,
-                                      reinterpret_cast<const char *> (ssid.ucSSID),
-                                      len, wide, 32);
-  if (wide_len <= 0) {
-    // Not valid UTF-8 — widen as Latin-1 so the name is still readable.
-    MultiByteToWideChar (CP_ACP, 0,
-                         reinterpret_cast<const char *> (ssid.ucSSID),
-                         len, wide, 32);
-    wide_len = len;
-  }
-  wide[wide_len] = L'\0';
-
-  WideCharToMultiByte (CP_UTF8, 0, wide, -1, out,
-                       static_cast<int> (out_size), nullptr, nullptr);
+  winome_wifi_decode_ssid (ssid.ucSSID, ssid.uSSIDLength, out, out_size);
 }
 
 // Fetch the interface list; caller frees with WlanFreeMemory.
@@ -235,6 +211,47 @@ query_radio_enabled (HANDLE client, const GUID &guid, bool fallback)
 }
 
 }  // namespace
+
+void
+winome_wifi_decode_ssid (const guint8 *bytes, gsize len,
+                         char *out, gsize out_size)
+{
+  if (out == nullptr || out_size == 0)
+    return;
+  out[0] = '\0';
+
+  if (bytes == nullptr || len == 0 || len > 32)
+    return;
+
+  for (gsize i = 0; i < len; i++) {
+    if (bytes[i] == 0)
+      return;   // hidden network: opaque bytes, not a name
+  }
+
+  const int slen = static_cast<int> (len);
+  wchar_t wide[33] = {};
+  int wide_len = MultiByteToWideChar (CP_UTF8, MB_ERR_INVALID_CHARS,
+                                      reinterpret_cast<const char *> (bytes),
+                                      slen, wide, 32);
+  if (wide_len <= 0) {
+    // Not valid UTF-8 — widen as Windows-1252 (Latin-1 superset) so accented
+    // router names remain readable.
+    wide_len = MultiByteToWideChar (1252, 0,
+                                    reinterpret_cast<const char *> (bytes),
+                                    slen, wide, 32);
+    if (wide_len <= 0) {
+      for (gsize i = 0; i < len; i++)
+        wide[i] = static_cast<wchar_t> (bytes[i]);
+      wide_len = slen;
+    }
+  }
+  wide[wide_len] = L'\0';
+
+  char utf8[132] = {};
+  WideCharToMultiByte (CP_UTF8, 0, wide, -1, utf8,
+                       static_cast<int> (sizeof (utf8)), nullptr, nullptr);
+  g_strlcpy (out, utf8, out_size);
+}
 
 gboolean
 winome_wifi_get_status (WinomeWifiStatus *out)

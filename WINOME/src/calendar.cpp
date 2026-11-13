@@ -3,6 +3,7 @@
 // GNOME-style calendar (matches js/ui/calendar.js Calendar widget).
 
 #include "quick-settings.h"
+#include "i18n.h"
 #include "system-status.h"
 
 #include <windows.h>
@@ -12,17 +13,10 @@
 #include <string.h>
 
 // Convenience for the language check used throughout this file.
-static const char *
-sys_lang (void)
-{
-  return winome::get_system_language ();
-}
-
 static bool
 is_zh (void)
 {
-  const char *lang = sys_lang ();
-  return lang != nullptr && strcmp (lang, "zh") == 0;
+  return winome::is_zh ();
 }
 
 // Calendar state.
@@ -48,10 +42,7 @@ weekday_abbrev (int day)
 {
   static const char *zh[] = {"日", "一", "二", "三", "四", "五", "六"};
   static const char *en[] = {"S", "M", "T", "W", "T", "F", "S"};
-  const char *lang = sys_lang ();
-  if (lang && strcmp (lang, "zh") == 0)
-    return zh[day];
-  return en[day];
+  return is_zh () ? zh[day] : en[day];
 }
 
 static const char *
@@ -62,18 +53,14 @@ month_name (int month)
   static const char *en[] = {"January", "February", "March", "April", "May",
                              "June", "July", "August", "September", "October",
                              "November", "December"};
-  const char *lang = sys_lang ();
-  if (lang && strcmp (lang, "zh") == 0)
-    return zh[month];
-  return en[month];
+  return is_zh () ? zh[month] : en[month];
 }
 
 static void
 update_month_label (CalendarData *data)
 {
   gchar text[64];
-  const char *lang = sys_lang ();
-  if (lang && strcmp (lang, "zh") == 0)
+  if (is_zh ())
     snprintf (text, sizeof (text), "%d年%s", data->selected_year,
               month_name (data->selected_month));
   else

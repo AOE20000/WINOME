@@ -15,6 +15,7 @@
 // combination still reaches the system, and a tagged Win keyup releases it.
 
 #include "overview-trigger.h"
+#include "config.h"
 #include "overview.h"
 
 #include <windows.h>
@@ -131,6 +132,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
     if (state->vkCode == VK_LWIN || state->vkCode == VK_RWIN) {
       if (down) {
+        if (!g_win_down && !get_config().win_key_overview)
+          return CallNextHookEx(nullptr, nCode, wParam, lParam);
         // Swallow the Win keydown so Windows does not open the Start menu.
         // If another key follows, the Win keydown is re-injected for Win+<key>.
         // Only the first keydown initializes the state: holding Win generates
@@ -144,6 +147,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         return 1;
       }
       if (up) {
+        if (!g_win_down)
+          return CallNextHookEx(nullptr, nCode, wParam, lParam);
         g_win_down = FALSE;
         const bool bare = g_win_alone;
         g_win_alone = FALSE;

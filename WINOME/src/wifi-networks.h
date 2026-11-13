@@ -52,3 +52,9 @@ gboolean winome_wifi_disconnect (void);
 
 // Enable or disable the first wireless interface's software radio state.
 gboolean winome_wifi_set_enabled (gboolean enabled);
+
+// Decode raw IEEE 802.11 SSID bytes (up to 32 bytes) into a UTF-8 C string.
+// Invalid UTF-8 falls back to Windows-1252 / Latin-1; hidden NUL-containing
+// SSIDs produce "".
+void winome_wifi_decode_ssid (const guint8 *bytes, gsize len,
+                              char *out, gsize out_size);

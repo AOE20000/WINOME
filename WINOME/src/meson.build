@@ -1,9 +1,10 @@
 winome_sources = files(
   'main.cpp',
+  'config.cpp',
+  'i18n.cpp',
   'shell-panel.cpp',
   'fonts.cpp',
   'native-taskbar.cpp',
-  'desktop-layer.cpp',
   'host-utils.cpp',
   'win-event-hook.cpp',
   'overview-trigger.cpp',

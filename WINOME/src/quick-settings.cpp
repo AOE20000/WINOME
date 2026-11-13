@@ -10,6 +10,7 @@
 //          light, dark mode, do-not-disturb, keyboard, airplane mode.
 
 #include "quick-settings.h"
+#include "i18n.h"
 #include "system-status.h"
 #include "power-modes.h"
 #include "wifi-networks.h"
@@ -22,11 +23,11 @@
 #include <math.h>
 #include <string.h>
 
-// Minimal zh/en localization based on the system UI language.
+// Centralized zh/en localization respecting config overrides.
 static const char *
 tr (const char *en, const char *zh)
 {
-  return strcmp (winome::get_system_language (), "zh") == 0 ? zh : en;
+  return winome::tr (en, zh);
 }
 
 // $scalable_icon_size from gnome-shell-sass (1.091em at "Sans 11" -> 16px).

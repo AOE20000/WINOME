@@ -16,6 +16,8 @@
 // true center), so a dedicated widget is used.
 
 #include "shell-panel.h"
+#include "config.h"
+#include "i18n.h"
 #include "st-engine.h"
 #include "system-status.h"
 #include "wifi-networks.h"
@@ -352,19 +354,29 @@ winome_panel_layout_set (GtkWidget *layout,
 static gboolean
 is_24h_clock (void)
 {
-  DWORD iTime = 0;
-  DWORD size = sizeof (iTime);
+  const auto &cfg = winome::get_config ();
+  if (cfg.clock_format == "24h")
+    return TRUE;
+  if (cfg.clock_format == "12h")
+    return FALSE;
+
+  wchar_t buf[8] = {};
+  DWORD size = sizeof (buf);
+  DWORD type = 0;
   HKEY key = NULL;
 
   if (RegOpenKeyExW (HKEY_CURRENT_USER,
                      L"Control Panel\\International", 0, KEY_READ, &key)
       == ERROR_SUCCESS) {
-    RegQueryValueExW (key, L"iTime", NULL, NULL,
-                      reinterpret_cast<BYTE *> (&iTime), &size);
+    // Windows stores iTime as REG_SZ ("0" = 12h, "1" = 24h), not DWORD.
+    LSTATUS status = RegQueryValueExW (key, L"iTime", NULL, &type,
+                                       reinterpret_cast<BYTE *> (buf), &size);
     RegCloseKey (key);
+    if (status == ERROR_SUCCESS && type == REG_SZ)
+      return buf[0] == L'1';
   }
 
-  return iTime == 1;
+  return FALSE;
 }
 
 static gboolean
@@ -376,13 +388,14 @@ update_clock (gpointer data)
 
   now = g_date_time_new_now_local ();
 
-  // Matches gnome-shell formatTime(): %H:%M (24h) or %l:%M %p (12h).
+  // Matches gnome-shell formatTime(): %H:%M (24h) or %l:%M %p (12h), with
+  // optional seconds when enabled in WINOME config.
   // GDateTime.format() produces UTF-8 (unlike strftime, whose %p emits the
   // locale's GBK "上午/下午" on Chinese Windows and trips Pango).
-  if (is_24h_clock ())
-    text = g_date_time_format (now, "%H:%M");
-  else
-    text = g_date_time_format (now, "%l:%M %p");
+  const auto &cfg = winome::get_config ();
+  const char *fmt_24 = cfg.clock_show_seconds ? "%H:%M:%S" : "%H:%M";
+  const char *fmt_12 = cfg.clock_show_seconds ? "%l:%M:%S %p" : "%l:%M %p";
+  text = g_date_time_format (now, is_24h_clock () ? fmt_24 : fmt_12);
 
   gtk_label_set_text (clock, text);
 
@@ -655,6 +668,8 @@ panel_popover_close (PanelPopover *pp, const char *reason)
   }
 
   if (pp->anchored_menu) {
+    // Disable interaction immediately so stray clicks cannot fire during the fade.
+    gtk_widget_set_sensitive (pp->wrap, FALSE);
     // Keep the window mapped for the duration of the fade — hiding it first
     // would make the animation invisible and drop the topmost placement.
     auto window_ref = std::shared_ptr<GtkWidget> (
@@ -1329,16 +1344,22 @@ update_battery_icon (PanelStatus *st)
                 fill, battery.charging ? "-charging" : "");
 
     set_icon_name_if_changed (GTK_IMAGE (st->battery_icon), name);
+
+    if (winome::get_config ().show_battery_percentage) {
+      char pct[16];
+      snprintf (pct, sizeof (pct), "%d%%", battery.percentage);
+      gtk_label_set_text (GTK_LABEL (st->battery_label), pct);
+      gtk_widget_set_visible (st->battery_label, TRUE);
+    } else {
+      gtk_widget_set_visible (st->battery_label, FALSE);
+    }
   } else {
     // No battery/UPS: like status/system.js, show the power icon instead.
     gtk_widget_set_visible (st->battery_box, TRUE);
     set_icon_name_if_changed (GTK_IMAGE (st->battery_icon),
                                "system-shutdown-symbolic");
+    gtk_widget_set_visible (st->battery_label, FALSE);
   }
-
-  // Percentage label: only shown when org.gnome.desktop.interface
-  // show-battery-percentage is enabled (off by default).
-  gtk_widget_set_visible (st->battery_label, FALSE);
 }
 
 static gboolean
@@ -1451,6 +1472,18 @@ winome_shell_panel_popover_just_closed (void)
 
 // --- Panel entry point ------------------------------------------------------
 
+static void
+on_panel_config_changed (void *data)
+{
+  refresh_status (data);
+}
+
+static void
+on_panel_destroy (GtkWidget *panel G_GNUC_UNUSED, gpointer user_data)
+{
+  winome::remove_config_listener (on_panel_config_changed, user_data);
+}
+
 GtkWidget *
 winome_shell_panel_new (void)
 {
@@ -1488,6 +1521,8 @@ winome_shell_panel_new (void)
   // Refresh network / bluetooth / volume / battery icons immediately and periodically.
   refresh_status (status);
   g_timeout_add_seconds (2, refresh_status, status);
+  winome::add_config_listener (on_panel_config_changed, status);
+  g_signal_connect (panel, "destroy", G_CALLBACK (on_panel_destroy), status);
 
   // Give the panel its own font map so the bundled Cantarell font is used.
   winome::install_bundled_fonts (panel);

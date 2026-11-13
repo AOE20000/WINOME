@@ -7,11 +7,13 @@
 #include <epoxy/gl.h>
 
 #include <windows.h>
+#include <dbghelp.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 
+#include "config.h"
 #include "host-utils.h"
 #include "native-taskbar.h"
 #include "overview-trigger.h"
@@ -135,9 +137,63 @@ restore_environment_emergency (void)
   clear_recovery_file ();
 }
 
-static LONG WINAPI
-unhandled_exception_filter (EXCEPTION_POINTERS * /*info*/)
+using MiniDumpWriteDumpFn = BOOL (WINAPI *)(
+    HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
+    PMINIDUMP_EXCEPTION_INFORMATION,
+    PMINIDUMP_USER_STREAM_INFORMATION,
+    PMINIDUMP_CALLBACK_INFORMATION);
+
+static void
+write_crash_minidump (EXCEPTION_POINTERS *info)
 {
+  HMODULE dbghelp = LoadLibraryW (L"dbghelp.dll");
+  if (dbghelp == nullptr)
+    return;
+
+  auto write_dump = reinterpret_cast<MiniDumpWriteDumpFn> (
+      reinterpret_cast<void *> (GetProcAddress (dbghelp, "MiniDumpWriteDump")));
+  if (write_dump == nullptr) {
+    FreeLibrary (dbghelp);
+    return;
+  }
+
+  std::wstring dir = winome::app_data_dir ();
+  if (dir.empty ()) {
+    FreeLibrary (dbghelp);
+    return;
+  }
+  CreateDirectoryW (dir.c_str (), nullptr);
+  std::wstring crash_dir = dir + L"\\crashes";
+  CreateDirectoryW (crash_dir.c_str (), nullptr);
+
+  SYSTEMTIME st {};
+  GetLocalTime (&st);
+  wchar_t path[MAX_PATH] = {};
+  _snwprintf (path, MAX_PATH - 1,
+              L"%ls\\winome-%04u%02u%02u-%02u%02u%02u-%lu.dmp",
+              crash_dir.c_str (),
+              st.wYear, st.wMonth, st.wDay,
+              st.wHour, st.wMinute, st.wSecond,
+              static_cast<unsigned long> (GetCurrentProcessId ()));
+
+  HANDLE file = CreateFileW (path, GENERIC_WRITE, 0, nullptr,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file != INVALID_HANDLE_VALUE) {
+    MINIDUMP_EXCEPTION_INFORMATION mei {};
+    mei.ThreadId = GetCurrentThreadId ();
+    mei.ExceptionPointers = info;
+    mei.ClientPointers = FALSE;
+    write_dump (GetCurrentProcess (), GetCurrentProcessId (), file,
+                MiniDumpNormal, info ? &mei : nullptr, nullptr, nullptr);
+    CloseHandle (file);
+  }
+  FreeLibrary (dbghelp);
+}
+
+static LONG WINAPI
+unhandled_exception_filter (EXCEPTION_POINTERS *info)
+{
+  write_crash_minidump (info);
   restore_environment_emergency ();
   return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -350,10 +406,108 @@ position_panel (GtkWidget *panel)
   winome::start_hot_corner (hwnd);
 }
 
+constexpr const wchar_t *kControlWindowClass = L"WINOME_ControlWindow";
+constexpr UINT WINOME_CMD_SHOW_OVERVIEW = WM_APP + 101;
+constexpr UINT WINOME_CMD_RELOAD_CONFIG = WM_APP + 102;
+constexpr UINT WINOME_CMD_QUIT = WM_APP + 103;
+constexpr UINT WINOME_CMD_OPEN_SETTINGS = WM_APP + 104;
+
+static GtkApplication *g_gtk_app = nullptr;
+static HWND g_control_hwnd = nullptr;
+static bool g_open_overview_on_start = false;
+static bool g_open_settings_on_start = false;
+
+static gboolean
+idle_open_overview (gpointer G_GNUC_UNUSED data)
+{
+  winome::open_overview ("cli");
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
+idle_reload_config (gpointer G_GNUC_UNUSED data)
+{
+  winome::reload_config ();
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
+idle_quit_app (gpointer G_GNUC_UNUSED data)
+{
+  if (g_gtk_app != nullptr)
+    g_application_quit (G_APPLICATION (g_gtk_app));
+  return G_SOURCE_REMOVE;
+}
+
+static LRESULT CALLBACK
+control_wnd_proc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+  switch (msg) {
+  case WINOME_CMD_SHOW_OVERVIEW:
+    g_idle_add (idle_open_overview, nullptr);
+    return 0;
+  case WINOME_CMD_RELOAD_CONFIG:
+    g_idle_add (idle_reload_config, nullptr);
+    return 0;
+  case WINOME_CMD_QUIT:
+    g_idle_add (idle_quit_app, nullptr);
+    return 0;
+  case WINOME_CMD_OPEN_SETTINGS:
+    // Settings window is wired in Phase 5; ignore cleanly for now.
+    return 0;
+  case WM_QUERYENDSESSION:
+    return TRUE;
+  case WM_ENDSESSION:
+    if (wParam != FALSE) {
+      restore_environment_emergency ();
+      if (g_gtk_app != nullptr)
+        g_application_quit (G_APPLICATION (g_gtk_app));
+    }
+    return 0;
+  default:
+    return DefWindowProcW (hwnd, msg, wParam, lParam);
+  }
+}
+
+static void
+create_control_window (void)
+{
+  if (g_control_hwnd != nullptr)
+    return;
+
+  HINSTANCE inst = GetModuleHandleW (nullptr);
+  WNDCLASSEXW wc {};
+  wc.cbSize = sizeof (wc);
+  wc.lpfnWndProc = control_wnd_proc;
+  wc.hInstance = inst;
+  wc.lpszClassName = kControlWindowClass;
+  RegisterClassExW (&wc);
+
+  // Use a hidden top-level WS_POPUP (not HWND_MESSAGE) so both FindWindowW
+  // IPC and broadcast session-end messages (WM_QUERYENDSESSION/WM_ENDSESSION)
+  // reach the window reliably.
+  g_control_hwnd = CreateWindowExW (0, kControlWindowClass, L"WINOME Control",
+                                    WS_POPUP, 0, 0, 0, 0,
+                                    nullptr, nullptr, inst, nullptr);
+}
+
+static void
+destroy_control_window (void)
+{
+  if (g_control_hwnd != nullptr) {
+    DestroyWindow (g_control_hwnd);
+    g_control_hwnd = nullptr;
+  }
+  UnregisterClassW (kControlWindowClass, GetModuleHandleW (nullptr));
+}
+
 static void
 on_activate (GtkApplication      *app,
              gpointer G_GNUC_UNUSED user_data)
 {
+  g_gtk_app = app;
+  create_control_window ();
+
   GtkWidget *panel = winome_shell_panel_new ();
 
   gtk_window_set_application (GTK_WINDOW (panel), app);
@@ -373,12 +527,21 @@ on_activate (GtkApplication      *app,
                                      nullptr, pin_show_event_proc,
                                      GetCurrentProcessId (), 0,
                                      WINEVENT_OUTOFCONTEXT);
+
+  if (g_open_overview_on_start) {
+    g_open_overview_on_start = false;
+    g_idle_add (idle_open_overview, nullptr);
+  }
+  (void)g_open_settings_on_start;
 }
 
 static void
 on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
              gpointer G_GNUC_UNUSED user_data)
 {
+  destroy_control_window ();
+  g_gtk_app = nullptr;
+
   if (g_pin_show_hook != nullptr) {
     UnhookWinEvent (g_pin_show_hook);
     g_pin_show_hook = nullptr;
@@ -421,6 +584,36 @@ main (int argc, char **argv)
     }
   }
 
+  // Forward single-instance CLI commands to an already-running WINOME shell.
+  bool want_overview = false;
+  bool want_settings = false;
+  UINT remote_cmd = 0;
+  for (int i = 1; i < argc; ++i) {
+    std::string arg (argv[i]);
+    if (arg == "--show-overview") {
+      remote_cmd = WINOME_CMD_SHOW_OVERVIEW;
+      want_overview = true;
+    } else if (arg == "--reload") {
+      remote_cmd = WINOME_CMD_RELOAD_CONFIG;
+    } else if (arg == "--quit") {
+      remote_cmd = WINOME_CMD_QUIT;
+    } else if (arg == "--settings") {
+      remote_cmd = WINOME_CMD_OPEN_SETTINGS;
+      want_settings = true;
+    }
+  }
+  if (remote_cmd != 0) {
+    HWND ctrl = FindWindowW (kControlWindowClass, nullptr);
+    if (ctrl != nullptr) {
+      PostMessageW (ctrl, remote_cmd, 0, 0);
+      return 0;
+    }
+    if (remote_cmd == WINOME_CMD_RELOAD_CONFIG || remote_cmd == WINOME_CMD_QUIT)
+      return 0;
+  }
+  g_open_overview_on_start = want_overview;
+  g_open_settings_on_start = want_settings;
+
   // Single-instance guard so two shell panels do not fight over the taskbar.
   HANDLE instance_mutex = CreateMutexW (nullptr, TRUE,
                                         L"Local\\WINOME_Shell_SingleInstance");
@@ -428,6 +621,9 @@ main (int argc, char **argv)
     CloseHandle (instance_mutex);
     return 0;
   }
+
+  // Load user configuration before initializing subsystems.
+  (void)winome::get_config ();
 
   // Route stdout/stderr to a log file first: this process is a GUI app and
   // must never pop a console window.
@@ -465,7 +661,7 @@ main (int argc, char **argv)
   g_signal_connect (app, "shutdown",
                     G_CALLBACK (on_shutdown), NULL);
 
-  int status = g_application_run (G_APPLICATION (app), argc, argv);
+  int status = g_application_run (G_APPLICATION (app), 1, argv);
 
   g_object_unref (app);
   if (instance_mutex != nullptr)

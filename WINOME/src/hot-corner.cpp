@@ -4,6 +4,7 @@
 // primary monitor opens the Activities overview.
 
 #include "hot-corner.h"
+#include "config.h"
 #include "fullscreen-watcher.h"
 #include "overview-trigger.h"
 
@@ -18,7 +19,6 @@ namespace {
 // corner, poll interval, and re-trigger cooldown.
 constexpr int kCornerSize = 5;
 constexpr int kPollMs = 100;
-constexpr int kCooldownMs = 500;
 
 gboolean hot_corner_tick(gpointer user_data) {
   HWND panel = static_cast<HWND>(user_data);
@@ -26,6 +26,13 @@ gboolean hot_corner_tick(gpointer user_data) {
   static guint64 last_trigger_ms = 0;
   static RECT corner_monitor = {};
   static guint64 next_refresh_ms = 0;
+
+  const auto& cfg = get_config();
+  if (!cfg.hot_corner_enabled) {
+    in_corner = false;
+    return G_SOURCE_CONTINUE;
+  }
+  const guint64 cooldown_ms = static_cast<guint64>(cfg.hot_corner_cooldown_ms);
 
   POINT pt;
   if (!GetCursorPos(&pt))
@@ -59,7 +66,7 @@ gboolean hot_corner_tick(gpointer user_data) {
             pt.y >= corner_monitor.top &&
             pt.y <= corner_monitor.top + kCornerSize;
 
-  if (in && !in_corner && now_ms - last_trigger_ms >= kCooldownMs) {
+  if (in && !in_corner && now_ms - last_trigger_ms >= cooldown_ms) {
     last_trigger_ms = now_ms;
     g_print("[hot] corner trigger\n");
     open_overview("hot-corner");

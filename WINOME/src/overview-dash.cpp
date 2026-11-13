@@ -9,6 +9,7 @@
 // IShellItemImageFactory on the exe path, converted to GdkTexture.
 
 #include "overview-dash.h"
+#include "i18n.h"
 #include "overview-trigger.h"
 #include "st-engine.h"
 #include "system-status.h"
@@ -512,9 +513,8 @@ place_label (WinomeDash *self, int index)
 
   DashApp *app =
       index < (int)self->apps.size () ? &self->apps[index] : nullptr;
-  const char *text = app ? app->name.c_str () : "Show Apps";
-  if (strcmp (get_system_language (), "zh") == 0 && app == nullptr)
-    text = "显示应用";
+  const char *text = app ? app->name.c_str ()
+                         : winome::tr ("Show Apps", "显示应用");
   gtk_label_set_text (GTK_LABEL (self->label), text);
 
   GtkRequisition natural;

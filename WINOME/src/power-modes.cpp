@@ -3,6 +3,7 @@
 // Windows power scheme switching (PowrProf).
 
 #include "power-modes.h"
+#include "i18n.h"
 #include "system-status.h"
 
 #include <windows.h>
@@ -127,8 +128,7 @@ winome_power_mode_available (WinomePowerMode mode)
 const char *
 winome_power_mode_label (WinomePowerMode mode)
 {
-  const char *lang = winome::get_system_language ();
-  gboolean zh = (strcmp (lang, "zh") == 0);
+  gboolean zh = winome::is_zh () ? TRUE : FALSE;
   switch (mode) {
   case WINOME_POWER_SAVER:
     return zh ? "节能" : "Power Saver";

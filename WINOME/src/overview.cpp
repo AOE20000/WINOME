@@ -51,6 +51,7 @@
 // opened over the overview is swallowed (GNOME's menu grab consumes it).
 
 #include "overview.h"
+#include "i18n.h"
 #include "overview-layout.h"
 #include "overview-dash.h"
 #include "overview-thumbs.h"
@@ -2501,8 +2502,7 @@ overview_init (HWND panel_hwnd)
                                      "edit-find-symbolic");
   gtk_entry_set_placeholder_text (
       GTK_ENTRY (g_search),
-      strcmp (get_system_language (), "zh") == 0 ? "输入以搜索"
-                                                 : "Type to search");
+      winome::tr ("Type to search", "输入以搜索"));
   g_signal_connect (g_search, "changed", G_CALLBACK (on_search_changed),
                     nullptr);
   g_signal_connect (g_search, "icon-press", G_CALLBACK (on_search_icon_press),
