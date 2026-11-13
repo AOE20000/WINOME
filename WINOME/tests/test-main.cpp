@@ -4,6 +4,7 @@
 
 #include "config.h"
 #include "i18n.h"
+#include "notifications.h"
 #include "overview-layout.h"
 #include "wifi-networks.h"
 
@@ -265,6 +266,42 @@ void test_overview_layout_geometry() {
   }
 }
 
+void test_wifi_profile_xml() {
+  char* wpa = winome_wifi_build_profile_xml("Café & \"Home\" <5G>", "p&w<d>1'", FALSE);
+  CHECK(wpa != nullptr);
+  if (wpa != nullptr) {
+    CHECK(std::strstr(wpa, "<name>Café &amp; &quot;Home&quot; &lt;5G&gt;</name>") != nullptr);
+    CHECK(std::strstr(wpa, "<authentication>WPA2PSK</authentication>") != nullptr);
+    CHECK(std::strstr(wpa, "<encryption>AES</encryption>") != nullptr);
+    CHECK(std::strstr(wpa, "<keyMaterial>p&amp;w&lt;d&gt;1&apos;</keyMaterial>") != nullptr);
+    CHECK(std::strstr(wpa, "<hex>436166C3A920262022486F6D6522203C35473E</hex>") != nullptr);
+    g_free(wpa);
+  }
+
+  char* open = winome_wifi_build_profile_xml("GuestWifi", "", TRUE);
+  CHECK(open != nullptr);
+  if (open != nullptr) {
+    CHECK(std::strstr(open, "<authentication>open</authentication>") != nullptr);
+    CHECK(std::strstr(open, "<encryption>none</encryption>") != nullptr);
+    CHECK(std::strstr(open, "<sharedKey>") == nullptr);
+    g_free(open);
+  }
+
+  CHECK(winome_wifi_build_profile_xml("", "secret", FALSE) == nullptr);
+}
+
+void test_notification_age_formatting() {
+  const int64_t now = 1700000000;
+  CHECK(winome::format_notification_age(now - 20, now, false) == "Just now");
+  CHECK(winome::format_notification_age(now - 20, now, true) == "刚刚");
+  CHECK(winome::format_notification_age(now - 300, now, false) == "5m");
+  CHECK(winome::format_notification_age(now - 300, now, true) == "5 分钟前");
+  CHECK(winome::format_notification_age(now - 7200, now, false) == "2h");
+  CHECK(winome::format_notification_age(now - 7200, now, true) == "2 小时前");
+  CHECK(winome::format_notification_age(now - 172800, now, false) == "2d");
+  CHECK(winome::format_notification_age(now - 172800, now, true) == "2 天前");
+}
+
 }  // namespace
 
 int main() {
@@ -274,6 +311,8 @@ int main() {
   test_config_persistence_and_i18n(&temp_dir);
   test_wifi_ssid_decoding();
   test_overview_layout_geometry();
+  test_wifi_profile_xml();
+  test_notification_age_formatting();
 
   if (g_failures == 0)
     std::printf("ALL WINOME UNIT TESTS PASSED\n");

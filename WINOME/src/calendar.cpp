@@ -4,6 +4,7 @@
 
 #include "quick-settings.h"
 #include "i18n.h"
+#include "notifications.h"
 #include "system-status.h"
 
 #include <windows.h>
@@ -11,6 +12,9 @@
 
 #include <time.h>
 #include <string.h>
+#include <ctime>
+#include <string>
+#include <vector>
 
 // Convenience for the language check used throughout this file.
 static bool
@@ -31,6 +35,12 @@ typedef struct {
   GtkWidget *date_header_label;
   GtkWidget *dnd_switch;
   GtkWidget *utc_time_label;
+
+  GtkWidget *message_scroll;
+  GtkWidget *message_view;
+  GtkWidget *placeholder;
+  GtkWidget *clear_btn;
+  uint64_t last_notif_gen;
 } CalendarData;
 
 static void calendar_rebuild (CalendarData *data);
@@ -142,6 +152,245 @@ on_datemenu_dnd_state_set (GtkSwitch *sw G_GNUC_UNUSED,
 {
   winome::set_do_not_disturb (state != FALSE);
   return FALSE;
+}
+
+static void
+on_media_prev_clicked (GtkButton *b G_GNUC_UNUSED,
+                       gpointer G_GNUC_UNUSED user_data)
+{
+  winome::notifications_media_action (winome::WinomeMediaAction::Previous);
+}
+
+static void
+on_media_play_pause_clicked (GtkButton *b G_GNUC_UNUSED,
+                             gpointer G_GNUC_UNUSED user_data)
+{
+  winome::notifications_media_action (winome::WinomeMediaAction::PlayPause);
+}
+
+static void
+on_media_next_clicked (GtkButton *b G_GNUC_UNUSED,
+                       gpointer G_GNUC_UNUSED user_data)
+{
+  winome::notifications_media_action (winome::WinomeMediaAction::Next);
+}
+
+static void
+on_notif_close_clicked (GtkButton *btn, gpointer G_GNUC_UNUSED user_data)
+{
+  uint64_t *key = static_cast<uint64_t *> (
+      g_object_get_data (G_OBJECT (btn), "notif-key"));
+  if (key != nullptr)
+    winome::notifications_dismiss (*key);
+}
+
+static void
+on_clear_notifs_clicked (GtkButton *b G_GNUC_UNUSED,
+                         gpointer G_GNUC_UNUSED user_data)
+{
+  winome::notifications_clear_all ();
+}
+
+static void
+free_notif_key (gpointer data)
+{
+  delete static_cast<uint64_t *> (data);
+}
+
+static GtkWidget *
+create_media_card (const winome::WinomeMediaInfo &media)
+{
+  GtkWidget *card = gtk_box_new (GTK_ORIENTATION_VERTICAL, 4);
+  gtk_widget_add_css_class (card, "message");
+  gtk_widget_add_css_class (card, "media-message");
+
+  GtkWidget *row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 10);
+  gtk_widget_add_css_class (row, "message-box");
+
+  GtkWidget *art = gtk_image_new_from_icon_name ("audio-x-generic-symbolic");
+  gtk_image_set_pixel_size (GTK_IMAGE (art), 32);
+  gtk_widget_add_css_class (art, "message-icon");
+  gtk_widget_add_css_class (art, "message-themed-icon");
+  gtk_box_append (GTK_BOX (row), art);
+
+  GtkWidget *info = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
+  gtk_widget_add_css_class (info, "message-content");
+  gtk_widget_set_hexpand (info, TRUE);
+  gtk_widget_set_valign (info, GTK_ALIGN_CENTER);
+
+  const char *title_text = media.title.empty ()
+      ? (is_zh () ? "正在播放媒体" : "Media Playback")
+      : media.title.c_str ();
+  GtkWidget *title = gtk_label_new (title_text);
+  gtk_widget_add_css_class (title, "message-title");
+  gtk_label_set_xalign (GTK_LABEL (title), 0.0f);
+  gtk_label_set_ellipsize (GTK_LABEL (title), PANGO_ELLIPSIZE_END);
+  gtk_box_append (GTK_BOX (info), title);
+
+  std::string sub = media.artist;
+  if (!media.album.empty ()) {
+    if (!sub.empty ())
+      sub += " — ";
+    sub += media.album;
+  }
+  if (!sub.empty ()) {
+    GtkWidget *artist = gtk_label_new (sub.c_str ());
+    gtk_label_set_xalign (GTK_LABEL (artist), 0.0f);
+    gtk_label_set_ellipsize (GTK_LABEL (artist), PANGO_ELLIPSIZE_END);
+    gtk_box_append (GTK_BOX (info), artist);
+  }
+  gtk_box_append (GTK_BOX (row), info);
+
+  GtkWidget *btns = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 4);
+  gtk_widget_set_valign (btns, GTK_ALIGN_CENTER);
+
+  GtkWidget *prev = gtk_button_new_from_icon_name ("media-skip-backward-symbolic");
+  gtk_widget_add_css_class (prev, "message-media-control");
+  gtk_widget_set_focus_on_click (prev, FALSE);
+  g_signal_connect (prev, "clicked", G_CALLBACK (on_media_prev_clicked), nullptr);
+  gtk_box_append (GTK_BOX (btns), prev);
+
+  GtkWidget *play = gtk_button_new_from_icon_name (
+      media.playing ? "media-playback-pause-symbolic"
+                    : "media-playback-start-symbolic");
+  gtk_widget_add_css_class (play, "message-media-control");
+  gtk_widget_set_focus_on_click (play, FALSE);
+  g_signal_connect (play, "clicked",
+                    G_CALLBACK (on_media_play_pause_clicked), nullptr);
+  gtk_box_append (GTK_BOX (btns), play);
+
+  GtkWidget *next = gtk_button_new_from_icon_name ("media-skip-forward-symbolic");
+  gtk_widget_add_css_class (next, "message-media-control");
+  gtk_widget_set_focus_on_click (next, FALSE);
+  g_signal_connect (next, "clicked", G_CALLBACK (on_media_next_clicked), nullptr);
+  gtk_box_append (GTK_BOX (btns), next);
+
+  gtk_box_append (GTK_BOX (row), btns);
+  gtk_box_append (GTK_BOX (card), row);
+  return card;
+}
+
+static GtkWidget *
+create_notification_card (const winome::ShellNotification &notif,
+                          int64_t now_unix)
+{
+  GtkWidget *card = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
+  gtk_widget_add_css_class (card, "message");
+
+  GtkWidget *header = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_widget_add_css_class (header, "message-header");
+
+  GtkWidget *src_icon = gtk_image_new_from_icon_name ("dialog-information-symbolic");
+  gtk_image_set_pixel_size (GTK_IMAGE (src_icon), 14);
+  gtk_widget_add_css_class (src_icon, "message-source-icon");
+  gtk_box_append (GTK_BOX (header), src_icon);
+
+  GtkWidget *hc = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_add_css_class (hc, "message-header-content");
+  gtk_widget_set_hexpand (hc, TRUE);
+
+  GtkWidget *app_lbl = gtk_label_new (
+      notif.app_name.empty () ? "Windows" : notif.app_name.c_str ());
+  gtk_widget_add_css_class (app_lbl, "message-source-title");
+  gtk_label_set_xalign (GTK_LABEL (app_lbl), 0.0f);
+  gtk_label_set_ellipsize (GTK_LABEL (app_lbl), PANGO_ELLIPSIZE_END);
+  gtk_box_append (GTK_BOX (hc), app_lbl);
+
+  std::string age = winome::format_notification_age (
+      notif.timestamp_unix, now_unix, is_zh ());
+  GtkWidget *time_lbl = gtk_label_new (age.c_str ());
+  gtk_widget_add_css_class (time_lbl, "event-time");
+  gtk_box_append (GTK_BOX (hc), time_lbl);
+  gtk_box_append (GTK_BOX (header), hc);
+
+  GtkWidget *close_btn = gtk_button_new_from_icon_name ("window-close-symbolic");
+  gtk_widget_add_css_class (close_btn, "message-close-button");
+  gtk_widget_set_focus_on_click (close_btn, FALSE);
+  g_object_set_data_full (G_OBJECT (close_btn), "notif-key",
+                          new uint64_t (notif.key), free_notif_key);
+  g_signal_connect (close_btn, "clicked",
+                    G_CALLBACK (on_notif_close_clicked), nullptr);
+  gtk_box_append (GTK_BOX (header), close_btn);
+  gtk_box_append (GTK_BOX (card), header);
+
+  GtkWidget *body_row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_add_css_class (body_row, "message-box");
+
+  GtkWidget *content = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
+  gtk_widget_add_css_class (content, "message-content");
+  gtk_widget_set_hexpand (content, TRUE);
+
+  if (!notif.title.empty ()) {
+    GtkWidget *title = gtk_label_new (notif.title.c_str ());
+    gtk_widget_add_css_class (title, "message-title");
+    gtk_label_set_xalign (GTK_LABEL (title), 0.0f);
+    gtk_label_set_wrap (GTK_LABEL (title), TRUE);
+    gtk_box_append (GTK_BOX (content), title);
+  }
+  if (!notif.body.empty ()) {
+    GtkWidget *body = gtk_label_new (notif.body.c_str ());
+    gtk_label_set_xalign (GTK_LABEL (body), 0.0f);
+    gtk_label_set_wrap (GTK_LABEL (body), TRUE);
+    gtk_label_set_lines (GTK_LABEL (body), 3);
+    gtk_label_set_ellipsize (GTK_LABEL (body), PANGO_ELLIPSIZE_END);
+    gtk_box_append (GTK_BOX (content), body);
+  }
+
+  gtk_box_append (GTK_BOX (body_row), content);
+  gtk_box_append (GTK_BOX (card), body_row);
+  return card;
+}
+
+static void
+rebuild_message_list (CalendarData *data, bool force = false)
+{
+  if (data == nullptr || data->message_view == nullptr)
+    return;
+
+  const uint64_t gen = winome::notifications_generation ();
+  if (!force && data->last_notif_gen == gen)
+    return;
+  data->last_notif_gen = gen;
+
+  while (GtkWidget *child = gtk_widget_get_first_child (data->message_view))
+    gtk_box_remove (GTK_BOX (data->message_view), child);
+
+  const winome::WinomeMediaInfo media = winome::notifications_get_media ();
+  const auto notifs = winome::notifications_get_all ();
+  const int64_t now_unix = static_cast<int64_t> (std::time (nullptr));
+
+  if (media.active)
+    gtk_box_append (GTK_BOX (data->message_view), create_media_card (media));
+
+  for (const auto &notif : notifs) {
+    gtk_box_append (GTK_BOX (data->message_view),
+                    create_notification_card (notif, now_unix));
+  }
+
+  const bool has_content = media.active || !notifs.empty ();
+  if (data->message_scroll != nullptr)
+    gtk_widget_set_visible (data->message_scroll, has_content ? TRUE : FALSE);
+  if (data->placeholder != nullptr)
+    gtk_widget_set_visible (data->placeholder, has_content ? FALSE : TRUE);
+  if (data->clear_btn != nullptr)
+    gtk_widget_set_sensitive (data->clear_btn, !notifs.empty () ? TRUE : FALSE);
+}
+
+static void
+on_calendar_notifications_changed (void *user_data)
+{
+  GtkWidget *cal = GTK_WIDGET (user_data);
+  if (cal == nullptr)
+    return;
+  CalendarData *data = static_cast<CalendarData *> (
+      g_object_get_data (G_OBJECT (cal), "calendar-data"));
+  rebuild_message_list (data, false);
+}
+
+static void
+on_calendar_destroy (GtkWidget *cal, gpointer G_GNUC_UNUSED user_data)
+{
+  winome::notifications_remove_listener (on_calendar_notifications_changed, cal);
 }
 
 static void
@@ -283,11 +532,29 @@ winome_calendar_new (void)
   gtk_widget_add_css_class (msg_list, "message-list");
   gtk_widget_set_valign (msg_list, GTK_ALIGN_FILL);
 
+  GtkWidget *msg_view = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
+  gtk_widget_add_css_class (msg_view, "message-view");
+  data->message_view = msg_view;
+
+  GtkWidget *msg_scroll = gtk_scrolled_window_new ();
+  gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (msg_scroll),
+                                  GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+  gtk_scrolled_window_set_propagate_natural_height (
+      GTK_SCROLLED_WINDOW (msg_scroll), TRUE);
+  gtk_scrolled_window_set_max_content_height (
+      GTK_SCROLLED_WINDOW (msg_scroll), 360);
+  gtk_widget_set_vexpand (msg_scroll, TRUE);
+  gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (msg_scroll), msg_view);
+  gtk_widget_set_visible (msg_scroll, FALSE);
+  data->message_scroll = msg_scroll;
+  gtk_box_append (GTK_BOX (msg_list), msg_scroll);
+
   GtkWidget *placeholder = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class (placeholder, "message-list-placeholder");
   gtk_widget_set_vexpand (placeholder, TRUE);
   gtk_widget_set_valign (placeholder, GTK_ALIGN_CENTER);
   gtk_widget_set_halign (placeholder, GTK_ALIGN_CENTER);
+  data->placeholder = placeholder;
 
   GtkWidget *ph_icon = gtk_image_new_from_icon_name ("notifications-disabled-symbolic");
   gtk_image_set_pixel_size (GTK_IMAGE (ph_icon), 96);
@@ -317,6 +584,9 @@ winome_calendar_new (void)
   gtk_widget_add_css_class (clear_btn, "message-list-clear-button");
   gtk_widget_set_focus_on_click (clear_btn, FALSE);
   gtk_widget_set_sensitive (clear_btn, FALSE);
+  g_signal_connect (clear_btn, "clicked",
+                    G_CALLBACK (on_clear_notifs_clicked), NULL);
+  data->clear_btn = clear_btn;
   gtk_box_append (GTK_BOX (controls), clear_btn);
   gtk_box_append (GTK_BOX (msg_list), controls);
 
@@ -410,6 +680,10 @@ winome_calendar_new (void)
 
   // Attach the CalendarData to the root widget so its lifetime matches.
   g_object_set_data_full (G_OBJECT (root), "calendar-data", data, g_free);
+  winome::notifications_add_listener (on_calendar_notifications_changed, root);
+  g_signal_connect (root, "destroy", G_CALLBACK (on_calendar_destroy), NULL);
+
+  rebuild_message_list (data, true);
   winome_calendar_refresh (root);
 
   return root;
@@ -480,4 +754,6 @@ winome_calendar_refresh (GtkWidget *calendar)
       }
     }
   }
+
+  rebuild_message_list (data, false);
 }

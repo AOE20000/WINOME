@@ -20,6 +20,8 @@ winome_sources = files(
   'power-modes.cpp',
   'wifi-networks.cpp',
   'easing.cpp',
+  'winrt-bridge.cpp',
+  'notifications.cpp',
   'quick-settings.cpp',
   'calendar.cpp',
   'st-engine.cpp',

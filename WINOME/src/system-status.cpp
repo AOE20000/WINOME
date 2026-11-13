@@ -5,6 +5,7 @@
 #include "system-status.h"
 #include "wifi-networks.h"
 #include "host-utils.h"
+#include "winrt-bridge.h"
 
 #include <windows.h>
 #include <winioctl.h>
@@ -479,13 +480,20 @@ void wide_to_utf8(const wchar_t *src, char *dst, int dst_size) {
 
 } // namespace
 
+bool has_brightness_control() {
+  double value = 0.0;
+  return get_lcd_brightness(&value) || get_dxva2_brightness(&value);
+}
+
 bool get_brightness(double* out) {
   double value = s_cached_brightness;
-  if (get_lcd_brightness(&value) || get_dxva2_brightness(&value))
+  if (get_lcd_brightness(&value) || get_dxva2_brightness(&value)) {
     s_cached_brightness = value;
-  if (out != nullptr)
-    *out = value;
-  return true;
+    if (out != nullptr)
+      *out = value;
+    return true;
+  }
+  return false;
 }
 
 bool set_brightness(double fraction) {
@@ -624,7 +632,19 @@ bool get_bluetooth_status(bool* present, bool* enabled,
     return true;
   }
 
-  // No powered radio handle: check if Bluetooth hardware/devices exist in registry.
+  // No powered radio handle: query WinRT Radio API first for powered-off state.
+  bool winrt_present = false;
+  bool winrt_enabled = false;
+  if (winrt_get_bluetooth_radio(&winrt_present, &winrt_enabled) &&
+      winrt_present) {
+    if (present != nullptr)
+      *present = true;
+    if (enabled != nullptr)
+      *enabled = winrt_enabled;
+    return true;
+  }
+
+  // Fallback: check if Bluetooth hardware/devices exist in registry.
   if (reg_key_exists(HKEY_LOCAL_MACHINE,
                      L"SYSTEM\\CurrentControlSet\\Services\\BTHPORT\\Parameters\\Devices") ||
       reg_key_exists(HKEY_LOCAL_MACHINE,
@@ -640,6 +660,9 @@ bool get_bluetooth_status(bool* present, bool* enabled,
 }
 
 bool set_bluetooth_enabled(bool enabled) {
+  if (winrt_set_bluetooth_radio(enabled))
+    return true;
+
   const BthApi &api = bth_api();
   if (!api.loaded)
     return false;

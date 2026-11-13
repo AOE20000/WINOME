@@ -11,17 +11,21 @@
 
 #include "quick-settings.h"
 #include "i18n.h"
+#include "notifications.h"
 #include "system-status.h"
 #include "power-modes.h"
 #include "wifi-networks.h"
 #include "shell-panel.h"
 
+#include <gdk/win32/gdkwin32.h>
 #include <windows.h>
 #include <shellapi.h>
 
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include <string>
+#include <thread>
 
 // Centralized zh/en localization respecting config overrides.
 static const char *
@@ -1093,12 +1097,49 @@ on_wlan_toggled (GtkToggleButton *button, gpointer user_data)
     winome_quick_settings_refresh (GTK_WIDGET (user_data));
 }
 
+struct BluetoothTaskResult {
+  GtkWidget *panel;
+  GtkWidget *button;
+  bool       ok;
+};
+
+static gboolean
+idle_bluetooth_task_done (gpointer user_data)
+{
+  BluetoothTaskResult *res = static_cast<BluetoothTaskResult *> (user_data);
+  if (res->button != nullptr)
+    gtk_widget_set_sensitive (res->button, TRUE);
+  if (res->panel != nullptr) {
+    winome_quick_settings_refresh (res->panel);
+    g_object_unref (res->panel);
+  }
+  if (res->button != nullptr)
+    g_object_unref (res->button);
+  if (!res->ok) {
+    winome::notify_shell (
+        tr ("Bluetooth", "蓝牙"),
+        tr ("Could not change Bluetooth radio state.",
+            "无法切换蓝牙开关状态。"),
+        "bluetooth-disabled-symbolic");
+  }
+  delete res;
+  return G_SOURCE_REMOVE;
+}
+
 static void
 on_bluetooth_toggled (GtkToggleButton *button, gpointer user_data)
 {
-  winome::set_bluetooth_enabled (gtk_toggle_button_get_active (button) != FALSE);
-  if (user_data != nullptr)
-    winome_quick_settings_refresh (GTK_WIDGET (user_data));
+  const bool active = gtk_toggle_button_get_active (button) != FALSE;
+  gtk_widget_set_sensitive (GTK_WIDGET (button), FALSE);
+  GtkWidget *panel = user_data != nullptr
+                         ? GTK_WIDGET (g_object_ref (G_OBJECT (user_data)))
+                         : nullptr;
+  GtkWidget *btn = GTK_WIDGET (g_object_ref (G_OBJECT (button)));
+  std::thread ([active, panel, btn] () {
+    bool ok = winome::set_bluetooth_enabled (active);
+    auto *res = new BluetoothTaskResult{panel, btn, ok};
+    g_idle_add (idle_bluetooth_task_done, res);
+  }).detach ();
 }
 
 static void
@@ -1485,6 +1526,179 @@ typedef struct {
 // menu row can be activated more than once (they are not: the popup is torn
 // down on the next open, and the free func below releases whatever is left).
 static void
+run_wifi_task_async (GtkWidget *panel,
+                     std::string ssid,
+                     gboolean (*fn)(const char *, const char *, gboolean),
+                     std::string password,
+                     gboolean open_network,
+                     bool is_disconnect,
+                     bool has_saved_profile)
+{
+  if (panel != nullptr)
+    g_object_ref (panel);
+
+  std::thread ([panel, ssid = std::move (ssid), fn,
+                password = std::move (password), open_network,
+                is_disconnect, has_saved_profile] () {
+    gboolean ok = FALSE;
+    if (is_disconnect)
+      ok = winome_wifi_disconnect ();
+    else if (has_saved_profile)
+      ok = winome_wifi_connect (ssid.c_str ());
+    else if (fn != nullptr)
+      ok = fn (ssid.c_str (), password.c_str (), open_network);
+
+    struct DoneData {
+      GtkWidget *panel;
+      std::string ssid;
+      bool failed;
+    };
+    auto *done = new DoneData {panel, ssid, !ok && !is_disconnect};
+    g_idle_add ([] (gpointer ud) -> gboolean {
+      auto *d = static_cast<DoneData *> (ud);
+      if (d->panel != nullptr) {
+        winome_quick_settings_refresh (d->panel);
+        g_object_unref (d->panel);
+      }
+      if (d->failed) {
+        winome::notify_shell (
+            tr ("Wi-Fi Connection Failed", "Wi-Fi 连接失败"),
+            d->ssid, "WINOME");
+      }
+      delete d;
+      return G_SOURCE_REMOVE;
+    }, done);
+  }).detach ();
+}
+
+typedef struct {
+  GtkWidget *dialog;
+  GtkWidget *entry;
+  GtkWidget *panel;
+  char *ssid;
+} WifiPasswordPrompt;
+
+static void
+wifi_password_prompt_free (gpointer data)
+{
+  WifiPasswordPrompt *p = static_cast<WifiPasswordPrompt *> (data);
+  if (p == nullptr)
+    return;
+  if (p->panel != nullptr)
+    g_object_unref (p->panel);
+  g_free (p->ssid);
+  g_free (p);
+}
+
+static void
+on_wifi_pwd_cancel (GtkButton *b G_GNUC_UNUSED, gpointer user_data)
+{
+  GtkWidget *dlg = GTK_WIDGET (user_data);
+  if (dlg != nullptr)
+    gtk_window_destroy (GTK_WINDOW (dlg));
+}
+
+static void
+on_wifi_pwd_submit (GtkWidget *w G_GNUC_UNUSED, gpointer user_data)
+{
+  WifiPasswordPrompt *p = static_cast<WifiPasswordPrompt *> (user_data);
+  if (p == nullptr)
+    return;
+  const char *pwd = gtk_editable_get_text (GTK_EDITABLE (p->entry));
+  std::string ssid = p->ssid ? p->ssid : "";
+  std::string pass = pwd ? pwd : "";
+  GtkWidget *panel = p->panel;
+  GtkWidget *dlg = p->dialog;
+  if (dlg != nullptr)
+    gtk_window_destroy (GTK_WINDOW (dlg));
+  run_wifi_task_async (panel, std::move (ssid),
+                       winome_wifi_connect_with_password,
+                       std::move (pass), FALSE, false, false);
+}
+
+static void
+show_wifi_password_dialog (const char *ssid, GtkWidget *panel)
+{
+  GtkWidget *dlg = gtk_window_new ();
+  gtk_window_set_decorated (GTK_WINDOW (dlg), FALSE);
+  gtk_window_set_resizable (GTK_WINDOW (dlg), FALSE);
+  gtk_window_set_title (GTK_WINDOW (dlg),
+                        tr ("Connect to Wi-Fi", "连接到无线网络"));
+
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 12);
+  gtk_widget_add_css_class (box, "modal-dialog");
+  gtk_widget_add_css_class (box, "prompt-dialog");
+  gtk_widget_set_size_request (box, 340, -1);
+
+  GtkWidget *content = gtk_box_new (GTK_ORIENTATION_VERTICAL, 8);
+  gtk_widget_add_css_class (content, "modal-dialog-content-box");
+
+  gchar *heading = g_strdup_printf (
+      tr ("Enter password for “%s”", "输入 “%s” 的密码"), ssid);
+  GtkWidget *lbl = gtk_label_new (heading);
+  g_free (heading);
+  gtk_widget_add_css_class (lbl, "prompt-dialog-info-label");
+  gtk_label_set_xalign (GTK_LABEL (lbl), 0.0f);
+  gtk_label_set_wrap (GTK_LABEL (lbl), TRUE);
+  gtk_box_append (GTK_BOX (content), lbl);
+
+  GtkWidget *entry = gtk_password_entry_new ();
+  gtk_password_entry_set_show_peek_icon (GTK_PASSWORD_ENTRY (entry), TRUE);
+  gtk_box_append (GTK_BOX (content), entry);
+  gtk_box_append (GTK_BOX (box), content);
+
+  GtkWidget *btns = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_add_css_class (btns, "modal-dialog-button-box");
+  gtk_widget_set_halign (btns, GTK_ALIGN_END);
+
+  GtkWidget *cancel = gtk_button_new_with_label (tr ("Cancel", "取消"));
+  gtk_widget_add_css_class (cancel, "cancel-button");
+  g_signal_connect (cancel, "clicked", G_CALLBACK (on_wifi_pwd_cancel), dlg);
+  gtk_box_append (GTK_BOX (btns), cancel);
+
+  GtkWidget *connect_btn = gtk_button_new_with_label (tr ("Connect", "连接"));
+  gtk_widget_add_css_class (connect_btn, "default");
+  gtk_box_append (GTK_BOX (btns), connect_btn);
+  gtk_box_append (GTK_BOX (box), btns);
+
+  WifiPasswordPrompt *p = g_new0 (WifiPasswordPrompt, 1);
+  p->dialog = dlg;
+  p->entry = entry;
+  p->panel = panel ? GTK_WIDGET (g_object_ref (panel)) : nullptr;
+  p->ssid = g_strdup (ssid);
+  g_object_set_data_full (G_OBJECT (dlg), "wifi-prompt", p,
+                          wifi_password_prompt_free);
+
+  g_signal_connect (connect_btn, "clicked", G_CALLBACK (on_wifi_pwd_submit), p);
+  g_signal_connect (entry, "activate", G_CALLBACK (on_wifi_pwd_submit), p);
+
+  gtk_window_set_child (GTK_WINDOW (dlg), box);
+  gtk_widget_realize (dlg);
+  GdkSurface *surf = gtk_native_get_surface (GTK_NATIVE (dlg));
+  if (surf != nullptr) {
+    HWND hwnd = gdk_win32_surface_get_handle (surf);
+    if (hwnd != nullptr) {
+      LONG_PTR ex = GetWindowLongPtrW (hwnd, GWL_EXSTYLE);
+      SetWindowLongPtrW (hwnd, GWL_EXSTYLE,
+                         (ex | WS_EX_TOOLWINDOW | WS_EX_TOPMOST) & ~WS_EX_APPWINDOW);
+      RECT wa = {};
+      SystemParametersInfoW (SPI_GETWORKAREA, 0, &wa, 0);
+      RECT wr = {};
+      GetWindowRect (hwnd, &wr);
+      int w = std::max<int> (wr.right - wr.left, 360);
+      int h = std::max<int> (wr.bottom - wr.top, 160);
+      int x = wa.left + ((wa.right - wa.left) - w) / 2;
+      int y = wa.top + ((wa.bottom - wa.top) - h) / 2;
+      SetWindowPos (hwnd, HWND_TOPMOST, x, y, 0, 0,
+                    SWP_NOSIZE | SWP_SHOWWINDOW);
+    }
+  }
+  gtk_widget_set_visible (dlg, TRUE);
+  gtk_window_present (GTK_WINDOW (dlg));
+  gtk_widget_grab_focus (entry);
+}
+
+static void
 on_wifi_network_activate (gpointer user_data)
 {
   WifiRowTarget *row = static_cast<WifiRowTarget *> (user_data);
@@ -1496,20 +1710,29 @@ on_wifi_network_activate (gpointer user_data)
   const WinomeWifiNetwork *net = static_cast<const WinomeWifiNetwork *>
       (g_ptr_array_index (row->menu->networks, row->index));
 
-  // Association is asynchronous — Windows does the work in the background, so
-  // just issue the request and let the 2s status poll pick up the result.
-  if (net->connected)
-    winome_wifi_disconnect ();
-  else
-    winome_wifi_connect (net->ssid);
-  if (row->menu->panel != nullptr)
-    winome_quick_settings_refresh (row->menu->panel);
+  if (net->connected) {
+    run_wifi_task_async (row->menu->panel, net->ssid, nullptr, "", FALSE,
+                         true, false);
+    return;
+  }
+
+  if (winome_wifi_has_profile (net->ssid)) {
+    run_wifi_task_async (row->menu->panel, net->ssid, nullptr, "", FALSE,
+                         false, true);
+  } else if (!net->secured) {
+    run_wifi_task_async (row->menu->panel, net->ssid,
+                         winome_wifi_connect_with_password, "", TRUE,
+                         false, false);
+  } else {
+    show_wifi_password_dialog (net->ssid, row->menu->panel);
+  }
 }
 
 static GtkWidget *
 build_wifi_menu (gpointer user_data)
 {
   GtkWidget *panel = GTK_WIDGET (user_data);
+  winome_wifi_trigger_scan_async ();
   WinomeWifiNetwork *list = nullptr;
   guint count = 0;
 
@@ -1697,7 +1920,7 @@ winome_quick_settings_new (void)
   GtkWidget *root;
   GtkWidget *grid;
   GtkWidget *volume_slider, *volume_icon, *volume_button;
-  GtkWidget *brightness_slider;
+  GtkWidget *brightness_slider, *brightness_row = NULL;
   GtkWidget *wlan = NULL, *bluetooth = NULL, *powermode = NULL;
   GtkWidget *nightlight = NULL, *darkmode = NULL, *dnd = NULL;
   GtkWidget *keyboard = NULL, *airplane = NULL;
@@ -1774,6 +1997,7 @@ winome_quick_settings_new (void)
   {
     GtkWidget *row = make_quick_slider ("display-brightness-symbolic",
                                         &brightness_slider, NULL, NULL);
+    brightness_row = row;
     winome_quick_settings_grid_attach (grid, row, 2);
   }
 
@@ -1869,6 +2093,7 @@ winome_quick_settings_new (void)
   g_object_set_data (G_OBJECT (root), "volume-slider", volume_slider);
   g_object_set_data (G_OBJECT (root), "volume-icon", volume_icon);
   g_object_set_data (G_OBJECT (root), "brightness-slider", brightness_slider);
+  g_object_set_data (G_OBJECT (root), "brightness-row", brightness_row);
   g_object_set_data (G_OBJECT (root), "wlan-toggle", wlan);
   g_object_set_data (G_OBJECT (root), "bluetooth-toggle", bluetooth);
   g_object_set_data (G_OBJECT (root), "powermode-toggle", powermode);
@@ -1897,6 +2122,8 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
       GTK_WIDGET (g_object_get_data (G_OBJECT (quick_settings), "volume-icon"));
   GtkWidget *brightness_slider =
       GTK_WIDGET (g_object_get_data (G_OBJECT (quick_settings), "brightness-slider"));
+  GtkWidget *brightness_row =
+      GTK_WIDGET (g_object_get_data (G_OBJECT (quick_settings), "brightness-row"));
   GtkWidget *wlan_toggle =
       GTK_WIDGET (g_object_get_data (G_OBJECT (quick_settings), "wlan-toggle"));
   GtkWidget *bluetooth_toggle =
@@ -1946,7 +2173,10 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
   }
 
   double brightness = 0.5;
-  if (brightness_slider && winome::get_brightness (&brightness)) {
+  const bool has_brightness = winome::get_brightness (&brightness);
+  if (brightness_row)
+    gtk_widget_set_visible (brightness_row, has_brightness ? TRUE : FALSE);
+  if (brightness_slider && has_brightness) {
     g_signal_handlers_block_by_func (brightness_slider,
         (gpointer) on_brightness_changed, NULL);
     quick_slider_set_value (brightness_slider, brightness);

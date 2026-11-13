@@ -39,7 +39,10 @@ bool get_network_connected(bool* out);
 // Get connected network name (SSID), if any.
 bool get_network_name(char* out, int out_size);
 
-// Get current screen brightness as 0..1 fraction.
+// Whether any LCD backlight or DDC/CI monitor brightness control is available.
+bool has_brightness_control();
+
+// Get current screen brightness as 0..1 fraction (returns false when unavailable).
 bool get_brightness(double* out);
 
 // Set current screen brightness as 0..1 fraction.

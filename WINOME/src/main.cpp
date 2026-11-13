@@ -22,8 +22,10 @@
 #include "win-event-hook.h"
 #include "fullscreen-watcher.h"
 #include "hot-corner.h"
+#include "notifications.h"
 #include "ws-osd.h"
 #include "virtual-desktop.h"
+#include "winrt-bridge.h"
 
 // The host runs as a GUI application (no console window). Route diagnostics
 // to a rotating log file under %LOCALAPPDATA%\WINOME.
@@ -519,6 +521,9 @@ on_activate (GtkApplication      *app,
   // Workspace-switch OSD (workspaceSwitcherPopup.js) + desktop poll.
   winome::ws_osd_init ();
 
+  // Live WinRT notifications + toast banner + SMTC store.
+  winome::notifications_init ();
+
   // Pin the shell chrome to all virtual desktops (see pin_shell_windows).
   // Delayed: the first COM call can block up to the vd module's 8s timeout
   // when the explorer RPC deadlocks — off the startup path.
@@ -541,6 +546,9 @@ on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
 {
   destroy_control_window ();
   g_gtk_app = nullptr;
+
+  winome::notifications_shutdown ();
+  winome::winrt_shutdown ();
 
   if (g_pin_show_hook != nullptr) {
     UnhookWinEvent (g_pin_show_hook);

@@ -10,6 +10,11 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include <algorithm>
+#include <cstring>
+#include <string>
+#include <thread>
+
 namespace {
 
 // wlanapi.dll is delay-loaded: absent on machines without a wireless stack.
@@ -31,9 +36,13 @@ struct WlanApi {
                                DWORD, const PVOID, PVOID);
   DWORD (WINAPI *Scan)(HANDLE, const GUID *, const PDOT11_SSID,
                        const PWLAN_RAW_DATA, PVOID);
-  DWORD (WINAPI *Connect)(HANDLE, PVOID, const GUID *, const WCHAR *,
-                          DWORD, PVOID, PVOID);
-  DWORD (WINAPI *Disconnect)(HANDLE, PVOID, const GUID *);
+  DWORD (WINAPI *Connect)(HANDLE, const GUID *,
+                          const PWLAN_CONNECTION_PARAMETERS, PVOID);
+  DWORD (WINAPI *Disconnect)(HANDLE, const GUID *, PVOID);
+  DWORD (WINAPI *GetProfile)(HANDLE, const GUID *, LPCWSTR, PVOID,
+                             LPWSTR *, DWORD *, PDWORD);
+  DWORD (WINAPI *SetProfile)(HANDLE, const GUID *, DWORD, LPCWSTR,
+                             LPCWSTR, WINBOOL, PVOID, DWORD *);
   void  (WINAPI *FreeMemory)(PVOID);
 
   bool loaded;
@@ -70,6 +79,8 @@ load_api ()
   WINOME_LOAD_WLAN (Scan, "WlanScan");
   WINOME_LOAD_WLAN (Connect, "WlanConnect");
   WINOME_LOAD_WLAN (Disconnect, "WlanDisconnect");
+  WINOME_LOAD_WLAN (GetProfile, "WlanGetProfile");
+  WINOME_LOAD_WLAN (SetProfile, "WlanSetProfile");
   WINOME_LOAD_WLAN (FreeMemory, "WlanFreeMemory");
 
   #undef WINOME_LOAD_WLAN
@@ -386,36 +397,245 @@ winome_wifi_free_networks (WinomeWifiNetwork *networks)
   free (networks);
 }
 
+static std::wstring
+utf8_to_wide (const char *s)
+{
+  if (s == nullptr || s[0] == '\0')
+    return {};
+  int len = MultiByteToWideChar (CP_UTF8, 0, s, -1, nullptr, 0);
+  if (len <= 1)
+    return {};
+  std::wstring out (static_cast<size_t> (len - 1), L'\0');
+  MultiByteToWideChar (CP_UTF8, 0, s, -1, out.data (), len);
+  return out;
+}
+
+static std::string
+xml_escape (const char *s)
+{
+  if (s == nullptr)
+    return {};
+  std::string out;
+  out.reserve (std::strlen (s) + 8);
+  for (const unsigned char *p = reinterpret_cast<const unsigned char *> (s);
+       *p != '\0'; ++p) {
+    switch (*p) {
+    case '&':  out += "&amp;"; break;
+    case '<':  out += "&lt;"; break;
+    case '>':  out += "&gt;"; break;
+    case '"':  out += "&quot;"; break;
+    case '\'': out += "&apos;"; break;
+    default:   out.push_back (static_cast<char> (*p)); break;
+    }
+  }
+  return out;
+}
+
 gboolean
 winome_wifi_connect (const char *ssid)
 {
   if (ssid == nullptr || ssid[0] == '\0')
     return FALSE;
 
+  if (!load_api ())
+    return FALSE;
+
+  DWORD negotiated = 0;
   HANDLE client = nullptr;
-  if (!ensure_client (&client))
+  if (g_api.OpenHandle (2, nullptr, &negotiated, &client) != ERROR_SUCCESS ||
+      client == nullptr)
     return FALSE;
 
   PWLAN_INTERFACE_INFO_LIST list = nullptr;
-  bool ok = FALSE;
+  gboolean ok = FALSE;
   if (enum_interfaces (client, &list)) {
     const WLAN_INTERFACE_INFO *info = pick_interface (list);
-    if (info != nullptr) {
-      int len = MultiByteToWideChar (CP_UTF8, 0, ssid, -1, nullptr, 0);
-      if (len > 0) {
-        wchar_t *wide = (wchar_t *) calloc ((size_t) len, sizeof (wchar_t));
-        if (wide != nullptr) {
-          MultiByteToWideChar (CP_UTF8, 0, ssid, -1, wide, len);
-          DWORD flags = 0;
-          ok = g_api.Connect (client, nullptr, &info->InterfaceGuid, wide,
-                              flags, nullptr, nullptr) == ERROR_SUCCESS;
-          free (wide);
-        }
+    std::wstring wide = utf8_to_wide (ssid);
+    if (info != nullptr && !wide.empty ()) {
+      DOT11_SSID dot11 = {};
+      dot11.uSSIDLength =
+          static_cast<ULONG> (std::min<size_t> (std::strlen (ssid), 32));
+      memcpy (dot11.ucSSID, ssid, dot11.uSSIDLength);
+
+      WLAN_CONNECTION_PARAMETERS params = {};
+      params.wlanConnectionMode = wlan_connection_mode_profile;
+      params.strProfile = wide.c_str ();
+      params.pDot11Ssid = &dot11;
+      params.dot11BssType = dot11_BSS_type_infrastructure;
+      params.dwFlags = 0;
+
+      ok = g_api.Connect (client, &info->InterfaceGuid, &params, nullptr)
+           == ERROR_SUCCESS;
+    }
+    g_api.FreeMemory (list);
+  }
+  g_api.CloseHandle (client, nullptr);
+  return ok;
+}
+
+gboolean
+winome_wifi_has_profile (const char *ssid)
+{
+  if (ssid == nullptr || ssid[0] == '\0')
+    return FALSE;
+  HANDLE client = nullptr;
+  if (!ensure_client (&client) || g_api.GetProfile == nullptr)
+    return FALSE;
+
+  PWLAN_INTERFACE_INFO_LIST list = nullptr;
+  gboolean found = FALSE;
+  if (enum_interfaces (client, &list)) {
+    const WLAN_INTERFACE_INFO *info = pick_interface (list);
+    std::wstring wide = utf8_to_wide (ssid);
+    if (info != nullptr && !wide.empty ()) {
+      LPWSTR xml = nullptr;
+      DWORD flags = 0;
+      DWORD access = 0;
+      if (g_api.GetProfile (client, &info->InterfaceGuid, wide.c_str (),
+                            nullptr, &xml, &flags, &access) == ERROR_SUCCESS) {
+        found = TRUE;
+        if (xml != nullptr)
+          g_api.FreeMemory (xml);
       }
     }
     g_api.FreeMemory (list);
   }
+  return found;
+}
+
+gchar *
+winome_wifi_build_profile_xml (const char *ssid,
+                               const char *password,
+                               gboolean open_network)
+{
+  if (ssid == nullptr || ssid[0] == '\0')
+    return nullptr;
+
+  std::string hex;
+  static const char kHexDigits[] = "0123456789ABCDEF";
+  const size_t raw_len = std::min<size_t> (std::strlen (ssid), 32);
+  hex.reserve (raw_len * 2);
+  for (size_t i = 0; i < raw_len; ++i) {
+    unsigned char b = static_cast<unsigned char> (ssid[i]);
+    hex.push_back (kHexDigits[(b >> 4) & 0xF]);
+    hex.push_back (kHexDigits[b & 0xF]);
+  }
+
+  std::string esc_name = xml_escape (ssid);
+  std::string xml;
+  xml.reserve (640);
+  xml += "<?xml version=\"1.0\"?>\n";
+  xml += "<WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\">\n";
+  xml += "  <name>" + esc_name + "</name>\n";
+  xml += "  <SSIDConfig>\n";
+  xml += "    <SSID>\n";
+  xml += "      <hex>" + hex + "</hex>\n";
+  xml += "      <name>" + esc_name + "</name>\n";
+  xml += "    </SSID>\n";
+  xml += "  </SSIDConfig>\n";
+  xml += "  <connectionType>ESS</connectionType>\n";
+  xml += "  <connectionMode>auto</connectionMode>\n";
+  xml += "  <MSM>\n";
+  xml += "    <security>\n";
+  xml += "      <authEncryption>\n";
+  if (open_network) {
+    xml += "        <authentication>open</authentication>\n";
+    xml += "        <encryption>none</encryption>\n";
+    xml += "        <useOneX>false</useOneX>\n";
+    xml += "      </authEncryption>\n";
+  } else {
+    xml += "        <authentication>WPA2PSK</authentication>\n";
+    xml += "        <encryption>AES</encryption>\n";
+    xml += "        <useOneX>false</useOneX>\n";
+    xml += "      </authEncryption>\n";
+    xml += "      <sharedKey>\n";
+    xml += "        <keyType>passPhrase</keyType>\n";
+    xml += "        <protected>false</protected>\n";
+    xml += "        <keyMaterial>" + xml_escape (password ? password : "") + "</keyMaterial>\n";
+    xml += "      </sharedKey>\n";
+  }
+  xml += "    </security>\n";
+  xml += "  </MSM>\n";
+  xml += "</WLANProfile>\n";
+  return g_strdup (xml.c_str ());
+}
+
+gboolean
+winome_wifi_connect_with_password (const char *ssid,
+                                   const char *password,
+                                   gboolean open_network)
+{
+  if (ssid == nullptr || ssid[0] == '\0')
+    return FALSE;
+  if (!load_api () || g_api.SetProfile == nullptr)
+    return FALSE;
+
+  gchar *xml_utf8 = winome_wifi_build_profile_xml (ssid, password, open_network);
+  if (xml_utf8 == nullptr)
+    return FALSE;
+  std::wstring xml_wide = utf8_to_wide (xml_utf8);
+  g_free (xml_utf8);
+  if (xml_wide.empty ())
+    return FALSE;
+
+  DWORD negotiated = 0;
+  HANDLE client = nullptr;
+  if (g_api.OpenHandle (2, nullptr, &negotiated, &client) != ERROR_SUCCESS ||
+      client == nullptr)
+    return FALSE;
+
+  gboolean ok = FALSE;
+  PWLAN_INTERFACE_INFO_LIST list = nullptr;
+  if (enum_interfaces (client, &list)) {
+    const WLAN_INTERFACE_INFO *info = pick_interface (list);
+    std::wstring ssid_wide = utf8_to_wide (ssid);
+    if (info != nullptr && !ssid_wide.empty ()) {
+      DWORD reason = 0;
+      DWORD set_rc = g_api.SetProfile (client, &info->InterfaceGuid, 0,
+                                       xml_wide.c_str (), nullptr, TRUE,
+                                       nullptr, &reason);
+      if (set_rc == ERROR_SUCCESS) {
+        DOT11_SSID dot11 = {};
+        dot11.uSSIDLength =
+            static_cast<ULONG> (std::min<size_t> (std::strlen (ssid), 32));
+        memcpy (dot11.ucSSID, ssid, dot11.uSSIDLength);
+
+        WLAN_CONNECTION_PARAMETERS params = {};
+        params.wlanConnectionMode = wlan_connection_mode_profile;
+        params.strProfile = ssid_wide.c_str ();
+        params.pDot11Ssid = &dot11;
+        params.dot11BssType = dot11_BSS_type_infrastructure;
+        params.dwFlags = 0;
+        ok = g_api.Connect (client, &info->InterfaceGuid, &params, nullptr)
+             == ERROR_SUCCESS;
+      }
+    }
+    g_api.FreeMemory (list);
+  }
+  g_api.CloseHandle (client, nullptr);
   return ok;
+}
+
+void
+winome_wifi_trigger_scan_async (void)
+{
+  if (!load_api () || g_api.Scan == nullptr)
+    return;
+  std::thread ([] {
+    DWORD negotiated = 0;
+    HANDLE client = nullptr;
+    if (g_api.OpenHandle (2, nullptr, &negotiated, &client) != ERROR_SUCCESS ||
+        client == nullptr)
+      return;
+    PWLAN_INTERFACE_INFO_LIST list = nullptr;
+    if (enum_interfaces (client, &list)) {
+      const WLAN_INTERFACE_INFO *info = pick_interface (list);
+      if (info != nullptr)
+        g_api.Scan (client, &info->InterfaceGuid, nullptr, nullptr, nullptr);
+      g_api.FreeMemory (list);
+    }
+    g_api.CloseHandle (client, nullptr);
+  }).detach ();
 }
 
 gboolean
@@ -426,11 +646,11 @@ winome_wifi_disconnect (void)
     return FALSE;
 
   PWLAN_INTERFACE_INFO_LIST list = nullptr;
-  bool ok = FALSE;
+  gboolean ok = FALSE;
   if (enum_interfaces (client, &list)) {
     const WLAN_INTERFACE_INFO *info = pick_interface (list);
     if (info != nullptr)
-      ok = g_api.Disconnect (client, nullptr, &info->InterfaceGuid)
+      ok = g_api.Disconnect (client, &info->InterfaceGuid, nullptr)
            == ERROR_SUCCESS;
     g_api.FreeMemory (list);
   }

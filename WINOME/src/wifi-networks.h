@@ -47,6 +47,23 @@ void winome_wifi_free_networks (WinomeWifiNetwork *networks);
 // no matching profile exists or the request was rejected.
 gboolean winome_wifi_connect (const char *ssid);
 
+// Check whether a saved WLAN profile already exists for @ssid.
+gboolean winome_wifi_has_profile (const char *ssid);
+
+// Save a user WLAN profile (open or WPA2-PSK) and connect to @ssid.
+gboolean winome_wifi_connect_with_password (const char *ssid,
+                                            const char *password,
+                                            gboolean open_network);
+
+// Build a Windows WLAN profile XML payload for @ssid (heap allocated with
+// g_malloc; caller frees with g_free). Exposed for automated unit testing.
+gchar *winome_wifi_build_profile_xml (const char *ssid,
+                                      const char *password,
+                                      gboolean open_network);
+
+// Issue a non-blocking hardware WLAN scan on a background thread.
+void winome_wifi_trigger_scan_async (void);
+
 // Disconnect the current association (the radio stays on).
 gboolean winome_wifi_disconnect (void);
 
