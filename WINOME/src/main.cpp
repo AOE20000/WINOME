@@ -23,6 +23,8 @@
 #include "fullscreen-watcher.h"
 #include "hot-corner.h"
 #include "notifications.h"
+#include "settings-window.h"
+#include "systray.h"
 #include "ws-osd.h"
 #include "virtual-desktop.h"
 #include "winrt-bridge.h"
@@ -434,6 +436,13 @@ idle_reload_config (gpointer G_GNUC_UNUSED data)
 }
 
 static gboolean
+idle_open_settings (gpointer G_GNUC_UNUSED data)
+{
+  winome::open_settings_window ();
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
 idle_quit_app (gpointer G_GNUC_UNUSED data)
 {
   if (g_gtk_app != nullptr)
@@ -455,7 +464,7 @@ control_wnd_proc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     g_idle_add (idle_quit_app, nullptr);
     return 0;
   case WINOME_CMD_OPEN_SETTINGS:
-    // Settings window is wired in Phase 5; ignore cleanly for now.
+    g_idle_add (idle_open_settings, nullptr);
     return 0;
   case WM_QUERYENDSESSION:
     return TRUE;
@@ -524,6 +533,9 @@ on_activate (GtkApplication      *app,
   // Live WinRT notifications + toast banner + SMTC store.
   winome::notifications_init ();
 
+  // Compatible system tray collector (classic toolbar + Win11 UIA).
+  winome::systray_init ();
+
   // Pin the shell chrome to all virtual desktops (see pin_shell_windows).
   // Delayed: the first COM call can block up to the vd module's 8s timeout
   // when the explorer RPC deadlocks — off the startup path.
@@ -537,7 +549,10 @@ on_activate (GtkApplication      *app,
     g_open_overview_on_start = false;
     g_idle_add (idle_open_overview, nullptr);
   }
-  (void)g_open_settings_on_start;
+  if (g_open_settings_on_start) {
+    g_open_settings_on_start = false;
+    g_idle_add (idle_open_settings, nullptr);
+  }
 }
 
 static void
@@ -547,6 +562,8 @@ on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
   destroy_control_window ();
   g_gtk_app = nullptr;
 
+  winome::close_settings_window ();
+  winome::systray_shutdown ();
   winome::notifications_shutdown ();
   winome::winrt_shutdown ();
 

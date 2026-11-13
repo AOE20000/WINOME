@@ -6,6 +6,7 @@
 #include "i18n.h"
 #include "notifications.h"
 #include "overview-layout.h"
+#include "systray.h"
 #include "wifi-networks.h"
 
 #include <windows.h>
@@ -302,6 +303,45 @@ void test_notification_age_formatting() {
   CHECK(winome::format_notification_age(now - 172800, now, true) == "2 天前");
 }
 
+void test_systray_filtering_and_fallback() {
+  CHECK(winome::is_system_builtin_tray_item("Show hidden icons", ""));
+  CHECK(winome::is_system_builtin_tray_item("显示隐藏的图标", ""));
+  CHECK(winome::is_system_builtin_tray_item("Volume", "SystemTrayIcon"));
+  CHECK(winome::is_system_builtin_tray_item("Battery status: 98% remaining", ""));
+  CHECK(!winome::is_system_builtin_tray_item("BatteryMon Pro", ""));
+  CHECK(!winome::is_system_builtin_tray_item("Steam - Updates", "NotifyItemIcon_1"));
+  CHECK(!winome::is_system_builtin_tray_item("WeChat", ""));
+
+  CHECK_STREQ(winome::tray_fallback_icon_name("NVIDIA Settings", ""),
+              "video-display-symbolic");
+  CHECK_STREQ(winome::tray_fallback_icon_name("Steam", ""),
+              "applications-games-symbolic");
+  CHECK_STREQ(winome::tray_fallback_icon_name("OneDrive - Personal", ""),
+              "weather-overcast-symbolic");
+  CHECK_STREQ(winome::tray_fallback_icon_name("Clash Verge", ""),
+              "network-wired-symbolic");
+  CHECK_STREQ(winome::tray_fallback_icon_name("Microsoft Pinyin IME", ""),
+              "input-keyboard-symbolic");
+  CHECK_STREQ(winome::tray_fallback_icon_name("Unknown Utility", ""),
+              "application-x-executable-symbolic");
+}
+
+void test_config_listener_updates() {
+  int notifications = 0;
+  auto listener = [](void* ud) {
+    int* n = static_cast<int*>(ud);
+    ++(*n);
+  };
+  winome::add_config_listener(listener, &notifications);
+  winome::WinomeConfig updated = winome::get_config();
+  updated.show_battery_percentage = !updated.show_battery_percentage;
+  updated.clock_show_seconds = !updated.clock_show_seconds;
+  winome::update_config(updated);
+  CHECK(notifications >= 1);
+  CHECK(winome::get_config().show_battery_percentage == updated.show_battery_percentage);
+  winome::remove_config_listener(listener, &notifications);
+}
+
 }  // namespace
 
 int main() {
@@ -313,6 +353,8 @@ int main() {
   test_overview_layout_geometry();
   test_wifi_profile_xml();
   test_notification_age_formatting();
+  test_systray_filtering_and_fallback();
+  test_config_listener_updates();
 
   if (g_failures == 0)
     std::printf("ALL WINOME UNIT TESTS PASSED\n");

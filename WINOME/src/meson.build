@@ -22,6 +22,8 @@ winome_sources = files(
   'easing.cpp',
   'winrt-bridge.cpp',
   'notifications.cpp',
+  'systray.cpp',
+  'settings-window.cpp',
   'quick-settings.cpp',
   'calendar.cpp',
   'st-engine.cpp',
@@ -38,6 +40,7 @@ psapi_dep = cc.find_library('psapi', required: true)
 shlwapi_dep = cc.find_library('shlwapi', required: true)
 advapi32_dep = cc.find_library('advapi32', required: true)
 ole32_dep = cc.find_library('ole32', required: true)
+oleaut32_dep = cc.find_library('oleaut32', required: true)
 wininet_dep = cc.find_library('wininet', required: true)
 dwmapi_dep = cc.find_library('dwmapi', required: true)
 version_dep = cc.find_library('version', required: true)
@@ -56,7 +59,7 @@ resources = gnome.compile_resources('winome-resources',
 
 executable('winome',
   [winome_sources, resources],
-  dependencies: [gtk4_dep, fontconfig_dep, pangoft2_dep, shell32_dep, user32_dep, gdi32_dep, psapi_dep, shlwapi_dep, advapi32_dep, ole32_dep, wininet_dep, dwmapi_dep, version_dep, powrprof_dep, stcompat_dep, epoxy_dep],
+  dependencies: [gtk4_dep, fontconfig_dep, pangoft2_dep, shell32_dep, user32_dep, gdi32_dep, psapi_dep, shlwapi_dep, advapi32_dep, ole32_dep, oleaut32_dep, wininet_dep, dwmapi_dep, version_dep, powrprof_dep, stcompat_dep, epoxy_dep],
   include_directories: [winome_src_inc, include_directories('.')],
   cpp_args: ['-DUNICODE', '-D_UNICODE'],
   win_subsystem: 'windows',

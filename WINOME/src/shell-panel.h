@@ -38,3 +38,6 @@ gboolean winome_shell_panel_close_menu_for (GtkWidget *anchor);
 
 // Close any active secondary menu.
 void winome_shell_panel_close_menu (void);
+
+// Close all open panel popovers and secondary menus.
+void winome_shell_panel_close_popovers (void);

@@ -12,6 +12,7 @@
 #include "quick-settings.h"
 #include "i18n.h"
 #include "notifications.h"
+#include "settings-window.h"
 #include "system-status.h"
 #include "power-modes.h"
 #include "wifi-networks.h"
@@ -1077,8 +1078,8 @@ static void
 on_settings_clicked (GtkButton *button G_GNUC_UNUSED,
                      gpointer G_GNUC_UNUSED user_data)
 {
-  ShellExecuteW (nullptr, L"open", L"ms-settings:", nullptr, nullptr,
-                 SW_SHOWNORMAL);
+  winome_shell_panel_close_popovers ();
+  winome::open_settings_window ();
 }
 
 static void

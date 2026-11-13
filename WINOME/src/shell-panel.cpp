@@ -23,6 +23,7 @@
 #include "wifi-networks.h"
 #include "easing.h"
 #include "quick-settings.h"
+#include "systray.h"
 #include "overview-trigger.h"
 #include "overview.h"
 #include "fonts.h"
@@ -996,10 +997,7 @@ on_overview_state_changed (bool active, void *user_data)
   g_print ("[panel] overview state -> %d\n", (int)active);
   if (active) {
     gtk_widget_add_css_class (panel, "overview");
-    while (g_open_popovers != nullptr) {
-      PanelPopover *pp = static_cast<PanelPopover *>(g_open_popovers->data);
-      panel_popover_close (pp, "overview-open");
-    }
+    winome_shell_panel_close_popovers ();
   } else {
     gtk_widget_remove_css_class (panel, "overview");
   }
@@ -1155,6 +1153,16 @@ winome_shell_panel_close_menu (void)
     panel_popover_close (menu, "activate");
   }
 }
+
+void
+winome_shell_panel_close_popovers (void)
+{
+  winome_shell_panel_close_menu ();
+  while (g_open_popovers != nullptr) {
+    PanelPopover *pp = static_cast<PanelPopover *> (g_open_popovers->data);
+    panel_popover_close (pp, "dismiss");
+  }
+}
 typedef struct PanelStatus {
   GtkWidget *network_icon;
   GtkWidget *bluetooth_icon;
@@ -1164,6 +1172,10 @@ typedef struct PanelStatus {
   GtkWidget *battery_label;
   GtkWidget *quick_settings;
   GtkWidget *date_menu;
+  GtkWidget *tray_inline_box;
+  GtkWidget *tray_menu;
+  GtkWidget *tray_list_box;
+  GtkWidget *tray_empty_label;
 } PanelStatus;
 
 // In GNOME the hover/active highlight lives on the .clock child (an St.Widget).
@@ -1379,6 +1391,239 @@ refresh_status (gpointer data)
   return G_SOURCE_CONTINUE;
 }
 
+// --- System Tray (compatible toolbar / Win11 UIA overflow) ----------------
+
+typedef struct TrayRowPayload {
+  uint64_t id;
+} TrayRowPayload;
+
+static void
+clear_box_children (GtkWidget *box)
+{
+  if (box == nullptr)
+    return;
+  GtkWidget *child = gtk_widget_get_first_child (box);
+  while (child != nullptr) {
+    GtkWidget *next = gtk_widget_get_next_sibling (child);
+    gtk_box_remove (GTK_BOX (box), child);
+    child = next;
+  }
+}
+
+static GtkWidget *
+make_tray_image (const winome::TrayIconEntry &item, int px)
+{
+  GtkWidget *img = nullptr;
+  GdkTexture *tex = winome::systray_create_texture (item);
+  if (tex != nullptr) {
+    img = gtk_image_new_from_paintable (GDK_PAINTABLE (tex));
+    g_object_unref (tex);
+  } else {
+    img = gtk_image_new_from_icon_name (
+        winome::tray_fallback_icon_name (item.title, item.app_hint));
+  }
+  gtk_image_set_pixel_size (GTK_IMAGE (img), px);
+  return img;
+}
+
+static void
+on_tray_item_clicked (GtkButton *button, gpointer G_GNUC_UNUSED data)
+{
+  TrayRowPayload *payload = static_cast<TrayRowPayload *> (
+      g_object_get_data (G_OBJECT (button), "tray-payload"));
+  if (payload == nullptr)
+    return;
+  winome_shell_panel_close_popovers ();
+  POINT pt{};
+  GetCursorPos (&pt);
+  winome::systray_activate_item (payload->id, false, pt.x, pt.y);
+}
+
+static void
+on_tray_item_right_click (GtkGestureClick *gesture G_GNUC_UNUSED,
+                          int n_press G_GNUC_UNUSED,
+                          double x G_GNUC_UNUSED,
+                          double y G_GNUC_UNUSED,
+                          gpointer user_data)
+{
+  GtkWidget *button = GTK_WIDGET (user_data);
+  TrayRowPayload *payload = static_cast<TrayRowPayload *> (
+      g_object_get_data (G_OBJECT (button), "tray-payload"));
+  if (payload == nullptr)
+    return;
+  winome_shell_panel_close_popovers ();
+  POINT pt{};
+  GetCursorPos (&pt);
+  winome::systray_activate_item (payload->id, true, pt.x, pt.y);
+}
+
+static void
+rebuild_tray_views (PanelStatus *st)
+{
+  if (st == nullptr)
+    return;
+
+  std::vector<winome::TrayIconEntry> items = winome::systray_get_items ();
+
+  if (st->tray_inline_box != nullptr) {
+    clear_box_children (st->tray_inline_box);
+    const size_t limit = std::min<size_t> (items.size (), 4);
+    for (size_t i = 0; i < limit; ++i) {
+      GtkWidget *img = make_tray_image (items[i], 14);
+      gtk_widget_add_css_class (img, "system-status-icon");
+      gtk_widget_set_tooltip_text (img, items[i].title.c_str ());
+      gtk_box_append (GTK_BOX (st->tray_inline_box), img);
+    }
+    GtkWidget *chevron = create_status_icon ("pan-down-symbolic");
+    gtk_image_set_pixel_size (GTK_IMAGE (chevron), 13);
+    gtk_box_append (GTK_BOX (st->tray_inline_box), chevron);
+  }
+
+  if (st->tray_list_box != nullptr) {
+    clear_box_children (st->tray_list_box);
+    const bool empty = items.empty ();
+    if (st->tray_empty_label != nullptr)
+      gtk_widget_set_visible (st->tray_empty_label, empty ? TRUE : FALSE);
+
+    for (const auto &item : items) {
+      GtkWidget *row_btn = gtk_button_new ();
+      gtk_widget_add_css_class (row_btn, "popup-menu-item");
+      gtk_widget_set_focus_on_click (row_btn, FALSE);
+      gtk_widget_set_hexpand (row_btn, TRUE);
+
+      GtkWidget *row_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 10);
+      GtkWidget *icon = make_tray_image (item, 16);
+      gtk_widget_add_css_class (icon, "popup-menu-icon");
+      GtkWidget *lbl = gtk_label_new (item.title.c_str ());
+      gtk_label_set_xalign (GTK_LABEL (lbl), 0.0f);
+      gtk_label_set_ellipsize (GTK_LABEL (lbl), PANGO_ELLIPSIZE_END);
+      gtk_label_set_max_width_chars (GTK_LABEL (lbl), 28);
+      gtk_widget_set_hexpand (lbl, TRUE);
+
+      gtk_box_append (GTK_BOX (row_box), icon);
+      gtk_box_append (GTK_BOX (row_box), lbl);
+      gtk_button_set_child (GTK_BUTTON (row_btn), row_box);
+      gtk_widget_set_tooltip_text (row_btn, item.title.c_str ());
+
+      TrayRowPayload *payload = g_new (TrayRowPayload, 1);
+      payload->id = item.id;
+      g_object_set_data_full (G_OBJECT (row_btn), "tray-payload", payload, g_free);
+      g_signal_connect (row_btn, "clicked",
+                        G_CALLBACK (on_tray_item_clicked), nullptr);
+
+      GtkGesture *right_click = gtk_gesture_click_new ();
+      gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (right_click),
+                                     GDK_BUTTON_SECONDARY);
+      g_signal_connect (right_click, "pressed",
+                        G_CALLBACK (on_tray_item_right_click), row_btn);
+      gtk_widget_add_controller (row_btn, GTK_EVENT_CONTROLLER (right_click));
+
+      gtk_box_append (GTK_BOX (st->tray_list_box), row_btn);
+    }
+  }
+}
+
+static void
+on_systray_changed (void *data)
+{
+  rebuild_tray_views (static_cast<PanelStatus *> (data));
+}
+
+static void
+on_tray_refresh_clicked (GtkButton *button G_GNUC_UNUSED,
+                         gpointer G_GNUC_UNUSED data)
+{
+  winome::systray_refresh_async (true);
+}
+
+static void
+on_tray_native_overflow_clicked (GtkButton *button G_GNUC_UNUSED,
+                                 gpointer G_GNUC_UNUSED data)
+{
+  winome_shell_panel_close_popovers ();
+  winome::systray_toggle_native_overflow ();
+}
+
+static void
+on_tray_popover_map (GtkWidget *win G_GNUC_UNUSED, gpointer data)
+{
+  PanelStatus *st = static_cast<PanelStatus *> (data);
+  winome::systray_refresh_async (true);
+  rebuild_tray_views (st);
+}
+
+static GtkWidget *
+create_tray_button (PanelStatus *st)
+{
+  GtkWidget *button = gtk_button_new ();
+  gtk_widget_add_css_class (button, "panel-button");
+  gtk_widget_set_focus_on_click (button, FALSE);
+  gtk_widget_set_vexpand (button, TRUE);
+  gtk_widget_set_tooltip_text (button, winome::tr ("System Tray", "系统托盘"));
+
+  st->tray_inline_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_widget_add_css_class (st->tray_inline_box, "panel-status-indicators-box");
+  gtk_widget_set_valign (st->tray_inline_box, GTK_ALIGN_CENTER);
+  gtk_button_set_child (GTK_BUTTON (button), st->tray_inline_box);
+
+  st->tray_menu = gtk_box_new (GTK_ORIENTATION_VERTICAL, 8);
+  gtk_widget_add_css_class (st->tray_menu, "popup-menu-content");
+  gtk_widget_set_size_request (st->tray_menu, 280, -1);
+
+  GtkWidget *header = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
+  GtkWidget *title = gtk_label_new (winome::tr ("System Tray", "系统托盘"));
+  gtk_label_set_xalign (GTK_LABEL (title), 0.0f);
+  gtk_widget_set_hexpand (title, TRUE);
+
+  GtkWidget *refresh_btn = gtk_button_new_from_icon_name ("view-refresh-symbolic");
+  gtk_widget_set_focus_on_click (refresh_btn, FALSE);
+  gtk_widget_set_tooltip_text (refresh_btn, winome::tr ("Refresh", "刷新"));
+  g_signal_connect (refresh_btn, "clicked",
+                    G_CALLBACK (on_tray_refresh_clicked), nullptr);
+
+  GtkWidget *overflow_btn =
+      gtk_button_new_with_label (winome::tr ("Windows Tray", "原生托盘"));
+  gtk_widget_set_focus_on_click (overflow_btn, FALSE);
+  gtk_widget_set_tooltip_text (
+      overflow_btn, winome::tr ("Open Windows system tray overflow", "打开 Windows 系统托盘溢出区"));
+  g_signal_connect (overflow_btn, "clicked",
+                    G_CALLBACK (on_tray_native_overflow_clicked), nullptr);
+
+  gtk_box_append (GTK_BOX (header), title);
+  gtk_box_append (GTK_BOX (header), refresh_btn);
+  gtk_box_append (GTK_BOX (header), overflow_btn);
+  gtk_box_append (GTK_BOX (st->tray_menu), header);
+
+  GtkWidget *sep = gtk_separator_new (GTK_ORIENTATION_HORIZONTAL);
+  gtk_box_append (GTK_BOX (st->tray_menu), sep);
+
+  st->tray_empty_label = gtk_label_new (
+      winome::tr ("No third-party tray icons detected.\nClick \"Windows Tray\" above to open native overflow.",
+                  "暂未发现第三方托盘图标。\n可点击右上角“原生托盘”打开 Windows 系统托盘。"));
+  gtk_label_set_wrap (GTK_LABEL (st->tray_empty_label), TRUE);
+  gtk_label_set_xalign (GTK_LABEL (st->tray_empty_label), 0.0f);
+  gtk_widget_set_margin_top (st->tray_empty_label, 6);
+  gtk_widget_set_margin_bottom (st->tray_empty_label, 6);
+  gtk_box_append (GTK_BOX (st->tray_menu), st->tray_empty_label);
+
+  GtkWidget *scroll = gtk_scrolled_window_new ();
+  gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (scroll),
+                                  GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+  gtk_scrolled_window_set_propagate_natural_height (GTK_SCROLLED_WINDOW (scroll),
+                                                    TRUE);
+  gtk_scrolled_window_set_max_content_height (GTK_SCROLLED_WINDOW (scroll), 320);
+
+  st->tray_list_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
+  gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scroll), st->tray_list_box);
+  gtk_box_append (GTK_BOX (st->tray_menu), scroll);
+
+  GtkWidget *pop_win = make_panel_popover (button, st->tray_menu, FALSE);
+  g_signal_connect (pop_win, "map", G_CALLBACK (on_tray_popover_map), st);
+
+  rebuild_tray_views (st);
+  return button;
+}
+
 static GtkWidget *
 create_quick_settings (PanelStatus *st)
 {
@@ -1482,6 +1727,7 @@ static void
 on_panel_destroy (GtkWidget *panel G_GNUC_UNUSED, gpointer user_data)
 {
   winome::remove_config_listener (on_panel_config_changed, user_data);
+  winome::systray_remove_listener (on_systray_changed, user_data);
 }
 
 GtkWidget *
@@ -1514,6 +1760,7 @@ winome_shell_panel_new (void)
   status = g_new0 (PanelStatus, 1);
   gtk_box_append (GTK_BOX (left_box), create_activities_button ());
   gtk_box_append (GTK_BOX (center_box), create_clock_button (status));
+  gtk_box_append (GTK_BOX (right_box), create_tray_button (status));
   gtk_box_append (GTK_BOX (right_box), create_quick_settings (status));
 
   winome_panel_layout_set (layout, left_box, center_box, right_box);
@@ -1522,6 +1769,7 @@ winome_shell_panel_new (void)
   refresh_status (status);
   g_timeout_add_seconds (2, refresh_status, status);
   winome::add_config_listener (on_panel_config_changed, status);
+  winome::systray_add_listener (on_systray_changed, status);
   g_signal_connect (panel, "destroy", G_CALLBACK (on_panel_destroy), status);
 
   // Give the panel its own font map so the bundled Cantarell font is used.
