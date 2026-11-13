@@ -54,11 +54,30 @@ WINOME 主工程在 `WINOME/` 目录下，统一使用仓库根目录的交互�
 
 | 方案 | 配置 | 构建目录 | 实测产物基线 | 说明 |
 |------|------|----------|--------------|------|
-| `release` | `release` + LTO + `NDEBUG` | `WINOME/build-release/` | ~1.3MB–1.4MB | 最小体积、最快指令（内存基线 ~30MB） |
-| `test` | `debugoptimized` | `WINOME/build/` | ~4.6MB–4.9MB | 项目默认，保留 `g_print` 诊断日志与断言 |
+| `release` | `release` + LTO + `NDEBUG` | `WINOME/build-release/` | ~1.9MB | 最小体积、最快指令 |
+| `test` | `debugoptimized` | `WINOME/build/` | ~12MB | 项目默认，保留 `g_print` 诊断日志与断言 |
 | `debug` | `debug` (`-O0 -g`) | `WINOME/build-debug/` | — | GDB 友好 |
 
 三方案使用**独立构建目录**，切换互不触发重编；LTO 安全（COM 接口走运行时 `vcall` 裸函数指针，链接器无法去虚拟化）。
+
+### 单元测试、样式检查与便携打包
+
+```bash
+# 运行单元测试（winome:unit-tests）与 CSS 转换测试（winome:css-converter）
+meson test -C WINOME/build --print-errorlogs
+meson test -C WINOME/build-release --print-errorlogs
+
+# 检查 GTK4 CSS 控件类覆盖率（注意 CSS 文件在前、源码列表在后）
+python3 WINOME/tools/check-widget-classes.py WINOME/build/src/theme/gnome-shell-gtk4.css WINOME/src/*.cpp
+
+# 打包自包含便携目录与 zip 安装包（输出至 WINOME/dist/）
+./WINOME/package.sh            # 会先执行 ./build.sh release
+./WINOME/package.sh --no-build # 直接复用现有 release 产物
+```
+
+`WINOME/package.sh` 会自动收集 `winome.exe`、GLib 辅助程序（`gdbus.exe`、`gspawn-win64-helper*.exe`）、`ldd` 递归闭包分析出的 `/ucrt64/bin/*.dll`、`gdk-pixbuf` loaders（含 `pixbufloader_svg.dll`）与 `loaders.cache`、`gschemas.compiled`、`Adwaita` symbolic/scalable 图标、`etc/fonts/`、许可声明与 `restore-taskbar.bat` 急救脚本，输出到 `WINOME/dist/WINOME-portable/` 与 `WINOME/dist/WINOME-win64-portable.zip`。
+
+自动化流水线配置见 [.github/workflows/ci.yml](../.github/workflows/ci.yml)，在 `windows-latest` + `msys2/setup-msys2@v2`（`UCRT64`）上依次执行 `test` 构建、单元测试、样式类检查、`release` 构建与发布版打包验证。
 
 ### 手动调用 Meson / Ninja
 

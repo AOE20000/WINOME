@@ -28,3 +28,7 @@ Desktop.ini
 
 # Upstream reference clones (kept as working copies, not published)
 upstream/
+
+# Distribution staging & archives
+dist/
+*.zip

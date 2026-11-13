@@ -1,0 +1,68 @@
+name: WINOME CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-libepoxy
+            mingw-w64-ucrt-x86_64-librsvg
+            mingw-w64-ucrt-x86_64-adwaita-icon-theme
+            mingw-w64-ucrt-x86_64-python
+
+      - name: Build test configuration and run unit tests
+        run: |
+          export WINOME_TMP="$(cygpath -w "${RUNNER_TEMP:-/tmp}/winome_tmp")"
+          ./build.sh test
+          meson test -C WINOME/build --print-errorlogs
+
+      - name: Check GTK4 widget class coverage
+        run: |
+          python3 WINOME/tools/check-widget-classes.py \
+            WINOME/build/src/theme/gnome-shell-gtk4.css \
+            WINOME/src/*.cpp
+
+      - name: Build release (LTO) configuration and run release tests
+        run: |
+          export WINOME_TMP="$(cygpath -w "${RUNNER_TEMP:-/tmp}/winome_tmp")"
+          ./build.sh release
+          meson test -C WINOME/build-release --print-errorlogs
+
+      - name: Package portable bundle and verify DLL closure
+        run: |
+          ./WINOME/package.sh --no-build
+          if PATH=/usr/bin ldd WINOME/dist/WINOME-portable/winome.exe | grep -qi "not found"; then
+            PATH=/usr/bin ldd WINOME/dist/WINOME-portable/winome.exe | grep -i "not found"
+            exit 1
+          fi
+
+      - name: Upload portable release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WINOME-win64-portable
+          path: WINOME/dist/WINOME-win64-portable.zip
+          if-no-files-found: error

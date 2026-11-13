@@ -18,12 +18,14 @@
 1. **技术路线**：在 Windows 上用原生 Win32/COM 能力支撑的 GNOME Shell UI 复刻。宿主单进程 `winome.exe`（C++17 + GTK4），无注入、无 DLL；源码以逐组件移植 `upstream/gnome-shell` 的 JS/CSS 为准（`upstream/` 仅作只读参考，不派生发布）。
 2. **注释与文档语言**：源码注释使用英文；技术散文与开发文档使用中文。
 3. **模块职责边界**：
-   - 概览相关 → `WINOME/src/overview*.cpp`
+   - 概览、应用索引与分页网格 → `WINOME/src/overview*.cpp`、`app-index.cpp`、`app-grid.cpp`
    - 顶栏、工作区保留与弹出窗窗口壳 → `WINOME/src/shell-panel.cpp`
-   - 快速设置面板与二级菜单内容 → `WINOME/src/quick-settings.cpp`
-   - 日历控件 → `WINOME/src/calendar.cpp`
-   - 虚拟桌面 COM 与窗口固定 → `WINOME/src/virtual-desktop.cpp`
+   - 多显示器拓扑、全屏与锁屏监测 → `WINOME/src/monitor-manager.cpp`、`fullscreen-watcher.cpp`
+   - 快速设置面板与系统托盘 → `WINOME/src/quick-settings.cpp`、`systray.cpp`
+   - 日历、通知中心与媒体卡片 → `WINOME/src/calendar.cpp`、`notifications.cpp`、`winrt-bridge.cpp`
+   - 虚拟桌面 COM 与窗口移动/创建/关闭 → `WINOME/src/virtual-desktop.cpp`
    - 系统数据源 → `WINOME/src/system-status.cpp`、`wifi-networks.cpp`、`power-modes.cpp`
+   - 配置、国际化与设置窗口 → `WINOME/src/config.cpp`、`i18n.cpp`、`settings-window.cpp`
 4. **构建清单同步**：新增源码文件必须同步加入 [WINOME/src/meson.build](../WINOME/src/meson.build) 的 `winome_sources`；引入新的 Win32 系统库须同步添加 `cc.find_library(...)`。
-5. **状态清单单一事实源**：功能完成状态与待办清单统一维护在根目录 [README.md](../README.md)，避免多处 README 各自维护导致漂移。
-6. **常用轮询节拍**：状态区图标 `2s`、`fullscreen-watcher` `400ms`、OSD / 虚拟桌面切换检测 `400ms`（桌面计数每约 `5s` 刷新一次）、左上角热角 `100ms`。
+5. **状态清单单一事实源**：功能完成状态统一维护在根目录 [README.md](../README.md)，避免多处 README 各自维护导致漂移。
+6. **数据刷新模型**：WASAPI 音量与 `WlanRegisterNotification` Wi-Fi 采用事件驱动回调，显示器/DPI/会话切换响应 OS 广播消息；轻量轮询仅保留在低开销巡检场景（`fullscreen-watcher` `400ms`、左上角热角 `100ms`）。
