@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 WINOME contributors
-// Auto-hide the top panel while a genuine fullscreen window or the lock
-// screen is active. GNOME keeps the panel over maximized windows, so
-// maximized windows (IsZoomed) never hide it; a window is considered
-// fullscreen only when it covers its entire monitor.
+// Event-driven per-monitor fullscreen detection & lock-screen panel hiding.
 
 #include "fullscreen-watcher.h"
 #include "overview-trigger.h"
@@ -12,16 +9,24 @@
 #include <windows.h>
 #include <glib.h>
 
+#include <algorithm>
 #include <string>
+#include <vector>
 
 namespace winome {
-
 namespace {
 
-// Whether the panel is currently hidden by a fullscreen window / lock
-// screen. Read by panel_hidden() so the hot corner can stay inactive while
-// the panel is not visible.
-bool g_panel_hidden = false;
+struct PanelTrackEntry {
+  HWND hwnd = nullptr;
+  bool is_primary = false;
+  bool hidden = false;
+};
+
+std::vector<PanelTrackEntry> g_panels;
+bool g_session_locked = false;
+guint g_tick_source = 0;
+HWINEVENTHOOK g_fg_hook = nullptr;
+HWINEVENTHOOK g_loc_hook = nullptr;
 
 bool belongs_to_process(HWND hwnd, const wchar_t* name) {
   DWORD pid = 0;
@@ -42,34 +47,31 @@ bool belongs_to_process(HWND hwnd, const wchar_t* name) {
 
   std::wstring full(path);
   size_t sep = full.find_last_of(L'\\');
-  std::wstring base = (sep != std::wstring::npos) ? full.substr(sep + 1)
-                                                  : full;
-  return base == name;
+  std::wstring base = (sep != std::wstring::npos) ? full.substr(sep + 1) : full;
+  return _wcsicmp(base.c_str(), name) == 0;
 }
 
-// True when @hwnd covers its entire monitor (within a small tolerance),
-// i.e. it is a genuine fullscreen window.
-bool covers_monitor(HWND hwnd) {
-  RECT r;
+bool covers_monitor(HWND hwnd, HMONITOR* out_mon) {
+  RECT r{};
   if (!GetWindowRect(hwnd, &r))
     return false;
 
   HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
   MONITORINFO mi{};
   mi.cbSize = sizeof(mi);
-  if (!GetMonitorInfo(mon, &mi))
+  if (!GetMonitorInfoW(mon, &mi))
     return false;
 
   constexpr int kTolerance = 6;
-  return r.left <= mi.rcMonitor.left + kTolerance &&
-         r.top <= mi.rcMonitor.top + kTolerance &&
-         r.right >= mi.rcMonitor.right - kTolerance &&
-         r.bottom >= mi.rcMonitor.bottom - kTolerance;
+  const bool full = r.left <= mi.rcMonitor.left + kTolerance &&
+                    r.top <= mi.rcMonitor.top + kTolerance &&
+                    r.right >= mi.rcMonitor.right - kTolerance &&
+                    r.bottom >= mi.rcMonitor.bottom - kTolerance;
+  if (full && out_mon != nullptr)
+    *out_mon = mon;
+  return full;
 }
 
-// The Explorer desktop surfaces cover the whole monitor but are not
-// fullscreen apps: clicking the desktop foregrounds a WorkerW/Progman window
-// and must not hide the panel.
 bool is_desktop_window(HWND hwnd) {
   wchar_t cls[256] = {0};
   if (GetClassNameW(hwnd, cls, 256) == 0)
@@ -80,101 +82,200 @@ bool is_desktop_window(HWND hwnd) {
          wcscmp(cls, L"SysListView32") == 0;
 }
 
-// Should the panel be hidden while @fg is the foreground window?
-bool should_hide_panel(HWND fg) {
+// Compute which monitor (if any) is currently covered by a fullscreen foreground
+// window. When @all_locked is true every panel must hide regardless of monitor.
+void detect_fullscreen_state(bool* all_locked, HMONITOR* fullscreen_mon) {
+  *all_locked = g_session_locked;
+  *fullscreen_mon = nullptr;
+
+  if (g_session_locked)
+    return;
+
+  HWND fg = GetForegroundWindow();
   if (fg == nullptr)
-    return false;
+    return;
 
-  // The panel always stays visible over the Activities overview (the
-  // overview window itself does not take focus, so @fg may still be a
-  // fullscreen app).
+  // Overview always keeps top panels visible.
   if (winome::overview_active())
-    return false;
+    return;
 
-  // Our own windows (the panel itself, popovers, the overview) never hide
-  // the panel.
   if (belongs_to_process(fg, L"winome.exe"))
-    return false;
+    return;
 
-  // The desktop is not a fullscreen app.
   if (is_desktop_window(fg))
-    return false;
+    return;
 
-  // The Alt-Tab/Task View switcher is a fullscreen overlay, but the panel
-  // must stay visible above it.
   wchar_t cls[256] = {0};
   if (GetClassNameW(fg, cls, 256) > 0 &&
-      wcscmp(cls, L"XamlExplorerHostIslandWindow") == 0)
-    return false;
+      wcscmp(cls, L"XamlExplorerHostIslandWindow") == 0) {
+    return;
+  }
 
-  // Lock screen: hide the panel so it does not float over it.
-  if (belongs_to_process(fg, L"LogonUI.exe"))
-    return true;
+  if (belongs_to_process(fg, L"LogonUI.exe")) {
+    *all_locked = true;
+    return;
+  }
 
-  // Maximized windows are not fullscreen (GNOME keeps the panel visible).
   if (IsZoomed(fg))
-    return false;
+    return;
 
-  return covers_monitor(fg);
+  HMONITOR covered = nullptr;
+  if (covers_monitor(fg, &covered))
+    *fullscreen_mon = covered;
 }
 
-gboolean fullscreen_tick(gpointer user_data) {
-  HWND panel = static_cast<HWND>(user_data);
+void reassert_primary_workarea_and_styles() {
+  for (const auto& entry : g_panels) {
+    if (!IsWindow(entry.hwnd))
+      continue;
 
-  // GDK re-applies its own extended styles on configure events, which would
-  // drop WS_EX_TOOLWINDOW (needed to keep the panel out of Alt-Tab and the
-  // taskbar). Re-assert it every tick.
-  LONG_PTR ex = GetWindowLongPtrW(panel, GWL_EXSTYLE);
-  if ((ex & WS_EX_TOOLWINDOW) == 0)
-    SetWindowLongPtrW(panel, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW);
+    LONG_PTR ex = GetWindowLongPtrW(entry.hwnd, GWL_EXSTYLE);
+    if ((ex & WS_EX_TOOLWINDOW) == 0)
+      SetWindowLongPtrW(entry.hwnd, GWL_EXSTYLE, (ex | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW);
 
-  // Same idea for z-order: GDK/Windows reshuffle the topmost band, which
-  // can leave the overview above the panel or a popover buried under the
-  // overview. The restack checks the chain first and only re-asserts
-  // popover > panel > overview when it actually drifted.
-  winome::overview_restack ();
-
-  // Hiding the taskbar makes the shell asynchronously recompute the work area
-  // to the full screen, which can revert the panel-strip reservation set at
-  // startup. Re-assert it, but only when it currently differs, so stable
-  // states do not trigger needless relayouts.
-  RECT panel_rect;
-  if (GetWindowRect(panel, &panel_rect)) {
-    HMONITOR mon = MonitorFromWindow(panel, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    RECT current;
-    if (mon != nullptr && GetMonitorInfo(mon, &mi) &&
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &current, 0)) {
-      RECT work = mi.rcMonitor;
-      work.top += (panel_rect.bottom - panel_rect.top);
-      if (current.top != work.top || current.left != work.left ||
-          current.right != work.right || current.bottom != work.bottom)
-        SystemParametersInfoW(SPI_SETWORKAREA, 0, &work, 0);
+    if (entry.is_primary) {
+      RECT panel_rect{};
+      if (GetWindowRect(entry.hwnd, &panel_rect)) {
+        HMONITOR mon = MonitorFromWindow(entry.hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        RECT current{};
+        if (mon != nullptr && GetMonitorInfoW(mon, &mi) &&
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, &current, 0)) {
+          RECT work = mi.rcMonitor;
+          work.top += (panel_rect.bottom - panel_rect.top);
+          if (current.top != work.top || current.left != work.left ||
+              current.right != work.right || current.bottom != work.bottom) {
+            SystemParametersInfoW(SPI_SETWORKAREA, 0, &work, 0);
+          }
+        }
+      }
     }
   }
+  winome::overview_restack();
+}
 
-  bool hide = should_hide_panel(GetForegroundWindow());
-  if (hide != g_panel_hidden) {
-    g_panel_hidden = hide;
-    ShowWindow(panel, hide ? SW_HIDE : SW_SHOWNOACTIVATE);
-  }
+void CALLBACK fg_win_event_proc(HWINEVENTHOOK hook G_GNUC_UNUSED,
+                                  DWORD event,
+                                  HWND hwnd,
+                                  LONG id_object,
+                                  LONG id_child G_GNUC_UNUSED,
+                                  DWORD thread G_GNUC_UNUSED,
+                                  DWORD time G_GNUC_UNUSED) {
+  if (id_object != OBJID_WINDOW)
+    return;
+  if (event == EVENT_OBJECT_LOCATIONCHANGE && hwnd != GetForegroundWindow())
+    return;
+  evaluate_fullscreen_state();
+}
+
+gboolean maintenance_tick(gpointer G_GNUC_UNUSED user_data) {
+  reassert_primary_workarea_and_styles();
+  evaluate_fullscreen_state();
   return G_SOURCE_CONTINUE;
 }
 
 }  // namespace
 
-bool
-panel_hidden (void)
-{
-  return g_panel_hidden;
+void evaluate_fullscreen_state(void) {
+  bool all_locked = false;
+  HMONITOR fs_mon = nullptr;
+  detect_fullscreen_state(&all_locked, &fs_mon);
+
+  for (auto& entry : g_panels) {
+    if (!IsWindow(entry.hwnd))
+      continue;
+    HMONITOR pmon = MonitorFromWindow(entry.hwnd, MONITOR_DEFAULTTONEAREST);
+    const bool want_hide = all_locked || (fs_mon != nullptr && pmon == fs_mon);
+    if (want_hide != entry.hidden) {
+      entry.hidden = want_hide;
+      ShowWindow(entry.hwnd, want_hide ? SW_HIDE : SW_SHOWNOACTIVATE);
+    }
+  }
 }
 
-void start_fullscreen_watcher(HWND panel_hwnd) {
-  // Re-evaluate immediately so a fullscreen app already focused hides the
-  // panel without waiting for the first timeout.
-  fullscreen_tick(static_cast<gpointer>(panel_hwnd));
-  g_timeout_add(400, fullscreen_tick, static_cast<gpointer>(panel_hwnd));
+void register_panel_window(HWND panel_hwnd) {
+  if (panel_hwnd == nullptr)
+    return;
+  for (const auto& entry : g_panels) {
+    if (entry.hwnd == panel_hwnd)
+      return;
+  }
+  g_panels.push_back({panel_hwnd, g_panels.empty(), false});
+  evaluate_fullscreen_state();
+}
+
+void unregister_panel_window(HWND panel_hwnd) {
+  g_panels.erase(
+      std::remove_if(g_panels.begin(), g_panels.end(),
+                     [&](const PanelTrackEntry& e) {
+                       return e.hwnd == panel_hwnd;
+                     }),
+      g_panels.end());
+}
+
+void set_session_locked(bool locked) {
+  g_session_locked = locked;
+  evaluate_fullscreen_state();
+}
+
+bool panel_hidden(void) {
+  if (g_session_locked)
+    return true;
+  for (const auto& entry : g_panels) {
+    if (entry.is_primary)
+      return entry.hidden;
+  }
+  return false;
+}
+
+bool panel_hidden_for_monitor(HMONITOR mon) {
+  if (g_session_locked)
+    return true;
+  for (const auto& entry : g_panels) {
+    if (MonitorFromWindow(entry.hwnd, MONITOR_DEFAULTTONEAREST) == mon)
+      return entry.hidden;
+  }
+  return false;
+}
+
+void start_fullscreen_watcher(HWND primary_panel_hwnd) {
+  g_panels.clear();
+  if (primary_panel_hwnd != nullptr)
+    g_panels.push_back({primary_panel_hwnd, true, false});
+
+  if (g_fg_hook == nullptr) {
+    g_fg_hook = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
+        fg_win_event_proc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+  }
+  if (g_loc_hook == nullptr) {
+    g_loc_hook = SetWinEventHook(
+        EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, nullptr,
+        fg_win_event_proc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+  }
+
+  reassert_primary_workarea_and_styles();
+  evaluate_fullscreen_state();
+  if (g_tick_source == 0)
+    g_tick_source = g_timeout_add(600, maintenance_tick, nullptr);
+}
+
+void stop_fullscreen_watcher(void) {
+  if (g_tick_source != 0) {
+    g_source_remove(g_tick_source);
+    g_tick_source = 0;
+  }
+  if (g_fg_hook != nullptr) {
+    UnhookWinEvent(g_fg_hook);
+    g_fg_hook = nullptr;
+  }
+  if (g_loc_hook != nullptr) {
+    UnhookWinEvent(g_loc_hook);
+    g_loc_hook = nullptr;
+  }
+  g_panels.clear();
+  g_session_locked = false;
 }
 
 }  // namespace winome

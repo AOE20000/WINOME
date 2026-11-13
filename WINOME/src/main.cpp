@@ -22,9 +22,12 @@
 #include "win-event-hook.h"
 #include "fullscreen-watcher.h"
 #include "hot-corner.h"
+#include "monitor-manager.h"
 #include "notifications.h"
 #include "settings-window.h"
 #include "systray.h"
+#include "system-status.h"
+#include "wifi-networks.h"
 #include "ws-osd.h"
 #include "virtual-desktop.h"
 #include "winrt-bridge.h"
@@ -350,6 +353,8 @@ log_gsk_renderer (GtkWidget *widget)
   g_object_unref (renderer);
 }
 
+static GtkApplication *g_gtk_app = nullptr;
+
 static void
 position_panel (GtkWidget *panel)
 {
@@ -408,6 +413,32 @@ position_panel (GtkWidget *panel)
 
   // GNOME-style top-left hot corner opens the overview.
   winome::start_hot_corner (hwnd);
+
+  // Multi-monitor & OS display/wallpaper/session-lock event manager.
+  winome::MonitorRuntimeCallbacks mm_cbs{};
+  mm_cbs.panel_height = winome_shell_panel_height;
+  mm_cbs.create_secondary_panel = [] () -> GtkWidget * {
+    GtkWidget *sec = winome_shell_panel_new_secondary ();
+    if (sec != nullptr && g_gtk_app != nullptr)
+      gtk_window_set_application (GTK_WINDOW (sec), g_gtk_app);
+    return sec;
+  };
+  mm_cbs.register_panel = winome::register_panel_window;
+  mm_cbs.unregister_panel = winome::unregister_panel_window;
+  mm_cbs.pin_window = [] (HWND w) { winome::vd::pin_window (w); };
+  mm_cbs.on_session_lock_changed = [] (bool locked) {
+    winome::set_session_locked (locked);
+    if (!locked)
+      winome::NativeTaskbar::hide ();
+  };
+  mm_cbs.on_display_changed = [] (const RECT &primary_rect) {
+    g_primary_monitor = primary_rect;
+    save_recovery_workarea (primary_rect);
+    winome::evaluate_fullscreen_state ();
+    winome::overview_reposition ();
+  };
+  mm_cbs.on_wallpaper_changed = winome::overview_invalidate_wallpaper;
+  winome::monitor_manager_init (hwnd, mm_cbs);
 }
 
 constexpr const wchar_t *kControlWindowClass = L"WINOME_ControlWindow";
@@ -416,7 +447,6 @@ constexpr UINT WINOME_CMD_RELOAD_CONFIG = WM_APP + 102;
 constexpr UINT WINOME_CMD_QUIT = WM_APP + 103;
 constexpr UINT WINOME_CMD_OPEN_SETTINGS = WM_APP + 104;
 
-static GtkApplication *g_gtk_app = nullptr;
 static HWND g_control_hwnd = nullptr;
 static bool g_open_overview_on_start = false;
 static bool g_open_settings_on_start = false;
@@ -536,6 +566,9 @@ on_activate (GtkApplication      *app,
   // Compatible system tray collector (classic toolbar + Win11 UIA).
   winome::systray_init ();
 
+  // Event-driven WASAPI master volume & default audio endpoint monitor.
+  winome::start_volume_monitor ();
+
   // Pin the shell chrome to all virtual desktops (see pin_shell_windows).
   // Delayed: the first COM call can block up to the vd module's 8s timeout
   // when the explorer RPC deadlocks — off the startup path.
@@ -563,7 +596,11 @@ on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
   g_gtk_app = nullptr;
 
   winome::close_settings_window ();
+  winome::monitor_manager_shutdown ();
+  winome::stop_fullscreen_watcher ();
   winome::systray_shutdown ();
+  winome::stop_volume_monitor ();
+  winome_wifi_shutdown_notifications ();
   winome::notifications_shutdown ();
   winome::winrt_shutdown ();
 

@@ -70,6 +70,12 @@ gboolean winome_wifi_disconnect (void);
 // Enable or disable the first wireless interface's software radio state.
 gboolean winome_wifi_set_enabled (gboolean enabled);
 
+// Event-driven WLAN notification subscription (WlanRegisterNotification).
+typedef void (*WinomeWifiChangedCallback)(gpointer user_data);
+void winome_wifi_add_listener (WinomeWifiChangedCallback cb, gpointer user_data);
+void winome_wifi_remove_listener (WinomeWifiChangedCallback cb, gpointer user_data);
+void winome_wifi_shutdown_notifications (void);
+
 // Decode raw IEEE 802.11 SSID bytes (up to 32 bytes) into a UTF-8 C string.
 // Invalid UTF-8 falls back to Windows-1252 / Latin-1; hidden NUL-containing
 // SSIDs produce "".

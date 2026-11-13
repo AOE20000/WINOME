@@ -11,9 +11,12 @@
 #include <stdlib.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -43,6 +46,9 @@ struct WlanApi {
                              LPWSTR *, DWORD *, PDWORD);
   DWORD (WINAPI *SetProfile)(HANDLE, const GUID *, DWORD, LPCWSTR,
                              LPCWSTR, WINBOOL, PVOID, DWORD *);
+  DWORD (WINAPI *RegisterNotification)(HANDLE, DWORD, WINBOOL,
+                                       WLAN_NOTIFICATION_CALLBACK, PVOID,
+                                       PVOID, PDWORD);
   void  (WINAPI *FreeMemory)(PVOID);
 
   bool loaded;
@@ -81,6 +87,7 @@ load_api ()
   WINOME_LOAD_WLAN (Disconnect, "WlanDisconnect");
   WINOME_LOAD_WLAN (GetProfile, "WlanGetProfile");
   WINOME_LOAD_WLAN (SetProfile, "WlanSetProfile");
+  WINOME_LOAD_WLAN (RegisterNotification, "WlanRegisterNotification");
   WINOME_LOAD_WLAN (FreeMemory, "WlanFreeMemory");
 
   #undef WINOME_LOAD_WLAN
@@ -102,6 +109,69 @@ load_api ()
 // caller and the handle dies with the process.
 HANDLE g_client = nullptr;
 
+struct WifiListenerEntry {
+  WinomeWifiChangedCallback cb;
+  gpointer user_data;
+};
+
+struct WifiNotifState {
+  std::mutex mu;
+  std::vector<WifiListenerEntry> listeners;
+  std::atomic<bool> queued{false};
+  bool registered = false;
+};
+
+WifiNotifState g_wifi_notif;
+
+gboolean
+idle_dispatch_wifi_changed (gpointer G_GNUC_UNUSED data)
+{
+  g_wifi_notif.queued.store (false, std::memory_order_release);
+  std::vector<WifiListenerEntry> copy;
+  {
+    std::lock_guard<std::mutex> lock (g_wifi_notif.mu);
+    copy = g_wifi_notif.listeners;
+  }
+  for (const auto &e : copy) {
+    if (e.cb != nullptr)
+      e.cb (e.user_data);
+  }
+  return G_SOURCE_REMOVE;
+}
+
+VOID WINAPI
+wlan_notif_callback (PWLAN_NOTIFICATION_DATA data, PVOID G_GNUC_UNUSED ctx)
+{
+  if (data == nullptr)
+    return;
+  if (data->NotificationSource != WLAN_NOTIFICATION_SOURCE_ACM &&
+      data->NotificationSource != WLAN_NOTIFICATION_SOURCE_MSM) {
+    return;
+  }
+  bool expected = false;
+  if (g_wifi_notif.queued.compare_exchange_strong (
+          expected, true, std::memory_order_acq_rel)) {
+    g_idle_add (idle_dispatch_wifi_changed, nullptr);
+  }
+}
+
+void
+ensure_wlan_notifications (HANDLE client)
+{
+  std::lock_guard<std::mutex> lock (g_wifi_notif.mu);
+  if (g_wifi_notif.registered || client == nullptr ||
+      g_api.RegisterNotification == nullptr) {
+    return;
+  }
+  DWORD prev = 0;
+  if (g_api.RegisterNotification (
+          client,
+          WLAN_NOTIFICATION_SOURCE_ACM | WLAN_NOTIFICATION_SOURCE_MSM,
+          TRUE, wlan_notif_callback, nullptr, nullptr, &prev) == ERROR_SUCCESS) {
+    g_wifi_notif.registered = true;
+  }
+}
+
 bool
 ensure_client (HANDLE *out)
 {
@@ -122,6 +192,7 @@ ensure_client (HANDLE *out)
     g_client = client;
   }
 
+  ensure_wlan_notifications (g_client);
   *out = g_client;
   return true;
 }
@@ -703,4 +774,42 @@ winome_wifi_set_enabled (gboolean enabled)
 
   g_api.FreeMemory (list);
   return ok;
+}
+
+void
+winome_wifi_add_listener (WinomeWifiChangedCallback cb, gpointer user_data)
+{
+  if (cb == nullptr)
+    return;
+  HANDLE client = nullptr;
+  ensure_client (&client);
+  std::lock_guard<std::mutex> lock (g_wifi_notif.mu);
+  g_wifi_notif.listeners.push_back ({cb, user_data});
+}
+
+void
+winome_wifi_remove_listener (WinomeWifiChangedCallback cb, gpointer user_data)
+{
+  std::lock_guard<std::mutex> lock (g_wifi_notif.mu);
+  g_wifi_notif.listeners.erase (
+      std::remove_if (g_wifi_notif.listeners.begin (),
+                      g_wifi_notif.listeners.end (),
+                      [&] (const WifiListenerEntry &e) {
+                        return e.cb == cb && e.user_data == user_data;
+                      }),
+      g_wifi_notif.listeners.end ());
+}
+
+void
+winome_wifi_shutdown_notifications (void)
+{
+  std::lock_guard<std::mutex> lock (g_wifi_notif.mu);
+  g_wifi_notif.listeners.clear ();
+  if (g_wifi_notif.registered && g_client != nullptr &&
+      g_api.RegisterNotification != nullptr) {
+    DWORD prev = 0;
+    g_api.RegisterNotification (g_client, WLAN_NOTIFICATION_SOURCE_NONE,
+                                TRUE, nullptr, nullptr, nullptr, &prev);
+    g_wifi_notif.registered = false;
+  }
 }

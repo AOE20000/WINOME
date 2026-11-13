@@ -17,10 +17,13 @@
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include <audiopolicy.h>
+#include <glib.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdio.h>
 #include <vector>
 
@@ -865,6 +868,240 @@ bool set_airplane_mode(bool enabled) {
 
 bool has_keyboard_backlight() {
   return false;
+}
+
+namespace {
+
+struct VolumeListenerEntry {
+  VolumeChangedCallback cb;
+  void* user_data;
+};
+
+struct VolumeMonitorState {
+  std::mutex mu;
+  std::vector<VolumeListenerEntry> listeners;
+  std::atomic<bool> notify_queued{false};
+  bool started = false;
+  IMMDeviceEnumerator* enumerator = nullptr;
+  IAudioEndpointVolume* bound_volume = nullptr;
+  IAudioEndpointVolumeCallback* volume_cb = nullptr;
+  IMMNotificationClient* device_cb = nullptr;
+};
+
+VolumeMonitorState g_vol_mon;
+
+gboolean idle_dispatch_volume_changed(gpointer G_GNUC_UNUSED data) {
+  g_vol_mon.notify_queued.store(false, std::memory_order_release);
+  std::vector<VolumeListenerEntry> copy;
+  {
+    std::lock_guard<std::mutex> lock(g_vol_mon.mu);
+    copy = g_vol_mon.listeners;
+  }
+  for (const auto& entry : copy) {
+    if (entry.cb != nullptr)
+      entry.cb(entry.user_data);
+  }
+  return G_SOURCE_REMOVE;
+}
+
+void queue_volume_changed_notification() {
+  bool expected = false;
+  if (g_vol_mon.notify_queued.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    g_idle_add(idle_dispatch_volume_changed, nullptr);
+  }
+}
+
+void rebind_default_endpoint_locked();
+
+gboolean idle_rebind_default_endpoint(gpointer G_GNUC_UNUSED data) {
+  {
+    std::lock_guard<std::mutex> lock(g_vol_mon.mu);
+    if (g_vol_mon.started)
+      rebind_default_endpoint_locked();
+  }
+  queue_volume_changed_notification();
+  return G_SOURCE_REMOVE;
+}
+
+class EndpointVolumeCallbackImpl final : public IAudioEndpointVolumeCallback {
+ public:
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    return ++ref_count_;
+  }
+  ULONG STDMETHODCALLTYPE Release() override {
+    ULONG n = --ref_count_;
+    if (n == 0)
+      delete this;
+    return n;
+  }
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+    if (ppv == nullptr)
+      return E_POINTER;
+    if (riid == __uuidof(IUnknown) ||
+        riid == __uuidof(IAudioEndpointVolumeCallback)) {
+      *ppv = static_cast<IAudioEndpointVolumeCallback*>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppv = nullptr;
+    return E_NOINTERFACE;
+  }
+  HRESULT STDMETHODCALLTYPE OnNotify(
+      AUDIO_VOLUME_NOTIFICATION_DATA* pNotify G_GNUC_UNUSED) override {
+    queue_volume_changed_notification();
+    return S_OK;
+  }
+
+ private:
+  std::atomic<ULONG> ref_count_{1};
+};
+
+class DeviceNotificationClientImpl final : public IMMNotificationClient {
+ public:
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    return ++ref_count_;
+  }
+  ULONG STDMETHODCALLTYPE Release() override {
+    ULONG n = --ref_count_;
+    if (n == 0)
+      delete this;
+    return n;
+  }
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+    if (ppv == nullptr)
+      return E_POINTER;
+    if (riid == __uuidof(IUnknown) || riid == __uuidof(IMMNotificationClient)) {
+      *ppv = static_cast<IMMNotificationClient*>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppv = nullptr;
+    return E_NOINTERFACE;
+  }
+  HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(
+      LPCWSTR pwstrDeviceId G_GNUC_UNUSED,
+      DWORD dwNewState G_GNUC_UNUSED) override {
+    g_idle_add(idle_rebind_default_endpoint, nullptr);
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE OnDeviceAdded(
+      LPCWSTR pwstrDeviceId G_GNUC_UNUSED) override {
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE OnDeviceRemoved(
+      LPCWSTR pwstrDeviceId G_GNUC_UNUSED) override {
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(
+      EDataFlow flow,
+      ERole role,
+      LPCWSTR pwstrDeviceId G_GNUC_UNUSED) override {
+    if (flow == eRender && role == eConsole)
+      g_idle_add(idle_rebind_default_endpoint, nullptr);
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(
+      LPCWSTR pwstrDeviceId G_GNUC_UNUSED,
+      const PROPERTYKEY key G_GNUC_UNUSED) override {
+    return S_OK;
+  }
+
+ private:
+  std::atomic<ULONG> ref_count_{1};
+};
+
+void unbind_volume_locked() {
+  if (g_vol_mon.bound_volume != nullptr) {
+    if (g_vol_mon.volume_cb != nullptr)
+      g_vol_mon.bound_volume->UnregisterControlChangeNotify(g_vol_mon.volume_cb);
+    g_vol_mon.bound_volume->Release();
+    g_vol_mon.bound_volume = nullptr;
+  }
+}
+
+void rebind_default_endpoint_locked() {
+  unbind_volume_locked();
+  if (g_vol_mon.enumerator == nullptr || g_vol_mon.volume_cb == nullptr)
+    return;
+
+  IMMDevice* dev = nullptr;
+  if (g_vol_mon.enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &dev) != S_OK ||
+      dev == nullptr) {
+    return;
+  }
+  IAudioEndpointVolume* vol = nullptr;
+  if (dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
+                    reinterpret_cast<void**>(&vol)) == S_OK &&
+      vol != nullptr) {
+    if (vol->RegisterControlChangeNotify(g_vol_mon.volume_cb) == S_OK) {
+      g_vol_mon.bound_volume = vol;
+    } else {
+      vol->Release();
+    }
+  }
+  dev->Release();
+}
+
+}  // namespace
+
+void start_volume_monitor() {
+  std::lock_guard<std::mutex> lock(g_vol_mon.mu);
+  if (g_vol_mon.started)
+    return;
+  IMMDeviceEnumerator* enumerator = get_device_enumerator();
+  if (enumerator == nullptr)
+    return;
+
+  g_vol_mon.started = true;
+  g_vol_mon.enumerator = enumerator;
+  g_vol_mon.enumerator->AddRef();
+  g_vol_mon.volume_cb = new EndpointVolumeCallbackImpl();
+  g_vol_mon.device_cb = new DeviceNotificationClientImpl();
+  g_vol_mon.enumerator->RegisterEndpointNotificationCallback(g_vol_mon.device_cb);
+  rebind_default_endpoint_locked();
+}
+
+void stop_volume_monitor() {
+  std::lock_guard<std::mutex> lock(g_vol_mon.mu);
+  g_vol_mon.listeners.clear();
+  if (!g_vol_mon.started)
+    return;
+  g_vol_mon.started = false;
+  unbind_volume_locked();
+  if (g_vol_mon.enumerator != nullptr) {
+    if (g_vol_mon.device_cb != nullptr) {
+      g_vol_mon.enumerator->UnregisterEndpointNotificationCallback(
+          g_vol_mon.device_cb);
+    }
+    g_vol_mon.enumerator->Release();
+    g_vol_mon.enumerator = nullptr;
+  }
+  if (g_vol_mon.volume_cb != nullptr) {
+    g_vol_mon.volume_cb->Release();
+    g_vol_mon.volume_cb = nullptr;
+  }
+  if (g_vol_mon.device_cb != nullptr) {
+    g_vol_mon.device_cb->Release();
+    g_vol_mon.device_cb = nullptr;
+  }
+}
+
+void add_volume_listener(VolumeChangedCallback cb, void* user_data) {
+  if (cb == nullptr)
+    return;
+  std::lock_guard<std::mutex> lock(g_vol_mon.mu);
+  g_vol_mon.listeners.push_back({cb, user_data});
+}
+
+void remove_volume_listener(VolumeChangedCallback cb, void* user_data) {
+  std::lock_guard<std::mutex> lock(g_vol_mon.mu);
+  g_vol_mon.listeners.erase(
+      std::remove_if(g_vol_mon.listeners.begin(), g_vol_mon.listeners.end(),
+                     [&](const VolumeListenerEntry& e) {
+                       return e.cb == cb && e.user_data == user_data;
+                     }),
+      g_vol_mon.listeners.end());
 }
 
 }  // namespace winome

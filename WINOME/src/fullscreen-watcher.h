@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 WINOME contributors
-// Auto-hide the top panel while a fullscreen window or the lock screen is
-// active, and show it again otherwise.
+// Per-monitor fullscreen isolation & lock-screen auto-hide for top panels.
 
 #pragma once
 
@@ -9,13 +8,26 @@
 
 namespace winome {
 
-// Watch the foreground window and hide/show @panel_hwnd accordingly. The
-// panel stays visible over the overview and over maximized windows; only
-// genuine fullscreen windows and the lock screen hide it.
-void start_fullscreen_watcher(HWND panel_hwnd);
+// Start watching foreground fullscreen windows and work area for @primary_panel.
+void start_fullscreen_watcher(HWND primary_panel_hwnd);
 
-// True while the panel is hidden (a fullscreen window or the lock screen is
-// active). The hot corner lives on the panel, so it must be inactive then.
+// Unhook event listeners and release tracked panel windows.
+void stop_fullscreen_watcher(void);
+
+// Register/unregister secondary monitor panel windows for per-monitor isolation.
+void register_panel_window(HWND panel_hwnd);
+void unregister_panel_window(HWND panel_hwnd);
+
+// Track workstation lock state (WM_WTSSESSION_CHANGE) to immediately hide/show.
+void set_session_locked(bool locked);
+
+// Re-evaluate all panels immediately (called on display or lock changes).
+void evaluate_fullscreen_state(void);
+
+// True while the primary panel is hidden (fullscreen app on primary or locked).
 bool panel_hidden(void);
+
+// True while the panel covering @mon is hidden.
+bool panel_hidden_for_monitor(HMONITOR mon);
 
 }  // namespace winome

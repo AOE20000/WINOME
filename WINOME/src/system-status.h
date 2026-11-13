@@ -92,4 +92,11 @@ void restart_system();
 // System UI language: 'zh' or 'en' (from GetUserDefaultUILanguage).
 const char* get_system_language();
 
+// Event-driven WASAPI master volume / mute / default-endpoint change monitor.
+using VolumeChangedCallback = void (*)(void* user_data);
+void start_volume_monitor();
+void stop_volume_monitor();
+void add_volume_listener(VolumeChangedCallback cb, void* user_data);
+void remove_volume_listener(VolumeChangedCallback cb, void* user_data);
+
 }  // namespace winome

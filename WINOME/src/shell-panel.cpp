@@ -34,7 +34,9 @@
 #include <time.h>
 #include <string.h>
 #include <math.h>
+#include <algorithm>
 #include <memory>
+#include <vector>
 
 #include <windows.h>
 
@@ -986,31 +988,39 @@ ensure_popover_mouse_hook (void)
                                               nullptr, 0);
 }
 
-// When the Activities overview opens it takes over the screen: make the panel
+// When the Activities overview opens it takes over the screen: make all panels
 // transparent (GNOME style) and close any open popover so it does not float
 // over the overview.
-static void
-on_overview_state_changed (bool active, void *user_data)
-{
-  GtkWidget *panel = GTK_WIDGET (user_data);
+static std::vector<GtkWidget *> g_registered_panels;
 
+static void
+on_overview_state_changed (bool active, void *user_data G_GNUC_UNUSED)
+{
   g_print ("[panel] overview state -> %d\n", (int)active);
-  if (active) {
-    gtk_widget_add_css_class (panel, "overview");
+  if (active)
     winome_shell_panel_close_popovers ();
-  } else {
-    gtk_widget_remove_css_class (panel, "overview");
+  for (GtkWidget *panel : g_registered_panels) {
+    if (active)
+      gtk_widget_add_css_class (panel, "overview");
+    else
+      gtk_widget_remove_css_class (panel, "overview");
   }
 }
 
-// Register the overview state callback once, with the panel window as data.
+// Register a panel window in the shared overview CSS state tracker.
 static void
 connect_overview_state (GtkWidget *panel)
 {
-  if (g_overview_hooked)
-    return;
-  g_overview_hooked = TRUE;
-  winome::set_overview_change_callback (on_overview_state_changed, panel);
+  if (std::find (g_registered_panels.begin (), g_registered_panels.end (),
+                 panel) == g_registered_panels.end ()) {
+    g_registered_panels.push_back (panel);
+  }
+  if (!g_overview_hooked) {
+    g_overview_hooked = TRUE;
+    winome::set_overview_change_callback (on_overview_state_changed, nullptr);
+  }
+  if (winome::overview_active ())
+    gtk_widget_add_css_class (panel, "overview");
 }
 
 // A popover anchored to the given panel button: a borderless toplevel card
@@ -1164,6 +1174,10 @@ winome_shell_panel_close_popovers (void)
   }
 }
 typedef struct PanelStatus {
+  bool is_primary;
+  guint status_timer_id;
+  guint clock_timer_id;
+  GtkWidget *clock_label;
   GtkWidget *network_icon;
   GtkWidget *bluetooth_icon;
   GtkWidget *volume_icon;
@@ -1182,7 +1196,7 @@ typedef struct PanelStatus {
 // GtkLabel does not paint its CSS background in GTK4, so the .clock "label" is
 // a GtkBox (which does paint it) wrapping the actual text label.
 static GtkWidget *
-create_clock_button (PanelStatus *st)
+create_clock_button (PanelStatus *st, bool with_popover)
 {
   GtkWidget *button;
   GtkWidget *display_box;
@@ -1212,13 +1226,16 @@ create_clock_button (PanelStatus *st)
 
   gtk_button_set_child (GTK_BUTTON (button), display_box);
 
-  g_timeout_add_seconds (1, update_clock, clock_label);
+  st->clock_label = clock_label;
+  st->clock_timer_id = g_timeout_add_seconds (1, update_clock, clock_label);
   update_clock (clock_label);
 
-  // The clock opens the date/calendar popover (like DateMenuButton), centered
-  // below the clock.
-  st->date_menu = winome_calendar_new ();
-  make_panel_popover (button, st->date_menu, TRUE);
+  if (with_popover) {
+    // The clock opens the date/calendar popover (like DateMenuButton), centered
+    // below the clock.
+    st->date_menu = winome_calendar_new ();
+    make_panel_popover (button, st->date_menu, TRUE);
+  }
 
   return button;
 }
@@ -1378,11 +1395,19 @@ static gboolean
 refresh_status (gpointer data)
 {
   PanelStatus *st = static_cast<PanelStatus *>(data);
+  if (st == nullptr)
+    return G_SOURCE_REMOVE;
 
-  update_network_icon (st->network_icon);
-  update_bluetooth_icon (st->bluetooth_icon);
-  update_volume_icon (st->volume_icon);
-  update_battery_icon (st);
+  if (st->clock_label != nullptr)
+    update_clock (st->clock_label);
+  if (st->network_icon != nullptr)
+    update_network_icon (st->network_icon);
+  if (st->bluetooth_icon != nullptr)
+    update_bluetooth_icon (st->bluetooth_icon);
+  if (st->volume_icon != nullptr)
+    update_volume_icon (st->volume_icon);
+  if (st->battery_box != nullptr)
+    update_battery_icon (st);
   if (st->quick_settings != nullptr)
     winome_quick_settings_refresh (st->quick_settings);
   if (st->date_menu != nullptr)
@@ -1724,14 +1749,37 @@ on_panel_config_changed (void *data)
 }
 
 static void
-on_panel_destroy (GtkWidget *panel G_GNUC_UNUSED, gpointer user_data)
+on_panel_status_event (void *data)
 {
-  winome::remove_config_listener (on_panel_config_changed, user_data);
-  winome::systray_remove_listener (on_systray_changed, user_data);
+  refresh_status (data);
 }
 
-GtkWidget *
-winome_shell_panel_new (void)
+static void
+on_panel_destroy (GtkWidget *panel, gpointer user_data)
+{
+  PanelStatus *st = static_cast<PanelStatus *> (user_data);
+  g_registered_panels.erase (
+      std::remove (g_registered_panels.begin (), g_registered_panels.end (),
+                   panel),
+      g_registered_panels.end ());
+
+  if (st != nullptr) {
+    if (st->status_timer_id != 0)
+      g_source_remove (st->status_timer_id);
+    if (st->clock_timer_id != 0)
+      g_source_remove (st->clock_timer_id);
+    winome::remove_config_listener (on_panel_config_changed, st);
+    if (st->is_primary) {
+      winome::systray_remove_listener (on_systray_changed, st);
+      winome::remove_volume_listener (on_panel_status_event, st);
+      winome_wifi_remove_listener (on_panel_status_event, st);
+    }
+    g_free (st);
+  }
+}
+
+static GtkWidget *
+build_shell_panel (bool primary)
 {
   GtkWidget *panel;
   GtkWidget *layout;
@@ -1741,7 +1789,8 @@ winome_shell_panel_new (void)
   PanelStatus *status;
 
   panel = gtk_window_new ();
-  gtk_window_set_title (GTK_WINDOW (panel), "WINOME Shell");
+  gtk_window_set_title (GTK_WINDOW (panel),
+                        primary ? "WINOME Shell" : "WINOME Secondary Panel");
   gtk_window_set_decorated (GTK_WINDOW (panel), FALSE);
   gtk_window_set_default_size (GTK_WINDOW (panel), -1, panel_height ());
 
@@ -1758,29 +1807,50 @@ winome_shell_panel_new (void)
   gtk_widget_set_name (right_box, "panelRight");
 
   status = g_new0 (PanelStatus, 1);
+  status->is_primary = primary;
   gtk_box_append (GTK_BOX (left_box), create_activities_button ());
-  gtk_box_append (GTK_BOX (center_box), create_clock_button (status));
-  gtk_box_append (GTK_BOX (right_box), create_tray_button (status));
-  gtk_box_append (GTK_BOX (right_box), create_quick_settings (status));
+  gtk_box_append (GTK_BOX (center_box), create_clock_button (status, primary));
+  if (primary) {
+    gtk_box_append (GTK_BOX (right_box), create_tray_button (status));
+    gtk_box_append (GTK_BOX (right_box), create_quick_settings (status));
+  }
 
   winome_panel_layout_set (layout, left_box, center_box, right_box);
 
-  // Refresh network / bluetooth / volume / battery icons immediately and periodically.
-  refresh_status (status);
-  g_timeout_add_seconds (2, refresh_status, status);
+  if (primary) {
+    refresh_status (status);
+    // Slow fallback poll for battery percentage / Bluetooth; volume and WLAN
+    // push instant callbacks via WASAPI and WlanRegisterNotification.
+    status->status_timer_id = g_timeout_add_seconds (5, refresh_status, status);
+    winome::systray_add_listener (on_systray_changed, status);
+    winome::add_volume_listener (on_panel_status_event, status);
+    winome_wifi_add_listener (on_panel_status_event, status);
+  }
   winome::add_config_listener (on_panel_config_changed, status);
-  winome::systray_add_listener (on_systray_changed, status);
   g_signal_connect (panel, "destroy", G_CALLBACK (on_panel_destroy), status);
 
   // Give the panel its own font map so the bundled Cantarell font is used.
   winome::install_bundled_fonts (panel);
 
-  load_css (panel);
+  if (primary)
+    load_css (panel);
 
   // Make the panel transparent (and close popovers) while the overview is open.
   connect_overview_state (panel);
 
   return panel;
+}
+
+GtkWidget *
+winome_shell_panel_new (void)
+{
+  return build_shell_panel (true);
+}
+
+GtkWidget *
+winome_shell_panel_new_secondary (void)
+{
+  return build_shell_panel (false);
 }
 
 int

@@ -4,6 +4,7 @@
 
 #include "config.h"
 #include "i18n.h"
+#include "monitor-manager.h"
 #include "notifications.h"
 #include "overview-layout.h"
 #include "systray.h"
@@ -342,6 +343,33 @@ void test_config_listener_updates() {
   winome::remove_config_listener(listener, &notifications);
 }
 
+void test_monitor_manager_geometry() {
+  RECT mon{1920, 0, 3840, 1080};
+  RECT work = winome::compute_panel_work_area(mon, 32);
+  CHECK(work.left == 1920);
+  CHECK(work.top == 32);
+  CHECK(work.right == 3840);
+  CHECK(work.bottom == 1080);
+
+  winome::MonitorDescriptor d1;
+  d1.monitor_rect = mon;
+  d1.dpi_x = 96;
+  d1.dpi_y = 96;
+  d1.is_primary = true;
+
+  winome::MonitorDescriptor d2 = d1;
+  std::vector<winome::MonitorDescriptor> a{d1};
+  std::vector<winome::MonitorDescriptor> b{d2};
+  CHECK(winome::same_monitor_topology(a, b));
+  b[0].dpi_x = 144;
+  CHECK(!winome::same_monitor_topology(a, b));
+
+  auto live = winome::enumerate_monitors();
+  CHECK(!live.empty());
+  if (!live.empty())
+    CHECK(live[0].is_primary);
+}
+
 }  // namespace
 
 int main() {
@@ -355,6 +383,7 @@ int main() {
   test_notification_age_formatting();
   test_systray_filtering_and_fallback();
   test_config_listener_updates();
+  test_monitor_manager_geometry();
 
   if (g_failures == 0)
     std::printf("ALL WINOME UNIT TESTS PASSED\n");

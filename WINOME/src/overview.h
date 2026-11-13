@@ -40,4 +40,10 @@ int overview_is_open();
 // row without re-enumerating the COM interface on every poll.
 int overview_workspace_count();
 
+// Reload desktop wallpaper texture on WM_SETTINGCHANGE (SPI_SETDESKWALLPAPER).
+void overview_invalidate_wallpaper();
+
+// Reflow overview geometry and window bounds after display/DPI changes.
+void overview_reposition();
+
 }  // namespace winome

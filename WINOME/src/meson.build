@@ -15,6 +15,7 @@ winome_sources = files(
   'virtual-desktop.cpp',
   'ws-osd.cpp',
   'fullscreen-watcher.cpp',
+  'monitor-manager.cpp',
   'hot-corner.cpp',
   'system-status.cpp',
   'power-modes.cpp',

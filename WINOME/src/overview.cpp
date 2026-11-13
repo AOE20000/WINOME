@@ -2639,4 +2639,19 @@ overview_hide_async (void)
   g_main_context_invoke (nullptr, hide_idle, nullptr);
 }
 
+void
+overview_invalidate_wallpaper (void)
+{
+  load_wallpaper ();
+  if (g_window != nullptr && gtk_widget_get_visible (g_window))
+    gtk_widget_queue_draw (g_window);
+}
+
+void
+overview_reposition (void)
+{
+  if (g_window != nullptr && gtk_widget_get_visible (g_window))
+    place_overview_locked (false);
+}
+
 }  // namespace winome
