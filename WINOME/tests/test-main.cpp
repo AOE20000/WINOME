@@ -2,12 +2,17 @@
 // Copyright (C) 2026 WINOME contributors
 // Automated unit tests for WINOME core modules.
 
+#include "app-grid.h"
+#include "app-index.h"
 #include "config.h"
 #include "i18n.h"
 #include "monitor-manager.h"
 #include "notifications.h"
+#include "overview-dash.h"
 #include "overview-layout.h"
+#include "overview-thumbs.h"
 #include "systray.h"
+#include "virtual-desktop.h"
 #include "wifi-networks.h"
 
 #include <windows.h>
@@ -370,6 +375,131 @@ void test_monitor_manager_geometry() {
     CHECK(live[0].is_primary);
 }
 
+void test_virtual_desktop_profiles() {
+  auto win10 = winome::vd::vtable_slots_for_build(19045);
+  CHECK(!win10.can_manage_desktops);
+  CHECK(win10.create_desktop == -1);
+  CHECK(win10.remove_desktop == -1);
+
+  auto win11_23h2 = winome::vd::vtable_slots_for_build(22621);
+  CHECK(win11_23h2.can_manage_desktops);
+  CHECK(win11_23h2.move_view_to_desktop == 4);
+  CHECK(win11_23h2.create_desktop == 10);
+  CHECK(win11_23h2.remove_desktop == 12);
+
+  auto win11_24h2 = winome::vd::vtable_slots_for_build(26100);
+  CHECK(win11_24h2.can_manage_desktops);
+  CHECK(win11_24h2.move_view_to_desktop == 4);
+  CHECK(win11_24h2.create_desktop == 11);
+  CHECK(win11_24h2.remove_desktop == 13);
+
+  CHECK(winome::vd::windows_build_number() > 0);
+}
+
+void test_app_index_and_lru_cache() {
+  CHECK(winome::is_ignored_shortcut_name("uninstall my app"));
+  CHECK(winome::is_ignored_shortcut_name("卸载某某软件"));
+  CHECK(!winome::is_ignored_shortcut_name("notepad++"));
+
+  CHECK(winome::canonical_app_id(L"Microsoft.Terminal!App", L"C:\\a.exe",
+                                 L"C:\\a.lnk") == "microsoft.terminal!app");
+  CHECK(winome::canonical_app_id(L"", L"C:/Apps/Foo.exe", L"C:\\a.lnk") ==
+        "c:\\apps\\foo.exe");
+
+  winome::AppEntry a;
+  a.id = "1";
+  a.name = "My Terminal";
+  a.name_lower = "my terminal";
+  a.target_lower = "wt.exe";
+
+  winome::AppEntry b;
+  b.id = "2";
+  b.name = "Terminal Emulator";
+  b.name_lower = "terminal emulator";
+  b.target_lower = "term.exe";
+
+  winome::AppEntry c;
+  c.id = "3";
+  c.name = "Notepad";
+  c.name_lower = "notepad";
+  c.target_lower = "notepad.exe";
+
+  auto hits = winome::filter_and_sort_apps({a, b, c}, "term");
+  CHECK(hits.size() == 2);
+  CHECK(hits[0].id == "2"); // prefix beats word match
+  CHECK(hits[1].id == "1");
+
+  // Pinning persistence roundtrip.
+  winome::set_app_id_pinned("c:/Program Files/App.exe", true);
+  CHECK(winome::is_app_id_pinned(winome::get_config().pinned_apps,
+                                 "C:\\Program Files\\App.exe"));
+  CHECK(!winome::toggle_app_id_pinned("C:\\PROGRAM FILES\\APP.EXE"));
+  CHECK(!winome::is_app_id_pinned(winome::get_config().pinned_apps,
+                                  "c:\\program files\\app.exe"));
+
+  // LRU texture eviction test.
+  winome::app_icon_cache_clear();
+  uint32_t px = 0xFFFFFFFFu;
+  GBytes *bytes = g_bytes_new(&px, sizeof(px));
+  GdkTexture *tex = gdk_memory_texture_new(1, 1, GDK_MEMORY_B8G8R8A8_PREMULTIPLIED,
+                                           bytes, 4);
+  g_bytes_unref(bytes);
+  size_t cap = winome::app_icon_cache_capacity();
+  for (size_t i = 0; i < cap + 5; ++i)
+    winome::app_icon_cache_store("app-" + std::to_string(i), 64, tex);
+  g_object_unref(tex);
+
+  CHECK(winome::app_icon_cache_count() == cap);
+  GdkTexture *evicted = winome::app_icon_cache_lookup("app-0", 64);
+  CHECK(evicted == nullptr);
+  GdkTexture *kept =
+      winome::app_icon_cache_lookup("app-" + std::to_string(cap + 4), 64);
+  CHECK(kept != nullptr);
+  if (kept != nullptr)
+    g_object_unref(kept);
+  winome::app_icon_cache_clear();
+  CHECK(winome::app_icon_cache_count() == 0);
+}
+
+void test_app_grid_pagination() {
+  CHECK(winome::compute_app_grid_page_count(0, 24) == 1);
+  CHECK(winome::compute_app_grid_page_count(24, 24) == 1);
+  CHECK(winome::compute_app_grid_page_count(25, 24) == 2);
+
+  auto s0 = winome::compute_app_grid_slice(50, -3, 24);
+  CHECK(s0.page == 0 && s0.begin == 0 && s0.end == 24 && s0.total_pages == 3);
+
+  auto s_last = winome::compute_app_grid_slice(50, 99, 24);
+  CHECK(s_last.page == 2 && s_last.begin == 48 && s_last.end == 50);
+
+  auto d_lg = winome::compute_app_grid_dimensions(1600, 900);
+  CHECK(d_lg.cols == 6 && d_lg.rows == 4 && d_lg.page_size == 24);
+  auto d_sm = winome::compute_app_grid_dimensions(700, 380);
+  CHECK(d_sm.cols == 4 && d_sm.rows == 3 && d_sm.page_size == 12);
+}
+
+void test_dash_favorites_and_thumbs_summary() {
+  int pinned_cnt = 0;
+  auto order = winome::build_dash_item_order(
+      {"C:/Apps/Foo.exe", "Bar.App!Main"},
+      {"bar.app!main", "c:\\apps\\foo.exe", "c:\\apps\\baz.exe"},
+      &pinned_cnt);
+  CHECK(pinned_cnt == 2);
+  CHECK(order.size() == 3);
+  CHECK(order[0] == "c:\\apps\\foo.exe");
+  CHECK(order[1] == "bar.app!main");
+  CHECK(order[2] == "c:\\apps\\baz.exe");
+
+  auto t_idle = winome::compute_thumbs_summary(1, true, false);
+  CHECK(!t_idle.visible);
+
+  auto t_drag = winome::compute_thumbs_summary(1, true, true);
+  CHECK(t_drag.visible && t_drag.desktop_pills == 1 && t_drag.has_add_pill);
+
+  auto t_multi = winome::compute_thumbs_summary(2, true, false);
+  CHECK(t_multi.visible && t_multi.desktop_pills == 2 && t_multi.has_add_pill);
+}
+
 }  // namespace
 
 int main() {
@@ -384,6 +514,10 @@ int main() {
   test_systray_filtering_and_fallback();
   test_config_listener_updates();
   test_monitor_manager_geometry();
+  test_virtual_desktop_profiles();
+  test_app_index_and_lru_cache();
+  test_app_grid_pagination();
+  test_dash_favorites_and_thumbs_summary();
 
   if (g_failures == 0)
     std::printf("ALL WINOME UNIT TESTS PASSED\n");

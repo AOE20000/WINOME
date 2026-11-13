@@ -19,20 +19,39 @@
 
 namespace winome {
 
-// Create the empty row (invisible until repopulated with >1 desktop).
+struct ThumbLayoutSummary {
+  int desktop_pills = 0;
+  bool has_add_pill = false;
+  bool visible = false;
+};
+
+// Pure helper (unit-tested in winome-tests): decides pill & '+' count.
+inline ThumbLayoutSummary
+compute_thumbs_summary (int count, bool can_manage, bool force_show)
+{
+  ThumbLayoutSummary s;
+  if (count <= 0)
+    return s;
+  if (count > 1 || (force_show && count >= 1)) {
+    s.visible = true;
+    s.desktop_pills = count;
+    s.has_add_pill = can_manage;
+  }
+  return s;
+}
+
+// Create the empty row (invisible until repopulated with >1 desktop or
+// force_show during drag).
 GtkWidget *overview_thumbs_new (void);
 
-// Rebuild for @count desktops (@active = current index). @box_h is the row
-// height in LOGICAL px (ControlsManagerLayout caps it at 5% of the workarea
-// height); @avail_w the available width in LOGICAL px; @porthole_w/@porthole_h
-// the workarea the pills shrink (ThumbnailsBox scale =
-// min(vScale, hScale, MAX_THUMBNAIL_SCALE)). @wallpaper is ref'd by the
-// widget. A count <= 1 clears the row (GNOME hides the box for a single
-// workspace).
+// Rebuild for @count desktops (@active = current index). @can_manage adds the
+// '+' add-desktop pill and hover close badges when count > 1 or @force_show.
 void overview_thumbs_repopulate (GtkWidget *thumbs, int count, int active,
                                  double box_h, double avail_w,
                                  double porthole_w, double porthole_h,
-                                 GdkTexture *wallpaper);
+                                 GdkTexture *wallpaper,
+                                 bool can_manage = false,
+                                 bool force_show = false);
 
 // Natural size in LOGICAL px; height 0 when there is nothing to show.
 int overview_thumbs_get_width (GtkWidget *thumbs);
@@ -47,14 +66,28 @@ gboolean overview_thumbs_get_rect (GtkWidget *thumbs, int index,
 // coordinate (x, y) lands at pill-local (x * scale, y * scale).
 double overview_thumbs_get_scale (GtkWidget *thumbs);
 
-// Continuous indicator position while a workspace switch animates
-// (ThumbnailsBox tracks the eased scroll adjustment, sliding the accent
-// frame between the adjacent pills). Negative snaps back to `active`.
+// Continuous indicator position while a workspace switch animates. Negative
+// snaps back to `active`.
 void overview_thumbs_set_indicator_value (GtkWidget *thumbs, double value);
+
+// Highlight target index during window drag (-1 = none, 0..count-1 = pill,
+// count = '+' new-desktop pill).
+void overview_thumbs_set_drop_target (GtkWidget *thumbs, int target_index);
+
+// Hit test in widget-local LOGICAL coords for drag-and-drop: returns
+// 0..count-1 for an existing desktop, @count for the '+' new-desktop pill,
+// or -1 on miss.
+int overview_thumbs_drop_target_at (GtkWidget *thumbs, double x, double y);
 
 // Click callback: fired with the pill index.
 void overview_thumbs_set_click_cb (GtkWidget *thumbs,
                                    void (*cb) (int index, void *data),
                                    void *data);
+
+// Desktop management callbacks: add ('+') and remove ('x' / middle-click).
+void overview_thumbs_set_manage_cbs (GtkWidget *thumbs,
+                                     void (*on_add) (void *data),
+                                     void (*on_remove) (int index, void *data),
+                                     void *data);
 
 }  // namespace winome

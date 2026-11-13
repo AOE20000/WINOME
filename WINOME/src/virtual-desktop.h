@@ -12,6 +12,7 @@
 
 #include <windows.h>
 
+#include <cstdint>
 #include <vector>
 
 namespace winome {
@@ -21,6 +22,22 @@ struct DesktopInfo {
   int index;
   GUID id;
 };
+
+struct VtableProfile {
+  int move_view_to_desktop = 4;
+  int create_desktop = -1;
+  int move_desktop = -1;
+  int remove_desktop = -1;
+  bool can_manage_desktops = false;
+};
+
+// Pure helper mapping an OS build number to safe IVirtualDesktopManagerInternal
+// vtable slot indices (22621/23H2 vs 26100+ 24H2). Unrecognized builds return
+// can_manage_desktops = false so create/remove are safely disabled.
+VtableProfile vtable_slots_for_build (uint32_t build_number);
+
+// Queries the true Windows build number via ntdll!RtlGetVersion (0 on failure).
+uint32_t windows_build_number (void);
 
 // TRUE when the virtual desktop services are reachable and at least one
 // desktop was enumerated.
@@ -51,6 +68,19 @@ bool switch_to (int index);
 // instead of sliding away with its owning desktop. FALSE when the pin
 // services are unreachable (older builds, explorer-side failure).
 bool pin_window (HWND hwnd);
+
+// Unpin @hwnd from all virtual desktops; FALSE on failure.
+bool unpin_window (HWND hwnd);
+
+// Move @hwnd to virtual desktop @target_index (0-based); FALSE on failure.
+bool move_window_to_desktop (HWND hwnd, int target_index);
+
+// Create a new virtual desktop; FALSE if unsupported on this OS build or failed.
+bool create_desktop (void);
+
+// Remove virtual desktop @index (moves its windows to an adjacent fallback
+// desktop). Refuses when count <= 1 or build vtable layout is unrecognized.
+bool remove_desktop (int index);
 
 }  // namespace vd
 }  // namespace winome

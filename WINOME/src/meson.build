@@ -12,6 +12,8 @@ winome_sources = files(
   'overview-layout.cpp',
   'overview-dash.cpp',
   'overview-thumbs.cpp',
+  'app-index.cpp',
+  'app-grid.cpp',
   'virtual-desktop.cpp',
   'ws-osd.cpp',
   'fullscreen-watcher.cpp',

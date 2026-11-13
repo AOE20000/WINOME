@@ -9,6 +9,8 @@
 // IShellItemImageFactory on the exe path, converted to GdkTexture.
 
 #include "overview-dash.h"
+#include "app-index.h"
+#include "config.h"
 #include "i18n.h"
 #include "overview-trigger.h"
 #include "st-engine.h"
@@ -41,30 +43,40 @@ constexpr int kDashBottomMargin = 12; // .dash-background margin-bottom
 constexpr int kTilePad = 6;           // .overview-icon padding
 constexpr double kTileRadius = 16.0;
 constexpr int kItemGap = 4;           // margin 0 2px on both neighbours
+constexpr int kSeparatorGap = 9;      // .dash-separator (1px + 4px margin * 2)
 constexpr int kDotSize = 5;
 constexpr int kLabelHoverTimeoutMs = 300; // DASH_ITEM_HOVER_TIMEOUT
 constexpr int kLabelOffset = 8;           // .dash-label -y-offset
+
+constexpr const char *kDashCtxCss =
+    "#winome-dash-ctx-item {"
+    "  background: none;"
+    "  border: none;"
+    "  box-shadow: none;"
+    "  color: #fafafb;"
+    "  padding: 6px 12px;"
+    "  border-radius: 6px;"
+    "}"
+    "#winome-dash-ctx-item:hover {"
+    "  background-color: rgba(255, 255, 255, 0.12);"
+    "}";
 
 // PKEY_AppUserModel_ID (propsys), defined locally to avoid header churn.
 constexpr GUID kPKEY_AppUserModel_ID_fmt = {
     0x9F4C2855, 0x9F79, 0x4B39,
     {0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3}};
 
-// BHID_SFUIObject (shlguid.h) for IShellItem::BindToHandler; MinGW's
-// shobjidl.h doesn't pull shlguid.h in, so define the GUID locally.
-constexpr GUID kBHID_SFUIObject = {
-    0x3981e225, 0xf559, 0x11d3,
-    {0x8e, 0x3a, 0x00, 0xc0, 0x4f, 0x68, 0x37, 0xd5}};
-
 struct DashApp {
-  std::wstring key;          // AUMID or lowercased exe path
+  std::string id;            // canonical normalized app ID (AUMID / exe / lnk)
+  std::wstring exe_path;     // primary exe path if running or resolved
   std::string name;          // hover label text (UTF-8)
   GdkTexture *icon = nullptr;
   std::vector<HWND> windows; // z-order, topmost first
+  bool pinned = false;
 };
 
 struct DashTileRect {
-  double x, y, w, h; // pill-relative
+  double x, y, w, h; // widget-relative
 };
 
 struct WinomeDash {
@@ -73,17 +85,32 @@ struct WinomeDash {
   GtkWidget *root_fixed;  // overview root (owns the hover label)
   GtkWidget *label;       // .dash-label GtkLabel
   guint label_timeout;    // hover delay source
+  GtkWidget *active_menu; // right-click GtkPopover
+  GtkCssProvider *ctx_css;
 
   std::vector<DashApp> apps;
+  int pinned_count = 0;    // items [0..pinned_count) are persisted favorites
+  double separator_x = -1; // >= 0 when a separator separates favorites & running
   int icon_size = 64;      // logical px
 
   int pill_x = 0, pill_y = 0, pill_w = 0, pill_h = 0; // widget-relative
   std::vector<DashTileRect> tile_rects;
   int hover_index = -1;    // -1 = none
+  bool show_apps_active = false;
+
+  HMONITOR last_monitor = nullptr;
+  int last_max_height = 96;
+
+  void (*show_apps_cb) (void *) = nullptr;
+  void *show_apps_data = nullptr;
+  void (*changed_cb) (void *) = nullptr;
+  void *changed_data = nullptr;
 
   GdkRGBA pill_color;
   GdkRGBA tile_color;
   GdkRGBA tile_hover_color;
+  GdkRGBA tile_checked_color;
+  GdkRGBA sep_color;
   GdkRGBA fg_color;
   bool colors_resolved = false;
 };
@@ -108,7 +135,9 @@ resolve_colors (WinomeDash *self)
 
   self->pill_color = (GdkRGBA){0.22f, 0.22f, 0.23f, 1.0f};   // #38383b
   self->tile_color = self->pill_color;                        // flat on dash
-  self->tile_hover_color = (GdkRGBA){0.25f, 0.25f, 0.26f, 1.0f};
+  self->tile_hover_color = (GdkRGBA){0.286f, 0.286f, 0.302f, 1.0f}; // #49494d
+  self->tile_checked_color = (GdkRGBA){0.294f, 0.294f, 0.310f, 1.0f}; // #4b4b4f
+  self->sep_color = (GdkRGBA){0.98f, 0.98f, 0.98f, 0.12f};
   self->fg_color = (GdkRGBA){0.98f, 0.98f, 0.98f, 1.0f};      // #fafafb
 
   StEngine *engine = StEngine::get ();
@@ -123,12 +152,21 @@ resolve_colors (WinomeDash *self)
       gdk_rgba_parse (&self->pill_color, color.c_str ()))
     self->tile_color = self->pill_color;
 
-  // Hover: st-lighten(#38383b, 7%) ~= #414146
+  StEngine::Node sep (*engine, &dash, "", "dash-separator", "");
+  if (sep.lookup_color ("background-color", &color))
+    gdk_rgba_parse (&self->sep_color, color.c_str ());
+
+  // Hover / checked: .overview-icon
   StEngine::Node item (*engine, &dash, "", "dash-item-container", "");
   StEngine::Node tile (*engine, &item, "", "overview-tile", "hover");
   StEngine::Node icon (*engine, &tile, "", "overview-icon", "");
   if (icon.lookup_color ("background-color", &color))
     gdk_rgba_parse (&self->tile_hover_color, color.c_str ());
+
+  StEngine::Node tile_chk (*engine, &item, "", "overview-tile", "checked");
+  StEngine::Node icon_chk (*engine, &tile_chk, "", "overview-icon", "");
+  if (icon_chk.lookup_color ("background-color", &color))
+    gdk_rgba_parse (&self->tile_checked_color, color.c_str ());
 
   StEngine::Node tile_plain (*engine, &item, "", "overview-tile", "");
   StEngine::Node icon_plain (*engine, &tile_plain, "", "overview-icon", "");
@@ -272,177 +310,6 @@ exe_file_description (const std::wstring &exe)
   return result;
 }
 
-GdkTexture *
-hicon_to_texture (HICON icon)
-{
-  if (icon == nullptr)
-    return nullptr;
-
-  ICONINFO info = {};
-  if (!GetIconInfo (icon, &info))
-    return nullptr;
-
-  int w = 0, h = 0;
-  bool has_color = info.hbmColor != nullptr;
-  if (has_color) {
-    BITMAP bm = {};
-    GetObjectW (info.hbmColor, sizeof (bm), &bm);
-    w = bm.bmWidth;
-    h = bm.bmHeight;
-  } else if (info.hbmMask != nullptr) {
-    BITMAP bm = {};
-    GetObjectW (info.hbmMask, sizeof (bm), &bm);
-    w = bm.bmWidth;
-    h = bm.bmHeight / 2;
-  }
-  if (w <= 0 || h <= 0) {
-    if (info.hbmColor) DeleteObject (info.hbmColor);
-    if (info.hbmMask) DeleteObject (info.hbmMask);
-    return nullptr;
-  }
-
-  BITMAPINFO bi = {};
-  bi.bmiHeader.biSize = sizeof (BITMAPINFOHEADER);
-  bi.bmiHeader.biWidth = w;
-  bi.bmiHeader.biHeight = -h; // top-down
-  bi.bmiHeader.biPlanes = 1;
-  bi.bmiHeader.biBitCount = 32;
-  bi.bmiHeader.biCompression = BI_RGB;
-
-  HDC screen = GetDC (nullptr);
-  void *bits = nullptr;
-  HBITMAP dib = CreateDIBSection (screen, &bi, DIB_RGB_COLORS, &bits,
-                                  nullptr, 0);
-  HDC mem = CreateCompatibleDC (screen);
-  HGDIOBJ old = SelectObject (mem, dib);
-  BOOL ok = DrawIconEx (mem, 0, 0, icon, w, h, 0, nullptr, DI_NORMAL);
-  SelectObject (mem, old);
-  DeleteDC (mem);
-  ReleaseDC (nullptr, screen);
-
-  GdkTexture *texture = nullptr;
-  if (ok && bits != nullptr) {
-    GBytes *bytes = g_bytes_new (bits, (gsize)w * h * 4);
-    texture = gdk_memory_texture_new (w, h,
-                                      GDK_MEMORY_B8G8R8A8_PREMULTIPLIED,
-                                      bytes, (gsize)w * 4);
-    g_bytes_unref (bytes);
-  }
-
-  DeleteObject (dib);
-  if (info.hbmColor) DeleteObject (info.hbmColor);
-  if (info.hbmMask) DeleteObject (info.hbmMask);
-  return texture;
-}
-
-GdkTexture *
-texture_from_hbitmap (HBITMAP bmp)
-{
-  if (bmp == nullptr)
-    return nullptr;
-
-  BITMAP bm = {};
-  GetObjectW (bmp, sizeof (bm), &bm);
-  if (bm.bmWidth <= 0 || bm.bmHeight <= 0)
-    return nullptr;
-
-  BITMAPINFO bi = {};
-  bi.bmiHeader.biSize = sizeof (BITMAPINFOHEADER);
-  bi.bmiHeader.biWidth = bm.bmWidth;
-  bi.bmiHeader.biHeight = -bm.bmHeight;
-  bi.bmiHeader.biPlanes = 1;
-  bi.bmiHeader.biBitCount = 32;
-  bi.bmiHeader.biCompression = BI_RGB;
-
-  HDC screen = GetDC (nullptr);
-  void *bits = nullptr;
-  HBITMAP dib = CreateDIBSection (screen, &bi, DIB_RGB_COLORS, &bits,
-                                  nullptr, 0);
-  GdkTexture *texture = nullptr;
-  if (dib != nullptr && bits != nullptr) {
-    HDC src = CreateCompatibleDC (screen);
-    HDC dst = CreateCompatibleDC (screen);
-    HGDIOBJ old_src = SelectObject (src, bmp);
-    HGDIOBJ old_dst = SelectObject (dst, dib);
-    if (BitBlt (dst, 0, 0, bm.bmWidth, bm.bmHeight, src, 0, 0, SRCCOPY)) {
-      GBytes *bytes = g_bytes_new (bits,
-                                   (gsize)bm.bmWidth * bm.bmHeight * 4);
-      texture = gdk_memory_texture_new (bm.bmWidth, bm.bmHeight,
-                                        GDK_MEMORY_B8G8R8A8_PREMULTIPLIED,
-                                        bytes, (gsize)bm.bmWidth * 4);
-      g_bytes_unref (bytes);
-    }
-    SelectObject (src, old_src);
-    SelectObject (dst, old_dst);
-    DeleteDC (src);
-    DeleteDC (dst);
-  }
-  if (dib != nullptr)
-    DeleteObject (dib);
-  ReleaseDC (nullptr, screen);
-  return texture;
-}
-
-// Best-effort application icon at (at least) @size physical px.
-GdkTexture *
-app_icon_for (HWND hwnd, const std::wstring &exe, int size)
-{
-  // 1. Application-provided big icon.
-  HICON icon = (HICON)SendMessageTimeoutW (hwnd, WM_GETICON, ICON_BIG, 0,
-                                           SMTO_ABORTIFHUNG, 100, nullptr);
-  // 2. Class icon.
-  if (icon == nullptr)
-    icon = (HICON)GetClassLongPtrW (hwnd, GCLP_HICON);
-
-  GdkTexture *texture = hicon_to_texture (icon);
-  if (icon != nullptr)
-    DestroyIcon (icon);
-  if (texture != nullptr &&
-      gdk_texture_get_width (texture) >= size)
-    return texture;
-  g_clear_object (&texture);
-
-  // 3. Shell item image factory on the exe (crisp scaling, alpha).
-  if (!exe.empty ()) {
-    HRESULT hr = CoInitializeEx (nullptr,
-                                 COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    bool com = SUCCEEDED (hr);
-    IShellItem *item = nullptr;
-    if (SUCCEEDED (SHCreateItemFromParsingName (exe.c_str (), nullptr,
-                                                IID_PPV_ARGS (&item)))) {
-      IShellItemImageFactory *factory = nullptr;
-      if (SUCCEEDED (item->BindToHandler (nullptr, kBHID_SFUIObject,
-                                          IID_PPV_ARGS (&factory)))) {
-        HBITMAP bmp = nullptr;
-        if (SUCCEEDED (factory->GetImage (SIZE{size, size},
-                                          SIIGBF_ICONONLY |
-                                              SIIGBF_BIGGERSIZEOK,
-                                          &bmp))) {
-          texture = texture_from_hbitmap (bmp);
-          DeleteObject (bmp);
-        }
-        factory->Release ();
-      }
-      item->Release ();
-    }
-    if (com)
-      CoUninitialize ();
-    if (texture != nullptr)
-      return texture;
-  }
-
-  // 4. Classic SHGetFileInfo large icon.
-  if (icon == nullptr && !exe.empty ()) {
-    SHFILEINFOW sfi = {};
-    if (SHGetFileInfoW (exe.c_str (), 0, &sfi, sizeof (sfi),
-                        SHGFI_ICON | SHGFI_LARGEICON) && sfi.hIcon != nullptr) {
-      texture = hicon_to_texture (sfi.hIcon);
-      DestroyIcon (sfi.hIcon);
-    }
-  }
-  return texture;
-}
-
 struct EnumCtx {
   HMONITOR monitor;
   std::vector<HWND> *windows;
@@ -488,11 +355,16 @@ void
 recompute_layout (WinomeDash *self)
 {
   self->tile_rects.clear ();
+  self->separator_x = -1;
 
-  int tiles = (int)self->apps.size () + 1; // apps + show-apps
+  int n_apps = (int)self->apps.size ();
+  int tiles = n_apps + 1; // apps + show-apps
   int tile = self->icon_size + 2 * kTilePad;
+  bool has_split =
+      self->pinned_count > 0 && self->pinned_count < n_apps;
 
-  self->pill_w = 2 * kDashPadH + tiles * tile + (tiles - 1) * kItemGap;
+  self->pill_w = 2 * kDashPadH + tiles * tile + (tiles - 1) * kItemGap +
+                 (has_split ? kSeparatorGap : 0);
   self->pill_h = 2 * kDashPadV + tile;
   self->pill_x = kDashSidePadding;
   self->pill_y = 0;
@@ -500,6 +372,10 @@ recompute_layout (WinomeDash *self)
   double x = self->pill_x + kDashPadH;
   double y = self->pill_y + kDashPadV;
   for (int i = 0; i < tiles; ++i) {
+    if (has_split && i == self->pinned_count) {
+      self->separator_x = x + (kSeparatorGap - kItemGap) / 2.0 - 0.5;
+      x += kSeparatorGap;
+    }
     self->tile_rects.push_back ({x, y, (double)tile, (double)tile});
     x += tile + kItemGap;
   }
@@ -581,8 +457,16 @@ activate_app (WinomeDash *self, int index)
     best = hwnd;
     break;
   }
-  if (best == nullptr)
+  if (best == nullptr) {
+    if (app_index_launch_id (self->apps[index].id, false) ||
+        (!self->apps[index].exe_path.empty () &&
+         reinterpret_cast<INT_PTR> (ShellExecuteW (
+             nullptr, L"open", self->apps[index].exe_path.c_str (), nullptr,
+             nullptr, SW_SHOWNORMAL)) > 32)) {
+      close_overview ("dash-launch-favorite");
+    }
     return;
+  }
 
   if (IsIconic (best))
     ShowWindow (best, SW_RESTORE);
@@ -593,11 +477,174 @@ activate_app (WinomeDash *self, int index)
 void
 open_start_menu_and_close ()
 {
-  // The WINOME overview has no app grid yet; the Windows Start menu is the
-  // platform's application launcher, matching what Win+Tab is remapped to.
-  // open_start_menu() injects a tagged Win press our hook passes through.
   close_overview ("show-apps");
   open_start_menu ();
+}
+
+void
+activate_show_apps (WinomeDash *self, GdkModifierType mods)
+{
+  if (!(mods & GDK_SHIFT_MASK) && self->show_apps_cb != nullptr) {
+    self->show_apps_cb (self->show_apps_data);
+    return;
+  }
+  open_start_menu_and_close ();
+}
+
+struct DashMenuCtx {
+  WinomeDash *self = nullptr;
+  std::string app_id;
+  std::wstring exe_path;
+  std::vector<HWND> windows;
+  int index = -1;
+};
+
+gboolean
+deferred_notify_changed (gpointer user_data)
+{
+  WinomeDash *self = static_cast<WinomeDash *> (user_data);
+  if (GTK_IS_WIDGET (self) && self->changed_cb != nullptr)
+    self->changed_cb (self->changed_data);
+  g_object_unref (self);
+  return G_SOURCE_REMOVE;
+}
+
+GtkWidget *
+make_dash_menu_btn (const char *text, GCallback cb, DashMenuCtx *ctx)
+{
+  GtkWidget *btn = gtk_button_new_with_label (text);
+  gtk_widget_set_name (btn, "winome-dash-ctx-item");
+  gtk_widget_add_css_class (btn, "popup-menu-item");
+  GtkWidget *lbl = gtk_button_get_child (GTK_BUTTON (btn));
+  if (GTK_IS_LABEL (lbl))
+    gtk_label_set_xalign (GTK_LABEL (lbl), 0.0f);
+  g_signal_connect (btn, "clicked", cb, ctx);
+  return btn;
+}
+
+void
+on_dash_menu_activate (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
+{
+  auto *ctx = static_cast<DashMenuCtx *> (user_data);
+  overview_dash_close_menu (GTK_WIDGET (ctx->self));
+  activate_app (ctx->self, ctx->index);
+}
+
+void
+on_dash_menu_new_window (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
+{
+  auto *ctx = static_cast<DashMenuCtx *> (user_data);
+  overview_dash_close_menu (GTK_WIDGET (ctx->self));
+  if (app_index_launch_id (ctx->app_id, false) ||
+      (!ctx->exe_path.empty () &&
+       reinterpret_cast<INT_PTR> (ShellExecuteW (
+           nullptr, L"open", ctx->exe_path.c_str (), nullptr, nullptr,
+           SW_SHOWNORMAL)) > 32)) {
+    close_overview ("dash-new-window");
+  }
+}
+
+void
+on_dash_menu_toggle_pin (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
+{
+  auto *ctx = static_cast<DashMenuCtx *> (user_data);
+  WinomeDash *self = ctx->self;
+  toggle_app_id_pinned (ctx->app_id);
+  overview_dash_close_menu (GTK_WIDGET (self));
+  overview_dash_repopulate (GTK_WIDGET (self), self->last_monitor,
+                            self->last_max_height);
+  if (self->changed_cb != nullptr)
+    self->changed_cb (self->changed_data);
+}
+
+void
+on_dash_menu_close_all (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
+{
+  auto *ctx = static_cast<DashMenuCtx *> (user_data);
+  WinomeDash *self = ctx->self;
+  for (HWND hwnd : ctx->windows) {
+    if (IsWindow (hwnd))
+      PostMessageW (hwnd, WM_CLOSE, 0, 0);
+  }
+  overview_dash_close_menu (GTK_WIDGET (self));
+  g_object_ref (self);
+  g_timeout_add (140, deferred_notify_changed, self);
+}
+
+void
+show_dash_context_menu (WinomeDash *self, int index)
+{
+  if (index < 0 || index >= (int)self->apps.size () ||
+      index >= (int)self->tile_rects.size ()) {
+    return;
+  }
+
+  overview_dash_close_menu (GTK_WIDGET (self));
+  hide_label (self);
+
+  const DashApp &app = self->apps[index];
+  const DashTileRect &r = self->tile_rects[index];
+
+  GtkWidget *popover = gtk_popover_new ();
+  gtk_widget_set_parent (popover, GTK_WIDGET (self));
+  gtk_popover_set_has_arrow (GTK_POPOVER (popover), TRUE);
+  gtk_popover_set_position (GTK_POPOVER (popover), GTK_POS_TOP);
+  gtk_popover_set_autohide (GTK_POPOVER (popover), TRUE);
+  GdkRectangle target = {(int)r.x, (int)r.y, (int)r.w, (int)r.h};
+  gtk_popover_set_pointing_to (GTK_POPOVER (popover), &target);
+
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
+  gtk_widget_add_css_class (box, "popup-menu-content");
+
+  auto *ctx = new DashMenuCtx{self, app.id, app.exe_path, app.windows, index};
+  g_object_set_data_full (
+      G_OBJECT (popover), "winome-dash-ctx", ctx,
+      [] (gpointer p) { delete static_cast<DashMenuCtx *> (p); });
+
+  bool is_running = !app.windows.empty ();
+  gtk_box_append (
+      GTK_BOX (box),
+      make_dash_menu_btn (is_running ? tr ("Show Window", "显示窗口")
+                                     : tr ("Open", "打开"),
+                          G_CALLBACK (on_dash_menu_activate), ctx));
+
+  if (is_running) {
+    AppEntry tmp;
+    if (!app.exe_path.empty () || app_index_find_by_id (app.id, &tmp)) {
+      gtk_box_append (
+          GTK_BOX (box),
+          make_dash_menu_btn (tr ("New Window", "新建窗口"),
+                              G_CALLBACK (on_dash_menu_new_window), ctx));
+    }
+  }
+
+  WinomeConfig cfg = get_config ();
+  bool pinned = app.pinned || is_app_id_pinned (cfg.pinned_apps, app.id);
+  gtk_box_append (
+      GTK_BOX (box),
+      make_dash_menu_btn (pinned ? tr ("Unpin from Dash", "从程序坞取消固定")
+                                 : tr ("Pin to Dash", "固定到程序坞"),
+                          G_CALLBACK (on_dash_menu_toggle_pin), ctx));
+
+  if (is_running) {
+    gtk_box_append (
+        GTK_BOX (box),
+        make_dash_menu_btn (tr ("Close All Windows", "关闭全部窗口"),
+                            G_CALLBACK (on_dash_menu_close_all), ctx));
+  }
+
+  gtk_popover_set_child (GTK_POPOVER (popover), box);
+  g_signal_connect (
+      popover, "closed", G_CALLBACK (+[] (GtkPopover *p, gpointer d) {
+        auto *dash = WINOME_DASH (d);
+        if (dash->active_menu == GTK_WIDGET (p))
+          dash->active_menu = nullptr;
+        if (gtk_widget_get_parent (GTK_WIDGET (p)) != nullptr)
+          gtk_widget_unparent (GTK_WIDGET (p));
+      }),
+      self);
+  self->active_menu = popover;
+  gtk_popover_popup (GTK_POPOVER (popover));
 }
 
 void
@@ -615,7 +662,7 @@ on_dash_motion_enter (GtkEventControllerMotion *motion, double x, double y,
       g_source_remove (self->label_timeout);
       self->label_timeout = 0;
     }
-    if (index >= 0)
+    if (index >= 0 && self->active_menu == nullptr)
       self->label_timeout =
           g_timeout_add (kLabelHoverTimeoutMs, label_timeout_cb, self);
     else
@@ -648,19 +695,33 @@ on_dash_click (GtkGestureClick *gesture, int n_press, double x, double y,
                gpointer user_data)
 {
   (void)n_press;
-  if (gtk_gesture_single_get_current_button (GTK_GESTURE_SINGLE (gesture)) !=
-      GDK_BUTTON_PRIMARY)
-    return;
-
   WinomeDash *self = WINOME_DASH (user_data);
+  guint button =
+      gtk_gesture_single_get_current_button (GTK_GESTURE_SINGLE (gesture));
   int index = tile_at (self, x, y);
   if (index < 0)
     return;
 
-  if (index < (int)self->apps.size ())
+  if (button == GDK_BUTTON_SECONDARY) {
+    if (index < (int)self->apps.size ())
+      show_dash_context_menu (self, index);
+    return;
+  }
+
+  if (button != GDK_BUTTON_PRIMARY)
+    return;
+
+  if (index < (int)self->apps.size ()) {
     activate_app (self, index);
-  else
-    open_start_menu_and_close ();
+  } else {
+    GdkEvent *ev = gtk_gesture_get_last_event (
+        GTK_GESTURE (gesture),
+        gtk_gesture_single_get_current_sequence (GTK_GESTURE_SINGLE (gesture)));
+    GdkModifierType mods =
+        ev != nullptr ? gdk_event_get_modifier_state (ev)
+                      : static_cast<GdkModifierType> (0);
+    activate_show_apps (self, mods);
+  }
 }
 
 // --- widget ------------------------------------------------------------------
@@ -686,19 +747,34 @@ winome_dash_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
   gtk_snapshot_append_color (snapshot, &self->pill_color, &pill_rect);
   gtk_snapshot_pop (snapshot);
 
+  // Separator between Pinned Favorites and Unpinned Running Apps.
+  if (self->separator_x >= 0) {
+    graphene_rect_t sep_rect;
+    graphene_rect_init (&sep_rect, (float)self->separator_x,
+                        (float)(self->pill_y + kDashPadV), 1.0f,
+                        (float)(self->pill_h - 2 * kDashPadV));
+    gtk_snapshot_append_color (snapshot, &self->sep_color, &sep_rect);
+  }
+
   // Tiles.
-  GdkRGBA *hover = &self->tile_hover_color;
   for (int i = 0; i < (int)self->tile_rects.size (); ++i) {
     const DashTileRect &r = self->tile_rects[i];
+    bool is_show_apps = (i == (int)self->apps.size ());
 
-    // .overview-icon tile background (hover only, flat otherwise).
-    if (i == self->hover_index) {
+    // .overview-icon tile background (hover / show-apps checked state).
+    const GdkRGBA *bg_tile = nullptr;
+    if (is_show_apps && self->show_apps_active && i != self->hover_index)
+      bg_tile = &self->tile_checked_color;
+    else if (i == self->hover_index)
+      bg_tile = &self->tile_hover_color;
+
+    if (bg_tile != nullptr) {
       graphene_rect_t rect;
       graphene_rect_init (&rect, r.x, r.y, r.w, r.h);
       GskRoundedRect rounded;
       gsk_rounded_rect_init_from_rect (&rounded, &rect, (float)kTileRadius);
       gtk_snapshot_push_rounded_clip (snapshot, &rounded);
-      gtk_snapshot_append_color (snapshot, hover, &rect);
+      gtk_snapshot_append_color (snapshot, bg_tile, &rect);
       gtk_snapshot_pop (snapshot);
     }
 
@@ -741,9 +817,9 @@ winome_dash_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
       }
     }
 
-    // Running dot (every item here is a running app; the show-apps tile has
-    // no dot, exactly like the GNOME dash).
-    if (i < (int)self->apps.size ()) {
+    // Running dot: only shown when the app has open windows on this monitor
+    // (favorites with no active windows show cleanly without a dot).
+    if (i < (int)self->apps.size () && !self->apps[i].windows.empty ()) {
       double cx = r.x + r.w / 2.0;
       double dy = r.y + r.h - kTilePad - kDotSize / 2.0 - 0.5;
       graphene_rect_t dot;
@@ -783,7 +859,15 @@ static void
 winome_dash_dispose (GObject *object)
 {
   WinomeDash *self = WINOME_DASH (object);
+  overview_dash_close_menu (GTK_WIDGET (self));
   hide_label (self);
+  if (self->ctx_css != nullptr) {
+    if (GdkDisplay *disp = gdk_display_get_default ()) {
+      gtk_style_context_remove_provider_for_display (
+          disp, GTK_STYLE_PROVIDER (self->ctx_css));
+    }
+    g_clear_object (&self->ctx_css);
+  }
   if (self->label != nullptr) {
     gtk_fixed_remove (GTK_FIXED (self->root_fixed), self->label);
     self->label = nullptr;
@@ -803,6 +887,44 @@ winome_dash_class_init (WinomeDashClass *klass)
   object_class->dispose = winome_dash_dispose;
 }
 
+std::string
+display_name_for_window (HWND hwnd, const std::wstring &exe)
+{
+  wchar_t title[256] = L"";
+  GetWindowTextW (hwnd, title, 256);
+
+  std::wstring exe_lower = exe;
+  std::transform (exe_lower.begin (), exe_lower.end (), exe_lower.begin (),
+                  towlower);
+  bool is_frame_host =
+      exe_lower.find (L"applicationframehost.exe") != std::wstring::npos;
+
+  std::string name;
+  if (is_frame_host || exe.empty ())
+    name = utf8 (title);
+  else {
+    name = exe_file_description (exe);
+    if (name.empty ())
+      name = utf8 (title);
+  }
+  return name.empty () ? std::string ("Application") : name;
+}
+
+std::string
+pinned_fallback_label (const std::string &id)
+{
+  size_t sep = id.find_last_of ("\\/");
+  std::string base = (sep != std::string::npos) ? id.substr (sep + 1) : id;
+  if (base.size () > 4 &&
+      (base.rfind (".exe") == base.size () - 4 ||
+       base.rfind (".lnk") == base.size () - 4)) {
+    base.resize (base.size () - 4);
+  }
+  if (!base.empty ())
+    base[0] = (char)toupper ((unsigned char)base[0]);
+  return base.empty () ? std::string ("App") : base;
+}
+
 }  // namespace
 
 // Exported for the overview window-preview hover chrome (windowPreview.js
@@ -810,7 +932,9 @@ winome_dash_class_init (WinomeDashClass *klass)
 GdkTexture *
 winome_window_app_icon (HWND hwnd, int size)
 {
-  return app_icon_for (hwnd, window_exe_path (hwnd), size);
+  std::wstring exe = window_exe_path (hwnd);
+  std::string key = normalize_app_id (utf8 (exe));
+  return app_icon_for_window (hwnd, exe, size, key);
 }
 
 GtkWidget *
@@ -820,13 +944,21 @@ overview_dash_new (GtkWidget *root_fixed)
       (WinomeDash *)g_object_new (winome_dash_get_type (), nullptr);
   self->root_fixed = root_fixed;
 
+  if (GdkDisplay *disp = gdk_display_get_default ()) {
+    self->ctx_css = gtk_css_provider_new ();
+    gtk_css_provider_load_from_string (self->ctx_css, kDashCtxCss);
+    gtk_style_context_add_provider_for_display (
+        disp, GTK_STYLE_PROVIDER (self->ctx_css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 2);
+  }
+
   // Hover label (.dash-label pill), floating above the dash.
   self->label = gtk_label_new ("");
   gtk_widget_add_css_class (self->label, "dash-label");
   gtk_widget_set_visible (self->label, FALSE);
   gtk_fixed_put (GTK_FIXED (root_fixed), self->label, 0, 0);
 
-  // Controllers: motion for hover + label, click for activation.
+  // Controllers: motion for hover + label, left/right click for activation/menu.
   GtkEventController *motion =
       gtk_event_controller_motion_new ();
   g_signal_connect (motion, "enter", G_CALLBACK (on_dash_motion_enter), self);
@@ -835,6 +967,7 @@ overview_dash_new (GtkWidget *root_fixed)
   gtk_widget_add_controller (GTK_WIDGET (self), motion);
 
   GtkGesture *click = gtk_gesture_click_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), 0);
   g_signal_connect (click, "released", G_CALLBACK (on_dash_click), self);
   gtk_widget_add_controller (GTK_WIDGET (self), GTK_EVENT_CONTROLLER (click));
 
@@ -842,15 +975,60 @@ overview_dash_new (GtkWidget *root_fixed)
 }
 
 void
+overview_dash_set_show_apps_cb (GtkWidget *dash, void (*cb) (void *),
+                                void *user_data)
+{
+  WinomeDash *self = WINOME_DASH (dash);
+  self->show_apps_cb = cb;
+  self->show_apps_data = user_data;
+}
+
+void
+overview_dash_set_apps_active (GtkWidget *dash, bool active)
+{
+  WinomeDash *self = WINOME_DASH (dash);
+  if (self->show_apps_active != active) {
+    self->show_apps_active = active;
+    gtk_widget_queue_draw (dash);
+  }
+}
+
+void
+overview_dash_set_changed_cb (GtkWidget *dash, void (*cb) (void *),
+                              void *user_data)
+{
+  WinomeDash *self = WINOME_DASH (dash);
+  self->changed_cb = cb;
+  self->changed_data = user_data;
+}
+
+void
+overview_dash_close_menu (GtkWidget *dash)
+{
+  if (dash == nullptr)
+    return;
+  WinomeDash *self = WINOME_DASH (dash);
+  if (self->active_menu != nullptr) {
+    GtkWidget *m = self->active_menu;
+    self->active_menu = nullptr;
+    gtk_popover_popdown (GTK_POPOVER (m));
+    if (gtk_widget_get_parent (m) != nullptr)
+      gtk_widget_unparent (m);
+  }
+}
+
+void
 overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
 {
   WinomeDash *self = WINOME_DASH (dash);
+  overview_dash_close_menu (dash);
   hide_label (self);
   self->hover_index = -1;
+  self->last_monitor = monitor;
+  self->last_max_height = max_height;
   clear_apps (self);
 
-  // Icon size: largest base size that fits the available dash height
-  // (dash.js _adjustIconSize, simplified to the height constraint).
+  // Icon size: largest base size that fits the available dash height.
   double scale = gtk_widget_get_scale_factor (dash);
   int avail = max_height - 2 * kDashPadV - 2 * kTilePad - kDashBottomMargin;
   self->icon_size = kBaseIconSizes[0];
@@ -860,66 +1038,123 @@ overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
   }
   int icon_px = (int)(self->icon_size * scale + 0.5);
 
-  // Enumerate windows top-down and group into applications.
+  // Enumerate windows top-down and group into running applications.
   std::vector<HWND> windows;
   EnumCtx ctx{monitor, &windows};
   EnumWindows (dash_collect, reinterpret_cast<LPARAM> (&ctx));
 
-  struct KeyOrder {
-    std::wstring key;
-    size_t index;
+  struct RunningGroup {
+    std::string id;
+    std::wstring exe;
+    std::string name;
+    std::vector<HWND> windows;
   };
-  std::vector<KeyOrder> order;
+  std::vector<RunningGroup> running;
 
   for (HWND hwnd : windows) {
-    std::wstring key = window_aumid (hwnd);
+    std::wstring aumid = window_aumid (hwnd);
     std::wstring exe = window_exe_path (hwnd);
-    if (key.empty ()) {
-      key = exe;
-      std::transform (key.begin (), key.end (), key.begin (), towlower);
-    }
+    std::string id = canonical_app_id (aumid, exe, std::wstring{});
+    if (id.empty ())
+      continue;
 
     size_t idx = SIZE_MAX;
-    for (size_t i = 0; i < self->apps.size (); ++i) {
-      if (self->apps[i].key == key) {
+    for (size_t i = 0; i < running.size (); ++i) {
+      if (running[i].id == id) {
         idx = i;
         break;
       }
     }
     if (idx == SIZE_MAX) {
-      DashApp app;
-      app.key = key;
-      self->apps.push_back (std::move (app));
-      idx = self->apps.size () - 1;
-      order.push_back ({key, idx});
+      RunningGroup g;
+      g.id = id;
+      g.exe = exe;
+      g.name = display_name_for_window (hwnd, exe);
+      running.push_back (std::move (g));
+      idx = running.size () - 1;
     }
-    self->apps[idx].windows.push_back (hwnd);
+    running[idx].windows.push_back (hwnd);
+  }
 
-    // Name + icon resolved lazily on first window of the group.
-    if (self->apps[idx].windows.size () == 1) {
-      wchar_t title[256] = L"";
-      GetWindowTextW (hwnd, title, 256);
+  WinomeConfig cfg = get_config ();
+  std::vector<bool> running_consumed (running.size (), false);
 
-      std::wstring exe_lower = exe;
-      std::transform (exe_lower.begin (), exe_lower.end (), exe_lower.begin (),
-                      towlower);
-      bool is_frame_host =
-          exe_lower.find (L"applicationframehost.exe") != std::wstring::npos;
+  auto find_running_match = [&] (const std::string &pin_id) -> size_t {
+    for (size_t i = 0; i < running.size (); ++i) {
+      if (running_consumed[i])
+        continue;
+      if (running[i].id == pin_id)
+        return i;
+      if (normalize_app_id (utf8 (running[i].exe)) == pin_id)
+        return i;
+    }
+    return SIZE_MAX;
+  };
 
-      std::string name;
-      if (is_frame_host || exe.empty ())
-        name = utf8 (title);
-      else {
-        name = exe_file_description (exe);
-        if (name.empty ())
-          name = utf8 (title);
+  // 1. Persisted Favorites (in configured order).
+  for (const std::string &raw_pin : cfg.pinned_apps) {
+    std::string pin_id = normalize_app_id (raw_pin);
+    if (pin_id.empty ())
+      continue;
+
+    bool dup = false;
+    for (const DashApp &existing : self->apps) {
+      if (existing.id == pin_id) {
+        dup = true;
+        break;
       }
-      if (name.empty ())
-        name = "Application";
-      self->apps[idx].name = name;
-
-      self->apps[idx].icon = app_icon_for (hwnd, exe, icon_px);
     }
+    if (dup)
+      continue;
+
+    AppEntry entry;
+    bool has_entry = app_index_find_by_id (pin_id, &entry);
+    size_t ridx = find_running_match (pin_id);
+    if (ridx == SIZE_MAX && has_entry && !entry.target_exe.empty ())
+      ridx = find_running_match (normalize_app_id (utf8 (entry.target_exe)));
+
+    DashApp app;
+    app.id = pin_id;
+    app.pinned = true;
+
+    if (ridx != SIZE_MAX) {
+      running_consumed[ridx] = true;
+      app.exe_path = running[ridx].exe;
+      app.windows = std::move (running[ridx].windows);
+      app.name = has_entry ? entry.name : running[ridx].name;
+      app.icon = app_icon_for_window (app.windows[0], app.exe_path, icon_px,
+                                      app.id);
+    } else if (has_entry) {
+      app.exe_path = entry.target_exe;
+      app.name = entry.name;
+      app.icon = app_icon_for_entry (entry, icon_px);
+    } else {
+      std::wstring wpath = app_utf8_to_wide (pin_id);
+      if (GetFileAttributesW (wpath.c_str ()) == INVALID_FILE_ATTRIBUTES)
+        continue; // ignore stale uninstalled favorite path
+      app.exe_path = wpath;
+      app.name = pinned_fallback_label (pin_id);
+      app.icon = app_icon_for_path (wpath, icon_px, pin_id);
+    }
+
+    self->apps.push_back (std::move (app));
+  }
+  self->pinned_count = (int)self->apps.size ();
+
+  // 2. Remaining running apps not in favorites.
+  for (size_t i = 0; i < running.size (); ++i) {
+    if (running_consumed[i])
+      continue;
+    RunningGroup &g = running[i];
+    DashApp app;
+    app.id = g.id;
+    app.exe_path = g.exe;
+    app.name = g.name;
+    app.windows = std::move (g.windows);
+    app.pinned = false;
+    app.icon =
+        app_icon_for_window (app.windows[0], app.exe_path, icon_px, app.id);
+    self->apps.push_back (std::move (app));
   }
 
   recompute_layout (self);

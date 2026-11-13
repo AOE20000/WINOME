@@ -46,4 +46,7 @@ void overview_invalidate_wallpaper();
 // Reflow overview geometry and window bounds after display/DPI changes.
 void overview_reposition();
 
+// Toggle in-host paginated App Grid view inside the open overview.
+void overview_toggle_app_grid();
+
 }  // namespace winome

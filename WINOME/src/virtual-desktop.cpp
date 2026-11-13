@@ -95,7 +95,8 @@ constexpr GUID kIID_IApplicationViewCollection = {
 constexpr int kSlotQueryService = 3;   // IServiceProvider
 constexpr int kSlotIsOnCurrent = 3;    // IVirtualDesktopManager
 constexpr int kSlotDesktopByWindow = 4;
-constexpr int kSlotGetDesktops = 7;    // IVirtualDesktopManagerInternal
+constexpr int kSlotMoveViewToDesktop = 4; // IVirtualDesktopManagerInternal
+constexpr int kSlotGetDesktops = 7;
 constexpr int kSlotGetCurrentDesktop = 6;
 constexpr int kSlotSwitchDesktop = 9;
 constexpr int kSlotGetId = 4;          // IVirtualDesktop
@@ -103,6 +104,7 @@ constexpr int kSlotGetCount = 3;       // IObjectArray
 constexpr int kSlotGetAt = 4;
 constexpr int kSlotGetViewForHwnd = 6; // IApplicationViewCollection
 constexpr int kSlotPinView = 7;        // IVirtualDesktopPinnedApps
+constexpr int kSlotUnpinView = 8;      // IVirtualDesktopPinnedApps
 
 // Call method @slot on COM interface @iface. The function pointer is read
 // from the object's vtable at runtime — GCC cannot devirtualize this.
@@ -132,6 +134,10 @@ struct Job {
     WindowOnCurrent,
     SwitchTo,
     PinWindow,
+    UnpinWindow,
+    MoveWindowToDesktop,
+    CreateDesktop,
+    RemoveDesktop,
   } op;
 
   std::vector<DesktopInfo> out_desktops;
@@ -281,12 +287,31 @@ struct ComState {
     return -1;
   }
 
+  bool
+  ensure_view_collection ()
+  {
+    if (view_collection != nullptr)
+      return true;
+    if (disabled || provider == nullptr)
+      return false;
+
+    void *obj = nullptr;
+    HRESULT hr = vcall<HRESULT> (provider, kSlotQueryService,
+                                 &kIID_IApplicationViewCollection,
+                                 &kIID_IApplicationViewCollection, &obj);
+    if (FAILED (hr) || obj == nullptr) {
+      return false;
+    }
+    view_collection = obj;
+    return true;
+  }
+
   // Resolve the pin services lazily: a build without them keeps the rest of
   // the module working (only pinning fails).
   bool
   ensure_pin_services ()
   {
-    if (pinned_apps != nullptr && view_collection != nullptr)
+    if (pinned_apps != nullptr && ensure_view_collection ())
       return true;
     if (pin_disabled || disabled || provider == nullptr)
       return false;
@@ -303,27 +328,27 @@ struct ComState {
       pinned_apps = obj;
     }
 
-    if (view_collection == nullptr) {
-      // Queried with its own IID as the service id (upstream does this).
-      void *obj = nullptr;
-      HRESULT hr = vcall<HRESULT> (provider, kSlotQueryService,
-                                   &kIID_IApplicationViewCollection,
-                                   &kIID_IApplicationViewCollection, &obj);
-      if (FAILED (hr) || obj == nullptr) {
-        pin_disabled = true;
-        return false;
-      }
-      view_collection = obj;
+    if (!ensure_view_collection ()) {
+      pin_disabled = true;
+      return false;
     }
     return true;
   }
 
-  // Pin a window to ALL virtual desktops (the taskbar's "show this window on
-  // every desktop"): it then stays put during desktop switches instead of
-  // sliding away with its owning desktop and being pulled back by our
-  // z-order re-assertions.
+  void *
+  desktop_at (void *arr, UINT index)
+  {
+    void *d = nullptr;
+    if (arr != nullptr &&
+        SUCCEEDED (vcall<HRESULT> (arr, kSlotGetAt, index,
+                                   &kIID_IVirtualDesktop, &d))) {
+      return d;
+    }
+    return nullptr;
+  }
+
   bool
-  pin_window (HWND hwnd)
+  set_window_pin_state (HWND hwnd, int slot)
   {
     if (!ensure () || !ensure_pin_services ())
       return false;
@@ -341,12 +366,109 @@ struct ComState {
         }
         return false;
       }
-      bool ok = SUCCEEDED (
-          vcall<HRESULT> (pinned_apps, kSlotPinView, view));
+      bool ok = SUCCEEDED (vcall<HRESULT> (pinned_apps, slot, view));
       vrelease (view);
       return ok;
     }
     return false;
+  }
+
+  bool
+  move_window_to_desktop (HWND hwnd, int target_index)
+  {
+    if (!ensure () || !ensure_view_collection ())
+      return false;
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      void *view = nullptr;
+      HRESULT hr = vcall<HRESULT> (view_collection, kSlotGetViewForHwnd, hwnd,
+                                   &view);
+      if (FAILED (hr) || view == nullptr) {
+        if (recoverable (hr) && attempt == 0) {
+          release ();
+          if (!ensure () || !ensure_view_collection ())
+            return false;
+          continue;
+        }
+        return false;
+      }
+
+      void *arr = nullptr;
+      hr = vcall<HRESULT> (internal, kSlotGetDesktops, &arr);
+      if (FAILED (hr) || arr == nullptr) {
+        vrelease (view);
+        if (recoverable (hr) && attempt == 0) {
+          release ();
+          if (!ensure () || !ensure_view_collection ())
+            return false;
+          continue;
+        }
+        return false;
+      }
+
+      bool ok = false;
+      UINT n = 0;
+      vcall<HRESULT> (arr, kSlotGetCount, &n);
+      if (target_index >= 0 && (UINT)target_index < n) {
+        void *target_desktop = desktop_at (arr, (UINT)target_index);
+        if (target_desktop != nullptr) {
+          ok = SUCCEEDED (vcall<HRESULT> (internal, kSlotMoveViewToDesktop,
+                                          view, target_desktop));
+          vrelease (target_desktop);
+        }
+      }
+      vrelease (arr);
+      vrelease (view);
+      return ok;
+    }
+    return false;
+  }
+
+  bool
+  create_desktop ()
+  {
+    VtableProfile slots = vtable_slots_for_build (windows_build_number ());
+    if (!slots.can_manage_desktops || slots.create_desktop < 0 || !ensure ())
+      return false;
+
+    void *created = nullptr;
+    HRESULT hr = vcall<HRESULT> (internal, slots.create_desktop, &created);
+    if (created != nullptr)
+      vrelease (created);
+    return SUCCEEDED (hr);
+  }
+
+  bool
+  remove_desktop (int index)
+  {
+    VtableProfile slots = vtable_slots_for_build (windows_build_number ());
+    if (!slots.can_manage_desktops || slots.remove_desktop < 0 || !ensure ())
+      return false;
+
+    void *arr = nullptr;
+    if (FAILED (vcall<HRESULT> (internal, kSlotGetDesktops, &arr)) ||
+        arr == nullptr) {
+      return false;
+    }
+
+    bool ok = false;
+    UINT n = 0;
+    vcall<HRESULT> (arr, kSlotGetCount, &n);
+    if (n > 1 && index >= 0 && (UINT)index < n) {
+      UINT fallback_index = (index > 0) ? (UINT)(index - 1) : 1u;
+      void *destroy_desktop = desktop_at (arr, (UINT)index);
+      void *fallback_desktop = desktop_at (arr, fallback_index);
+      if (destroy_desktop != nullptr && fallback_desktop != nullptr) {
+        ok = SUCCEEDED (vcall<HRESULT> (internal, slots.remove_desktop,
+                                        destroy_desktop, fallback_desktop));
+      }
+      if (destroy_desktop != nullptr)
+        vrelease (destroy_desktop);
+      if (fallback_desktop != nullptr)
+        vrelease (fallback_desktop);
+    }
+    vrelease (arr);
+    return ok;
   }
 };
 
@@ -474,7 +596,23 @@ run_on_worker (Job *job)
           break;
         }
         case Job::Op::PinWindow: {
-          job->ok = g_com.pin_window (job->in_hwnd);
+          job->ok = g_com.set_window_pin_state (job->in_hwnd, kSlotPinView);
+          break;
+        }
+        case Job::Op::UnpinWindow: {
+          job->ok = g_com.set_window_pin_state (job->in_hwnd, kSlotUnpinView);
+          break;
+        }
+        case Job::Op::MoveWindowToDesktop: {
+          job->ok = g_com.move_window_to_desktop (job->in_hwnd, job->in_index);
+          break;
+        }
+        case Job::Op::CreateDesktop: {
+          job->ok = g_com.create_desktop ();
+          break;
+        }
+        case Job::Op::RemoveDesktop: {
+          job->ok = g_com.remove_desktop (job->in_index);
           break;
         }
         }
@@ -578,6 +716,103 @@ pin_window (HWND hwnd)
     return false;
   Job *job = new Job{Job::Op::PinWindow};
   job->in_hwnd = hwnd;
+  run_on_worker (job);
+  bool out = job->ok;
+  delete job;
+  return out;
+}
+
+VtableProfile
+vtable_slots_for_build (uint32_t build_number)
+{
+  VtableProfile p;
+  if (build_number >= 26100) {
+    // Win11 24H2+ inserts SwitchDesktopAndMoveForegroundView at slot 10.
+    p.move_view_to_desktop = 4;
+    p.create_desktop = 11;
+    p.move_desktop = 12;
+    p.remove_desktop = 13;
+    p.can_manage_desktops = true;
+  } else if (build_number >= 22621) {
+    // Win11 22H2 / 23H2 (builds 22621..25999).
+    p.move_view_to_desktop = 4;
+    p.create_desktop = 10;
+    p.move_desktop = 11;
+    p.remove_desktop = 12;
+    p.can_manage_desktops = true;
+  }
+  return p;
+}
+
+uint32_t
+windows_build_number (void)
+{
+  static uint32_t cached = [] () -> uint32_t {
+    HMODULE ntdll = GetModuleHandleW (L"ntdll.dll");
+    if (ntdll == nullptr)
+      return 0;
+    using RtlGetVersionFn = LONG (WINAPI *) (OSVERSIONINFOW *);
+    auto fn = reinterpret_cast<RtlGetVersionFn> (
+        reinterpret_cast<void *> (GetProcAddress (ntdll, "RtlGetVersion")));
+    if (fn == nullptr)
+      return 0;
+    OSVERSIONINFOW info{};
+    info.dwOSVersionInfoSize = sizeof (info);
+    if (fn (&info) != 0)
+      return 0;
+    return static_cast<uint32_t> (info.dwBuildNumber);
+  }();
+  return cached;
+}
+
+bool
+unpin_window (HWND hwnd)
+{
+  if (hwnd == nullptr)
+    return false;
+  Job *job = new Job ();
+  job->op = Job::Op::UnpinWindow;
+  job->in_hwnd = hwnd;
+  run_on_worker (job);
+  bool out = job->ok;
+  delete job;
+  return out;
+}
+
+bool
+move_window_to_desktop (HWND hwnd, int target_index)
+{
+  if (hwnd == nullptr || target_index < 0)
+    return false;
+  Job *job = new Job ();
+  job->op = Job::Op::MoveWindowToDesktop;
+  job->in_hwnd = hwnd;
+  job->in_index = target_index;
+  run_on_worker (job);
+  bool out = job->ok;
+  delete job;
+  return out;
+}
+
+bool
+create_desktop (void)
+{
+  Job *job = new Job ();
+  job->op = Job::Op::CreateDesktop;
+  run_on_worker (job);
+  bool out = job->ok;
+  delete job;
+  return out;
+}
+
+bool
+remove_desktop (int index)
+{
+  if (index < 0)
+    return false;
+  Job *job = new Job ();
+  job->op = Job::Op::RemoveDesktop;
+  job->in_index = index;
   run_on_worker (job);
   bool out = job->ok;
   delete job;

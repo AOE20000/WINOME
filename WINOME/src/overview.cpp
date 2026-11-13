@@ -51,6 +51,8 @@
 // opened over the overview is swallowed (GNOME's menu grab consumes it).
 
 #include "overview.h"
+#include "app-grid.h"
+#include "app-index.h"
 #include "i18n.h"
 #include "overview-layout.h"
 #include "overview-dash.h"
@@ -120,10 +122,22 @@ int g_panel_height = 0;   // physical px; clicks above it are panel's
 GtkWidget *g_root = nullptr;      // GtkFixed named "overviewGroup"
 GtkWidget *g_search = nullptr;    // GtkEntry.search-entry
 GtkWidget *g_ws_bg = nullptr;     // workspace-background widget
+GtkWidget *g_app_grid = nullptr;  // paginated App Grid overlay
 GtkWidget *g_dash = nullptr;      // overview dash
 GtkWidget *g_thumbs = nullptr;    // .workspace-thumbnails row
 GtkWidget *g_caption = nullptr;   // .window-caption hover pill
 GdkTexture *g_wallpaper = nullptr;
+bool g_app_grid_mode = false;     // true when Show Apps grid is active
+
+// Drag-to-desktop state for window previews.
+int g_drag_slot = -1;
+HWND g_drag_hwnd = nullptr;
+RECT g_drag_orig_rect{};
+int g_drag_start_px = 0;
+int g_drag_start_py = 0;
+bool g_drag_active = false;
+bool g_drag_just_ended = false;
+bool g_drag_thumbs_revealed = false;
 std::string g_search_query;       // lowercased UTF-8 live search filter
 
 // Virtual desktops (virtual-desktop.cpp), refreshed on every placement.
@@ -398,69 +412,6 @@ window_matches_search (HWND hwnd, const std::string &query_lower)
     return true;
   std::string proc = utf8_tolower (hwnd_process_name_utf8 (hwnd));
   return proc.find (query_lower) != std::string::npos;
-}
-
-void
-find_best_lnk_recursive (const std::wstring &dir, const std::string &query_lower,
-                         int *best_score, std::wstring *best_path, int depth)
-{
-  if (depth > 4)
-    return;
-  std::wstring pattern = dir + L"\\*";
-  WIN32_FIND_DATAW ffd {};
-  HANDLE h = FindFirstFileW (pattern.c_str (), &ffd);
-  if (h == INVALID_HANDLE_VALUE)
-    return;
-
-  do {
-    if (wcscmp (ffd.cFileName, L".") == 0 || wcscmp (ffd.cFileName, L"..") == 0)
-      continue;
-    std::wstring full = dir + L"\\" + ffd.cFileName;
-    if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-      find_best_lnk_recursive (full, query_lower, best_score, best_path,
-                               depth + 1);
-      continue;
-    }
-    size_t flen = wcslen (ffd.cFileName);
-    if (flen > 4 && _wcsicmp (ffd.cFileName + flen - 4, L".lnk") == 0) {
-      std::wstring stem (ffd.cFileName, flen - 4);
-      std::string name_lower = utf8_tolower (wide_to_utf8 (stem.c_str ()));
-      size_t pos = name_lower.find (query_lower);
-      if (pos != std::string::npos) {
-        int score = (pos == 0) ? 2 : 1;
-        if (score > *best_score) {
-          *best_score = score;
-          *best_path = std::move (full);
-        }
-      }
-    }
-  } while (FindNextFileW (h, &ffd));
-  FindClose (h);
-}
-
-bool
-launch_matching_start_menu_app (const std::string &query_lower)
-{
-  if (query_lower.empty ())
-    return false;
-  int best_score = 0;
-  std::wstring best_path;
-
-  const wchar_t *vars[] = {L"APPDATA", L"ProgramData"};
-  for (const wchar_t *var : vars) {
-    wchar_t base[MAX_PATH] = L"";
-    if (GetEnvironmentVariableW (var, base, MAX_PATH) > 0) {
-      std::wstring programs = std::wstring (base) +
-                              L"\\Microsoft\\Windows\\Start Menu\\Programs";
-      find_best_lnk_recursive (programs, query_lower, &best_score, &best_path,
-                               0);
-    }
-  }
-  if (best_path.empty ())
-    return false;
-  HINSTANCE res = ShellExecuteW (nullptr, L"open", best_path.c_str (), nullptr,
-                                 nullptr, SW_SHOWNORMAL);
-  return reinterpret_cast<INT_PTR> (res) > 32;
 }
 
 // --- window enumeration (alt-tab eligible, DWM visible bounds) ---------------
@@ -1520,18 +1471,21 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
   int search_total =
       (kSearchMarginTop + kSearchMarginBottom) * scale + search_h * scale;
 
-  // Workspace thumbnails (ThumbnailsBox, shown for >1 desktop). The row is
-  // capped at MAX_THUMBNAIL_SCALE of the workarea height
-  // (ControlsManagerLayout), full width, content centered.
+  // Workspace thumbnails (ThumbnailsBox, shown for >1 desktop or during drag).
+  bool can_manage =
+      vd::vtable_slots_for_build (vd::windows_build_number ()).can_manage_desktops;
   int thumbs_h = 0;  // physical
-  if (g_desktops.size () > 1) {
+  if (!g_app_grid_mode &&
+      (g_desktops.size () > 1 || (g_drag_active && !g_desktops.empty ()))) {
     int box_h = (int)(wa_h * kMaxThumbnailScale) / scale;  // logical
     overview_thumbs_repopulate (g_thumbs, (int)g_desktops.size (),
                                 g_desktop_active, box_h, (double)mw / scale,
-                                (double)mw, (double)wa_h, g_wallpaper);
+                                (double)mw, (double)wa_h, g_wallpaper,
+                                can_manage, g_drag_active);
     thumbs_h = overview_thumbs_get_height (g_thumbs) * scale;
   } else {
-    overview_thumbs_repopulate (g_thumbs, 0, -1, 0, 0, 0, 0, nullptr);
+    overview_thumbs_repopulate (g_thumbs, 0, -1, 0, 0, 0, 0, nullptr, false,
+                                false);
   }
 
   // Dash (16% cap, ControlsManagerLayout DASH_MAX_HEIGHT_RATIO).
@@ -1647,8 +1601,9 @@ position_widgets (const PlacedGeometry &geo, bool opening)
   }
 
   gtk_widget_set_visible (g_search, TRUE);
-  gtk_widget_set_visible (g_ws_bg, TRUE);
+  gtk_widget_set_visible (g_ws_bg, !g_app_grid_mode);
   gtk_widget_set_visible (g_dash, TRUE);
+  gtk_widget_set_visible (g_app_grid, g_app_grid_mode);
 }
 
 // --- z-order ----------------------------------------------------------------------
@@ -1726,12 +1681,30 @@ place_overview_locked (bool opening)
   PlacedGeometry geo;
   if (!compute_geometry (monitor, mi.rcMonitor, panel_height, &geo))
     return;
-  position_widgets (geo, opening);
+  position_widgets (geo, opening && !g_app_grid_mode);
 
   // The dark backdrop applies only once the workspace background actually
   // covers the work area: before that, a bare #overviewGroup would flash
   // full-screen dark in the pre-placement frames.
   gtk_widget_set_name (g_root, "overviewGroup");
+
+  if (g_app_grid_mode && g_app_grid != nullptr) {
+    set_hover (-1, true);
+    destroy_previews ();
+    destroy_mini_previews ();
+    int scale = gtk_widget_get_scale_factor (g_window);
+    int grid_w = std::max (std::min (w / scale - 48, 1180), 400);
+    int grid_h = std::max ((int)(geo.ws_box.bottom - geo.ws_box.top) / scale, 320);
+    int grid_x = (w / scale - grid_w) / 2;
+    int grid_y = (int)geo.ws_box.top / scale;
+    app_grid_set_query (g_app_grid, g_search_query);
+    app_grid_rebuild (g_app_grid, grid_w, grid_h);
+    gtk_widget_set_size_request (g_app_grid, grid_w, grid_h);
+    gtk_fixed_move (GTK_FIXED (g_root), g_app_grid, grid_x, grid_y);
+    gtk_widget_set_visible (g_app_grid, TRUE);
+    restack_locked ();
+    return;
+  }
 
   // Windows -> slots (workspace.js strategy inside the workspace box, with
   // the chrome-oversize-adjusted spacing). With the virtual desktop API
@@ -2178,6 +2151,23 @@ finish_hide (void)
   destroy_previews ();
   switch_cancel ();
   destroy_mini_previews ();
+  g_drag_active = false;
+  g_drag_slot = -1;
+  g_drag_hwnd = nullptr;
+  g_drag_just_ended = false;
+  g_drag_thumbs_revealed = false;
+  if (g_thumbs != nullptr)
+    overview_thumbs_set_drop_target (g_thumbs, -1);
+  if (g_dash != nullptr) {
+    overview_dash_close_menu (g_dash);
+    overview_dash_set_apps_active (g_dash, false);
+  }
+  if (g_app_grid != nullptr) {
+    app_grid_close_menu (g_app_grid);
+    app_grid_reset_page (g_app_grid);
+    gtk_widget_set_visible (g_app_grid, FALSE);
+  }
+  g_app_grid_mode = false;
   if (g_desktop_poll != 0) {
     g_source_remove (g_desktop_poll);
     g_desktop_poll = 0;
@@ -2195,6 +2185,170 @@ finish_hide (void)
     gtk_widget_set_visible (g_window, FALSE);
 }
 
+gboolean
+delayed_rebuild_cb (gpointer user_data G_GNUC_UNUSED)
+{
+  rebuild_now ();
+  return G_SOURCE_REMOVE;
+}
+
+void
+on_drag_begin (GtkGestureDrag *drag, double x, double y,
+               gpointer user_data G_GNUC_UNUSED)
+{
+  g_drag_slot = -1;
+  g_drag_hwnd = nullptr;
+  g_drag_active = false;
+  g_drag_thumbs_revealed = false;
+
+  if (g_app_grid_mode || g_desktops.empty () || g_window == nullptr) {
+    gtk_gesture_set_state (GTK_GESTURE (drag), GTK_EVENT_SEQUENCE_DENIED);
+    return;
+  }
+
+  int scale = gtk_widget_get_scale_factor (g_window);
+  int px = (int)(x * scale);
+  int py = (int)(y * scale);
+  if ((g_panel_height > 0 && py < g_panel_height) || py >= g_dash_top ||
+      (px >= g_search_rect.left && px < g_search_rect.right &&
+       py >= g_search_rect.top && py < g_search_rect.bottom) ||
+      (g_thumbs_rect.right > g_thumbs_rect.left &&
+       px >= g_thumbs_rect.left && px < g_thumbs_rect.right &&
+       py >= g_thumbs_rect.top && py < g_thumbs_rect.bottom)) {
+    gtk_gesture_set_state (GTK_GESTURE (drag), GTK_EVENT_SEQUENCE_DENIED);
+    return;
+  }
+
+  for (int i = 0; i < (int)g_slots.size (); ++i) {
+    const RECT &r = g_slots[i].rect;
+    if (px >= r.left && px < r.right && py >= r.top && py < r.bottom) {
+      g_drag_slot = i;
+      g_drag_hwnd = g_slots[i].target;
+      g_drag_orig_rect = r;
+      g_drag_start_px = px;
+      g_drag_start_py = py;
+      return;
+    }
+  }
+  gtk_gesture_set_state (GTK_GESTURE (drag), GTK_EVENT_SEQUENCE_DENIED);
+}
+
+void
+on_drag_update (GtkGestureDrag *drag G_GNUC_UNUSED, double dx, double dy,
+                gpointer user_data G_GNUC_UNUSED)
+{
+  if (g_drag_slot < 0 || g_drag_slot >= (int)g_slots.size () ||
+      g_window == nullptr)
+    return;
+
+  if (!g_drag_active) {
+    if (dx * dx + dy * dy < 64.0)
+      return;
+    g_drag_active = true;
+    set_hover (-1, true);
+
+    int scale = gtk_widget_get_scale_factor (g_window);
+    bool can_manage =
+        vd::vtable_slots_for_build (vd::windows_build_number ())
+            .can_manage_desktops;
+    if (g_desktops.size () == 1 && can_manage && g_thumbs != nullptr) {
+      int mw = g_monitor_w;
+      int wa_h = std::max (g_monitor_h - g_panel_height, 1);
+      int spacing = (int)(wa_h * kVerticalSpacingRatio + 0.5);
+      int thumb_adjust = (int)(spacing * kThumbnailsAdjustTop + 0.5);
+      GtkRequisition search_nat{};
+      gtk_widget_get_preferred_size (g_search, nullptr, &search_nat);
+      int search_total =
+          (kSearchMarginTop + kSearchMarginBottom + search_nat.height) * scale;
+      int box_h = (int)(wa_h * kMaxThumbnailScale) / scale;
+      overview_thumbs_repopulate (g_thumbs, 1, 0, box_h, (double)mw / scale,
+                                  (double)mw, (double)wa_h, g_wallpaper, true,
+                                  true);
+      int thumbs_w = overview_thumbs_get_width (g_thumbs);
+      int thumbs_h = overview_thumbs_get_height (g_thumbs) * scale;
+      int thumbs_x = (mw / scale - thumbs_w) / 2;
+      int thumbs_y = (g_panel_height + search_total + thumb_adjust) / scale;
+      gtk_fixed_move (GTK_FIXED (g_root), g_thumbs, thumbs_x, thumbs_y);
+      gtk_widget_set_visible (g_thumbs, thumbs_h > 0);
+      if (thumbs_h > 0) {
+        g_thumbs_rect.left = thumbs_x * scale;
+        g_thumbs_rect.top = thumbs_y * scale;
+        g_thumbs_rect.right = (thumbs_x + thumbs_w) * scale;
+        g_thumbs_rect.bottom = (thumbs_y * scale) + thumbs_h;
+        g_drag_thumbs_revealed = true;
+      }
+    }
+  }
+
+  int scale = gtk_widget_get_scale_factor (g_window);
+  int orig_w = g_drag_orig_rect.right - g_drag_orig_rect.left;
+  int orig_h = g_drag_orig_rect.bottom - g_drag_orig_rect.top;
+  int dw = std::max ((int)(orig_w * 0.55), 80 * scale);
+  int dh = std::max ((int)(orig_h * 0.55), 60 * scale);
+  int cur_px = g_drag_start_px + (int)(dx * scale);
+  int cur_py = g_drag_start_py + (int)(dy * scale);
+  RECT moved{cur_px - dw / 2, cur_py - dh / 2, cur_px + dw / 2,
+             cur_py + dh / 2};
+  apply_thumb_rect (g_slots[g_drag_slot], moved, 215);
+
+  if (g_thumbs != nullptr && g_thumbs_rect.right > g_thumbs_rect.left &&
+      cur_px >= g_thumbs_rect.left && cur_px < g_thumbs_rect.right &&
+      cur_py >= g_thumbs_rect.top && cur_py < g_thumbs_rect.bottom) {
+    double lx = (double)(cur_px - g_thumbs_rect.left) / scale;
+    double ly = (double)(cur_py - g_thumbs_rect.top) / scale;
+    overview_thumbs_set_drop_target (
+        g_thumbs, overview_thumbs_drop_target_at (g_thumbs, lx, ly));
+  } else if (g_thumbs != nullptr) {
+    overview_thumbs_set_drop_target (g_thumbs, -1);
+  }
+}
+
+void
+on_drag_end (GtkGestureDrag *drag G_GNUC_UNUSED, double dx, double dy,
+             gpointer user_data G_GNUC_UNUSED)
+{
+  if (g_drag_slot < 0)
+    return;
+
+  bool was_drag = g_drag_active;
+  HWND target_hwnd = g_drag_hwnd;
+  int scale = g_window != nullptr ? gtk_widget_get_scale_factor (g_window) : 1;
+  int end_px = g_drag_start_px + (int)(dx * scale);
+  int end_py = g_drag_start_py + (int)(dy * scale);
+
+  g_drag_active = false;
+  g_drag_slot = -1;
+  g_drag_hwnd = nullptr;
+
+  if (!was_drag)
+    return;
+
+  g_drag_just_ended = true;
+
+  int tgt = -1;
+  if (g_thumbs != nullptr && g_thumbs_rect.right > g_thumbs_rect.left &&
+      end_px >= g_thumbs_rect.left && end_px < g_thumbs_rect.right &&
+      end_py >= g_thumbs_rect.top && end_py < g_thumbs_rect.bottom) {
+    double lx = (double)(end_px - g_thumbs_rect.left) / scale;
+    double ly = (double)(end_py - g_thumbs_rect.top) / scale;
+    tgt = overview_thumbs_drop_target_at (g_thumbs, lx, ly);
+  }
+  if (g_thumbs != nullptr)
+    overview_thumbs_set_drop_target (g_thumbs, -1);
+
+  if (tgt >= 0 && target_hwnd != nullptr && IsWindow (target_hwnd)) {
+    if (tgt < (int)g_desktops.size () && tgt != g_desktop_active) {
+      vd::move_window_to_desktop (target_hwnd, tgt);
+    } else if (tgt == (int)g_desktops.size () && vd::create_desktop ()) {
+      int n = vd::count ();
+      if (n > 0)
+        vd::move_window_to_desktop (target_hwnd, n - 1);
+    }
+  }
+  g_drag_thumbs_revealed = false;
+  rebuild_now ();
+}
+
 // --- clicks --------------------------------------------------------------------------
 
 void
@@ -2203,8 +2357,14 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
 {
   (void)n_press;
   (void)user_data;
-  if (gtk_gesture_single_get_current_button (GTK_GESTURE_SINGLE (gesture)) !=
-      GDK_BUTTON_PRIMARY)
+  guint button =
+      gtk_gesture_single_get_current_button (GTK_GESTURE_SINGLE (gesture));
+
+  if (g_drag_just_ended) {
+    g_drag_just_ended = false;
+    return;
+  }
+  if (button != GDK_BUTTON_PRIMARY && button != GDK_BUTTON_MIDDLE)
     return;
 
   int scale = g_window != nullptr ? gtk_widget_get_scale_factor (g_window) : 1;
@@ -2223,7 +2383,24 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
     return;
   }
 
+  if (g_app_grid_mode)
+    return;
+
   POINT pt = {px, py};
+
+  if (button == GDK_BUTTON_MIDDLE) {
+    for (const SlotEntry &e : g_slots) {
+      if (pt.x >= e.rect.left && pt.x < e.rect.right && pt.y >= e.rect.top &&
+          pt.y < e.rect.bottom) {
+        if (IsWindow (e.target)) {
+          PostMessageW (e.target, WM_CLOSE, 0, 0);
+          g_timeout_add (140, delayed_rebuild_cb, nullptr);
+        }
+        return;
+      }
+    }
+    return;
+  }
 
   // The title pill is reactive upstream and propagates the click to the
   // preview: activate the hovered window.
@@ -2345,6 +2522,51 @@ on_thumb_clicked (int index, void *user_data)
   }
 }
 
+void
+on_thumb_add_desktop (void *user_data G_GNUC_UNUSED)
+{
+  if (vd::create_desktop ()) {
+    int n = vd::count ();
+    if (n > 0)
+      vd::switch_to (n - 1);
+    rebuild_now ();
+  }
+}
+
+void
+on_thumb_remove_desktop (int index, void *user_data G_GNUC_UNUSED)
+{
+  if (vd::remove_desktop (index))
+    rebuild_now ();
+}
+
+void
+on_dash_show_apps_clicked (void *user_data G_GNUC_UNUSED)
+{
+  overview_toggle_app_grid ();
+}
+
+void
+on_dash_changed (void *user_data G_GNUC_UNUSED)
+{
+  rebuild_now ();
+}
+
+void
+on_app_grid_launch_done (void *user_data G_GNUC_UNUSED)
+{
+  close_overview ("app-grid-launch");
+}
+
+void
+on_app_grid_pins_changed (void *user_data G_GNUC_UNUSED)
+{
+  if (g_dash != nullptr && g_window != nullptr &&
+      gtk_widget_get_visible (g_window)) {
+    rebuild_now ();
+  }
+}
+
 // Relayout when the active desktop changed outside the overview.
 gboolean
 desktop_poll_cb (gpointer user_data)
@@ -2402,6 +2624,8 @@ on_search_changed (GtkEditable *editable, gpointer user_data G_GNUC_UNUSED)
                                      GTK_ENTRY_ICON_SECONDARY,
                                      g_search_query.empty () ? nullptr
                                                              : "edit-clear-symbolic");
+  if (g_app_grid != nullptr)
+    app_grid_set_query (g_app_grid, g_search_query);
   if (g_window != nullptr && gtk_widget_get_visible (g_window))
     rebuild_now ();
 }
@@ -2418,6 +2642,11 @@ void
 on_search_activate (GtkEntry *entry G_GNUC_UNUSED,
                     gpointer user_data G_GNUC_UNUSED)
 {
+  if (g_app_grid_mode && g_app_grid != nullptr) {
+    if (app_grid_launch_first (g_app_grid))
+      close_overview ("app-grid-enter");
+    return;
+  }
   if (!g_slots.empty ()) {
     HWND target = g_slots[0].target;
     if (IsWindow (target)) {
@@ -2429,7 +2658,7 @@ on_search_activate (GtkEntry *entry G_GNUC_UNUSED,
     return;
   }
   if (!g_search_query.empty () &&
-      launch_matching_start_menu_app (g_search_query)) {
+      app_index_launch_best_match (g_search_query)) {
     close_overview ("search-enter-app");
   }
 }
@@ -2446,8 +2675,34 @@ on_overview_key_pressed (GtkEventControllerKey *controller G_GNUC_UNUSED,
       gtk_editable_set_text (GTK_EDITABLE (g_search), "");
       return GDK_EVENT_STOP;
     }
+    if (g_app_grid_mode) {
+      overview_toggle_app_grid ();
+      return GDK_EVENT_STOP;
+    }
     close_overview ("escape");
     return GDK_EVENT_STOP;
+  }
+  if ((state & GDK_CONTROL_MASK) && (state & GDK_SHIFT_MASK) &&
+      (keyval == GDK_KEY_n || keyval == GDK_KEY_N)) {
+    on_thumb_add_desktop (nullptr);
+    return GDK_EVENT_STOP;
+  }
+  if (keyval == GDK_KEY_Page_Up || keyval == GDK_KEY_Page_Down) {
+    if (g_app_grid_mode && g_app_grid != nullptr) {
+      if (keyval == GDK_KEY_Page_Up)
+        app_grid_prev_page (g_app_grid);
+      else
+        app_grid_next_page (g_app_grid);
+      return GDK_EVENT_STOP;
+    }
+    if (g_desktops.size () > 1 && g_desktop_active >= 0) {
+      int target = g_desktop_active + (keyval == GDK_KEY_Page_Up ? -1 : 1);
+      if (target >= 0 && target < (int)g_desktops.size () &&
+          vd::switch_to (target)) {
+        switch_workspace_animated (target);
+      }
+      return GDK_EVENT_STOP;
+    }
   }
   if ((state & GDK_CONTROL_MASK) &&
       (keyval == GDK_KEY_f || keyval == GDK_KEY_F)) {
@@ -2522,7 +2777,16 @@ overview_init (HWND panel_hwnd)
   // "fighting" look this avoids. (The window clones are DWM thumbnails,
   // composited above everything anyway, matching the topmost
   // workspacesDisplay.) The caption stays topmost, above the background.
+  app_index_refresh_async ();
+
+  g_app_grid = app_grid_new (on_app_grid_launch_done,
+                             on_app_grid_pins_changed, nullptr);
+  gtk_fixed_put (GTK_FIXED (g_root), g_app_grid, 0, 0);
+  gtk_widget_set_visible (g_app_grid, FALSE);
+
   g_dash = overview_dash_new (g_root);
+  overview_dash_set_show_apps_cb (g_dash, on_dash_show_apps_clicked, nullptr);
+  overview_dash_set_changed_cb (g_dash, on_dash_changed, nullptr);
   gtk_fixed_put (GTK_FIXED (g_root), g_dash, 0, 0);
   gtk_widget_set_visible (g_dash, FALSE);
 
@@ -2532,6 +2796,8 @@ overview_init (HWND panel_hwnd)
   // desktop during placement.
   g_thumbs = overview_thumbs_new ();
   overview_thumbs_set_click_cb (g_thumbs, on_thumb_clicked, nullptr);
+  overview_thumbs_set_manage_cbs (g_thumbs, on_thumb_add_desktop,
+                                  on_thumb_remove_desktop, nullptr);
   gtk_fixed_put (GTK_FIXED (g_root), g_thumbs, 0, 0);
   gtk_widget_set_visible (g_thumbs, FALSE);
 
@@ -2563,8 +2829,18 @@ overview_init (HWND panel_hwnd)
                     nullptr);
   gtk_widget_add_controller (g_root, GTK_EVENT_CONTROLLER (motion));
 
-  // Slot hit-testing for preview activation; blank clicks close.
+  // Window drag-to-desktop + slot hit-testing (left click activate / middle
+  // click close / blank click dismiss).
+  GtkGesture *drag = gtk_gesture_drag_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (drag),
+                                 GDK_BUTTON_PRIMARY);
+  g_signal_connect (drag, "drag-begin", G_CALLBACK (on_drag_begin), nullptr);
+  g_signal_connect (drag, "drag-update", G_CALLBACK (on_drag_update), nullptr);
+  g_signal_connect (drag, "drag-end", G_CALLBACK (on_drag_end), nullptr);
+  gtk_widget_add_controller (g_window, GTK_EVENT_CONTROLLER (drag));
+
   GtkGesture *click = gtk_gesture_click_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), 0);
   g_signal_connect (click, "released", G_CALLBACK (on_click_released),
                     nullptr);
   gtk_widget_add_controller (g_window, GTK_EVENT_CONTROLLER (click));
@@ -2603,6 +2879,11 @@ overview_hide (void)
   if (g_window == nullptr || !gtk_widget_get_visible (g_window)) {
     destroy_previews ();
     switch_cancel ();
+    g_app_grid_mode = false;
+    return;
+  }
+  if (g_app_grid_mode) {
+    finish_hide ();
     return;
   }
   // Animate out, then unmap from finish_hide().
@@ -2652,6 +2933,19 @@ overview_reposition (void)
 {
   if (g_window != nullptr && gtk_widget_get_visible (g_window))
     place_overview_locked (false);
+}
+
+void
+overview_toggle_app_grid (void)
+{
+  if (g_window == nullptr || !gtk_widget_get_visible (g_window))
+    return;
+  g_app_grid_mode = !g_app_grid_mode;
+  if (g_dash != nullptr)
+    overview_dash_set_apps_active (g_dash, g_app_grid_mode);
+  if (g_app_grid_mode && g_app_grid != nullptr)
+    app_grid_reset_page (g_app_grid);
+  place_overview_locked (false);
 }
 
 }  // namespace winome

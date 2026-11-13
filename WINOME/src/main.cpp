@@ -14,6 +14,7 @@
 #include <string>
 
 #include "config.h"
+#include "app-index.h"
 #include "host-utils.h"
 #include "native-taskbar.h"
 #include "overview-trigger.h"
@@ -596,6 +597,7 @@ on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
   g_gtk_app = nullptr;
 
   winome::close_settings_window ();
+  winome::app_icon_cache_clear ();
   winome::monitor_manager_shutdown ();
   winome::stop_fullscreen_watcher ();
   winome::systray_shutdown ();
