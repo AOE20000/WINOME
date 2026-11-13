@@ -111,17 +111,12 @@ winome_power_mode_available (WinomePowerMode mode)
   // activated (PowerSetActiveScheme would fail silently).
   DWORD index = 0;
   for (;;) {
-    DWORD size = 0;
-    if (PowerEnumerate (NULL, &target, NULL, ACCESS_SCHEME, index,
-                        NULL, &size) != ERROR_SUCCESS)
-      return FALSE;
-    if (size != sizeof (GUID))
-      return FALSE;
-    GUID found;
-    if (PowerEnumerate (NULL, &target, NULL, ACCESS_SCHEME, index,
+    GUID found = {};
+    DWORD size = sizeof (found);
+    if (PowerEnumerate (NULL, NULL, NULL, ACCESS_SCHEME, index,
                         (UCHAR *) &found, &size) != ERROR_SUCCESS)
       return FALSE;
-    if (IsEqualGUID (found, target))
+    if (size == sizeof (GUID) && IsEqualGUID (found, target))
       return TRUE;
     index++;
     if (index > 64)  // safety bound; a normal machine has < 10 schemes

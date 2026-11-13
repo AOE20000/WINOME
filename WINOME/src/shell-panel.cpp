@@ -30,6 +30,7 @@
 #include <time.h>
 #include <string.h>
 #include <math.h>
+#include <memory>
 
 #include <windows.h>
 
@@ -414,14 +415,25 @@ typedef struct {
   gboolean anchored_menu;
   RECT anchor_rect;        // the button's screen rect, for the close hook
   gint raise_attempts;     // post-map re-assert counter (GDK re-lates late)
+  guint raise_source_id;   // pending g_idle/g_timeout id for popover_raise_idle
 } PanelPopover;
 
 static GList *g_open_popovers = NULL;
+static PanelPopover *g_open_menu = NULL;
 static HHOOK g_popover_mouse_hook = NULL;
 static gboolean g_overview_hooked = FALSE;
 // Monotonic time of the last popover dismissal by an outside click while the
 // overview was open (see popover_mouse_hook_proc).
 static gint64 g_popover_outside_close_us = 0;
+
+static void
+panel_popover_cancel_raise (PanelPopover *pp)
+{
+  if (pp->raise_source_id != 0) {
+    g_source_remove (pp->raise_source_id);
+    pp->raise_source_id = 0;
+  }
+}
 
 // GTK4's popover grab window on Windows leaves the anchor button's :hover
 // (PRELIGHT) state stale: after the popover closes, the button keeps its
@@ -547,6 +559,8 @@ panel_popover_geometry (PanelPopover *pp, int width, int height,
                         int *out_x, int *out_y)
 {
   GtkWidget *root = GTK_WIDGET (gtk_widget_get_root (pp->button));
+  if (root == nullptr)
+    return FALSE;
   GdkSurface *ps = gtk_native_get_surface (GTK_NATIVE (root));
   RECT pr = {};
   if (ps == nullptr ||
@@ -600,20 +614,15 @@ panel_popover_geometry (PanelPopover *pp, int width, int height,
   return TRUE;
 }
 
-// Fade a secondary menu out, then hide its window (quickSettings.js:500
-// fades the box, then collapses the height on completion). The callback holds
-// its own reference on the window and never touches PanelPopover, because the
-// window's destroy handler frees that struct and the animation may outlive a
-// menu the user opened and closed quickly.
+// Fade a secondary menu out, then destroy its one-shot window (quickSettings.js:500
+// fades the box, then destroys the menu). The callback holds its own strong
+// reference on the window via shared_ptr and never touches PanelPopover, because
+// gtk_window_destroy emits "destroy" and frees that struct.
 static void
-on_menu_fade_out_done (GtkWidget *window, gpointer data G_GNUC_UNUSED)
+on_menu_fade_out_done (GtkWidget *window)
 {
   gtk_widget_set_visible (window, FALSE);
-  // Reset so the next open starts from transparent again.
-  GtkWidget *wrap = gtk_widget_get_first_child (window);
-  if (wrap != nullptr)
-    gtk_widget_set_opacity (wrap, 1.0);
-  g_object_unref (window);
+  gtk_window_destroy (GTK_WINDOW (window));
 }
 
 static void
@@ -624,17 +633,27 @@ panel_popover_close (PanelPopover *pp, const char *reason)
 
   g_print ("[pop] close (%s)\n", reason);
   pp->open = FALSE;
+  panel_popover_cancel_raise (pp);
   gtk_widget_remove_css_class (pp->button, "open");
+
+  if (!pp->anchored_menu && g_open_menu != NULL && g_open_menu != pp) {
+    PanelPopover *menu = g_open_menu;
+    g_open_menu = NULL;
+    panel_popover_close (menu, "parent-closed");
+  } else if (g_open_menu == pp) {
+    g_open_menu = NULL;
+  }
 
   if (pp->anchored_menu) {
     // Keep the window mapped for the duration of the fade — hiding it first
     // would make the animation invisible and drop the topmost placement.
-    g_object_ref (pp->window);
+    auto window_ref = std::shared_ptr<GtkWidget> (
+        GTK_WIDGET (g_object_ref (pp->window)), g_object_unref);
     winome::tween_opacity (pp->wrap, gtk_widget_get_opacity (pp->wrap), 0.0,
                            winome::QUICK_SETTINGS_ANIMATION_TIME / 2,
                            winome::Ease::ease_out_quad,
-                           [window = pp->window] {
-                             on_menu_fade_out_done (window, nullptr);
+                           [window_ref] () {
+                             on_menu_fade_out_done (window_ref.get ());
                            });
   } else {
     gtk_widget_set_visible (pp->window, FALSE);
@@ -655,7 +674,8 @@ panel_popover_close (PanelPopover *pp, const char *reason)
     gtk_widget_unset_state_flags (p, GTK_STATE_FLAG_PRELIGHT);
     p = gtk_widget_get_parent (p);
   }
-  g_timeout_add (200, clear_stale_hover, pp->button);
+  g_timeout_add_full (G_PRIORITY_DEFAULT, 200, clear_stale_hover,
+                      g_object_ref (pp->button), g_object_unref);
 }
 
 // After GTK maps the popover, re-assert the shell-chrome ex styles, the
@@ -669,6 +689,7 @@ static gboolean
 popover_raise_idle (gpointer data)
 {
   PanelPopover *pp = static_cast<PanelPopover *> (data);
+  pp->raise_source_id = 0;
   if (!pp->open)
     return G_SOURCE_REMOVE;
 
@@ -708,7 +729,7 @@ popover_raise_idle (gpointer data)
     winome::overview_restack ();
 
   if (++pp->raise_attempts < 10) {
-    g_timeout_add (100, popover_raise_idle, pp);
+    pp->raise_source_id = g_timeout_add (100, popover_raise_idle, pp);
     return G_SOURCE_REMOVE;
   }
   return G_SOURCE_REMOVE;
@@ -722,7 +743,11 @@ static void
 on_popover_map (GtkWidget *widget, gpointer data)
 {
   (void)widget;
-  g_idle_add (popover_raise_idle, data);
+  PanelPopover *pp = static_cast<PanelPopover *> (data);
+  if (!pp->open)
+    return;
+  panel_popover_cancel_raise (pp);
+  pp->raise_source_id = g_idle_add (popover_raise_idle, pp);
 }
 
 static void
@@ -790,7 +815,8 @@ panel_popover_open (PanelPopover *pp)
   // Re-assert the topmost placement after GTK's map completes (see
   // popover_raise_idle): the first map demotes the window out of the
   // topmost band, hiding it below the overview.
-  g_idle_add (popover_raise_idle, pp);
+  panel_popover_cancel_raise (pp);
+  pp->raise_source_id = g_idle_add (popover_raise_idle, pp);
 
   g_open_popovers = g_list_append (g_open_popovers, pp);
 }
@@ -842,10 +868,11 @@ popover_mouse_hook_proc (int nCode, WPARAM wParam, LPARAM lParam)
     MSLLHOOKSTRUCT *ms = reinterpret_cast<MSLLHOOKSTRUCT *>(lParam);
     POINT pt = ms->pt;
 
-    GList *l = g_open_popovers;
-    while (l != nullptr) {
+    GList *snapshot = g_list_copy (g_open_popovers);
+    for (GList *l = snapshot; l != nullptr; l = l->next) {
       PanelPopover *pp = static_cast<PanelPopover *>(l->data);
-      GList *next = l->next;
+      if (g_list_find (g_open_popovers, pp) == nullptr || !pp->open)
+        continue;
 
       HWND hwnd = panel_popover_hwnd (pp);
       RECT r;
@@ -855,6 +882,16 @@ popover_mouse_hook_proc (int nCode, WPARAM wParam, LPARAM lParam)
         // Clicks on the anchor button are handled by its toggle handler.
         if (!inside && PtInRect (&pp->anchor_rect, pt))
           inside = TRUE;
+        // Keep the parent popover open when clicking inside an active
+        // secondary menu that extends past the parent's bounds.
+        if (!inside && !pp->anchored_menu && g_open_menu != NULL &&
+            g_open_menu->open) {
+          HWND menu_hwnd = panel_popover_hwnd (g_open_menu);
+          RECT mr;
+          if (menu_hwnd != nullptr && GetWindowRect (menu_hwnd, &mr) &&
+              PtInRect (&mr, pt))
+            inside = TRUE;
+        }
       }
       if (!inside) {
         // GNOME's menu grab consumes an outside click: it dismisses the menu
@@ -864,9 +901,8 @@ popover_mouse_hook_proc (int nCode, WPARAM wParam, LPARAM lParam)
           g_popover_outside_close_us = g_get_monotonic_time ();
         panel_popover_close (pp, "outside-click");
       }
-
-      l = next;
     }
+    g_list_free (snapshot);
   }
   return CallNextHookEx (nullptr, nCode, wParam, lParam);
 }
@@ -965,14 +1001,14 @@ make_panel_popover (GtkWidget *button, GtkWidget *child, gboolean centered)
 // shadow-wrapped card, WH_MOUSE_LL outside-click dismissal, topmost reassert —
 // so a menu behaves like every other popover in the shell.
 
-static PanelPopover *g_open_menu = NULL;
-
 static void
 menu_window_destroyed (GtkWidget *widget G_GNUC_UNUSED, gpointer data)
 {
   PanelPopover *pp = static_cast<PanelPopover *> (data);
   if (g_open_menu == pp)
     g_open_menu = NULL;
+  panel_popover_cancel_raise (pp);
+  g_open_popovers = g_list_remove (g_open_popovers, pp);
   // The menu content is owned by the window's child; dropping the last
   // reference to it here would strand the WifiMenu context.
   g_free (pp);
@@ -985,8 +1021,11 @@ winome_shell_panel_open_menu (GtkWidget *anchor, GtkWidget *menu)
     return;
 
   // Only one secondary menu at a time (matches GNOME's single menu grab).
-  if (g_open_menu != NULL)
-    panel_popover_close (g_open_menu, "replaced");
+  if (g_open_menu != NULL) {
+    PanelPopover *prev = g_open_menu;
+    g_open_menu = NULL;
+    panel_popover_close (prev, "replaced");
+  }
 
   PanelPopover *pp = g_new0 (PanelPopover, 1);
   pp->button = anchor;

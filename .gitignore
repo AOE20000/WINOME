@@ -1,5 +1,7 @@
 # Build artifacts
 build/
+build-release/
+build-debug/
 _build/
 meson-logs/
 
@@ -11,9 +13,10 @@ meson-logs/
 *.o
 *.obj
 
-# Editor / OS
+# Editor / OS / AI tool local state
 .vscode/
 .idea/
+.workbuddy/
 *.swp
 Thumbs.db
 Desktop.ini
@@ -25,6 +28,3 @@ Desktop.ini
 
 # Upstream reference clones (kept as working copies, not published)
 upstream/
-
-# WorkBuddy workspace state (project memory / task data)
-.workbuddy/

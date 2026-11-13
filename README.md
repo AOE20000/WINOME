@@ -10,15 +10,15 @@
 ```
 .
 ├── WINOME/          # 主工程（meson 构建根，C++ 宿主 + GTK4 UI + St 引擎）
+├── docs/            # 项目开发文档（环境、架构、主题管线、踩坑记录与开发日志）
+├── extracted/       # 从上游提取、经 WINOME 修改的参考模块（去掉了上游 git）
+│   ├── GMONE-Shell/ # Shell 外观（Sass 主题 + SVG）+ 布局/日期/动画算法参考
+│   └── WinOverview/ # 旧概览方案（DLL 注入，已退役，仅参考）
 ├── upstream/        # 上游完整仓库（独立 git，仅供参考/更新提取）
-│   ├── gnome-shell/   # GNOME Shell（GPL-2.0-or-later）
-│   ├── Seelen-UI/     # 启发实现（AGPL-3.0-or-later，仅致谢，不派生）
-│   └── WinOverview/   # GNOME 概览复刻（GPL-2.0）
-├── extracted/       # 从上游提取、经 WINOME 修改的模块（去掉了上游 git）
-│   ├── WinOverview/   # 旧概览方案（DLL 注入，已退役，仅参考）
-│   └── GMONE-Shell/   # Shell 外观（Sass 主题 + SVG）+ 布局/日期/动画算法
+│   ├── gnome-shell/ # GNOME Shell（GPL-2.0-or-later）
+│   ├── Seelen-UI/   # 启发实现（AGPL-3.0-or-later，仅致谢，不派生）
+│   └── WinOverview/ # GNOME 概览复刻（GPL-2.0）
 ├── build.sh         # 交互式构建程序（生产/测试/调试方案）
-├── ENV.md           # 开发环境说明（MSYS2 UCRT64 + GTK4）
 └── LICENSE / README.md
 ```
 
@@ -31,7 +31,7 @@
 
 ## 构建（MSYS2 UCRT64）
 
-推荐使用根目录的交互式构建程序：
+推荐使用根目录的交互式构建程序（环境配置与已知构建问题见 [docs/build-and-env.md](docs/build-and-env.md)）：
 
 ```bash
 ./build.sh          # 交互式菜单
@@ -40,13 +40,13 @@
 
 | 方案 | 配置 | 构建目录 | 说明 |
 |------|------|----------|------|
-| `release` 生产 | release + LTO + NDEBUG | `build-release/` | 最小体积、最快指令（约 1.3MB） |
-| `test` 测试 | debugoptimized | `build/` | 项目默认，保留 `g_print` 诊断日志 |
-| `debug` 调试 | debug（-O0 -g） | `build-debug/` | GDB 友好 |
+| `release` 生产 | release + LTO + NDEBUG | `WINOME/build-release/` | 最小体积、最快指令（约 1.3MB） |
+| `test` 测试 | debugoptimized | `WINOME/build/` | 项目默认，保留 `g_print` 诊断日志 |
+| `debug` 调试 | debug（-O0 -g） | `WINOME/build-debug/` | GDB 友好 |
 
 其他子命令：`./build.sh run`（运行最近构建）、`./build.sh clean`（清理全部构建目录）。三方案独立目录，切换互不触发重编。
 
-也可手动构建（等价于测试方案）：
+也可手动构建（等价于测试方案，注意先设置 ASCII 临时目录，详见 [docs/build-and-env.md](docs/build-and-env.md)）：
 
 ```bash
 cd WINOME
@@ -65,12 +65,12 @@ ninja -C build
 - [x] 面板全屏自动隐藏（真全屏/锁屏），桌面/最大化/Alt-Tab 切换器下保持显示
 - [x] 面板隐藏于 Alt-Tab 与任务栏（`WS_EX_TOOLWINDOW`）
 - [x] 宿主为 GUI 程序（无终端窗口），stdout/stderr 写入 `%TEMP%\winome.log`
-- [x] 快速设置/日历弹出窗重新接入：点击状态区打开 GNOME 快速设置（电量+操作按钮、音量/亮度滑块、8 个开关胶囊），点击时钟打开日历；弹出窗为自绘无边框顶层窗口，面板下方 + 屏幕侧边留有稳定间隙，概览打开时自动关闭、在概览上打开时置顶
+- [x] 快速设置/日历弹出窗重新接入：点击状态区打开快速设置（电量+操作按钮、音量/亮度滑块、8 个开关胶囊），点击时钟打开日历；弹出窗为自绘无边框顶层窗口，面板下方 + 屏幕侧边留有稳定间隙，概览打开时自动关闭、在概览上打开时置顶
 - [x] 概览层级集成：顶栏与弹出窗浮于概览之上（概览让出顶栏条带），概览打开时顶栏底色变为透明（GNOME 风格），面板/弹出窗上的点击不会让概览误判为空白而关闭
 - [x] 真实数据源：电量（`GetSystemPowerStatus`）、音量（WASAPI，滑块实时调节 + 图标动态）、网络（`InternetGetConnectedState`）、锁屏（`LockWorkStation`）
 - [x] **Windows 虚拟桌面兼容**：Win11 22621/24H2 COM 接口枚举/切换桌面、窗口归属查询；概览按桌面过滤窗口、工作区缩略图行点击切换桌面
 - [x] **原生概览重写**：overviewControls.js WINDOW_PICKER 布局逐组件移植（搜索栏/工作区背景/窗口网格/dash/悬停 chrome），DWM 缩略图飞入动画
-- [x] 性能优化：动画走帧时钟（`gtk_widget_add_tick_callback`，vblank 对齐）、z-order 重排漂移门控（空闲零 `SetWindowPos` churn）、状态图标跳过无谓重绘、发布构建 LTO + NDEBUG（详见 [WINOME/README.md](WINOME/README.md) 性能章节）
+- [x] 性能优化：动画走帧时钟（`gtk_widget_add_tick_callback`，vblank 对齐）、z-order 重排漂移门控（空闲零 `SetWindowPos` churn）、状态图标跳过无谓重绘、发布构建 LTO + NDEBUG（详见 [docs/architecture.md](docs/architecture.md)）
 - [x] 快速设置二级菜单：电源模式（节能/均衡/性能，真实切换 Windows 电源方案）与电源菜单（挂起/注销/重启/关机）
 - [x] Wi-Fi 真实数据源（Wlan API）：SSID/信号强度/可见网络枚举，点击切换网络
 - [ ] 二级菜单（蓝牙设备）、日历面板重构、蓝牙真实数据
@@ -89,9 +89,14 @@ ninja -C build
 | **Alt+Tab** | 切换窗口（透传，切换器不被抑制） |
 | **Esc** | 关闭概览 |
 
-## 架构说明
+## 文档导航
 
-详见 [WINOME/README.md](WINOME/README.md)。
+完整开发文档已统一收口至 [docs/README.md](docs/README.md)：
+
+- 开发环境与构建排障：[docs/build-and-env.md](docs/build-and-env.md)
+- 系统架构、概览与数据源：[docs/architecture.md](docs/architecture.md)
+- 主题管线、St 引擎与 UI 规范：[docs/theme-and-ui.md](docs/theme-and-ui.md)
+- 硬约束与踩坑备忘：[docs/pitfalls.md](docs/pitfalls.md)
 
 ## 权限要求
 

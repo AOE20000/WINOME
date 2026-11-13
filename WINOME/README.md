@@ -1,351 +1,45 @@
-# WINOME
+# WINOME 主工程
 
-在 Microsoft Windows 上用 Windows 原生功能支撑的 GNOME Shell UI 复刻。
+本目录是 WINOME 的 Meson 构建根目录（C++17 宿主进程 + GTK4 UI + St CSS 引擎复刻）。
 
-- **宿主进程**：C++（`src/`），GTK4 UI
-- **隐藏/替换 Windows 原生界面**：`src/native-taskbar.cpp` + `src/win-event-hook.cpp`（独立实现）
-- **概览（Activities）**：`src/overview.cpp` 宿主进程内 GTK4 渲染 + DWM 缩略图（旧 DLL 注入方案已退役）
-- **虚拟桌面**：`src/virtual-desktop.cpp`（移植 VirtualDesktopAccessor-rust 的 COM 接口）
-- **外观与布局算法参考**：`../extracted/GMONE-Shell/`（Sass 主题 + JS 算法）
-- **St CSS 引擎**：`st-compat/`（libcroco + st-theme-node，运行时查询 GNOME 样式）
+> 项目功能状态清单与快捷键说明统一维护在仓库根目录 [README.md](../README.md)；完整设计、环境与踩坑文档请查阅 [docs/README.md](../docs/README.md)。
 
-## 构建（MSYS2 UCRT64）
+## 目录结构
 
-统一使用仓库根目录的交互式构建程序 `../build.sh`：
-
-```bash
-./build.sh            # 交互式菜单（显示各方案产物状态）
-./build.sh release    # 生产：release + LTO + NDEBUG  -> build-release/
-./build.sh test       # 测试：debugoptimized (项目默认) -> build/
-./build.sh debug      # 调试：debug -O0 -g              -> build-debug/
-./build.sh run        # 运行最近构建的 winome.exe
-./build.sh clean      # 清理全部构建目录
-```
-
-三方案使用**独立构建目录**，切换互不触发重编；LTO 安全（COM 接口走运行时 `vcall` 裸函数指针，链接器无法去虚拟化）。中文用户名环境下脚本自动处理 gcc 临时目录编码问题。
-
-手动构建（等价于测试方案）：
-
-```bash
-meson setup build
-ninja -C build
-./build/src/winome.exe   # 需管理员权限运行
-```
-
-## 当前状态
-
-- [x] Phase 0：宿主进程骨架 + 顶部面板占位（GTK4），可编译运行
-- [x] 隐藏原生任务栏（`src/native-taskbar.cpp`，独立实现）
-- [x] 桌面层嵌入 WorkerW（`src/desktop-layer.cpp`，独立实现）
-- [x] 事件钩子防止任务栏/通知中心/XAML 浮窗重现（`src/win-event-hook.cpp`；**保留全屏 Alt-Tab/任务视图切换器**）
-- [x] 接入 WinOverview 概览（**Win 键** / **左上角热角**触发，`src/overview-trigger.cpp` + `src/hot-corner.cpp`）
-- [x] 概览增强：显示**最小化窗口**（恢复矩形、无离屏飞入）、排除 WINOME 面板、让出顶栏条带（面板保持可见）
-- [x] 面板：置顶全宽顶栏，GNOME 主题精确复刻（Activities 圆点按钮 + 时钟 + 状态区图标 + 悬停/点击动画）
-- [x] 面板保留工作区（`SPI_SETWORKAREA`）：最大化/全屏应用停在面板下方（像任务栏保留底部）
-- [x] 面板全屏自动隐藏（`src/fullscreen-watcher.cpp`）：真全屏/锁屏隐藏，桌面/最大化/概览/Alt-Tab 切换器下保持显示
-- [x] 面板隐藏于 Alt-Tab 与任务栏（`WS_EX_TOOLWINDOW`，GDK 重置后周期性重断言）
-- [x] 宿主为 GUI 程序（`win_subsystem: 'windows'`），stdout/stderr 写入 `%TEMP%\winome.log`
-- [x] 快速设置面板：GNOME 完整布局——电量+操作按钮顶行、音量/亮度滑块（整行，accent 进度 + 白色圆手柄）、8 个开关（WLAN/蓝牙/电源模式/夜间模式/深色主题/勿扰/键盘/飞行模式，菜单型开关带 `>` 分隔 + 二级箭头，accent 选中态）
-- [x] 真实数据源：电量（`GetSystemPowerStatus`）、音量（WASAPI `IAudioEndpointVolume`，滑块实时调节 + 图标动态）、网络（**Wlan API**：SSID + 信号强度 + 可见网络枚举/切换，见下方 Wi-Fi 章节）、锁屏（`LockWorkStation`）
-- [x] 时钟 UTF-8 修复（改用 `GDateTime`，避免 strftime 的 GBK `%p` 触发 Pango 报错）
-- [x] 快捷键：Win = 概览、**左上角热角** = 打开概览、Win+Tab = 开始菜单、其余 Win 组合键/Alt+Tab 透传、Esc = 关闭概览
-- [x] 快速设置/日历弹出窗重新接入（点击状态区打开快速设置、点击时钟打开日历）：自绘无边框顶层窗口，右侧对齐/时钟居中、面板下方 8px + 屏幕侧边 12px 稳定间隙；WH_MOUSE_LL 钩子处理外部点击关闭；打开时置顶（概览上方）；概览打开时自动关闭弹出窗、面板/弹出窗上的点击不转发给概览
-- [x] 概览层级集成：概览打开时面板加 `.overview` 类使顶栏底色透明（`#panel.overview { background-color: transparent }`，对应原生 `#panel:overview`），顶栏与弹出窗浮于概览之上且可交互
-- [x] **原生概览重写**（`src/overview.cpp`，替代旧 DLL 注入）：overviewControls.js WINDOW_PICKER 布局逐行移植——搜索栏（24em 药丸）、工作区背景（保持工作区纵横比的居中盒子 + cover 壁纸 + 0→30px 圆角插值）、窗口网格（`UnalignedLayoutStrategy`，含 chrome oversize 有效间距）、dash、悬停 chrome（预览放大 + 64px 应用图标 + 标题胶囊 + 关闭按钮，750ms 空闲隐藏）
-- [x] 概览开合动画：`Overview.ANIMATION_TIME` 250ms（开 EASE_OUT_SINE / 关 EASE_OUT_QUAD）；窗口从真实位置飞入槽位，最小化窗口从角落展开 + 淡入；布局 idle 用 `G_PRIORITY_HIGH_IDLE` 抢在重绘前执行，杜绝首帧黑闪
-- [x] **Windows 虚拟桌面兼容**（`src/virtual-desktop.cpp`，移植 VirtualDesktopAccessor-rust）：Win11 22621/24H2 COM 接口（ImmersiveShell → IVirtualDesktopManagerInternal），枚举/切换桌面、窗口归属查询
-- [x] **工作区缩略图**（`src/overview-thumbs.cpp`，workspaceThumbnail.js 移植）：>1 桌面时显示壁纸药丸行（4px 圆角 + 活动桌面 3px accent 指示器），药丸内含各桌面窗口的 DWM 迷你预览；点击切换桌面（概览保持打开），Win+Ctrl+←/→ 外部切换时 400ms 轮询跟随重排
-- [x] **工作区切换动画**（workspacesView.js `_scrollToActive` 移植）：概览内切换桌面时新旧桌面预览同步横向滑动（250ms EASE_OUT_CUBIC），背景盒随行、缩略图指示器连续插值滑动
-- [x] **工作区切换 OSD**（`src/ws-osd.cpp`，workspaceSwitcherPopup.js 移植）：概览外 Win+Ctrl+←/→ 切换时主屏底部显示 GNOME 风格圆点指示器（100ms 淡入 / 600ms 常驻 / 100ms 淡出）
-- [x] 概览内可打开快速设置/日历（弹出窗浮于概览之上，关闭弹窗的外部点击不再连带关闭概览——对应 GNOME 菜单 grab 吞点击）
-- [x] 性能优化：动画走帧时钟（vblank 对齐）、z-order 重排漂移门控、状态图标跳过无谓重绘、悬停药丸位置守卫、发布构建 LTO + NDEBUG（详见下方「性能」章节）
-- [x] **快速设置二级菜单**（`quick-settings.cpp` + `power-modes.cpp`）：`.quick-toggle-menu-button` 的 `>` 箭头接上真实点击回调，复用主题已有的 `.popup-menu` / `.popup-menu-item`（20px 圆角卡片 + 12px 条目圆角）渲染二级菜单浮层；**电源模式菜单**（节能/均衡/性能，`PowrProf` 切换 Windows 电源方案，当前方案打勾）与**电源菜单**（挂起/注销/重启/关机，接 `.power-item` 电池胶囊点击）
-- [x] **Wi-Fi 二级菜单**（`quick-settings.cpp` + `wifi-networks.cpp`）：列出可见网络（`SSID   72%` 格式、加密网络用锁形图标、当前网络打勾），点击用已存 profile 连接（`WlanConnect`，不弹凭据框，对应 GNOME 对已保存网络的行为）；开关子标题显示真实 SSID，隐藏网络显示 "Not Connected"
-- [ ] 二级菜单（蓝牙设备，日历面板重构，蓝牙真实数据）
-- [ ] 概览搜索（应用/窗口检索）
-
-## 快捷键
-
-| 按键 | 行为 |
+| 路径 | 说明 |
 |------|------|
-| **Win**（单独按下松开） | 切换概览 |
-| **鼠标移到左上角热角** | 打开概览（`src/hot-corner.cpp`，主显示器左上角，带 2s 冷却） |
-| **Win+Tab** | 打开开始菜单 |
-| **Win+E / Win+R / Win+D …** | 透传给 Windows（组合键保留） |
-| **Win+Alt+Tab** | 任务视图（透传） |
-| **Win+Ctrl+←/→** | 切换虚拟桌面（透传；概览打开时自动跟随重排） |
-| **Alt+Tab** | 切换窗口（透传，切换器不被抑制） |
-| **Esc** | 关闭概览 |
+| `src/` | 宿主进程与各 UI / Win32 集成模块（产出 `winome.exe`） |
+| `src/theme/` | 上游 `gnome-shell-dark.css` 真源、Cantarell 字体及 GResource 构建配置 |
+| `st-compat/` | 提取自 GNOME Shell / libcroco 的 St CSS 解析与属性求值引擎（去 Clutter/Cogl） |
+| `tools/` | St → GTK4 样式转换器（`convert-st-css.py`）、`st-css-eval` 及样式/结构自检脚本 |
+| `meson.build` / `meson.options` | Meson 构建配置 |
+| `LICENSE` / `THIRD-PARTY-NOTICES` | 许可证与上游第三方声明 |
 
-> Win 键实现：钩子吞掉 Win keydown 阻止系统打开开始菜单；裸 Win 在 keyup 判定后切换概览；检测到组合键时重新注入带标记的 Win（`dwExtraInfo`），系统照常处理 Win+E 等；Win+Tab 用 `SendInput` 合成裸 Win 打开开始菜单。
+## 构建
 
-## 架构说明
+推荐使用仓库根目录的构建脚本（详见 [docs/build-and-env.md](../docs/build-and-env.md)）：
 
-宿主进程（`winome.exe`）启动时：
-
-1. `setup_log_file()` — 重定向 stdout/stderr 到 `%TEMP%\winome.log`（GUI 程序，无终端窗口）
-2. `set_process_dpi_aware()` — 每显示器 DPI 感知 v2
-3. `enable_privilege(SeTcbPrivilege)` — 提权（隐藏任务栏需要）
-4. `NativeTaskbar::hide()` — `SHAppBarMessage(ABM_SETSTATE)` + `ShowWindowAsync(SW_HIDE)`，事件驱动看守线程应对 Explorer 重建
-5. `start_win_event_hook()` — `SetWinEventHook` 分别注册 `EVENT_OBJECT_CREATE/SHOW/UNCLOAKED`：任务栏/通知中心/非全屏 XAML 浮窗重现时再次隐藏；**全屏 XAML island（Alt-Tab/任务视图切换器）放行**
-6. `start_overview_trigger()` — `WH_KEYBOARD_LL` 钩子：裸 **Win** 切换概览、Win+Tab 打开开始菜单、其余 Win 组合键/Alt+Tab 透传（概览在本进程内 GTK 渲染，详见下节）；Esc 关闭
-7. 创建 GTK4 面板窗口（置顶全宽顶栏，时钟/Activities/快速设置）：`SetWindowPos(HWND_TOPMOST)` 定位到**主显示器原点**；`WS_EX_TOOLWINDOW` 使其隐藏于 Alt-Tab/任务栏；`SPI_SETWORKAREA` 保留顶栏条带（应用停在面板下方）；`start_fullscreen_watcher()` 每 400ms 检查前台窗口（真全屏/锁屏隐藏面板，同时重断言 `WS_EX_TOOLWINDOW` 并按需重排概览层级——漂移门控，z-order 正确时零开销）+ 轮询虚拟桌面切换；`start_hot_corner()` 每 100ms 轮询光标，进入左上角热角打开概览
-8. 退出时恢复工作区与 `NativeTaskbar::restore()` — 仅当本进程隐藏过才恢复
-
-构建产物（`build/` 下）：
-- `src/winome.exe` — 宿主进程（概览同进程渲染，无 DLL/注入）
-
-### 概览（`src/overview.cpp`，宿主进程内）
-
-对 gnome-shell `js/ui/overviewControls.js` WINDOW_PICKER 状态的逐组件移植：
-
-- **布局**（`ControlsManagerLayout` + `WorkspacesView`）：搜索栏居中（24em）；工作区缩略图行（>1 桌面时，上限为工作区高度 5%）；工作区盒与工作区同纵横比、居中（`_getFirstFitSingleWorkspaceBox`）；dash 底部居中（16% 高度上限）；z 序按 `ControlsManager.add_child`——背景在 dash/搜索栏之上（开合动画中它们从背景边缘后浮现）
-- **窗口网格**（`overview-layout.cpp`，`UnalignedLayoutStrategy` 1:1 移植）：`lerp(1.5,1)` 窗口缩放、行搜索最优 scale/space、`WINDOW_PREVIEW_MAXIMUM_SCALE` 0.95、像素对齐；有效间距 = 主题 6px + windowPreview chrome oversize（关闭按钮半高/图标外沿 + 5px）
-- **DWM 缩略图**：`DwmRegisterThumbnail` 挂在概览顶层窗口上（要求顶层目标），飞入动画 = 逐帧 `DWM_TNP_RECTDESTINATION` 插值；挂起的 UWP（cloaked）窗口按桌面归属过滤后同样渲染
-- **悬停 chrome**（windowPreview.js）：预览中心放大 10px（200ms EASE_OUT_QUAD）；64px 应用图标（WM_GETICON / IShellItemImageFactory，独立透明窗口承载于缩略图之上）、标题胶囊、右上 32px 关闭按钮；离开 750ms 后淡出；关闭按钮发 `WM_CLOSE` 后重排
-- **开合动画**：250ms（开 EASE_OUT_SINE / 关 EASE_OUT_QUAD）；背景在全工作区（圆角 0）与工作区盒（圆角 30）间插值，窗口反向飞回原位，缩略图行淡入淡出；窗口 `gtk_window_fullscreen` 创建（surface 尺寸即显示器，无 resize 增长）；关闭后保留控件几何使重开首帧即壁纸铺满工作区
-- **层级契约**：popover > panel > 概览 chrome 窗口 > 概览窗口 > 应用 > 壁纸，由 fullscreen-watcher 每 400ms 重断言（漂移门控：链完整时跳过 `SetWindowPos`）；概览窗口 `WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW|WS_EX_TOPMOST`
-- **概览内弹出窗**：快速设置/日历可直接在概览上方打开（GNOME 原生行为）；关闭弹窗的外部点击被吞并（菜单 grab 语义），不会连带关闭概览
-
-### 快速设置二级菜单（`quick-settings.cpp` + `power-modes.cpp`）
-
-`QuickMenuToggle` 的 `>` 箭头原本只有外观。现状：
-
-- **浮层复用主题既有样式**：`gnome-shell-dark.css` 里 `.popup-menu` / `.popup-menu-content`
-  （6px padding、`#36363a` 底、20px 圆角）/ `.popup-menu-item`（12px 圆角、active 时
-  `lighten(#424247,9%)`）全部齐备，二级菜单直接套用，无需新增 CSS
-- **点击区域独立**：箭头是外层 `GtkToggleButton` 内的 `GtkBox`，其 `GtkGestureClick`
-  设为 **`GTK_PHASE_CAPTURE`** 并在 `pressed` 里 `gtk_gesture_set_state(CLAIMED)`，
-  确保点箭头开菜单**不会**误触发开关
-- **浮层是真窗口**：`winome_shell_panel_open_menu()` 复用快速设置那套自绘顶层窗口
-  （shadow-wrap 卡片 + `WH_MOUSE_LL` 外部点击关闭 + 置顶重断言 + Cantarell 字体表）
-- **定位照抄 `BoxPointer._reposition()`**（`upstream/js/ui/boxpointer.js:480`）：
-  ```
-  margin  = 4*arrow_border_radius + arrow_border_width + arrow_base = 109
-  resX = anchorCenterX - (margin/2 + (width - margin) * alignment)   // alignment 0.5
-  resX = clamp(resX, workarea.x + arrow_rise,
-                    workarea.x + workarea.width - (arrow_rise + width))
-  resY = anchorBottom + boxpointer_gap                                // 4px
-  ```
-  主题值：`-arrow-rise 10px`、`-boxpointer-gap 4px`、`-arrow-border-radius 22px`、
-  `-arrow-border-width 1px`、`-arrow-base 20px`。
-  ⚠️ **不能简单按锚点右缘对齐**——`margin/2` 有 54px，照右缘放会整体偏出屏幕左缘
-- **`max-width` 必须映射到 `max-width`**：St 的 `width`/`height` 是下限 → GTK4
-  `min-*`；但 `max-*` **不能**也映射成 `min-*`。映射错的后果很隐蔽：
-  `.quick-toggle { min-width: 12em; max-width: 12em }`（GNOME 的**固定宽度**
-  toggle 网格）会变成两条 `min-width`，上限丢失 → 每个胶囊按文字伸缩 →
-  **面板的视觉节奏（"层次"）垮掉**。修前产物 `max-width` 出现 0 次，修后 5 次。
-- **卡片只有一层**：上游 `.quick-toggle-menu { @extend %card }`（`#47474c` 底、
-  24px 圆角、`margin: 12px 0 0`）**本身就是卡片**，条目直接放在
-  `.popup-menu-box` 里。若再套一层 `.popup-menu-content` 或
-  `.quick-settings-popover-card`，会出现双层圆角底色（截图里的发灰边框）
-- **锚点取整颗胶囊**：`panel_popover_anchor_rect` 对菜单会向上找到
-  `GtkToggleButton`，否则点胶囊别处会立刻把刚开的菜单关掉
-- **菜单每次打开重建**：`object-select-symbolic` 勾选标记因此始终反映当前电源方案
-- **必须有 header**（`quickSettings.js:389` `QuickToggleMenu._init`）：菜单顶部是
-  `setHeader()` 建的 `.header` 网格——**圆形图标徽章 + 标题 + 副标题**，
-  这正是 GNOME 50 每个二级菜单顶部那个大圆标的来源。样式表里
-  `.quick-toggle-menu .header` 的规则**一直都在**（`.icon` 的
-  `border-radius: 999px` / `padding: 9px` / `.active` 蓝色填充、
-  `.header` 的 `padding-bottom: 12px`），缺的只是 C++ 侧的节点结构。
-  `winome_quick_menu_new_full()` 负责建它；三个菜单分别对应上游的
-  `setHeader('system-shutdown-symbolic', 'Power Off Menu')`、
-  `('network-wireless-symbolic', 'Wi-Fi', <SSID 或 Not Connected>)`、
-  `(<当前方案图标>, 'Power Mode', <当前方案名>)`
-- **菜单 box 自己带卡片样式**：上游 `this.box` 是 popup menu box，
-  `.quick-toggle-menu` 是**它自己的 style class**（含 `@extend %card`）。
-  所以 `popup-menu-box` 和 `quick-toggle-menu` 两个类加在**同一个** GtkBox 上，
-  item 直接作为其子节点——不要再套一层 `.popup-menu-content`（双层圆角）
-- **电源模式**（`power-modes.cpp`，PowrProf）：三档对应 Windows 三个标准电源方案
-  GUID（节能 `a1841308…` / 均衡 `381b4222…` / 性能 `8c5e7fda…`）；均衡在
-  Windows 11 还有一个随机化 GUID（`b9a9a03a…`）一并识别；`PowerEnumerate` 探测
-  方案是否存在，缺失的档位不显示；无法识别时回退显示"均衡"
-- **电源菜单**：挂起（`SetSuspendState`）/ 注销 / 重启 / 关机，挂在 `.power-item`
-  电池胶囊上（GNOME 的电源入口），保持原布局不加 `>` 箭头
-- WLAN / 蓝牙 / 键盘三个箭头暂为装饰，等 Wlan API 与蓝牙 API 接入（见待办）
-
-### Wi-Fi 数据源（`wifi-networks.cpp`）
-
-系统状态里的网络指示器与 Wi-Fi 二级菜单共用这个模块，基于原生 Wlan API：
-
-- **`wlanapi.dll` 动态加载**：该 DLL 由系统按需加载，无线网卡的机器上才有；直接静态
-  链接会让无网卡机器启动失败（`LoadLibrary` 进不去）。用 `LoadLibraryW` +
-  `GetProcAddress` 解析 `WlanOpenHandle`/`WlanEnumInterfaces`/`WlanQueryInterface`/
-  `WlanGetAvailableNetworkList`/`WlanConnect`/`WlanDisconnect`/`WlanFreeMemory`，
-  缺失时整个模块安静降级（指示器隐藏、箭头菜单不出现）
-- **进程级客户端句柄**：`WlanOpenHandle` 有驱动往返开销且是会话级的，开一次后常驻，
-  不在每次查询时开关
-- **取当前连接**：`WlanQueryInterface(wlan_intf_opcode_current_connection)` 拿
-  `WLAN_CONNECTION_ATTRIBUTES`，SSID + `wlanSignalQuality`（0..100）
-- **枚举可见网络**：`WlanGetAvailableNetworkList`（第三参是保留位，传 0），
-  菜单里按 GNOME 格式渲染 `SSID   72%`，加密网络用锁形图标
-- **切换网络**：`WlanConnect` 用已存 profile 连接，不弹凭据框；关联是异步的，
-  由 2s 状态轮询自然刷新，不额外起回调
-- **SSID 编码**：`ucSSID` 是**原始字节**而非文本，802.11 规范不规定编码；实际部署
-  中 UTF-8（Windows 对中文 SSID 就是这么编码）与 Latin-1 都有。`uSSIDLength` 是
-  **字节数**，所以直接 memcpy 只对 ASCII 安全——4 个汉字是 12 字节，会截断成乱码。
-  `copy_ssid` 先按 UTF-8 校验（有效则保留），失败再按 Latin-1 展开（永不失败）；
-  含 NUL 字节则判定为隐藏网络（字节不是名字），留空不显示
-- **SSID 缓冲区 97 字节**：32 字节 SSID 若全为多字节 UTF-8 展开可达 96 字节
-- **同 SSID 去重**：Windows 按 BSSID 返回条目，一个 SSID 被多个 AP
-  （漫游候选、mesh）广播时会出现多行。合并同名，保留最强信号
-- **列表范围受 Windows 扫描缓存影响**：实测同一接口有时返回完整列表（含周边
-  多个网络），有时只返回当前连接的 AP 的若干 BSSID。这是驱动侧行为，
-  `dwFlags` 不影响（文档中该参数为保留位），菜单每次打开重新查询即可
-
-### 虚拟桌面（`src/virtual-desktop.cpp`）
-
-移植 [VirtualDesktopAccessor-rust](https://github.com/Ciantic/VirtualDesktopAccessor)（MIT）的 COM 接口定义，Win11 22621/24H2 验证：
-
-- `CoIncrementMTAUsage`（MTA 常驻）→ `CLSID_ImmersiveShell` → `QueryService` 取 `IVirtualDesktopManagerInternal`（枚举/切换）+ `IVirtualDesktopManager`（窗口归属）
-- **布局兼容 22621 与 24H2**：接口 IID 相同（53F5CA0B），但 24H2 在 slot 10 插入了 `switch_desktop_and_move_foreground_view`，其后所有槽位 +1（如 `find_desktop` 22621=slot 13 / 24H2=slot 14）。winome 只调用偏移区之前的稳定槽位：`GetDesktops`/`GetCurrentDesktop`/`SwitchDesktop`——桌面切换经 `GetAt(index)` 解析，绝不使用 `find_desktop`
-- **调用顺序**：先枚举再查当前桌面（22621 上直接先调 `GetCurrentDesktop` 会使 explorer 服务挂起）
-- **所有 COM 调用走裸 vtable**（运行时函数指针）：GCC -O2 会对全纯虚接口结构做去虚拟化（本翻译单元无派生类），把调用替换成 `__cxa_pure_virtual`，而 MinGW 链接器把该弱符号解析到垃圾地址 `0x100000000`——运行时跳转到镜像基址下方 256MB（某 DLL 基址）即 SIGSEGV。裸调用无法被去虚拟化
-- **专用 COM 线程**：所有调用 marshalled 到单个工作线程（上游注释："VD COM Objects don't like being called from different threads rapidly"）；主线程等待**完成**（非取走）并带 8s 超时——explorer 端死锁（如低完整性调用方）时放弃并永久禁用模块，概览回退单工作区布局，绝不冻结 UI
-- 不可用环境（旧版本 Windows / explorer 死锁）下安静降级：`desktops()` 返回空，概览布局与单工作区完全一致
-- **窗口固定到所有桌面**（`pin_window`，Win11 `IVirtualDesktopPinnedApps` IID 4CE81583 + `IApplicationViewCollection` IID 1841C6D7，`GetViewForHwnd`→`PinView`）：shell 全部顶层窗口（面板/概览/chrome/弹出窗/OSD）跨桌面常驻——否则 `Win+Ctrl+←/→` 时整个 shell 跟着旧桌面滑走，再被 400ms z-order 重断言拉回新桌面（"跟随移动后才恢复"）。`main.cpp` 启动 3s 后枚举本进程可见窗口统一 pin，并用 `SetWinEventHook(EVENT_OBJECT_SHOW)` 对后续出现的窗口（popover/OSD/概览 chrome）事件驱动补 pin；pin 服务不可达时只禁用 pin，不影响其余 VD 功能
-
-### 工作区缩略图（`src/overview-thumbs.cpp`）
-
-`workspaceThumbnail.js` ThumbnailsBox 的视觉移植：每桌面一枚 4px 圆角壁纸药丸（cover 渲染），活动桌面套 3px accent（#3584e4）8px 圆角指示器；缩放 `min(hScale, vScale, 0.05)`；主题值（spacing/padding 6px、#46464e）经 St 引擎查询。药丸内的窗口迷你预览 = 窗口矩形裁剪到工作区后按药丸缩放系数放置的 DWM 缩略图。点击药丸 → `SwitchDesktop` → 概览原地重排（概览保持打开，GNOME 行为）。
-
-### 工作区切换动画与 OSD
-
-- **概览内切换**（`overview.cpp` `switch_workspace_animated`，workspacesView.js `_scrollToActive` 移植）：点击药丸或外部切换（Win+Ctrl+←/→）时，旧桌面的 DWM 预览移入离场组继续渲染，新桌面重建后两侧同步滑动——**250ms EASE_OUT_CUBIC**（`WORKSPACE_SWITCH_TIME`）：新组从目标方向滑入、旧组反向滑出、工作区背景盒随行平移、缩略图 accent 指示器在两个药丸间连续插值（`overview_thumbs_set_indicator_value`，对应 upstream 读取 scroll adjustment 的 `indicatorUpperWs/indicatorLowerWs` 插值）。完成时销毁离场缩略图并 snap。开/合动画进行中会推迟切换（下轮 400ms 轮询补上）；窗口关闭等普通重排会立即 snap 进行中的切换
-- **概览外 OSD**（`src/ws-osd.cpp`，workspaceSwitcherPopup.js 移植）：Win+Ctrl+←/→ 在概览外切换桌面时，主显示器底部中央（4em 边距）显示胶囊形 OSD——`%osd_panel`（lighten(#222226,5%) 底、1px transparentize(white,0.98) 边、999px 圆角）内一排 32px 单元的圆点指示器：活动桌面 10.67px 实心白点、其余 5.33px 半透明白点（`.ws-switcher-indicator` 的 active padding/margin 差异）。**100ms EASE_OUT_QUAD 淡入 → 600ms 常驻（`DISPLAY_TIMEOUT`）→ 100ms 淡出**；连续切换重置计时且不重播淡入。概览打开期间不触发（upstream 仅 mutter 的切换动作驱动此弹窗）。切换检测为 400ms 轮询 `current_index`（桌面计数每 ~5s 刷新一次）；首次 COM 枚举延迟到启动 2 秒后，避开 explorer RPC 死锁（非管理员）时的 8s 超时阻塞
-
-### 概览与面板的协作（本进程实现）
-
-- **排除 WINOME 自身窗口**：概览枚举用 `is_our_process()` 过滤本进程窗口（面板/弹出窗/概览 chrome 不进缩略图）；旧 DLL 方案的 `IsWinomeHostWindow` 跨进程标题匹配已随 DLL 退役
-- **最小化窗口**：`GetWindowPlacement().rcNormalPosition` 作为矩形（`GetWindowRect` 对最小化返回离屏坐标）、按恢复矩形归属显示器；打开动画从工作区角落展开 + 淡入（对应 `showing_on_its_workspace() == false` 分支）；点击时先 `SW_RESTORE` 再 `SetForegroundWindow`
-- **顶层缩略图**：DWM 要求目标是顶层窗口，概览本体即顶层窗口，缩略图天然与概览同级渲染；关闭按钮/应用图标等交互件放在独立的 chrome 透明窗口（`WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW|WS_EX_TOPMOST`）浮于缩略图之上
-
-主题处理（`src/theme/meson.build` + `tools/` + `st-compat/`）：
-
-**双 CSS 管线**：
-1. `gnome-shell-dark.css`（sassc 编译 GNOME SCSS 的产物，提交在 `src/theme/`）——**原始 CSS，含 St 专属属性**
-2. 它同时供两个消费者使用：
-   - **St CSS 引擎**（`st-compat/`，libcroco + st-theme-node 复刻）：运行时解析原始 CSS，精确查询任意 St 属性（`icon-size`、`spacing`、`-natural-hpadding`、颜色、em 换算、级联继承），供 C++ 代码应用
-   - **GTK4 渲染**（`tools/convert-st-css.py` → `gnome-shell-gtk4.css`）：把 St 专属属性映射/丢弃为 GTK4 等价（`height`→`min-height`、`-natural-hpadding`→`padding-left/right`），结果 0 个 GTK4 解析报错
-3. GResource 同时打包两份 CSS：原始版给 St 引擎，转换版给 GTK4
-
-### St CSS 引擎复刻（`st-compat/`）
-
-完整抽取 GNOME 的 St 样式引擎（非补丁），让 WINOME 能**运行时精确查询** GNOME 主题属性，与旧版 GNOME 行为逐字节一致：
-
-| 组件 | 来源 | 说明 |
-|------|------|------|
-| `croco/` | libcroco | CSS 解析器（21 个 .c，纯 GLib） |
-| `st-theme.c` | gnome-shell | 样式表加载 + 级联 |
-| `st-theme-node.c` | gnome-shell | 属性求值（4565 行核心，选择器匹配/em 换算/继承） |
-| `st-shadow.c`、`st-border-image.c`、`st-icon-colors.c`、`st-types.h` | gnome-shell | 数据类型 |
-| `st-compat.h` | WINOME | CoglColor/ClutterActorBox shim（去 Clutter/Cogl 依赖） |
-| `st-compat-impl.c` | WINOME | StThemeContext/StSettings 极简实现 |
-| `src/st-engine.{h,cpp}` | WINOME | C++ 绑定（StEngine 加载 + Node 查询，支持父链复合选择器） |
-
-`extract-st-tokens.py`（旧的构建期正则提取）已删除，被 St 引擎运行时查询取代。
-
-### St → GTK4 的差异处理（`convert-st-css.py`，仅用于 GTK4 渲染）
-
-颜色求值（`st-mix()`/`st-lighten()`/`st-darken()`/`st-transparentize()`/`-st-accent-color`）**委托给 `st-css-eval` 工具**（链接 st-compat，复用 St 的 C 实现，结果与 GNOME 逐字节一致），而非在 Python 里复刻。
-
-| GNOME (St) | GTK4 等价处理 |
-|------------|--------------|
-| `st-mix()/st-lighten()/st-darken()/st-transparentize()` | 委托 `st-css-eval`（St 原生颜色数学） |
-| `-st-accent-color` / `-st-accent-fg-color` | 委托 `st-css-eval`（读 StThemeContext accent 色 #3584e4 / #fff） |
-| `box-shadow: inset 0 0 0 100px <c>`（背景填充 hack） | 翻译成 `background-color: <c>`（GTK4 大 spread box-shadow 渲染有 bug） |
-| `height`/`width` | `min-height`/`min-width`（GTK4 无 height/width） |
-| `-natural-hpadding` | `padding-left` + `padding-right` |
-| `:insensitive` 伪类 | `:disabled` |
-| **省略的 `transition-property`** | **补默认值**。St 省略它时默认为 `background-color`，所以 `_common.scss` 里满地的 `%menuitem { transition-duration: 100ms; }`（只写时长）在 GNOME 里会动；**GTK4 无此默认值，缺 `transition-property` 的声明直接失效** → hover 硬跳变。`inject_transition_property()` 按块补 `background-color, color, border-color, box-shadow` |
-| `:overview`/`:unlock-screen` 等状态伪类 | 整条规则丢弃（剥离会误应用到默认态） |
-| `!important` | 剥离（GTK4 对 box-shadow 等不支持） |
-
-### 覆盖率自检（`tools/check-st-css-coverage.py`）
-
-前几轮出过三次静默丢失（`transition-property` 默认值、`max-width` 被映射成
-`min-width`、`box-shadow` 未声明）。它们**都不报任何警告**，只表现为「看着不对劲」。
-这个脚本把「谁记得去查样式表」变成构建步骤，四类检查：
-
-| 检查 | 抓什么 |
-|------|--------|
-| coverage | 上游属性既不在 RENAME/EXPAND/DROP、也不在 `GTK4_NATIVE` → 静默丢弃 |
-| pass-through | 声明为 GTK4 原生却没进产物 → 被吃掉 |
-| semantics | 同时设 `min-width`+`max-width` 的规则，产物缺 `max-width` → 上限丢失 |
-| transitions | 产物里带 `transition-duration` 的规则数 > 带 `transition-property` 的 → hover 硬跳 |
-
-三张表直接从 `convert-st-css.py` 正则读取，**两者不可能不一致**；
-`GTK4_NATIVE` 必须显式列举（而非"未知的都透传"），这样新的 St 专有属性会报缺口。
-
-```sh
-python tools/check-st-css-coverage.py     src/theme/gnome-shell-dark.css build/src/theme/gnome-shell-gtk4.css
+```bash
+../build.sh            # 交互式菜单（显示各方案产物状态）
+../build.sh release    # 生产：release + LTO + NDEBUG -> build-release/
+../build.sh test       # 测试：debugoptimized (默认)   -> build/
+../build.sh debug      # 调试：debug -O0 -g            -> build-debug/
+../build.sh run        # 运行最近构建的 winome.exe
+../build.sh clean      # 清理全部构建目录
 ```
 
-非零退出码可直接卡构建。当前结果：
-`OK 83 upstream properties all accounted for; 40 reached the GTK4 stylesheet.`
+手工调用 Meson / Ninja 前请注意在 MSYS2 UCRT64 下设置 ASCII 临时目录，并在重编前清理陈旧的 `st-compat/libstcompat.a`（详见 [docs/build-and-env.md](../docs/build-and-env.md)）。
 
-⚠️ **写检查器时它先漏判了两次，都靠"故意制造缺陷"发现**：
-① `max-width` 被重写成 `min-width` 时，因为 `min-width` 在 `GTK4_NATIVE` 里而被放行
-→ 改为**数量**比较；② `transition-property` 永远有 2 处（转换器的面板硬编码补丁），
-所以存在性检查失效 → 也改为数量比较。
-**任何新检查项都必须用"注入已知缺陷"验证它真能报错。**
+## 文档延伸阅读
 
-> `inject_transition_property()` 是**纯文本后处理**，挂在 `main()` 写文件之前，
-> 不碰主解析循环。实现要点：块的闭合有两种形式——独立的 `}` 行，或挂在最后一条
-> 声明上（`padding: 9px 12px; }`），**两种都要认**，否则漏掉
-> `.popup-menu-item` 这种写法。改动此脚本时务必用
-> `diff` 对比新旧产物，确认只有新增行、没有删除行。
+- [系统架构与各子系统实现](../docs/architecture.md)
+- [双 CSS 主题管线、动效层与快速设置规范](../docs/theme-and-ui.md)
+- [硬约束、Win32/GTK4 踩坑与开发约定](../docs/pitfalls.md)
 
-### `:checked` 是当前最大的样式缺口
+## 权限与日志
 
-`PSEUDO_CLASS_MAP` 只映射了 `:insensitive → :disabled`，**`:checked` 未处理**。
-`_quick-settings.scss:23` 的 `.quick-toggle:checked { @extend %default_button }`
-决定了 GNOME 50 的标志性观感——**蓝色实心药丸**（`-st-accent-color` = `#3584e4`）。
-拿不到这个状态伪类，就只能在 C++ 里手动设色，那正是"手写而非移植"。
-
-正确做法是让 `GtkToggleButton` 的 `:checked` 状态**自然驱动**样式，
-而不是在 C++ 里 `gtk_widget_set_opacity` / 改 background 硬凑。
-
-### 动画层（`src/easing.cpp`）
-
-GTK4 **无原生动画框架**（无 `GtkAnimation`，`gtkstylecontext.h` 无 transition API），
-而 GNOME 动效全部走 Clutter 的 `Clutter.EaseFunction`。`easing.cpp` 补这一层：
-
-- **曲线**：Clutter `clutter-easing.c` 的标准 cubic-bezier。默认 `ease_out_cubic`
-  = `(0.215, 0.61, 0.355, 1.0)`；`ease_out_back = (0.34, 1.56, 0.64, 1.0)` 在
-  t≈0.6 过冲到 **1.10** 再回落——这就是 GNOME 菜单的"沉降"感。求解用
-  Newton-Raphson + 二分兜底（`ease_out_back` 导数趋零，Newton 会停滞）
-- **驱动**：`gtk_widget_add_tick_callback`（与 vblank 对齐，不用 16ms 定时器），
-  tween 状态随 widget 销毁自然释放
-- **时长照抄上游**：`quickSettings.js:17` `POPUP_ANIMATION_TIME = 400`、
-  `boxpointer.js:14` `= 150`
-- **菜单开合是两阶段串行**（`quickSettings.js:464` open / `:500` close）：
-  open = 高度补间 → 完成后淡入；close = 淡出 → 完成后收起隐藏。
-  ⚠️ **窗口不能提前 `set_visible(FALSE)`**——会掉出 topmost 队形且动画不可见。
-  关闭用 opacity→0 + 延迟隐藏，且回调**只持 window 引用、不碰 `PanelPopover`**
-  （后者由 window 的 destroy handler 释放，动画可能比它活得久）
-
-### C++ 侧的关键适配（`shell-panel.cpp`）
-
-- **widget 树复刻 GNOME**：Activities = `.panel-button` 按钮内含 `workspace-dot` 圆点；时钟 = `.panel-button.clock-display` 按钮内含 `.clock` label（高亮在子元素上）；状态区 = `.panel-button` 按钮内含 `.panel-status-indicators-box` + 图标。时钟/图标继承按钮的白色前景。
-- **`gtk_widget_set_focus_on_click(FALSE)`**：GNOME 的 `:focus`/`:hover` 共用高亮，但 GTK4 点击会让按钮持续 `:focus` 导致高亮"粘住"，必须禁用点击聚焦。
-- **St 属性运行时查询**：`status_icon_size()`/`status_indicators_spacing()` 通过 St 引擎按 `#panel .panel-button .system-status-icon` 等复合选择器查询 icon-size/spacing，替代硬编码。
-
-## 性能
-
-- **动画走帧时钟**：概览开合动画（`anim_tick`）与悬停缩放/淡入动画（`hover_anim_tick`）使用 `gtk_widget_add_tick_callback`（GdkFrameClock），与显示器 vblank 对齐——替代固定 16ms `g_timeout_add` 定时器，消除与刷新率的节拍错位；动画结束回调自动停止，空闲零开销
-- **z-order 重排漂移门控**：400ms 周期性重断言（fullscreen-watcher）前先经 `zorder_drifted()` 用 `GetWindow(GW_HWNDPREV)` 校验 popover > panel > chrome > overview 链——链完整时直接返回，不再无条件发送 `SWP_FRAMECHANGED`（每次都强制 `WM_NCCALCSIZE` 往返并重排 topmost 带）；漂移时行为与旧逻辑一致
-- **状态图标跳过无谓重绘**：网络/音量/电池图标（2s 轮询）经 `set_icon_name_if_changed` 保护——`gtk_image_set_from_icon_name` 即使名字未变也会使渲染节点失效排队重绘
-- **悬停标题药丸位置守卫**：`hover_layout_chrome` 中 `gtk_fixed_move` 即使坐标不变也会排队整容器 relayout，fade-only 帧跳过
-- **GPU 渲染**：GTK 默认按表面智能选择渲染器，关键窗口（概览/面板）由 OpenGL (ngl) 在硬件 GPU 上绘制；`[gpu]` 诊断日志输出渲染器类型与 GL 厂商供排查
-- **内存基线-开发构建**：Pango fontmap 启动时枚举全系统字体构建内存数据库（290 族 ≈450MB），约 6 秒爬升后终身稳定驻留，非泄漏；已实测与渲染器（cairo 同价）、动画 tick、窗口数均无关。减小字体库（卸载不用的字体）可线性降低该基线。
-- **内存基线-生产构建**：约 30MB，无异常占用。
-
-## 权限要求
-
-- 隐藏任务栏、操作 Explorer 窗口需要**管理员权限**运行 `winome.exe`
-- 虚拟桌面 COM 接口对低完整性调用方可能死锁（explorer 端 RPC 不响应）：未提权运行时 VD 模块在 8s 超时后自动禁用，概览回退单工作区布局（不崩溃、不冻结）；**提权运行则完整可用**
-- `SeTcbPrivilege` 由 `enable_privilege` 尝试启用
+- 隐藏原生任务栏、操作 Explorer 窗口与完整访问虚拟桌面 COM 接口需要**管理员权限**运行 `winome.exe`（未提权时虚拟桌面模块在 8s 超时后自动降级为单工作区，不崩溃、不冻结）。
+- 宿主以 GUI 子系统构建（无终端窗口），诊断输出写入 `%TEMP%\winome.log`。
 
 ## 许可
 

@@ -103,6 +103,12 @@ struct TweenState {
   std::function<void()> on_complete;
 };
 
+static void
+tween_state_destroy (gpointer data)
+{
+  delete static_cast<TweenState *> (data);
+}
+
 void
 apply_value (GtkWidget *widget, const TweenTarget &target, double value)
 {
@@ -145,9 +151,11 @@ on_tick (GtkWidget *widget, GdkFrameClock *clock G_GNUC_UNUSED, gpointer data)
     return G_SOURCE_CONTINUE;
 
   // Finished: apply the exact target (so no rounding residue) then detach.
+  // Move on_complete out before running it because G_SOURCE_REMOVE invokes the
+  // tick callback's GDestroyNotify, and cb() itself may destroy widget early.
   apply_value (widget, st->target, st->target.to);
-  auto cb = st->on_complete;
-  delete st;
+  st->widget = nullptr;
+  auto cb = std::move (st->on_complete);
   if (cb)
     cb ();
   return G_SOURCE_REMOVE;
@@ -200,7 +208,7 @@ tween_property (GtkWidget *widget, const TweenTarget &target,
   st->ease = ease;
   st->on_complete = std::move (on_complete);
 
-  gtk_widget_add_tick_callback (widget, on_tick, st, nullptr);
+  gtk_widget_add_tick_callback (widget, on_tick, st, tween_state_destroy);
 }
 
 void

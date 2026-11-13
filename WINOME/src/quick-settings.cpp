@@ -120,21 +120,26 @@ make_quick_toggle (const char *icon_name, const char *title,
 // (a Clutter.BindConstraint on Y with offset = sourceActor.height), so the
 // menu hangs directly under the row that opened it.
 
+typedef struct {
+  WinomeMenuItemCallback callback;
+  gpointer               user_data;
+} QuickMenuItemData;
+
 // Build one `.popup-menu-item` row. Items with a callback become clickable.
 static void
 on_quick_menu_item_activated (GtkGestureClick *gesture, int n_press,
                               double x, double y, gpointer user_data)
 {
-  const WinomeMenuEntry *entry =
-      static_cast<const WinomeMenuEntry *>(user_data);
+  const QuickMenuItemData *data =
+      static_cast<const QuickMenuItemData *> (user_data);
 
   (void)gesture;
   (void)n_press;
   (void)x;
   (void)y;
 
-  if (entry->callback != NULL)
-    entry->callback (entry->user_data);
+  if (data->callback != NULL)
+    data->callback (data->user_data);
 }
 
 static GtkWidget *
@@ -180,14 +185,18 @@ make_quick_menu_item (const WinomeMenuEntry *entry)
   }
 
   if (entry->callback != NULL) {
+    QuickMenuItemData *data = g_new0 (QuickMenuItemData, 1);
+    data->callback = entry->callback;
+    data->user_data = entry->user_data;
+    // Tie lifetime to the menu item widget; callers often pass stack-allocated
+    // WinomeMenuEntry arrays when constructing the menu.
+    g_object_set_data_full (G_OBJECT (item), "menu-item-data", data, g_free);
+
     GtkGesture *click = gtk_gesture_click_new ();
 
     gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), 0);
-    // The entries array outlives the widget it builds (the caller owns it for
-    // the lifetime of the panel), so passing the entry pointer is safe.
     g_signal_connect (click, "pressed",
-                      G_CALLBACK (on_quick_menu_item_activated),
-                      (gpointer) entry);
+                      G_CALLBACK (on_quick_menu_item_activated), data);
     gtk_widget_add_controller (item, GTK_EVENT_CONTROLLER (click));
   }
 
@@ -273,15 +282,22 @@ build_quick_menu_full (const WinomeMenuEntry *entries, guint n_entries,
   GtkWidget *header;
   guint i;
 
-  menu = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
-  gtk_widget_add_css_class (menu, "popup-menu-box");
-  gtk_widget_add_css_class (menu, "quick-toggle-menu");
-  gtk_widget_set_halign (menu, GTK_ALIGN_START);
+// Structure mirrors QuickToggleMenu (quickSettings.js:363). PopupMenuBase
+// builds `this.box` as a vertical St.BoxLayout with x_expand: true and sets its
+// style class to the one passed to super() — 'quick-toggle-menu' here
+// (popupMenu.js:640-647). So the box carries exactly one class and expands
+// rather than hugging its content.
+//
+// Note there is no `.popup-menu-box` rule in the stylesheet — a class by that
+// name would style nothing.
+menu = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+gtk_widget_add_css_class (menu, "quick-toggle-menu");
+gtk_widget_set_hexpand (menu, TRUE);
 
-  header = build_quick_menu_header (header_icon, header_title,
-                                    header_subtitle, header_active);
-  if (header != NULL)
-    gtk_box_append (GTK_BOX (menu), header);
+header = build_quick_menu_header (header_icon, header_title,
+                                  header_subtitle, header_active);
+if (header != NULL)
+  gtk_box_append (GTK_BOX (menu), header);
 
   for (i = 0; i < n_entries; i++) {
     GtkWidget *item = make_quick_menu_item (&entries[i]);
@@ -1321,12 +1337,6 @@ on_power_item_clicked (GtkButton *button, gpointer user_data)
   default_quick_menu_open (GTK_WIDGET (button), menu, NULL);
 }
 
-// Per-toggle menu context: the builder callback gets a pointer back to the
-// panel so menu items can refresh it (e.g. after switching power mode).
-typedef struct {
-  GtkWidget *owner;   // the quick settings root
-} WinomePowerEntry;
-
 // Each row needs its own target mode, so wrap it in a tiny heap struct kept
 // alive for the lifetime of the panel (the menu is rebuilt per open).
 typedef struct {
@@ -1475,7 +1485,7 @@ build_wifi_menu (gpointer user_data)
 static GtkWidget *
 build_power_mode_menu (gpointer user_data)
 {
-  WinomePowerEntry *entry = static_cast<WinomePowerEntry *> (user_data);
+  GtkWidget *panel = GTK_WIDGET (user_data);
   WinomeMenuEntry items[WINOME_POWER_MODE_COUNT];
   PowerModeTarget *targets = g_new0 (PowerModeTarget, WINOME_POWER_MODE_COUNT);
   WinomePowerMode active = winome_power_get_active ();
@@ -1487,7 +1497,7 @@ build_power_mode_menu (gpointer user_data)
     if (!winome_power_mode_available (mode))
       continue;
     targets[n].mode = mode;
-    targets[n].panel = entry->owner;
+    targets[n].panel = panel;
     items[n].label = winome_power_mode_label (mode);
     items[n].icon_name = winome_power_mode_icon (mode);
     items[n].checked = (mode == active);
@@ -1598,7 +1608,6 @@ winome_quick_settings_new (void)
   {
     GtkWidget *wlan, *bluetooth, *powermode, *nightlight;
     GtkWidget *darkmode, *dnd, *keyboard, *airplane;
-    WinomePowerEntry power_ctx = { root };
     // The subtitle mirrors the active plan; fall back to Balanced when the
     // scheme cannot be read (no PowrProf / only OEM plans).
     WinomePowerMode detected = winome_power_get_active ();
@@ -1634,7 +1643,7 @@ winome_quick_settings_new (void)
     powermode = make_quick_menu_toggle ("power-profile-balanced-symbolic",
                                         tr ("Power Mode", "电源模式"),
                                         winome_power_mode_label (active_power),
-                                        build_power_mode_menu, &power_ctx);
+                                        build_power_mode_menu, root);
     winome_quick_settings_grid_attach (grid, powermode, 1);
 
     nightlight = make_quick_toggle ("night-light-symbolic",
