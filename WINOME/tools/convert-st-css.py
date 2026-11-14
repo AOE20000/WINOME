@@ -564,6 +564,11 @@ window#winomeToastWindow {
   background-color: transparent;
   box-shadow: none;
 }
+
+/* QuickToggleMenu inside its own BoxPointer window sits flush under the arrow. */
+window.quick-settings-popover-window .quick-toggle-menu {
+  margin-top: 0;
+}
 """
 
 # em values in the stylesheet resolve against the St theme context font

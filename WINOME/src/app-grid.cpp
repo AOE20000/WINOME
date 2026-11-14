@@ -5,6 +5,7 @@
 #include "app-index.h"
 #include "config.h"
 #include "i18n.h"
+#include "st-engine.h"
 
 #include <algorithm>
 #include <vector>
@@ -353,12 +354,21 @@ rebuild_page_contents (WinomeAppGrid *self)
   gtk_widget_set_visible (self->indicators_box, multi_page);
 
   if (multi_page) {
+    int dot_size = 10;
+    if (StEngine *e = StEngine::get ()) {
+      StEngine::Node ind (*e, nullptr, "", "page-indicator", "");
+      StEngine::Node icon (*e, &ind, "", "page-indicator-icon", "");
+      double v = 0.0;
+      if (icon.lookup_length ("width", &v) && v > 0.0)
+        dot_size = (int)(v + 0.5);
+    }
     for (int p = 0; p < slice.total_pages; ++p) {
       GtkWidget *dot_btn = gtk_button_new ();
       gtk_widget_set_name (dot_btn, "winome-page-dot");
       gtk_widget_add_css_class (dot_btn, "page-indicator");
       GtkWidget *dot = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
       gtk_widget_add_css_class (dot, "page-indicator-icon");
+      gtk_widget_set_size_request (dot, dot_size, dot_size);
       gtk_widget_set_opacity (dot, (p == slice.page) ? 1.0 : 0.35);
       gtk_button_set_child (GTK_BUTTON (dot_btn), dot);
 
@@ -411,10 +421,21 @@ winome_app_grid_init (WinomeAppGrid *self)
   gtk_widget_set_valign (self->center_box, GTK_ALIGN_CENTER);
   gtk_widget_set_hexpand (self->center_box, TRUE);
 
+  int grid_col_spacing = 12;
+  int grid_row_spacing = 12;
+  if (StEngine *e = StEngine::get ()) {
+    StEngine::Node grid_node (*e, nullptr, "", "icon-grid", "");
+    double v = 0.0;
+    if (grid_node.lookup_length ("column-spacing", &v) && v > 0.0)
+      grid_col_spacing = (int)(v + 0.5);
+    if (grid_node.lookup_length ("row-spacing", &v) && v > 0.0)
+      grid_row_spacing = (int)(v + 0.5);
+  }
+
   self->grid = gtk_grid_new ();
   gtk_widget_add_css_class (self->grid, "icon-grid");
-  gtk_grid_set_column_spacing (GTK_GRID (self->grid), 18);
-  gtk_grid_set_row_spacing (GTK_GRID (self->grid), 18);
+  gtk_grid_set_column_spacing (GTK_GRID (self->grid), grid_col_spacing);
+  gtk_grid_set_row_spacing (GTK_GRID (self->grid), grid_row_spacing);
   gtk_grid_set_column_homogeneous (GTK_GRID (self->grid), TRUE);
   gtk_grid_set_row_homogeneous (GTK_GRID (self->grid), TRUE);
   gtk_widget_set_halign (self->grid, GTK_ALIGN_CENTER);

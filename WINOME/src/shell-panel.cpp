@@ -424,6 +424,7 @@ typedef struct {
   GtkWidget *window;
   GtkWidget *button;
   GtkWidget *wrap;         // shadow-wrap around the card
+  GtkWidget *arrow_area;   // BoxPointer upward triangle
   GtkWidget *card;
   gboolean open;
   gboolean centered;       // calendar: center on the button (quick settings right-aligns)
@@ -431,6 +432,7 @@ typedef struct {
   // under the panel bar (QuickToggleMenu anchors to the toggle capsule).
   gboolean anchored_menu;
   RECT anchor_rect;        // the button's screen rect, for the close hook
+  int win_x;               // last positioned left edge in physical px
   gint raise_attempts;     // post-map re-assert counter (GDK re-lates late)
   guint raise_source_id;   // pending g_idle/g_timeout id for popover_raise_idle
 } PanelPopover;
@@ -569,6 +571,122 @@ panel_popover_anchor_rect (PanelPopover *pp)
 #define BOXPOINTER_GAP     4
 #define BOXPOINTER_PADDING 10
 
+struct BoxPointerTheme {
+  double arrow_rise = 6.0;
+  double arrow_base = 20.0;
+  double arrow_border_radius = 22.0;
+  double arrow_border_width = 1.0;
+  double gap = BOXPOINTER_GAP;
+  GdkRGBA panel_bg = {0x36 / 255.0f, 0x36 / 255.0f, 0x3a / 255.0f, 1.0f};
+  GdkRGBA menu_bg = {0x47 / 255.0f, 0x47 / 255.0f, 0x4c / 255.0f, 1.0f};
+  GdkRGBA border_color = {0x42 / 255.0f, 0x42 / 255.0f, 0x47 / 255.0f, 1.0f};
+  bool resolved = false;
+};
+
+static const BoxPointerTheme &
+boxpointer_theme (void)
+{
+  static BoxPointerTheme t;
+  if (t.resolved)
+    return t;
+  t.resolved = true;
+
+  winome::StEngine *e = panel_engine ();
+  if (e == nullptr)
+    return t;
+
+  winome::StEngine::Node bp (*e, nullptr, "", "popup-menu-boxpointer", "");
+  winome::StEngine::Node sub (*e, nullptr, "", "keyboard-subkeys-boxpointer", "");
+  auto lookup_bp = [&] (const char *prop, double *out) {
+    double v = 0.0;
+    if (bp.lookup_length (prop, &v) || sub.lookup_length (prop, &v))
+      *out = v;
+  };
+  lookup_bp ("-arrow-rise", &t.arrow_rise);
+  if (t.arrow_rise <= 0.0)
+    t.arrow_rise = 6.0;
+  lookup_bp ("-arrow-base", &t.arrow_base);
+  lookup_bp ("-arrow-border-radius", &t.arrow_border_radius);
+  lookup_bp ("-arrow-border-width", &t.arrow_border_width);
+  lookup_bp ("-boxpointer-gap", &t.gap);
+
+  std::string hex;
+  GdkRGBA rgba{};
+  winome::StEngine::Node content (*e, nullptr, "", "popup-menu-content", "");
+  if (content.lookup_color ("background-color", &hex) &&
+      gdk_rgba_parse (&rgba, hex.c_str ()))
+    t.panel_bg = rgba;
+  if (content.lookup_color ("border-color", &hex) &&
+      gdk_rgba_parse (&rgba, hex.c_str ()))
+    t.border_color = rgba;
+
+  winome::StEngine::Node qtm (*e, nullptr, "", "quick-toggle-menu", "");
+  if (qtm.lookup_color ("background-color", &hex) &&
+      gdk_rgba_parse (&rgba, hex.c_str ()))
+    t.menu_bg = rgba;
+
+  return t;
+}
+
+static int
+boxpointer_margin (const BoxPointerTheme &t)
+{
+  return (int)(4.0 * t.arrow_border_radius + t.arrow_border_width +
+               t.arrow_base + 0.5);
+}
+
+static void
+draw_popover_arrow (GtkDrawingArea *area, cairo_t *cr, int width, int height,
+                    gpointer data)
+{
+  PanelPopover *pp = static_cast<PanelPopover *> (data);
+  if (pp == nullptr || !pp->open || width <= 0 || height <= 0)
+    return;
+
+  const BoxPointerTheme &t = boxpointer_theme ();
+  int scale = gtk_widget_get_scale_factor (GTK_WIDGET (area));
+  if (scale <= 0)
+    scale = 1;
+
+  // .quick-settings-popover-shadow-wrap adds 6px left padding around the area.
+  double wrap_pad = 6.0;
+  double anchor_cx =
+      ((pp->anchor_rect.left + pp->anchor_rect.right) * 0.5 - pp->win_x) /
+          scale -
+      wrap_pad;
+  double corner_r = pp->anchored_menu ? 24.0 : (pp->centered ? 30.0 : 36.0);
+  double half_base = t.arrow_base * 0.5;
+  double min_cx = corner_r + half_base;
+  double max_cx = (double)width - corner_r - half_base;
+  double cx = (max_cx >= min_cx) ? CLAMP (anchor_cx, min_cx, max_cx)
+                                 : width * 0.5;
+
+  double x_left = cx - half_base;
+  double x_right = cx + half_base;
+  double tip_y = MAX (1.0, (double)height - t.arrow_rise + 1.0);
+  double base_y = (double)height;
+
+  const GdkRGBA &fill = pp->anchored_menu ? t.menu_bg : t.panel_bg;
+  cairo_move_to (cr, x_left, base_y);
+  cairo_line_to (cr, cx, tip_y);
+  cairo_line_to (cr, x_right, base_y);
+  cairo_close_path (cr);
+  cairo_set_source_rgba (cr, fill.red, fill.green, fill.blue, fill.alpha);
+  cairo_fill (cr);
+
+  // Panel cards draw a 1px border (#424247); stroke the slanted triangle legs
+  // to meet it cleanly. QuickToggleMenu uses a transparent border upstream.
+  if (!pp->anchored_menu) {
+    cairo_move_to (cr, x_left + 0.5, base_y - 0.5);
+    cairo_line_to (cr, cx, tip_y + 0.5);
+    cairo_line_to (cr, x_right - 0.5, base_y - 0.5);
+    cairo_set_source_rgba (cr, t.border_color.red, t.border_color.green,
+                           t.border_color.blue, t.border_color.alpha);
+    cairo_set_line_width (cr, t.arrow_border_width);
+    cairo_stroke (cr);
+  }
+}
+
 // Compute the popover's top-left corner (screen coordinates, physical px).
 // Returns FALSE if the geometry could not be determined.
 static gboolean
@@ -593,6 +711,11 @@ panel_popover_geometry (PanelPopover *pp, int width, int height,
     return FALSE;
   RECT wa = mi.rcMonitor;
 
+  const BoxPointerTheme &bt = boxpointer_theme ();
+  const int bp_margin = boxpointer_margin (bt);
+  const int bp_gap = (int)(bt.gap + 0.5);
+  const int bp_pad = MAX ((int)(bt.arrow_rise + 0.5), BOXPOINTER_PADDING);
+
   // Right-align for the quick settings; center on the clock for the calendar.
   int x;
   if (pp->anchored_menu) {
@@ -600,7 +723,7 @@ panel_popover_geometry (PanelPopover *pp, int width, int height,
     // centre, then clamp inside the monitor.
     const int anchor_center_x = (pp->anchor_rect.left + pp->anchor_rect.right) / 2;
     x = anchor_center_x -
-        (BOXPOINTER_MARGIN / 2 + (width - BOXPOINTER_MARGIN) / 2);
+        (bp_margin / 2 + (width - bp_margin) / 2);
   } else if (pp->centered) {
     x = (pp->anchor_rect.left + pp->anchor_rect.right) / 2 - width / 2;
   } else {
@@ -610,7 +733,7 @@ panel_popover_geometry (PanelPopover *pp, int width, int height,
   int y;
   if (pp->anchored_menu) {
     // Directly under the anchor capsule, separated by the boxpointer gap.
-    y = pp->anchor_rect.bottom + BOXPOINTER_GAP;
+    y = pp->anchor_rect.bottom + bp_gap;
   } else {
     // A stable gap below the panel (the panel spans the monitor top).
     y = pr.bottom + POPOVER_TOP_GAP;
@@ -618,12 +741,12 @@ panel_popover_geometry (PanelPopover *pp, int width, int height,
 
   // Clamp inside the monitor. The menu uses the arrow padding (10px) rather
   // than the panel-bar gap, matching BoxPointer's own bounds.
-  int x_min = wa.left + (pp->anchored_menu ? BOXPOINTER_PADDING
+  int x_min = wa.left + (pp->anchored_menu ? bp_pad
                                            : POPOVER_SCREEN_GAP);
   int x_max = MAX (x_min, wa.right - width -
-                   (pp->anchored_menu ? BOXPOINTER_PADDING
+                   (pp->anchored_menu ? bp_pad
                                       : POPOVER_SCREEN_GAP));
-  int y_min = pp->anchored_menu ? wa.top + BOXPOINTER_PADDING
+  int y_min = pp->anchored_menu ? wa.top + bp_pad
                                 : pr.bottom + POPOVER_TOP_GAP;
   int y_max = MAX (y_min, wa.bottom - height - POPOVER_SCREEN_GAP);
   *out_x = CLAMP (x, x_min, x_max);
@@ -743,6 +866,9 @@ popover_raise_idle (gpointer data)
                pp->raise_attempts, before.left, before.top, w, h,
                (int)IsWindowVisible (hwnd), (int)cloaked);
     if (w > 0 && h > 0 && panel_popover_geometry (pp, w, h, &x, &y)) {
+      pp->win_x = x;
+      if (pp->arrow_area != nullptr)
+        gtk_widget_queue_draw (pp->arrow_area);
       SetWindowPos (hwnd, HWND_TOPMOST, x, y, w, h,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
     }
@@ -818,6 +944,9 @@ panel_popover_open (PanelPopover *pp)
     int px_h = nat_h * scale;
     int x = 0, y = 0;
     if (panel_popover_geometry (pp, px_w, px_h, &x, &y)) {
+      pp->win_x = x;
+      if (pp->arrow_area != nullptr)
+        gtk_widget_queue_draw (pp->arrow_area);
       // Show + raise + activate so the popover is interactive (Esc, clicks).
       // SWP_FRAMECHANGED so the ex-style changes above take effect on the
       // banding immediately.
@@ -1044,6 +1173,15 @@ make_panel_popover (GtkWidget *button, GtkWidget *child, gboolean centered)
   GtkWidget *wrap = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class (wrap, "quick-settings-popover-shadow-wrap");
   pp->wrap = wrap;
+  pp->arrow_area = gtk_drawing_area_new ();
+  gtk_drawing_area_set_content_height (
+      GTK_DRAWING_AREA (pp->arrow_area),
+      (int)(boxpointer_theme ().arrow_rise + 0.5));
+  gtk_widget_set_margin_bottom (pp->arrow_area, -1);
+  gtk_drawing_area_set_draw_func (GTK_DRAWING_AREA (pp->arrow_area),
+                                  draw_popover_arrow, pp, nullptr);
+  gtk_box_append (GTK_BOX (wrap), pp->arrow_area);
+
   pp->card = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class (pp->card, "quick-settings-popover-card");
   if (centered)
@@ -1117,6 +1255,14 @@ winome_shell_panel_open_menu (GtkWidget *anchor, GtkWidget *menu)
   GtkWidget *wrap = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class (wrap, "quick-settings-popover-shadow-wrap");
   pp->wrap = wrap;
+  pp->arrow_area = gtk_drawing_area_new ();
+  gtk_drawing_area_set_content_height (
+      GTK_DRAWING_AREA (pp->arrow_area),
+      (int)(boxpointer_theme ().arrow_rise + 0.5));
+  gtk_widget_set_margin_bottom (pp->arrow_area, -1);
+  gtk_drawing_area_set_draw_func (GTK_DRAWING_AREA (pp->arrow_area),
+                                  draw_popover_arrow, pp, nullptr);
+  gtk_box_append (GTK_BOX (wrap), pp->arrow_area);
 
   // The menu IS the card upstream (`.quick-toggle-menu { @extend %card }`), so
   // put it in the shadow-wrap directly. Wrapping it in the quick-settings card

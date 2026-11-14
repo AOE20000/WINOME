@@ -7,6 +7,7 @@
 #include "easing.h"
 #include "fonts.h"
 #include "i18n.h"
+#include "st-engine.h"
 #include "system-status.h"
 
 #include <gtk/gtk.h>
@@ -101,6 +102,65 @@ void on_banner_close_clicked(GtkButton* btn G_GNUC_UNUSED,
     notifications_dismiss(key);
 }
 
+int lookup_msg_length(const char* child1,
+                      const char* child2,
+                      const char* prop,
+                      int fallback) {
+  StEngine* e = StEngine::get();
+  if (e == nullptr)
+    return fallback;
+  double v = 0.0;
+  StEngine::Node root(*e, nullptr, "", "message", "");
+  if (child1 == nullptr) {
+    if (root.lookup_length(prop, &v) && v > 0.0)
+      return static_cast<int>(v + 0.5);
+    return fallback;
+  }
+  StEngine::Node n1(*e, &root, "", child1, "");
+  if (child2 == nullptr) {
+    if (n1.lookup_length(prop, &v) && v > 0.0)
+      return static_cast<int>(v + 0.5);
+    return fallback;
+  }
+  StEngine::Node n2(*e, &n1, "", child2, "");
+  if (n2.lookup_length(prop, &v) && v > 0.0)
+    return static_cast<int>(v + 0.5);
+  return fallback;
+}
+
+int banner_header_spacing() {
+  return lookup_msg_length("message-header", nullptr, "spacing", 6);
+}
+
+int banner_source_icon_size() {
+  return lookup_msg_length("message-header", "message-source-icon", "icon-size",
+                           16);
+}
+
+int banner_box_spacing() {
+  return lookup_msg_length("message-box", nullptr, "spacing", 6);
+}
+
+int banner_content_spacing() {
+  return lookup_msg_length("message-box", "message-content", "spacing", 4);
+}
+
+int banner_themed_icon_size() {
+  return lookup_msg_length("message-box", "message-icon message-themed-icon",
+                           "icon-size", 16);
+}
+
+int banner_min_width() {
+  StEngine* e = StEngine::get();
+  if (e == nullptr)
+    return 360;
+  StEngine::Node n(*e, nullptr, "", "notification-banner", "");
+  double v = 0.0;
+  if (n.lookup_length("width", &v) && v > 0.0)
+    return static_cast<int>(v + 0.5);
+  return 360;
+}
+
 void position_banner_window(GtkWidget* window) {
   if (window == nullptr)
     return;
@@ -123,7 +183,7 @@ void position_banner_window(GtkWidget* window) {
                      &min_w, &nat_w, nullptr, nullptr);
   gtk_widget_measure(window, GTK_ORIENTATION_VERTICAL, nat_w,
                      &min_h, &nat_h, nullptr, nullptr);
-  int w = std::max(nat_w, 360);
+  int w = std::max(nat_w, banner_min_width());
   int h = std::max(nat_h, 64);
 
   HMONITOR mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
@@ -159,15 +219,15 @@ void ensure_banner_window() {
   gtk_widget_add_css_class(g_banner_wrap, "notification-banner");
   gtk_widget_add_css_class(g_banner_wrap, "message");
 
-  GtkWidget* header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  GtkWidget* header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, banner_header_spacing());
   gtk_widget_add_css_class(header, "message-header");
 
   GtkWidget* src_icon = gtk_image_new_from_icon_name("dialog-information-symbolic");
-  gtk_image_set_pixel_size(GTK_IMAGE(src_icon), 16);
+  gtk_image_set_pixel_size(GTK_IMAGE(src_icon), banner_source_icon_size());
   gtk_widget_add_css_class(src_icon, "message-source-icon");
   gtk_box_append(GTK_BOX(header), src_icon);
 
-  GtkWidget* header_content = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  GtkWidget* header_content = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, banner_header_spacing());
   gtk_widget_add_css_class(header_content, "message-header-content");
   gtk_widget_set_hexpand(header_content, TRUE);
 
@@ -185,16 +245,16 @@ void ensure_banner_window() {
   gtk_box_append(GTK_BOX(header), close_btn);
   gtk_box_append(GTK_BOX(g_banner_wrap), header);
 
-  GtkWidget* msg_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+  GtkWidget* msg_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, banner_box_spacing());
   gtk_widget_add_css_class(msg_box, "message-box");
 
   GtkWidget* icon = gtk_image_new_from_icon_name("preferences-system-notifications-symbolic");
-  gtk_image_set_pixel_size(GTK_IMAGE(icon), 24);
+  gtk_image_set_pixel_size(GTK_IMAGE(icon), banner_themed_icon_size());
   gtk_widget_add_css_class(icon, "message-icon");
   gtk_widget_add_css_class(icon, "message-themed-icon");
   gtk_box_append(GTK_BOX(msg_box), icon);
 
-  GtkWidget* content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+  GtkWidget* content = gtk_box_new(GTK_ORIENTATION_VERTICAL, banner_content_spacing());
   gtk_widget_add_css_class(content, "message-content");
   gtk_widget_set_hexpand(content, TRUE);
 

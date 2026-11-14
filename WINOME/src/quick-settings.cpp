@@ -14,6 +14,7 @@
 #include "i18n.h"
 #include "notifications.h"
 #include "settings-window.h"
+#include "st-engine.h"
 #include "system-status.h"
 #include "power-modes.h"
 #include "wifi-networks.h"
@@ -750,12 +751,69 @@ G_DEFINE_TYPE (WinomeQuickSlider, winome_quick_slider, GTK_TYPE_WIDGET)
 #define SLIDER_HANDLE_RADIUS 9.0
 #define SLIDER_TROUGH_HEIGHT 4.0
 
+struct SliderTheme {
+  double handle_radius = SLIDER_HANDLE_RADIUS;
+  double trough_height = SLIDER_TROUGH_HEIGHT;
+  GdkRGBA trough_color = {1.0f, 1.0f, 1.0f, 0.15f};
+  GdkRGBA highlight_color = {0.208f, 0.518f, 0.894f, 1.0f};
+  GdkRGBA handle_color = {1.0f, 1.0f, 1.0f, 1.0f};
+  bool resolved = false;
+};
+
+static const SliderTheme &
+get_slider_theme (void)
+{
+  static SliderTheme theme;
+  if (theme.resolved)
+    return theme;
+  theme.resolved = true;
+
+  winome::StEngine *e = winome::StEngine::get ();
+  if (e == nullptr)
+    return theme;
+
+  winome::StEngine::Node node (*e, nullptr, "", "slider", "");
+  double v = 0.0;
+  if (node.lookup_length ("-slider-handle-radius", &v) && v > 0.0)
+    theme.handle_radius = v;
+  if (node.lookup_length ("-barlevel-height", &v) && v > 0.0)
+    theme.trough_height = v;
+
+  std::string color_hex;
+  GdkRGBA parsed{};
+  if (node.lookup_color ("-barlevel-background-color", &color_hex) &&
+      gdk_rgba_parse (&parsed, color_hex.c_str ()))
+    theme.trough_color = parsed;
+  if (node.lookup_color ("-barlevel-active-background-color", &color_hex) &&
+      gdk_rgba_parse (&parsed, color_hex.c_str ()))
+    theme.highlight_color = parsed;
+  if (node.lookup_color ("color", &color_hex) &&
+      gdk_rgba_parse (&parsed, color_hex.c_str ()))
+    theme.handle_color = parsed;
+
+  return theme;
+}
+
+static int
+qs_grid_spacing (const char *prop, int fallback)
+{
+  winome::StEngine *e = winome::StEngine::get ();
+  if (e == nullptr)
+    return fallback;
+  winome::StEngine::Node grid (*e, nullptr, "", "quick-settings-grid", "");
+  double v = 0.0;
+  if (grid.lookup_length (prop, &v) && v > 0.0)
+    return (int)(v + 0.5);
+  return fallback;
+}
+
 static void
 winome_quick_slider_set_value_from_x (WinomeQuickSlider *self, double x)
 {
+  const SliderTheme &st = get_slider_theme ();
   int width = gtk_widget_get_width (GTK_WIDGET (self));
-  double min_x = SLIDER_HANDLE_RADIUS;
-  double max_x = width - SLIDER_HANDLE_RADIUS;
+  double min_x = st.handle_radius;
+  double max_x = width - st.handle_radius;
   double value;
 
   if (max_x <= min_x) {
@@ -813,38 +871,36 @@ static void
 winome_quick_slider_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
 {
   WinomeQuickSlider *self = WINOME_QUICK_SLIDER (widget);
+  const SliderTheme &st = get_slider_theme ();
   double w = gtk_widget_get_width (widget);
   double h = gtk_widget_get_height (widget);
   double cy = h / 2.0;
 
   // Handle center: value * (width - handle) + handle/2, clamped like native.
-  double cx = SLIDER_HANDLE_RADIUS +
+  double cx = st.handle_radius +
               CLAMP (self->value, 0.0, 1.0) *
-                  (w - 2.0 * SLIDER_HANDLE_RADIUS);
+                  (w - 2.0 * st.handle_radius);
+  float trough_r = (float)(st.trough_height / 2.0);
 
-  GdkRGBA trough_color = {1.0, 1.0, 1.0, 0.15};  // rgba(255,255,255,0.15)
-  GdkRGBA highlight_color = {0.208, 0.518, 0.894, 1.0};  // accent #3584e4
-  GdkRGBA handle_color = {1.0, 1.0, 1.0, 1.0};
-
-  // Trough: full width, 4px, rounded.
-  append_rounded_color (snapshot, &trough_color,
-                        0, cy - SLIDER_TROUGH_HEIGHT / 2.0,
-                        w, SLIDER_TROUGH_HEIGHT, 2.0);
+  // Trough: full width, rounded.
+  append_rounded_color (snapshot, &st.trough_color,
+                        0, cy - st.trough_height / 2.0,
+                        w, st.trough_height, trough_r);
 
   // Highlight: from the origin (0) to the handle.
   if (cx > 0)
-    append_rounded_color (snapshot, &highlight_color,
-                          0, cy - SLIDER_TROUGH_HEIGHT / 2.0,
-                          cx, SLIDER_TROUGH_HEIGHT, 2.0);
+    append_rounded_color (snapshot, &st.highlight_color,
+                          0, cy - st.trough_height / 2.0,
+                          cx, st.trough_height, trough_r);
 
-  // Handle: 18px white circle.
+  // Handle: white circle.
   if (w > 0)
-    append_rounded_color (snapshot, &handle_color,
-                          cx - SLIDER_HANDLE_RADIUS,
-                          cy - SLIDER_HANDLE_RADIUS,
-                          2.0 * SLIDER_HANDLE_RADIUS,
-                          2.0 * SLIDER_HANDLE_RADIUS,
-                          SLIDER_HANDLE_RADIUS);
+    append_rounded_color (snapshot, &st.handle_color,
+                          cx - st.handle_radius,
+                          cy - st.handle_radius,
+                          2.0 * st.handle_radius,
+                          2.0 * st.handle_radius,
+                          (float)st.handle_radius);
 }
 
 static void
@@ -854,12 +910,14 @@ winome_quick_slider_measure (GtkWidget *widget G_GNUC_UNUSED,
                              int *minimum, int *natural,
                              int *minimum_baseline, int *natural_baseline)
 {
+  const SliderTheme &st = get_slider_theme ();
   if (orientation == GTK_ORIENTATION_HORIZONTAL) {
     *minimum = 0;
     *natural = 150;
   } else {
-    *minimum = 2 * SLIDER_HANDLE_RADIUS + 4;
-    *natural = 2 * SLIDER_HANDLE_RADIUS + 4;
+    int h = (int)(2.0 * st.handle_radius + 4.0 + 0.5);
+    *minimum = h;
+    *natural = h;
   }
   if (minimum_baseline)
     *minimum_baseline = -1;
@@ -1345,8 +1403,8 @@ static void
 winome_quick_settings_grid_init (WinomeQuickSettingsGrid *self)
 {
   self->children = g_ptr_array_new_with_free_func (g_free);
-  self->row_spacing = 12;
-  self->column_spacing = 12;
+  self->row_spacing = qs_grid_spacing ("spacing-rows", 12);
+  self->column_spacing = qs_grid_spacing ("spacing-columns", 12);
 }
 
 static void

@@ -25,6 +25,7 @@
 #include "ws-osd.h"
 #include "fonts.h"
 #include "overview.h"
+#include "st-engine.h"
 #include "virtual-desktop.h"
 
 #include <gtk/gtk.h>
@@ -57,6 +58,66 @@ constexpr double kMarginBottom = 60.0;  // 4em @ 11pt
 constexpr double kOsdBgR = 0x2e / 255.0;
 constexpr double kOsdBgG = 0x2e / 255.0;
 constexpr double kOsdBgB = 0x33 / 255.0;
+
+struct OsdMetrics {
+  double padding_x = kPaddingX;
+  double padding_y = kPaddingY;
+  double spacing = kSpacing;
+  double unit = kUnit;
+  double dot_active = kDotActive;
+  double dot_inactive = kDotInactive;
+  double margin_bottom = kMarginBottom;
+  double bg_r = kOsdBgR;
+  double bg_g = kOsdBgG;
+  double bg_b = kOsdBgB;
+  bool resolved = false;
+};
+
+OsdMetrics g_osd_metrics;
+
+const OsdMetrics &
+osd_metrics ()
+{
+  if (g_osd_metrics.resolved)
+    return g_osd_metrics;
+  g_osd_metrics.resolved = true;
+
+  StEngine *e = StEngine::get ();
+  if (e == nullptr)
+    return g_osd_metrics;
+
+  StEngine::Node panel (*e, nullptr, "", "workspace-switcher", "");
+  double v = 0.0;
+  if (panel.lookup_length ("spacing", &v) && v > 0.0)
+    g_osd_metrics.spacing = v;
+  if (panel.lookup_length ("padding-top", &v) && v > 0.0)
+    g_osd_metrics.padding_y = v;
+  if (panel.lookup_length ("padding-left", &v) && v > 0.0)
+    g_osd_metrics.padding_x = v;
+  if (panel.lookup_length ("margin-bottom", &v) && v > 0.0)
+    g_osd_metrics.margin_bottom = v;
+  std::string bg_hex;
+  if (panel.lookup_color ("background-color", &bg_hex)) {
+    GdkRGBA rgba{};
+    if (gdk_rgba_parse (&rgba, bg_hex.c_str ())) {
+      g_osd_metrics.bg_r = rgba.red;
+      g_osd_metrics.bg_g = rgba.green;
+      g_osd_metrics.bg_b = rgba.blue;
+    }
+  }
+
+  StEngine::Node ind (*e, nullptr, "", "ws-switcher-indicator", "");
+  if (ind.lookup_length ("border-radius", &v) && v > 0.0)
+    g_osd_metrics.unit = v;
+  if (ind.lookup_length ("padding-top", &v) && v > 0.0)
+    g_osd_metrics.dot_inactive = 2.0 * v;
+
+  StEngine::Node ind_act (*e, nullptr, "", "ws-switcher-indicator", "active");
+  if (ind_act.lookup_length ("padding-top", &v) && v > 0.0)
+    g_osd_metrics.dot_active = 2.0 * v;
+
+  return g_osd_metrics;
+}
 
 GtkWidget *g_window = nullptr;
 GtkWidget *g_area = nullptr;
@@ -101,12 +162,13 @@ draw_osd (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   cairo_set_operator (cr, CAIRO_OPERATOR_OVER);
 
   // Capsule panel ($forced_circular_radius 999px clamps to height/2).
+  const OsdMetrics &m = osd_metrics ();
   double r = height / 2.0;
   cairo_new_sub_path (cr);
   cairo_arc (cr, width - r, r, r, -G_PI_2, G_PI_2);
   cairo_arc (cr, r, r, r, G_PI_2, 3 * G_PI_2);
   cairo_close_path (cr);
-  cairo_set_source_rgba (cr, kOsdBgR, kOsdBgG, kOsdBgB, 1.0 * f);
+  cairo_set_source_rgba (cr, m.bg_r, m.bg_g, m.bg_b, 1.0 * f);
   cairo_fill_preserve (cr);
   cairo_set_source_rgba (cr, 1.0, 1.0, 1.0, 0.02 * f);
   cairo_set_line_width (cr, 1.0);
@@ -114,16 +176,16 @@ draw_osd (GtkDrawingArea *area, cairo_t *cr, int width, int height,
 
   // One 32px unit per workspace; dots grow via the padding/margin pairs
   // from the stylesheet (drawn centered on the unit here).
-  double x = kPaddingX + kUnit / 2.0;
-  double cy = kPaddingY + kUnit / 2.0;
+  double x = m.padding_x + m.unit / 2.0;
+  double cy = m.padding_y + m.unit / 2.0;
   for (int i = 0; i < g_count; ++i) {
     bool active = i == g_active;
-    double dot = (active ? kDotActive : kDotInactive) / 2.0;
+    double dot = (active ? m.dot_active : m.dot_inactive) / 2.0;
     double alpha = (active ? 1.0 : 0.5) * f;
     cairo_set_source_rgba (cr, 1.0, 1.0, 1.0, alpha);
     cairo_arc (cr, x, cy, dot, 0.0, 2.0 * G_PI);
     cairo_fill (cr);
-    x += kUnit + kSpacing;
+    x += m.unit + m.spacing;
   }
 }
 
@@ -173,9 +235,10 @@ osd_present (void)
   if (g_window == nullptr)
     return;
 
+  const OsdMetrics &m = osd_metrics ();
   int n = std::max (g_count, 1);
-  int w = (int)(2 * kPaddingX + n * kUnit + (n - 1) * kSpacing + 0.5);
-  int h = (int)(2 * kPaddingY + kUnit + 0.5);
+  int w = (int)(2 * m.padding_x + n * m.unit + (n - 1) * m.spacing + 0.5);
+  int h = (int)(2 * m.padding_y + m.unit + 0.5);
   gtk_widget_set_size_request (g_area, w, h);
 
   if (g_hwnd == nullptr || !IsWindow (g_hwnd))
@@ -183,13 +246,14 @@ osd_present (void)
 
   POINT origin = {0, 0};
   HMONITOR mon = MonitorFromPoint (origin, MONITOR_DEFAULTTONEAREST);
-  MONITORINFO mi = {sizeof (mi)};
+  MONITORINFO mi = {};
+  mi.cbSize = sizeof (mi);
   if (!GetMonitorInfoW (mon, &mi))
     return;
 
   int scale = gtk_widget_get_scale_factor (g_window);
   int pw = w * scale, ph = h * scale;
-  int margin = (int)(kMarginBottom * scale);
+  int margin = (int)(m.margin_bottom * scale);
   int x = mi.rcMonitor.left + (mi.rcMonitor.right - mi.rcMonitor.left) / 2 -
           pw / 2;
   int y = mi.rcMonitor.bottom - margin - ph;

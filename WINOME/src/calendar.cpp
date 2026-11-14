@@ -5,6 +5,7 @@
 #include "quick-settings.h"
 #include "i18n.h"
 #include "notifications.h"
+#include "st-engine.h"
 #include "system-status.h"
 
 #include <windows.h>
@@ -21,6 +22,110 @@ static bool
 is_zh (void)
 {
   return winome::is_zh ();
+}
+
+static int
+lookup_cal_length (const char *parent_cls, const char *cls, const char *prop,
+                   int fallback)
+{
+  winome::StEngine *e = winome::StEngine::get ();
+  if (e == nullptr)
+    return fallback;
+  double v = 0.0;
+  if (parent_cls != nullptr) {
+    winome::StEngine::Node parent (*e, nullptr, "", parent_cls, "");
+    winome::StEngine::Node node (*e, &parent, "", cls, "");
+    if (node.lookup_length (prop, &v) && v > 0.0)
+      return (int)(v + 0.5);
+  } else {
+    winome::StEngine::Node node (*e, nullptr, "", cls, "");
+    if (node.lookup_length (prop, &v) && v > 0.0)
+      return (int)(v + 0.5);
+  }
+  return fallback;
+}
+
+static int
+cal_col_spacing (void)
+{
+  return lookup_cal_length (nullptr, "datemenu-calendar-column", "spacing", 6);
+}
+
+static int
+cal_displays_spacing (void)
+{
+  return lookup_cal_length ("datemenu-calendar-column",
+                            "datemenu-displays-box", "spacing", 6);
+}
+
+static int
+cal_events_list_spacing (void)
+{
+  winome::StEngine *e = winome::StEngine::get ();
+  if (e == nullptr)
+    return 6;
+  winome::StEngine::Node btn (*e, nullptr, "", "events-button", "");
+  winome::StEngine::Node box (*e, &btn, "", "events-box", "");
+  winome::StEngine::Node list (*e, &box, "", "events-list", "");
+  double v = 0.0;
+  if (list.lookup_length ("spacing", &v) && v > 0.0)
+    return (int)(v + 0.5);
+  return 6;
+}
+
+static int
+cal_msg_controls_spacing (void)
+{
+  return lookup_cal_length (nullptr, "message-list-controls", "spacing", 6);
+}
+
+static int
+cal_msg_header_spacing (void)
+{
+  return lookup_cal_length ("message", "message-header", "spacing", 6);
+}
+
+static int
+cal_msg_source_icon_size (void)
+{
+  winome::StEngine *e = winome::StEngine::get ();
+  if (e == nullptr)
+    return 16;
+  winome::StEngine::Node msg (*e, nullptr, "", "message", "");
+  winome::StEngine::Node hdr (*e, &msg, "", "message-header", "");
+  winome::StEngine::Node icon (*e, &hdr, "", "message-source-icon", "");
+  double v = 0.0;
+  if (icon.lookup_length ("icon-size", &v) && v > 0.0)
+    return (int)(v + 0.5);
+  return 16;
+}
+
+static int
+cal_msg_box_spacing (void)
+{
+  return lookup_cal_length ("message", "message-box", "spacing", 6);
+}
+
+static int
+cal_msg_content_spacing (void)
+{
+  winome::StEngine *e = winome::StEngine::get ();
+  if (e == nullptr)
+    return 4;
+  winome::StEngine::Node msg (*e, nullptr, "", "message", "");
+  winome::StEngine::Node box (*e, &msg, "", "message-box", "");
+  winome::StEngine::Node content (*e, &box, "", "message-content", "");
+  double v = 0.0;
+  if (content.lookup_length ("spacing", &v) && v > 0.0)
+    return (int)(v + 0.5);
+  return 4;
+}
+
+static int
+cal_media_icon_size (void)
+{
+  return lookup_cal_length ("media-message", "message-icon message-themed-icon",
+                            "icon-size", 32);
 }
 
 // Calendar state.
@@ -204,16 +309,16 @@ create_media_card (const winome::WinomeMediaInfo &media)
   gtk_widget_add_css_class (card, "message");
   gtk_widget_add_css_class (card, "media-message");
 
-  GtkWidget *row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 10);
+  GtkWidget *row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, cal_msg_box_spacing ());
   gtk_widget_add_css_class (row, "message-box");
 
   GtkWidget *art = gtk_image_new_from_icon_name ("audio-x-generic-symbolic");
-  gtk_image_set_pixel_size (GTK_IMAGE (art), 32);
+  gtk_image_set_pixel_size (GTK_IMAGE (art), cal_media_icon_size ());
   gtk_widget_add_css_class (art, "message-icon");
   gtk_widget_add_css_class (art, "message-themed-icon");
   gtk_box_append (GTK_BOX (row), art);
 
-  GtkWidget *info = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
+  GtkWidget *info = gtk_box_new (GTK_ORIENTATION_VERTICAL, cal_msg_content_spacing ());
   gtk_widget_add_css_class (info, "message-content");
   gtk_widget_set_hexpand (info, TRUE);
   gtk_widget_set_valign (info, GTK_ALIGN_CENTER);
@@ -277,11 +382,11 @@ create_notification_card (const winome::ShellNotification &notif,
   GtkWidget *card = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
   gtk_widget_add_css_class (card, "message");
 
-  GtkWidget *header = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
+  GtkWidget *header = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, cal_msg_header_spacing ());
   gtk_widget_add_css_class (header, "message-header");
 
   GtkWidget *src_icon = gtk_image_new_from_icon_name ("dialog-information-symbolic");
-  gtk_image_set_pixel_size (GTK_IMAGE (src_icon), 14);
+  gtk_image_set_pixel_size (GTK_IMAGE (src_icon), cal_msg_source_icon_size ());
   gtk_widget_add_css_class (src_icon, "message-source-icon");
   gtk_box_append (GTK_BOX (header), src_icon);
 
@@ -313,10 +418,10 @@ create_notification_card (const winome::ShellNotification &notif,
   gtk_box_append (GTK_BOX (header), close_btn);
   gtk_box_append (GTK_BOX (card), header);
 
-  GtkWidget *body_row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
+  GtkWidget *body_row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, cal_msg_box_spacing ());
   gtk_widget_add_css_class (body_row, "message-box");
 
-  GtkWidget *content = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
+  GtkWidget *content = gtk_box_new (GTK_ORIENTATION_VERTICAL, cal_msg_content_spacing ());
   gtk_widget_add_css_class (content, "message-content");
   gtk_widget_set_hexpand (content, TRUE);
 
@@ -447,8 +552,12 @@ calendar_rebuild (CalendarData *data)
         gtk_widget_add_css_class (button, "calendar-today");
 
       if (y == data->selected_year && m == data->selected_month + 1 &&
-          d == data->selected_day)
+          d == data->selected_day) {
         gtk_widget_add_css_class (button, "selected");
+        gtk_widget_set_state_flags (button, GTK_STATE_FLAG_SELECTED, FALSE);
+      } else {
+        gtk_widget_unset_state_flags (button, GTK_STATE_FLAG_SELECTED);
+      }
 
       g_object_set_data (G_OBJECT (button), "row", GINT_TO_POINTER (row));
       g_object_set_data (G_OBJECT (button), "day", GINT_TO_POINTER (d));
@@ -564,13 +673,16 @@ winome_calendar_new (void)
   gtk_box_append (GTK_BOX (placeholder), ph_label);
   gtk_box_append (GTK_BOX (msg_list), placeholder);
 
-  GtkWidget *controls = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
+  GtkWidget *controls = gtk_box_new (GTK_ORIENTATION_HORIZONTAL,
+                                   cal_msg_controls_spacing ());
   gtk_widget_add_css_class (controls, "message-list-controls");
 
   GtkWidget *dnd_label = gtk_label_new (is_zh () ? "勿扰模式" : "Do Not Disturb");
   gtk_box_append (GTK_BOX (controls), dnd_label);
 
   data->dnd_switch = gtk_switch_new ();
+  gtk_widget_add_css_class (data->dnd_switch, "toggle-switch");
+  gtk_widget_set_focus_on_click (data->dnd_switch, FALSE);
   gtk_widget_set_valign (data->dnd_switch, GTK_ALIGN_CENTER);
   g_signal_connect (data->dnd_switch, "state-set",
                     G_CALLBACK (on_datemenu_dnd_state_set), NULL);
@@ -593,7 +705,8 @@ winome_calendar_new (void)
   gtk_box_append (GTK_BOX (root), msg_list);
 
   // --- Right column: today header, calendar grid, events & world clocks ---
-  GtkWidget *cal_col = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
+  GtkWidget *cal_col = gtk_box_new (GTK_ORIENTATION_VERTICAL,
+                                  cal_col_spacing ());
   gtk_widget_add_css_class (cal_col, "datemenu-calendar-column");
 
   GtkWidget *today_btn = gtk_button_new ();
@@ -617,7 +730,8 @@ winome_calendar_new (void)
 
   gtk_box_append (GTK_BOX (cal_col), box);
 
-  GtkWidget *displays_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
+  GtkWidget *displays_box = gtk_box_new (GTK_ORIENTATION_VERTICAL,
+                                       cal_displays_spacing ());
   gtk_widget_add_css_class (displays_box, "datemenu-displays-box");
 
   GtkWidget *events_btn = gtk_button_new ();
@@ -633,7 +747,8 @@ winome_calendar_new (void)
   gtk_widget_set_halign (events_title, GTK_ALIGN_START);
   gtk_box_append (GTK_BOX (events_box), events_title);
 
-  GtkWidget *events_list = gtk_box_new (GTK_ORIENTATION_VERTICAL, 4);
+  GtkWidget *events_list = gtk_box_new (GTK_ORIENTATION_VERTICAL,
+                                      cal_events_list_spacing ());
   gtk_widget_add_css_class (events_list, "events-list");
   GtkWidget *events_ph = gtk_label_new (is_zh () ? "无事件" : "No Events");
   gtk_widget_add_css_class (events_ph, "event-placeholder");
