@@ -10,6 +10,7 @@
 //          light, dark mode, do-not-disturb, keyboard, airplane mode.
 
 #include "quick-settings.h"
+#include "easing.h"
 #include "fonts.h"
 #include "i18n.h"
 #include "notifications.h"
@@ -44,38 +45,47 @@ tr (const char *en, const char *zh)
 // QuickToggleMenu header badge (`.quick-toggle-menu .header .icon`).
 #define QUICK_HEADER_ICON_SIZE 24
 
+static GtkWidget *find_quick_settings_root (GtkWidget *widget);
+static gboolean quick_settings_is_menu_open_for (GtkWidget *quick_settings,
+                                                 GtkWidget *anchor);
+static void quick_settings_toggle_inline_menu (GtkWidget *quick_settings,
+                                               GtkWidget *anchor,
+                                               GtkWidget *menu);
+
 // --- QuickToggle -------------------------------------------------------------
 //
-// Standalone toggle, matching QuickToggle in quickSettings.js:
+// Standalone toggle (or non-toggling .power-item capsule), matching QuickToggle
+// / QuickSettingsItem in quickSettings.js:
 //   .quick-toggle.button
 //     box  (St.BoxLayout, spacing 9px)
 //       .quick-toggle-icon   (16px)
 //       titleBox             (x_expand, vertical)
 //         .quick-toggle-title
 //         .quick-toggle-subtitle   (hidden when subtitle == NULL)
-//
-// The ltr box padding (15px left / 12px right) is re-asserted in the GTK4 CSS
-// overrides because the conversion drops the :ltr/:rtl rules.
 static GtkWidget *
-make_quick_toggle (const char *icon_name, const char *title,
-                   const char *subtitle,
-                   GtkWidget **icon_out, GtkWidget **title_out)
+create_toggle_capsule (bool toggle_mode,
+                       const char *icon_name, const char *title,
+                       const char *subtitle,
+                       GtkWidget **icon_out,
+                       GtkWidget **title_out,
+                       GtkWidget **subtitle_out)
 {
   GtkWidget *button;
   GtkWidget *box;
   GtkWidget *icon;
   GtkWidget *title_box;
   GtkWidget *title_label;
-  GtkWidget *subtitle_label;
+  GtkWidget *subtitle_label = NULL;
 
-  button = gtk_toggle_button_new ();
+  button = toggle_mode ? gtk_toggle_button_new () : gtk_button_new ();
   gtk_widget_add_css_class (button, "quick-toggle");
   gtk_widget_add_css_class (button, "button");
   gtk_widget_set_focus_on_click (button, FALSE);
 
   box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 9);
   gtk_widget_set_valign (box, GTK_ALIGN_CENTER);
-  gtk_widget_set_halign (box, GTK_ALIGN_START);
+  gtk_widget_set_halign (box, GTK_ALIGN_FILL);
+  gtk_widget_set_hexpand (box, TRUE);
   gtk_button_set_child (GTK_BUTTON (button), box);
 
   icon = gtk_image_new_from_icon_name (icon_name);
@@ -99,6 +109,7 @@ make_quick_toggle (const char *icon_name, const char *title,
   if (subtitle != NULL) {
     subtitle_label = gtk_label_new (subtitle);
     gtk_widget_add_css_class (subtitle_label, "quick-toggle-subtitle");
+    gtk_label_set_ellipsize (GTK_LABEL (subtitle_label), PANGO_ELLIPSIZE_END);
     gtk_widget_set_halign (subtitle_label, GTK_ALIGN_START);
     gtk_widget_set_valign (subtitle_label, GTK_ALIGN_CENTER);
     gtk_box_append (GTK_BOX (title_box), subtitle_label);
@@ -108,28 +119,32 @@ make_quick_toggle (const char *icon_name, const char *title,
     *icon_out = icon;
   if (title_out)
     *title_out = title_label;
+  if (subtitle_out)
+    *subtitle_out = subtitle_label;
 
   return button;
 }
 
-// --- QuickToggleMenu (secondary menu) ----------------------------------------
+static GtkWidget *
+make_quick_toggle (const char *icon_name, const char *title,
+                   const char *subtitle,
+                   GtkWidget **icon_out, GtkWidget **title_out)
+{
+  return create_toggle_capsule (true, icon_name, title, subtitle,
+                                icon_out, title_out, NULL);
+}
+
+// --- QuickToggleMenu (inline accordion menu) ---------------------------------
 //
-// The popover that opens from a `.quick-toggle-menu-button` arrow, matching
-// QuickToggleMenu in quickSettings.js:
-//
-//   super(sourceActor, 'quick-toggle-menu')
-//     .quick-toggle-menu-container   (reactive, x_expand, y_expand:false)
-//       .header                     (optional title, hidden here)
-//       .popup-menu-content         (6px padding, #36363a, 20px radius)
-//         .popup-menu-box
-//           .popup-menu-item         (12px radius, active = lighten(#424247,9%))
-//
-// Both the container and the item classes already exist in
-// gnome-shell-dark.css, so the menu reuses the theme verbatim — no extra CSS.
-//
-// GNOME anchors the menu's top edge to the *bottom of the toggle capsule*
-// (a Clutter.BindConstraint on Y with offset = sourceActor.height), so the
-// menu hangs directly under the row that opened it.
+// Expanded inline inside WinomeQuickSettingsGrid immediately under the row that
+// triggered it, matching QuickToggleMenu in quickSettings.js:
+//   .quick-toggle-menu
+//     .header
+//       .icon[.active]   24px glyph in a round badge
+//       .title            %title_3
+//       .subtitle         %caption_heading
+//     ScrolledWindow (natural height up to 280px)
+//       .popup-menu-item (12px radius, spacing 6px)
 
 typedef struct {
   WinomeMenuItemCallback callback;
@@ -152,10 +167,16 @@ on_quick_menu_item_activated (GtkGestureClick *gesture, int n_press,
 
   WinomeMenuItemCallback cb = data != NULL ? data->callback : NULL;
   gpointer ud = data != NULL ? data->user_data : NULL;
-  winome_shell_panel_close_menu ();
+  GtkWidget *item =
+      gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (gesture));
+  GtkWidget *qs = find_quick_settings_root (item);
 
+  // Invoke callback before closing so row metadata stays live during cb().
   if (cb != NULL)
     cb (ud);
+
+  if (qs != NULL)
+    winome_quick_settings_close_menu (qs, TRUE);
 }
 
 static GtkWidget *
@@ -186,9 +207,9 @@ make_quick_menu_item (const WinomeMenuEntry *entry)
   gtk_widget_add_css_class (item, "popup-menu-item");
   gtk_widget_set_focus_on_click (item, FALSE);
 
-  box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
   gtk_widget_set_valign (box, GTK_ALIGN_CENTER);
-  gtk_widget_set_halign (box, GTK_ALIGN_START);
+  gtk_widget_set_halign (box, GTK_ALIGN_FILL);
   gtk_widget_set_hexpand (box, TRUE);
   gtk_box_append (GTK_BOX (item), box);
 
@@ -201,15 +222,16 @@ make_quick_menu_item (const WinomeMenuEntry *entry)
   }
 
   label = gtk_label_new (entry->label);
-  gtk_widget_add_css_class (label, "popup-menu-item-label");
+  gtk_label_set_ellipsize (GTK_LABEL (label), PANGO_ELLIPSIZE_END);
   gtk_label_set_xalign (GTK_LABEL (label), 0.0);
   gtk_widget_set_valign (label, GTK_ALIGN_CENTER);
   gtk_widget_set_hexpand (label, TRUE);
   gtk_box_append (GTK_BOX (box), label);
 
-  // Radio-style active marker, matching `.popup-menu-item:checked` upstream.
+  // Radio-style active marker, matching `.popup-menu-ornament` upstream.
   if (entry->checked) {
-    GtkWidget *ornament = gtk_image_new_from_icon_name ("object-select-symbolic");
+    GtkWidget *ornament =
+        gtk_image_new_from_icon_name ("ornament-check-symbolic");
     gtk_image_set_pixel_size (GTK_IMAGE (ornament), QUICK_ICON_SIZE);
     gtk_widget_add_css_class (ornament, "popup-menu-ornament");
     gtk_widget_set_valign (ornament, GTK_ALIGN_CENTER);
@@ -235,16 +257,6 @@ make_quick_menu_item (const WinomeMenuEntry *entry)
   return item;
 }
 
-// QuickToggleMenu's header (quickSettings.js:389-430): a grid holding a
-// circular icon badge on the left, the title, and an optional subtitle below
-// it. `.quick-toggle-menu .header` in the stylesheet supplies
-// `padding-bottom: 12px`, the badge's `border-radius: 999px` and its
-// `.active` accent fill, so only the structure is needed here.
-//
-//   .header
-//     .header .icon[.active]   24px glyph in a round badge
-//     .header .title            %title_3
-//     .header .subtitle         %caption_heading
 static GtkWidget *
 build_quick_menu_header (const char *icon_name, const char *title,
                          const char *subtitle, gboolean active)
@@ -262,8 +274,6 @@ build_quick_menu_header (const char *icon_name, const char *title,
   header = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class (header, "header");
 
-  // Icon and text sit on one row; the subtitle stacks under the title, so the
-  // text column is itself a vertical box.
   row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
   gtk_widget_set_valign (row, GTK_ALIGN_CENTER);
 
@@ -281,12 +291,14 @@ build_quick_menu_header (const char *icon_name, const char *title,
 
   title_label = gtk_label_new (title != NULL ? title : "");
   gtk_widget_add_css_class (title_label, "title");
+  gtk_label_set_ellipsize (GTK_LABEL (title_label), PANGO_ELLIPSIZE_END);
   gtk_label_set_xalign (GTK_LABEL (title_label), 0.0);
   gtk_box_append (GTK_BOX (text_col), title_label);
 
   if (subtitle != NULL && subtitle[0] != '\0') {
     subtitle_label = gtk_label_new (subtitle);
     gtk_widget_add_css_class (subtitle_label, "subtitle");
+    gtk_label_set_ellipsize (GTK_LABEL (subtitle_label), PANGO_ELLIPSIZE_END);
     gtk_label_set_xalign (GTK_LABEL (subtitle_label), 0.0);
     gtk_box_append (GTK_BOX (text_col), subtitle_label);
   }
@@ -297,14 +309,7 @@ build_quick_menu_header (const char *icon_name, const char *title,
   return header;
 }
 
-// Build the popup content for a secondary menu.
-//
-// Structure mirrors QuickToggleMenu (quickSettings.js:363): the actor is a
-// `.quick-toggle-menu-container` wrapping `this.box`, which is the popup menu
-// box itself — `.quick-toggle-menu` is the *style class of the box*, and it
-// carries the card background (`@extend %card`, `border-radius:
-// $base_border_radius * 3`). Nesting a `.popup-menu-content` inside it paints
-// a second rounded background and reads as a washed-out double border.
+// Build the card content for an inline QuickToggleMenu drawer.
 static GtkWidget *
 build_quick_menu_full (const WinomeMenuEntry *entries, guint n_entries,
                        const char *header_icon, const char *header_title,
@@ -314,14 +319,6 @@ build_quick_menu_full (const WinomeMenuEntry *entries, guint n_entries,
   GtkWidget *header;
   guint i;
 
-  // Structure mirrors QuickToggleMenu (quickSettings.js:363). PopupMenuBase
-  // builds `this.box` as a vertical St.BoxLayout with x_expand: true and sets its
-  // style class to the one passed to super() — 'quick-toggle-menu' here
-  // (popupMenu.js:640-647). So the box carries exactly one class and expands
-  // rather than hugging its content.
-  //
-  // Note there is no `.popup-menu-box` rule in the stylesheet — a class by that
-  // name would style nothing.
   menu = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class (menu, "quick-toggle-menu");
   gtk_widget_set_hexpand (menu, TRUE);
@@ -331,9 +328,25 @@ build_quick_menu_full (const WinomeMenuEntry *entries, guint n_entries,
   if (header != NULL)
     gtk_box_append (GTK_BOX (menu), header);
 
-  for (i = 0; i < n_entries; i++) {
-    GtkWidget *item = make_quick_menu_item (&entries[i]);
-    gtk_box_append (GTK_BOX (menu), item);
+  if (n_entries > 0) {
+    GtkWidget *scroll = gtk_scrolled_window_new ();
+    gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (scroll),
+                                    GTK_POLICY_NEVER,
+                                    GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_propagate_natural_width (
+        GTK_SCROLLED_WINDOW (scroll), TRUE);
+    gtk_scrolled_window_set_propagate_natural_height (
+        GTK_SCROLLED_WINDOW (scroll), TRUE);
+    gtk_scrolled_window_set_max_content_height (
+        GTK_SCROLLED_WINDOW (scroll), 280);
+
+    GtkWidget *items_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+    for (i = 0; i < n_entries; i++) {
+      GtkWidget *item = make_quick_menu_item (&entries[i]);
+      gtk_box_append (GTK_BOX (items_box), item);
+    }
+    gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scroll), items_box);
+    gtk_box_append (GTK_BOX (menu), scroll);
   }
 
   return menu;
@@ -366,235 +379,71 @@ winome_quick_menu_new (const WinomeMenuEntry *entries, guint n_entries)
 
 // --- QuickMenuToggle ---------------------------------------------------------
 //
-// Toggle with a secondary-menu arrow, matching QuickMenuToggle in
-// quickSettings.js:
-//   .quick-toggle-has-menu (button)
-//     box
-//       .quick-toggle                (icon + title + subtitle)
-//       .quick-toggle-separator      (1px vertical rule)
-//       .quick-toggle-menu-button    (go-next-symbolic icon)
+// Split pill toggle matching QuickMenuToggle in upstream quickSettings.js and
+// GTK4's split-button pattern (outer GtkBox holding independent toggle +
+// separator + arrow buttons):
+//   .quick-toggle-has-menu        (outer GtkBox container)
+//     .quick-toggle.button        (GtkToggleButton: icon + title + subtitle)
+//     .quick-toggle-separator     (GtkSeparator, 1px vertical)
+//     .quick-toggle-menu-button   (GtkButton.icon-button: go-next-symbolic)
 //
-// The accent fill is keyed off `.quick-toggle:checked` and
-// `.quick-toggle-menu-button:checked` in the stylesheet, so the outer button's
-// active state is mirrored onto those two nodes (GTK4 has no state
-// inheritance). The separator colors itself via the ancestor selector
-// `.quick-toggle-has-menu:checked .quick-toggle-separator`.
+// When @menu_builder is NULL, the separator and arrow button are omitted so
+// `.quick-toggle:last-child` rounds all four capsule corners automatically.
 
-// Called with the freshly built menu popup and the arrow widget to anchor it
-// under. The popup is unref'd by the caller once the handler returns.
-typedef void (*QuickMenuOpenFunc) (GtkWidget *arrow, GtkWidget *menu,
-                                   gpointer user_data);
-// Builds the popup for a toggle's arrow. Returns a new widget (caller frees) or
-// NULL for a toggle with no menu.
+// Builds the inline drawer widget for a toggle's arrow. Returns a new widget
+// or NULL when no items are available.
 typedef GtkWidget *(*QuickMenuBuilder) (gpointer user_data);
 
 typedef struct {
-  GtkWidget *toggle_part;      // the .quick-toggle node
-  GtkWidget *menu_button_part; // the .quick-toggle-menu-button node
-  GtkWidget *icon;             // icon image inside toggle_part
-  GtkWidget *subtitle_label;   // optional subtitle label, may be NULL
-  QuickMenuBuilder    menu_builder;      // builds the popup, may be NULL
-  gpointer            menu_builder_data;
-  QuickMenuOpenFunc   menu_open_func;    // anchors the popup, may be NULL
-  gpointer            menu_open_data;
+  GtkWidget        *container;        // outer .quick-toggle-has-menu box
+  GtkWidget        *toggle_part;      // left GtkToggleButton (.quick-toggle)
+  GtkWidget        *menu_button_part; // right GtkButton (.quick-toggle-menu-button), may be NULL
+  GtkWidget        *icon;             // icon image inside toggle_part
+  GtkWidget        *subtitle_label;   // optional subtitle label, may be NULL
+  QuickMenuBuilder  menu_builder;
+  gpointer          menu_builder_data;
 } MenuToggleParts;
-
-// --- Menu toggle content layout ----------------------------------------------
-//
-// The QuickMenuToggle's inner box. GtkBox over-allocates the menu button by
-// 2px vertically (a GtkBoxLayout allocation quirk), leaving a 1px step at the
-// join; this custom widget lays the three parts out at exactly the box height.
-
-typedef struct {
-  GtkWidget parent_instance;
-  GtkWidget *toggle_part;
-  GtkWidget *separator;
-  GtkWidget *menu_button;
-} WinomeMenuToggleContent;
-
-typedef struct {
-  GtkWidgetClass parent_class;
-} WinomeMenuToggleContentClass;
-
-#define WINOME_TYPE_MENU_TOGGLE_CONTENT (winome_menu_toggle_content_get_type ())
-#define WINOME_MENU_TOGGLE_CONTENT(obj) (G_TYPE_CHECK_INSTANCE_CAST ((obj), \
-    WINOME_TYPE_MENU_TOGGLE_CONTENT, WinomeMenuToggleContent))
-
-G_DEFINE_TYPE (WinomeMenuToggleContent, winome_menu_toggle_content, GTK_TYPE_WIDGET)
-
-static void
-winome_menu_toggle_content_measure (GtkWidget *widget,
-                                    GtkOrientation orientation,
-                                    int for_size G_GNUC_UNUSED,
-                                    int *minimum, int *natural,
-                                    int *minimum_baseline, int *natural_baseline)
-{
-  WinomeMenuToggleContent *self = WINOME_MENU_TOGGLE_CONTENT (widget);
-
-  if (minimum_baseline)
-    *minimum_baseline = -1;
-  if (natural_baseline)
-    *natural_baseline = -1;
-
-  if (orientation == GTK_ORIENTATION_HORIZONTAL) {
-    int min = 0, nat = 0;
-    int m, n;
-    gtk_widget_measure (self->toggle_part, GTK_ORIENTATION_HORIZONTAL, -1,
-                        &m, &n, NULL, NULL);
-    min += m; nat += n;
-    gtk_widget_measure (self->separator, GTK_ORIENTATION_HORIZONTAL, -1,
-                        &m, &n, NULL, NULL);
-    min += m; nat += n;
-    gtk_widget_measure (self->menu_button, GTK_ORIENTATION_HORIZONTAL, -1,
-                        &m, &n, NULL, NULL);
-    min += m; nat += n;
-    *minimum = min;
-    *natural = nat;
-  } else {
-    int m1, n1, m2, n2, m3, n3;
-    gtk_widget_measure (self->toggle_part, GTK_ORIENTATION_VERTICAL, -1,
-                        &m1, &n1, NULL, NULL);
-    gtk_widget_measure (self->separator, GTK_ORIENTATION_VERTICAL, -1,
-                        &m2, &n2, NULL, NULL);
-    gtk_widget_measure (self->menu_button, GTK_ORIENTATION_VERTICAL, -1,
-                        &m3, &n3, NULL, NULL);
-    *minimum = MAX (MAX (m1, m2), m3);
-    *natural = MAX (MAX (n1, n2), n3);
-  }
-}
-
-static void
-winome_menu_toggle_content_size_allocate (GtkWidget *widget,
-                                          int width, int height,
-                                          int baseline G_GNUC_UNUSED)
-{
-  WinomeMenuToggleContent *self = WINOME_MENU_TOGGLE_CONTENT (widget);
-  int sep_w, menu_w;
-
-  gtk_widget_measure (self->separator, GTK_ORIENTATION_HORIZONTAL, -1,
-                      NULL, &sep_w, NULL, NULL);
-  gtk_widget_measure (self->menu_button, GTK_ORIENTATION_HORIZONTAL, -1,
-                      NULL, &menu_w, NULL, NULL);
-
-  GtkAllocation alloc;
-  alloc.y = 0;
-  alloc.height = height;
-
-  alloc.x = 0;
-  alloc.width = MAX (0, width - sep_w - menu_w);
-  gtk_widget_size_allocate (self->toggle_part, &alloc, -1);
-
-  alloc.x = alloc.width;
-  alloc.width = sep_w;
-  gtk_widget_size_allocate (self->separator, &alloc, -1);
-
-  alloc.x += sep_w;
-  alloc.width = menu_w;
-  gtk_widget_size_allocate (self->menu_button, &alloc, -1);
-}
-
-static void
-winome_menu_toggle_content_init (WinomeMenuToggleContent *self G_GNUC_UNUSED)
-{
-}
-
-static void
-winome_menu_toggle_content_class_init (WinomeMenuToggleContentClass *klass)
-{
-  GtkWidgetClass *widget_class = GTK_WIDGET_CLASS (klass);
-
-  widget_class->measure = winome_menu_toggle_content_measure;
-  widget_class->size_allocate = winome_menu_toggle_content_size_allocate;
-  gtk_widget_class_set_css_name (widget_class, "box");
-}
-
-static GtkWidget *
-menu_toggle_content_new (GtkWidget *toggle_part, GtkWidget *separator,
-                         GtkWidget *menu_button)
-{
-  WinomeMenuToggleContent *self =
-      static_cast<WinomeMenuToggleContent *> (g_object_new (
-          winome_menu_toggle_content_get_type (), NULL));
-
-  self->toggle_part = toggle_part;
-  self->separator = separator;
-  self->menu_button = menu_button;
-
-  gtk_widget_set_parent (toggle_part, GTK_WIDGET (self));
-  gtk_widget_set_parent (separator, GTK_WIDGET (self));
-  gtk_widget_set_parent (menu_button, GTK_WIDGET (self));
-
-  return GTK_WIDGET (self);
-}
 
 static void
 sync_menu_toggle_checked (GtkToggleButton *button, gpointer user_data)
 {
-  MenuToggleParts *parts = static_cast<MenuToggleParts *>(user_data);
+  MenuToggleParts *parts = static_cast<MenuToggleParts *> (user_data);
   if (gtk_toggle_button_get_active (button)) {
-    gtk_widget_set_state_flags (parts->toggle_part,
+    gtk_widget_set_state_flags (parts->container,
                                 GTK_STATE_FLAG_CHECKED, FALSE);
-    gtk_widget_set_state_flags (parts->menu_button_part,
-                                GTK_STATE_FLAG_CHECKED, FALSE);
+    if (parts->menu_button_part != NULL) {
+      gtk_widget_set_state_flags (parts->menu_button_part,
+                                  GTK_STATE_FLAG_CHECKED, FALSE);
+    }
   } else {
-    gtk_widget_unset_state_flags (parts->toggle_part,
+    gtk_widget_unset_state_flags (parts->container,
                                   GTK_STATE_FLAG_CHECKED);
-    gtk_widget_unset_state_flags (parts->menu_button_part,
-                                  GTK_STATE_FLAG_CHECKED);
+    if (parts->menu_button_part != NULL) {
+      gtk_widget_unset_state_flags (parts->menu_button_part,
+                                    GTK_STATE_FLAG_CHECKED);
+    }
   }
 }
 
-// Emitted when the arrow area is clicked. The menu_button is a GtkBox inside the
-// outer GtkToggleButton; the panel anchors the menu there.
-//
-// The click controller is on the arrow and runs before the outer toggle sees
-// the event, so the toggle does not flip — matching GNOME, where `clicked` is
-// bound to the inner St.Button and never reaches the QuickMenuToggle.
 static void
-on_menu_button_pressed (GtkGestureClick *gesture, int n_press,
-                        double x, double y, gpointer user_data)
+on_menu_button_clicked (GtkButton *button G_GNUC_UNUSED, gpointer user_data)
 {
-  MenuToggleParts *parts = static_cast<MenuToggleParts *>(user_data);
-  QuickMenuBuilder builder =
-      static_cast<QuickMenuBuilder> (parts->menu_builder);
-
-  (void)n_press;
-  (void)x;
-  (void)y;
-
-  // Consume the press so the enclosing toggle never sees it.
-  gtk_gesture_set_state (GTK_GESTURE (gesture), GTK_EVENT_SEQUENCE_CLAIMED);
-
-  if (winome_shell_panel_close_menu_for (parts->menu_button_part))
+  MenuToggleParts *parts = static_cast<MenuToggleParts *> (user_data);
+  if (parts == NULL || parts->menu_builder == NULL)
     return;
 
-  if (builder == NULL)
+  GtkWidget *qs = find_quick_settings_root (parts->container);
+  if (qs == NULL)
     return;
 
-  GtkWidget *menu = builder (parts->menu_builder_data);
-  if (menu == NULL)
+  if (quick_settings_is_menu_open_for (qs, parts->container)) {
+    winome_quick_settings_close_menu (qs, TRUE);
     return;
+  }
 
-  // The panel takes ownership and anchors the popup under the arrow.
-  QuickMenuOpenFunc open_func =
-      static_cast<QuickMenuOpenFunc> (parts->menu_open_func);
-  // The panel takes ownership of the popup (it parents it into the menu
-  // window), so drop our reference here.
-  if (open_func != NULL)
-    open_func (parts->menu_button_part, menu, parts->menu_open_data);
-  else
-    g_object_unref (menu);
-}
-
-// The panel owns menu windows: it reuses the popover chrome, screen
-// positioning, outside-click dismissal and topmost reassert, so a menu behaves
-// like the quick settings and calendar popovers.
-static void
-default_quick_menu_open (GtkWidget *arrow, GtkWidget *menu, gpointer user_data)
-{
-  (void)user_data;
-
-  winome_shell_panel_open_menu (arrow, menu);
+  GtkWidget *menu = parts->menu_builder (parts->menu_builder_data);
+  if (menu != NULL)
+    quick_settings_toggle_inline_menu (qs, parts->container, menu);
 }
 
 static GtkWidget *
@@ -603,125 +452,88 @@ make_quick_menu_toggle (const char *icon_name, const char *title,
                         QuickMenuBuilder menu_builder,
                         gpointer menu_builder_data)
 {
-  GtkWidget *button;
-  GtkWidget *content;
+  GtkWidget *container;
   GtkWidget *toggle_part;
-  GtkWidget *content_box;
-  GtkWidget *icon;
-  GtkWidget *title_box;
-  GtkWidget *title_label;
+  GtkWidget *icon = NULL;
   GtkWidget *subtitle_label = NULL;
-  GtkWidget *separator;
-  GtkWidget *menu_button;
-  GtkWidget *arrow;
+  GtkWidget *separator = NULL;
+  GtkWidget *menu_button = NULL;
   MenuToggleParts *parts;
 
-  button = gtk_toggle_button_new ();
-  gtk_widget_add_css_class (button, "quick-toggle-has-menu");
-  gtk_widget_set_focus_on_click (button, FALSE);
-  // Clip the inner parts to the capsule so the menu button's small allocation
-  // overflow (a GtkBox quirk) cannot poke out above/below the capsule.
-  gtk_widget_set_overflow (button, GTK_OVERFLOW_HIDDEN);
+  container = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_widget_add_css_class (container, "quick-toggle-has-menu");
+  gtk_widget_set_overflow (container, GTK_OVERFLOW_HIDDEN);
 
-  // The toggle part. A plain box (not a nested button) so clicks land on the
-  // outer toggle button; it carries the .quick-toggle capsule background and
-  // fills the button height like native (min-height 3.273em).
-  toggle_part = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
-  gtk_widget_add_css_class (toggle_part, "quick-toggle");
-  gtk_widget_add_css_class (toggle_part, "button");
+  toggle_part = create_toggle_capsule (true, icon_name, title, subtitle,
+                                       &icon, NULL, &subtitle_label);
+  gtk_widget_set_hexpand (toggle_part, TRUE);
   gtk_widget_set_valign (toggle_part, GTK_ALIGN_FILL);
-
-  // Content box: matches `.quick-toggle > box` in the stylesheet (the 9px
-  // spacing + ltr padding live here). Vertically centered in the capsule.
-  content_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 9);
-  gtk_widget_set_valign (content_box, GTK_ALIGN_CENTER);
-  gtk_widget_set_halign (content_box, GTK_ALIGN_START);
-  gtk_box_append (GTK_BOX (toggle_part), content_box);
-
-  icon = gtk_image_new_from_icon_name (icon_name);
-  gtk_image_set_pixel_size (GTK_IMAGE (icon), QUICK_ICON_SIZE);
-  gtk_widget_add_css_class (icon, "quick-toggle-icon");
-  gtk_widget_set_valign (icon, GTK_ALIGN_CENTER);
-  gtk_box_append (GTK_BOX (content_box), icon);
-
-  title_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
-  gtk_widget_set_hexpand (title_box, TRUE);
-  gtk_widget_set_valign (title_box, GTK_ALIGN_CENTER);
-  gtk_box_append (GTK_BOX (content_box), title_box);
-
-  title_label = gtk_label_new (title);
-  gtk_widget_add_css_class (title_label, "quick-toggle-title");
-  gtk_label_set_ellipsize (GTK_LABEL (title_label), PANGO_ELLIPSIZE_END);
-  gtk_widget_set_halign (title_label, GTK_ALIGN_START);
-  gtk_widget_set_valign (title_label, GTK_ALIGN_CENTER);
-  gtk_box_append (GTK_BOX (title_box), title_label);
-
-  if (subtitle != NULL) {
-    subtitle_label = gtk_label_new (subtitle);
-    gtk_widget_add_css_class (subtitle_label, "quick-toggle-subtitle");
-    gtk_widget_set_halign (subtitle_label, GTK_ALIGN_START);
-    gtk_widget_set_valign (subtitle_label, GTK_ALIGN_CENTER);
-    gtk_box_append (GTK_BOX (title_box), subtitle_label);
-  }
-
-  // 1px vertical rule; its background-color comes from the stylesheet
-  // (.quick-toggle-has-menu .quick-toggle-separator).
-  separator = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
-  gtk_widget_add_css_class (separator, "quick-toggle-separator");
-  gtk_widget_set_size_request (separator, 1, -1);
-
-  // The ">" menu button area (.icon-button fill + go-next arrow), filling the
-  // capsule height like native (y_expand).
-  menu_button = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
-  gtk_widget_add_css_class (menu_button, "quick-toggle-menu-button");
-  gtk_widget_add_css_class (menu_button, "icon-button");
-  arrow = gtk_image_new_from_icon_name ("go-next-symbolic");
-  gtk_image_set_pixel_size (GTK_IMAGE (arrow), QUICK_ICON_SIZE);
-  gtk_widget_set_valign (arrow, GTK_ALIGN_CENTER);
-  gtk_widget_set_halign (arrow, GTK_ALIGN_CENTER);
-  gtk_box_append (GTK_BOX (menu_button), arrow);
-
-  // Custom content layout: lays the three parts out at exactly the allocated
-  // height (GtkBox over-allocates the menu button by 2px).
-  content = menu_toggle_content_new (toggle_part, separator, menu_button);
-  gtk_widget_set_valign (content, GTK_ALIGN_FILL);
-  gtk_widget_set_halign (content, GTK_ALIGN_FILL);
-  gtk_button_set_child (GTK_BUTTON (button), content);
+  gtk_box_append (GTK_BOX (container), toggle_part);
 
   parts = g_new0 (MenuToggleParts, 1);
+  parts->container = container;
   parts->toggle_part = toggle_part;
-  parts->menu_button_part = menu_button;
   parts->icon = icon;
   parts->subtitle_label = subtitle_label;
   parts->menu_builder = menu_builder;
   parts->menu_builder_data = menu_builder_data;
-  // Until the panel installs its anchor handler, fall back to storing the popup
-  // on the arrow so the plumbing is exercised end to end.
-  parts->menu_open_func = default_quick_menu_open;
-  g_object_set_data_full (G_OBJECT (button), "menu-toggle-parts",
-                          parts, g_free);
-  g_signal_connect (button, "toggled",
-                    G_CALLBACK (sync_menu_toggle_checked), parts);
-  sync_menu_toggle_checked (GTK_TOGGLE_BUTTON (button), parts);
 
-  // Secondary menu. The arrow area gets its own click controller: clicking it
-  // must open the menu, not flip the outer toggle (GNOME binds `clicked` on
-  // the inner St.Button, which does not propagate to the toggle).
   if (menu_builder != NULL) {
-    GtkGesture *click = gtk_gesture_click_new ();
+    separator = gtk_separator_new (GTK_ORIENTATION_VERTICAL);
+    gtk_widget_add_css_class (separator, "quick-toggle-separator");
+    gtk_widget_set_valign (separator, GTK_ALIGN_FILL);
+    gtk_box_append (GTK_BOX (container), separator);
 
-    gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), 0);
-    // CAPTURE, so the arrow's press is consumed before the enclosing
-    // GtkToggleButton can act on it: clicking ">" must open the menu without
-    // flipping the capsule state.
-    gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (click),
-                                                GTK_PHASE_CAPTURE);
-    g_signal_connect (click, "pressed",
-                      G_CALLBACK (on_menu_button_pressed), parts);
-    gtk_widget_add_controller (menu_button, GTK_EVENT_CONTROLLER (click));
+    menu_button = gtk_button_new ();
+    gtk_widget_add_css_class (menu_button, "quick-toggle-menu-button");
+    gtk_widget_add_css_class (menu_button, "icon-button");
+    gtk_widget_set_focus_on_click (menu_button, FALSE);
+    gtk_widget_set_valign (menu_button, GTK_ALIGN_FILL);
+
+    GtkWidget *arrow = gtk_image_new_from_icon_name ("go-next-symbolic");
+    gtk_image_set_pixel_size (GTK_IMAGE (arrow), QUICK_ICON_SIZE);
+    gtk_widget_set_valign (arrow, GTK_ALIGN_CENTER);
+    gtk_widget_set_halign (arrow, GTK_ALIGN_CENTER);
+    gtk_button_set_child (GTK_BUTTON (menu_button), arrow);
+    gtk_box_append (GTK_BOX (container), menu_button);
+
+    parts->menu_button_part = menu_button;
+    g_signal_connect (menu_button, "clicked",
+                      G_CALLBACK (on_menu_button_clicked), parts);
   }
 
-  return button;
+  g_object_set_data_full (G_OBJECT (container), "menu-toggle-parts",
+                          parts, g_free);
+  g_signal_connect (toggle_part, "toggled",
+                    G_CALLBACK (sync_menu_toggle_checked), parts);
+  sync_menu_toggle_checked (GTK_TOGGLE_BUTTON (toggle_part), parts);
+
+  return container;
+}
+
+static GtkWidget *
+quick_menu_toggle_button (GtkWidget *widget)
+{
+  MenuToggleParts *parts = static_cast<MenuToggleParts *> (
+      g_object_get_data (G_OBJECT (widget), "menu-toggle-parts"));
+  return parts != NULL ? parts->toggle_part : widget;
+}
+
+static void
+set_toggle_active_blocked (GtkWidget *widget, gboolean active,
+                           GCallback blocked_cb, gpointer cb_data)
+{
+  GtkWidget *btn = quick_menu_toggle_button (widget);
+  if (blocked_cb != NULL)
+    g_signal_handlers_block_by_func (btn, (gpointer) blocked_cb, cb_data);
+  gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (btn), active);
+  if (blocked_cb != NULL)
+    g_signal_handlers_unblock_by_func (btn, (gpointer) blocked_cb, cb_data);
+
+  MenuToggleParts *parts = static_cast<MenuToggleParts *> (
+      g_object_get_data (G_OBJECT (widget), "menu-toggle-parts"));
+  if (parts != NULL)
+    sync_menu_toggle_checked (GTK_TOGGLE_BUTTON (btn), parts);
 }
 
 // --- QuickSlider -------------------------------------------------------------
@@ -1250,14 +1062,30 @@ on_lock_clicked (GtkButton *button G_GNUC_UNUSED, gpointer G_GNUC_UNUSED user_da
 // Port of the native QuickSettingsLayout (quickSettings.js) into a custom
 // widget. GtkGrid would work, but it distributes surplus height to rows that
 // report expand and misaligns the toggle capsules; the native layout sizes
-// each row to its natural height and gives each child exactly its share.
+// each row to its natural height and gives each child exactly its share, while
+// expanding any active QuickToggleMenu inline in a GtkRevealer directly under
+// its trigger row.
 //
 // Layout (nColumns=2, row/column spacing 12px):
-//   - A child with column-span 2 takes a whole row (system item, sliders).
-//   - A child with column-span 1 is packed two per row (the toggles).
+//   - Invisible children (e.g. missing brightness, Bluetooth, keyboard) are
+//     skipped during row packing so remaining tiles pack without blank holes.
+//   - Children with column-span 1 are capped horizontally at `.quick-toggle`'s
+//     theme `max-width` (12em) resolved through StEngine.
 //   - childWidth = floor((width - columnSpacing) / 2); a spanned child gets
 //     childWidth * span + columnSpacing * (span - 1).
-//   - Row height = max natural height of the children in the row.
+
+static int
+qs_toggle_max_width (void)
+{
+  winome::StEngine *e = winome::StEngine::get ();
+  if (e == nullptr)
+    return 176;
+  winome::StEngine::Node toggle (*e, nullptr, "", "quick-toggle", "");
+  double v = 0.0;
+  if (toggle.lookup_length ("max-width", &v) && v > 0.0)
+    return (int)(v + 0.5);
+  return 176;
+}
 
 typedef struct {
   GtkWidget *widget;
@@ -1267,8 +1095,11 @@ typedef struct {
 typedef struct {
   GtkWidget parent_instance;
   GPtrArray *children;
+  GtkWidget *drawer_revealer;
+  GtkWidget *drawer_anchor;
   int row_spacing;
   int column_spacing;
+  int toggle_max_width;
 } WinomeQuickSettingsGrid;
 
 typedef struct {
@@ -1281,44 +1112,121 @@ typedef struct {
 
 G_DEFINE_TYPE (WinomeQuickSettingsGrid, winome_quick_settings_grid, GTK_TYPE_WIDGET)
 
-// The rows: each entry is a GList of QuickGridChild* (in layout order).
+static gboolean
+grid_is_drawer_active (WinomeQuickSettingsGrid *self)
+{
+  if (self->drawer_revealer == NULL || self->drawer_anchor == NULL)
+    return FALSE;
+  GtkRevealer *rev = GTK_REVEALER (self->drawer_revealer);
+  return gtk_revealer_get_child (rev) != NULL &&
+         (gtk_revealer_get_reveal_child (rev) ||
+          gtk_revealer_get_child_revealed (rev));
+}
+
+static int
+grid_measure_drawer (WinomeQuickSettingsGrid *self, int for_width)
+{
+  if (!grid_is_drawer_active (self))
+    return 0;
+  int m = 0, n = 0;
+  gtk_widget_measure (self->drawer_revealer, GTK_ORIENTATION_VERTICAL,
+                      for_width, &m, &n, NULL, NULL);
+  return n;
+}
+
+static void
+grid_set_dimmed (WinomeQuickSettingsGrid *self, GtkWidget *keep_clear)
+{
+  for (guint i = 0; i < self->children->len; i++) {
+    QuickGridChild *c =
+        static_cast<QuickGridChild *> (g_ptr_array_index (self->children, i));
+    if (keep_clear != NULL && c->widget != keep_clear)
+      gtk_widget_add_css_class (c->widget, "quick-settings-dimmed");
+    else
+      gtk_widget_remove_css_class (c->widget, "quick-settings-dimmed");
+  }
+}
+
+static void
+on_drawer_child_revealed (GObject *object,
+                          GParamSpec *pspec G_GNUC_UNUSED,
+                          gpointer user_data)
+{
+  GtkRevealer *rev = GTK_REVEALER (object);
+  WinomeQuickSettingsGrid *self = WINOME_QUICK_SETTINGS_GRID (user_data);
+  if (!gtk_revealer_get_reveal_child (rev) &&
+      !gtk_revealer_get_child_revealed (rev)) {
+    gtk_revealer_set_child (rev, NULL);
+    self->drawer_anchor = NULL;
+    gtk_widget_queue_resize (GTK_WIDGET (self));
+  }
+}
+
+// Pack visible grid children into 2-column rows and report the row index
+// containing @drawer_anchor (or -1).
 static GList **
-compute_rows (WinomeQuickSettingsGrid *self, int n_columns)
+compute_rows (WinomeQuickSettingsGrid *self, int n_columns,
+              int *n_rows_out, int *anchor_row_out)
 {
   GList **rows = g_new0 (GList *, self->children->len + 1);
   int n_rows = 0;
   int line_index = 0;
+  int anchor_row = -1;
+  gboolean cur_has_anchor = FALSE;
   GList *cur = NULL;
 
   for (guint i = 0; i < self->children->len; i++) {
-    QuickGridChild *c = static_cast<QuickGridChild *> (g_ptr_array_index (self->children, i));
-    if (c->col_span > n_columns)
-      c->col_span = n_columns;
+    QuickGridChild *c =
+        static_cast<QuickGridChild *> (g_ptr_array_index (self->children, i));
+    if (!gtk_widget_get_visible (c->widget))
+      continue;
 
-    if (line_index == 0 || line_index + c->col_span > n_columns) {
-      if (cur != NULL)
+    int span = CLAMP (c->col_span, 1, n_columns);
+    c->col_span = span;
+
+    if (line_index == 0 || line_index + span > n_columns) {
+      if (cur != NULL) {
+        if (cur_has_anchor)
+          anchor_row = n_rows;
         rows[n_rows++] = cur;
+      }
       cur = NULL;
+      cur_has_anchor = FALSE;
       line_index = 0;
     }
+
+    if (c->widget == self->drawer_anchor)
+      cur_has_anchor = TRUE;
     cur = g_list_append (cur, c);
-    line_index = (line_index + c->col_span) % n_columns;
+    line_index = (line_index + span) % n_columns;
   }
-  if (cur != NULL)
+
+  if (cur != NULL) {
+    if (cur_has_anchor)
+      anchor_row = n_rows;
     rows[n_rows++] = cur;
+  }
   rows[n_rows] = NULL;
+
+  if (n_rows_out != NULL)
+    *n_rows_out = n_rows;
+  if (anchor_row_out != NULL)
+    *anchor_row_out = anchor_row;
 
   return rows;
 }
 
 static int
-max_child_height (GList *row)
+max_child_height (GList *row, int child_width, int column_spacing)
 {
   int h = 0;
   for (GList *l = row; l != NULL; l = l->next) {
     QuickGridChild *c = static_cast<QuickGridChild *>(l->data);
+    int for_w = -1;
+    if (child_width >= 0)
+      for_w = child_width * c->col_span + column_spacing * (c->col_span - 1);
     int m, n;
-    gtk_widget_measure (c->widget, GTK_ORIENTATION_VERTICAL, -1, &m, &n,
+    gtk_widget_measure (c->widget, GTK_ORIENTATION_VERTICAL, for_w, &m, &n,
                         NULL, NULL);
     h = MAX (h, n);
   }
@@ -1328,7 +1236,7 @@ max_child_height (GList *row)
 static void
 winome_quick_settings_grid_measure (GtkWidget *widget,
                                     GtkOrientation orientation,
-                                    int for_size G_GNUC_UNUSED,
+                                    int for_size,
                                     int *minimum, int *natural,
                                     int *minimum_baseline, int *natural_baseline)
 {
@@ -1343,34 +1251,48 @@ winome_quick_settings_grid_measure (GtkWidget *widget,
   if (orientation == GTK_ORIENTATION_HORIZONTAL) {
     int min_w = 0, nat_w = 0;
     for (guint i = 0; i < self->children->len; i++) {
-      QuickGridChild *c = static_cast<QuickGridChild *> (g_ptr_array_index (self->children, i));
+      QuickGridChild *c =
+          static_cast<QuickGridChild *> (g_ptr_array_index (self->children, i));
+      if (!gtk_widget_get_visible (c->widget))
+        continue;
       int m, n;
       gtk_widget_measure (c->widget, GTK_ORIENTATION_HORIZONTAL, -1,
                           &m, &n, NULL, NULL);
-      min_w = MAX (min_w, m / c->col_span);
-      nat_w = MAX (nat_w, n / c->col_span);
+      int cm = m / c->col_span;
+      int cn = n / c->col_span;
+      if (c->col_span == 1) {
+        cm = MIN (cm, self->toggle_max_width);
+        cn = MIN (cn, self->toggle_max_width);
+      }
+      min_w = MAX (min_w, cm);
+      nat_w = MAX (nat_w, cn);
     }
     *minimum = n_columns * min_w + self->column_spacing;
     *natural = n_columns * nat_w + self->column_spacing;
   } else {
-    GList **rows = compute_rows (self, n_columns);
-    int min_h = 0, nat_h = 0;
-    int n_rows = 0;
-    for (int r = 0; rows[r] != NULL; r++) {
-      int h = max_child_height (rows[r]);
-      min_h += h;
-      nat_h += h;
-      n_rows++;
-    }
-    if (n_rows > 0) {
-      min_h += (n_rows - 1) * self->row_spacing;
-      nat_h += (n_rows - 1) * self->row_spacing;
-    }
-    *minimum = min_h;
-    *natural = nat_h;
-    for (int r = 0; rows[r] != NULL; r++)
+    int n_rows = 0, anchor_row = -1;
+    GList **rows = compute_rows (self, n_columns, &n_rows, &anchor_row);
+    int child_width = for_size >= 0
+                          ? (for_size - self->column_spacing) / n_columns
+                          : -1;
+    int total_h = 0;
+    for (int r = 0; r < n_rows; r++) {
+      total_h += max_child_height (rows[r], child_width, self->column_spacing);
       g_list_free (rows[r]);
+    }
     g_free (rows);
+
+    if (n_rows > 1)
+      total_h += (n_rows - 1) * self->row_spacing;
+
+    if (anchor_row >= 0) {
+      int drawer_h = grid_measure_drawer (self, for_size);
+      if (drawer_h > 0)
+        total_h += drawer_h + MIN (self->row_spacing, drawer_h);
+    }
+
+    *minimum = total_h;
+    *natural = total_h;
   }
 }
 
@@ -1383,14 +1305,15 @@ winome_quick_settings_grid_size_allocate (GtkWidget *widget,
   WinomeQuickSettingsGrid *self = WINOME_QUICK_SETTINGS_GRID (widget);
   const int n_columns = 2;
 
-  GList **rows = compute_rows (self, n_columns);
+  int n_rows = 0, anchor_row = -1;
+  GList **rows = compute_rows (self, n_columns, &n_rows, &anchor_row);
 
   int child_width = (width - self->column_spacing) / n_columns;
   int y = 0;
 
-  for (int r = 0; rows[r] != NULL; r++) {
+  for (int r = 0; r < n_rows; r++) {
     GList *row = rows[r];
-    int row_height = max_child_height (row);
+    int row_height = max_child_height (row, child_width, self->column_spacing);
 
     int line_index = 0;
     for (GList *l = row; l != NULL; l = l->next) {
@@ -1399,18 +1322,27 @@ winome_quick_settings_grid_size_allocate (GtkWidget *widget,
                self->column_spacing * (c->col_span - 1);
       int x = line_index * (child_width + self->column_spacing);
 
-      GtkAllocation alloc;
-      alloc.x = x;
-      alloc.y = y;
-      alloc.width = cw;
-      alloc.height = row_height;
+      GtkAllocation alloc = {x, y, cw, row_height};
       gtk_widget_size_allocate (c->widget, &alloc, -1);
 
       line_index = (line_index + c->col_span) % n_columns;
     }
 
-    y += row_height + self->row_spacing;
+    y += row_height;
     g_list_free (row);
+
+    int drawer_h = (r == anchor_row) ? grid_measure_drawer (self, width) : 0;
+    if (drawer_h > 0) {
+      int top_gap = (r + 1 < n_rows) ? self->row_spacing
+                                     : MIN (self->row_spacing, drawer_h);
+      GtkAllocation drawer_alloc = {0, y + top_gap, width, drawer_h};
+      gtk_widget_size_allocate (self->drawer_revealer, &drawer_alloc, -1);
+      y += top_gap + drawer_h;
+      if (r + 1 < n_rows)
+        y += MIN (self->row_spacing, drawer_h);
+    } else if (r + 1 < n_rows) {
+      y += self->row_spacing;
+    }
   }
   g_free (rows);
 }
@@ -1421,14 +1353,34 @@ winome_quick_settings_grid_init (WinomeQuickSettingsGrid *self)
   self->children = g_ptr_array_new_with_free_func (g_free);
   self->row_spacing = qs_grid_spacing ("spacing-rows", 12);
   self->column_spacing = qs_grid_spacing ("spacing-columns", 12);
+  self->toggle_max_width = qs_toggle_max_width ();
+
+  self->drawer_revealer = gtk_revealer_new ();
+  gtk_revealer_set_transition_type (GTK_REVEALER (self->drawer_revealer),
+                                    GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
+  gtk_revealer_set_transition_duration (
+      GTK_REVEALER (self->drawer_revealer),
+      winome::QUICK_SETTINGS_ANIMATION_TIME / 2);
+  gtk_revealer_set_reveal_child (GTK_REVEALER (self->drawer_revealer), FALSE);
+  gtk_widget_set_hexpand (self->drawer_revealer, TRUE);
+  gtk_widget_set_parent (self->drawer_revealer, GTK_WIDGET (self));
+
+  g_signal_connect (self->drawer_revealer, "notify::child-revealed",
+                    G_CALLBACK (on_drawer_child_revealed), self);
 }
 
 static void
 winome_quick_settings_grid_finalize (GObject *object)
 {
   WinomeQuickSettingsGrid *self = WINOME_QUICK_SETTINGS_GRID (object);
+  self->drawer_anchor = NULL;
+  if (self->drawer_revealer != NULL) {
+    gtk_widget_unparent (self->drawer_revealer);
+    self->drawer_revealer = NULL;
+  }
   for (guint i = 0; i < self->children->len; i++) {
-    QuickGridChild *c = static_cast<QuickGridChild *> (g_ptr_array_index (self->children, i));
+    QuickGridChild *c =
+        static_cast<QuickGridChild *> (g_ptr_array_index (self->children, i));
     gtk_widget_unparent (c->widget);
   }
   g_ptr_array_unref (self->children);
@@ -1464,6 +1416,115 @@ winome_quick_settings_grid_attach (GtkWidget *grid, GtkWidget *child,
   c->col_span = col_span;
   g_ptr_array_add (self->children, c);
   gtk_widget_set_parent (child, grid);
+}
+
+static GtkWidget *
+find_quick_settings_root (GtkWidget *widget)
+{
+  GtkWidget *cur = widget;
+  while (cur != NULL) {
+    if (g_object_get_data (G_OBJECT (cur), "qs-grid") != NULL)
+      return cur;
+    cur = gtk_widget_get_parent (cur);
+  }
+  return NULL;
+}
+
+static WinomeQuickSettingsGrid *
+get_qs_grid (GtkWidget *quick_settings)
+{
+  if (quick_settings == NULL)
+    return NULL;
+  GtkWidget *grid = GTK_WIDGET (
+      g_object_get_data (G_OBJECT (quick_settings), "qs-grid"));
+  return grid != NULL ? WINOME_QUICK_SETTINGS_GRID (grid) : NULL;
+}
+
+static gboolean
+quick_settings_is_menu_open_for (GtkWidget *quick_settings, GtkWidget *anchor)
+{
+  WinomeQuickSettingsGrid *grid = get_qs_grid (quick_settings);
+  if (grid == NULL || anchor == NULL || grid->drawer_revealer == NULL)
+    return FALSE;
+  return grid->drawer_anchor == anchor &&
+         gtk_revealer_get_reveal_child (GTK_REVEALER (grid->drawer_revealer));
+}
+
+static void
+quick_settings_toggle_inline_menu (GtkWidget *quick_settings,
+                                   GtkWidget *anchor, GtkWidget *menu)
+{
+  WinomeQuickSettingsGrid *grid = get_qs_grid (quick_settings);
+  if (grid == NULL || anchor == NULL || menu == NULL)
+    return;
+
+  if (quick_settings_is_menu_open_for (quick_settings, anchor)) {
+    winome_quick_settings_close_menu (quick_settings, TRUE);
+    return;
+  }
+
+  GtkRevealer *rev = GTK_REVEALER (grid->drawer_revealer);
+  grid->drawer_anchor = anchor;
+  gtk_revealer_set_transition_duration (
+      rev, winome::QUICK_SETTINGS_ANIMATION_TIME / 2);
+  gtk_revealer_set_child (rev, menu);
+  grid_set_dimmed (grid, anchor);
+  gtk_revealer_set_reveal_child (rev, TRUE);
+  gtk_widget_queue_resize (GTK_WIDGET (grid));
+}
+
+gboolean
+winome_quick_settings_close_menu (GtkWidget *quick_settings, gboolean animate)
+{
+  WinomeQuickSettingsGrid *grid = get_qs_grid (quick_settings);
+  if (grid == NULL || grid->drawer_revealer == NULL)
+    return FALSE;
+
+  GtkRevealer *rev = GTK_REVEALER (grid->drawer_revealer);
+  gboolean open_now = gtk_revealer_get_reveal_child (rev) != FALSE;
+  gboolean active_now = open_now || gtk_revealer_get_child_revealed (rev);
+  if (!active_now && grid->drawer_anchor == NULL)
+    return FALSE;
+
+  grid_set_dimmed (grid, NULL);
+
+  if (!animate) {
+    gtk_revealer_set_transition_duration (rev, 0);
+    gtk_revealer_set_reveal_child (rev, FALSE);
+    gtk_revealer_set_child (rev, NULL);
+    grid->drawer_anchor = NULL;
+    gtk_widget_queue_resize (GTK_WIDGET (grid));
+    return open_now;
+  }
+
+  if (!open_now)
+    return FALSE;
+
+  gtk_revealer_set_transition_duration (
+      rev, winome::QUICK_SETTINGS_ANIMATION_TIME / 2);
+  gtk_revealer_set_reveal_child (rev, FALSE);
+  return TRUE;
+}
+
+static void
+on_grid_capture_pressed (GtkGestureClick *gesture, int n_press G_GNUC_UNUSED,
+                         double x, double y, gpointer user_data)
+{
+  GtkWidget *qs = GTK_WIDGET (user_data);
+  WinomeQuickSettingsGrid *grid = get_qs_grid (qs);
+  if (grid == NULL || grid->drawer_revealer == NULL ||
+      !gtk_revealer_get_reveal_child (GTK_REVEALER (grid->drawer_revealer)))
+    return;
+
+  GtkWidget *picked =
+      gtk_widget_pick (GTK_WIDGET (grid), x, y, GTK_PICK_DEFAULT);
+  if (picked == grid->drawer_revealer ||
+      (picked != NULL &&
+       gtk_widget_is_ancestor (picked, grid->drawer_revealer)))
+    return;
+
+  if (winome_quick_settings_close_menu (qs, TRUE))
+    gtk_gesture_set_state (GTK_GESTURE (gesture), GTK_EVENT_SEQUENCE_CLAIMED);
 }
 
 // --- Panel widget ------------------------------------------------------------
@@ -1559,19 +1620,26 @@ build_power_menu (gpointer user_data)
                                tr ("Power Off Menu", "关机菜单"), NULL, FALSE);
 }
 
-// Open handler for the battery capsule: same default anchor as the arrow.
+// Open handler for the system power capsule and shutdown button: toggles
+// the inline Power Off Menu directly below Row 0.
 static void
 on_power_item_clicked (GtkButton *button, gpointer user_data)
 {
-  (void)user_data;
-
-  if (winome_shell_panel_close_menu_for (GTK_WIDGET (button)))
+  GtkWidget *qs = find_quick_settings_root (GTK_WIDGET (button));
+  GtkWidget *anchor = user_data != NULL
+                          ? GTK_WIDGET (user_data)
+                          : gtk_widget_get_parent (GTK_WIDGET (button));
+  if (qs == NULL || anchor == NULL)
     return;
+
+  if (quick_settings_is_menu_open_for (qs, anchor)) {
+    winome_quick_settings_close_menu (qs, TRUE);
+    return;
+  }
 
   GtkWidget *menu = build_power_menu (NULL);
-  if (menu == NULL)
-    return;
-  default_quick_menu_open (GTK_WIDGET (button), menu, NULL);
+  if (menu != NULL)
+    quick_settings_toggle_inline_menu (qs, anchor, menu);
 }
 
 // Each row needs its own target mode, so wrap it in a tiny heap struct kept
@@ -1585,8 +1653,42 @@ static void
 on_power_mode_activate (gpointer user_data)
 {
   PowerModeTarget *t = static_cast<PowerModeTarget *> (user_data);
+  if (t->panel != NULL && t->mode != WINOME_POWER_BALANCED &&
+      t->mode < WINOME_POWER_MODE_COUNT) {
+    g_object_set_data (G_OBJECT (t->panel), "last-power-mode",
+                       GINT_TO_POINTER ((int)t->mode + 1));
+  }
   if (winome_power_set_mode (t->mode))
     winome_quick_settings_refresh (t->panel);
+}
+
+static WinomePowerMode
+preferred_non_balanced_mode (GtkWidget *qs)
+{
+  int stored = qs != NULL ? GPOINTER_TO_INT (
+      g_object_get_data (G_OBJECT (qs), "last-power-mode")) : 0;
+  if (stored > 0 && stored - 1 < WINOME_POWER_MODE_COUNT &&
+      stored - 1 != WINOME_POWER_BALANCED &&
+      winome_power_mode_available ((WinomePowerMode)(stored - 1))) {
+    return (WinomePowerMode)(stored - 1);
+  }
+  if (winome_power_mode_available (WINOME_POWER_SAVER))
+    return WINOME_POWER_SAVER;
+  if (winome_power_mode_available (WINOME_POWER_PERFORMANCE))
+    return WINOME_POWER_PERFORMANCE;
+  return WINOME_POWER_BALANCED;
+}
+
+static void
+on_power_mode_toggled (GtkToggleButton *button, gpointer user_data)
+{
+  GtkWidget *qs = GTK_WIDGET (user_data);
+  WinomePowerMode target = gtk_toggle_button_get_active (button)
+                               ? preferred_non_balanced_mode (qs)
+                               : WINOME_POWER_BALANCED;
+  winome_power_set_mode (target);
+  if (qs != NULL)
+    winome_quick_settings_refresh (qs);
 }
 
 // Wi-Fi secondary menu: the visible networks with the associated one checked.
@@ -1875,7 +1977,7 @@ build_wifi_menu (gpointer user_data)
     g_ptr_array_add (m->rows, row);
 
     items[i].label = static_cast<const char *> (g_ptr_array_index (m->labels, i));
-    items[i].icon_name = net->secured ? "network-wireless-secured-symbolic"
+    items[i].icon_name = net->secured ? "network-wireless-encrypted-symbolic"
                                       : "network-wireless-symbolic";
     items[i].checked = net->connected;
     items[i].callback = on_wifi_network_activate;
@@ -2033,30 +2135,36 @@ winome_quick_settings_new (void)
 
   grid = winome_quick_settings_grid_new ();
   gtk_widget_add_css_class (grid, "quick-settings-grid");
+  g_object_set_data (G_OBJECT (root), "qs-grid", grid);
   gtk_box_append (GTK_BOX (root), grid);
+
+  GtkGesture *grid_click = gtk_gesture_click_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (grid_click), 0);
+  gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (grid_click),
+                                              GTK_PHASE_CAPTURE);
+  g_signal_connect (grid_click, "pressed",
+                    G_CALLBACK (on_grid_capture_pressed), root);
+  gtk_widget_add_controller (grid, GTK_EVENT_CONTROLLER (grid_click));
 
   // --- Row 0: system item (battery + action buttons), full width ---
   {
     GtkWidget *row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
     gtk_widget_add_css_class (row, "quick-settings-system-item");
 
-    // PowerToggle: .quick-toggle.power-item with the battery icon + percentage
-    // as its title (status/system.js). .power-item resets the 12em min-size so
-    // the capsule hugs the icon + text; keep it non-expanding so the spacer
-    // pushes the action buttons to the right edge like native.
-    GtkWidget *power = make_quick_toggle ("battery-level-100-symbolic",
-                                          "100%", NULL,
-                                          &power_icon, &power_title);
+    // PowerToggle: non-toggling .quick-toggle.power-item with battery icon +
+    // percentage as title (status/system.js); clicking opens the Power Off Menu
+    // below Row 0.
+    GtkWidget *power = create_toggle_capsule (false,
+                                              "battery-level-100-symbolic",
+                                              "100%", NULL,
+                                              &power_icon, &power_title, NULL);
     power_toggle = power;
     gtk_widget_add_css_class (power, "power-item");
     gtk_widget_set_focus_on_click (power, FALSE);
     gtk_widget_set_hexpand (power, FALSE);
     gtk_widget_set_vexpand (power, FALSE);
-    // Clicking the battery item opens the power menu (Suspend / Log Out /
-    // Restart / Power Off). GNOME keeps the `.power-item` capsule look, so we
-    // attach a plain click controller instead of using the arrow layout.
     g_signal_connect (power, "clicked",
-                      G_CALLBACK (on_power_item_clicked), NULL);
+                      G_CALLBACK (on_power_item_clicked), row);
     gtk_box_append (GTK_BOX (row), power);
 
     // x_expand spacer: laptop-style layout when a battery is present, pushing
@@ -2070,7 +2178,7 @@ winome_quick_settings_new (void)
     g_signal_connect (btn, "clicked", G_CALLBACK (on_screenshot_clicked), NULL);
     gtk_box_append (GTK_BOX (row), btn);
 
-    btn = make_icon_button ("applications-system-symbolic");
+    btn = make_icon_button ("preferences-system-symbolic");
     g_signal_connect (btn, "clicked", G_CALLBACK (on_settings_clicked), NULL);
     gtk_box_append (GTK_BOX (row), btn);
 
@@ -2079,7 +2187,7 @@ winome_quick_settings_new (void)
     gtk_box_append (GTK_BOX (row), btn);
 
     btn = make_icon_button ("system-shutdown-symbolic");
-    g_signal_connect (btn, "clicked", G_CALLBACK (on_power_item_clicked), NULL);
+    g_signal_connect (btn, "clicked", G_CALLBACK (on_power_item_clicked), row);
     gtk_box_append (GTK_BOX (row), btn);
 
     winome_quick_settings_grid_attach (grid, row, 2);
@@ -2124,7 +2232,7 @@ winome_quick_settings_new (void)
                                    tr ("Wi-Fi", "无线网络"),
                                    have_name ? ssid : tr ("Not Connected", "未连接"),
                                    build_wifi_menu, root);
-    g_signal_connect (wlan, "toggled",
+    g_signal_connect (quick_menu_toggle_button (wlan), "toggled",
                       G_CALLBACK (on_wlan_toggled), root);
     winome_quick_settings_grid_attach (grid, wlan, 1);
 
@@ -2132,7 +2240,7 @@ winome_quick_settings_new (void)
                                         tr ("Bluetooth", "蓝牙"),
                                         tr ("Off", "已关闭"),
                                         build_bluetooth_menu, root);
-    g_signal_connect (bluetooth, "toggled",
+    g_signal_connect (quick_menu_toggle_button (bluetooth), "toggled",
                       G_CALLBACK (on_bluetooth_toggled), root);
     winome_quick_settings_grid_attach (grid, bluetooth, 1);
 
@@ -2140,6 +2248,8 @@ winome_quick_settings_new (void)
                                         tr ("Power Mode", "电源模式"),
                                         winome_power_mode_label (active_power),
                                         build_power_mode_menu, root);
+    g_signal_connect (quick_menu_toggle_button (powermode), "toggled",
+                      G_CALLBACK (on_power_mode_toggled), root);
     winome_quick_settings_grid_attach (grid, powermode, 1);
 
     nightlight = make_quick_toggle ("night-light-symbolic",
@@ -2289,12 +2399,9 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
   if (wlan_toggle) {
     WinomeWifiStatus wifi_st = {};
     gboolean have_wifi = winome_wifi_get_status (&wifi_st);
-    g_signal_handlers_block_by_func (wlan_toggle,
-        (gpointer) on_wlan_toggled, quick_settings);
-    gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (wlan_toggle),
-                                  have_wifi && wifi_st.enabled);
-    g_signal_handlers_unblock_by_func (wlan_toggle,
-        (gpointer) on_wlan_toggled, quick_settings);
+    set_toggle_active_blocked (wlan_toggle,
+                               have_wifi && wifi_st.enabled,
+                               G_CALLBACK (on_wlan_toggled), quick_settings);
 
     MenuToggleParts *parts = static_cast<MenuToggleParts *> (
         g_object_get_data (G_OBJECT (wlan_toggle), "menu-toggle-parts"));
@@ -2314,12 +2421,9 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
     winome::get_bluetooth_status (&bt_present, &bt_enabled, bt_name,
                                   sizeof (bt_name));
     gtk_widget_set_visible (bluetooth_toggle, bt_present ? TRUE : FALSE);
-    g_signal_handlers_block_by_func (bluetooth_toggle,
-        (gpointer) on_bluetooth_toggled, quick_settings);
-    gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (bluetooth_toggle),
-                                  bt_enabled ? TRUE : FALSE);
-    g_signal_handlers_unblock_by_func (bluetooth_toggle,
-        (gpointer) on_bluetooth_toggled, quick_settings);
+    set_toggle_active_blocked (bluetooth_toggle,
+                               bt_enabled ? TRUE : FALSE,
+                               G_CALLBACK (on_bluetooth_toggled), quick_settings);
 
     MenuToggleParts *parts = static_cast<MenuToggleParts *> (
         g_object_get_data (G_OBJECT (bluetooth_toggle), "menu-toggle-parts"));
@@ -2335,11 +2439,18 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
   if (powermode_toggle) {
     MenuToggleParts *parts = static_cast<MenuToggleParts *> (
         g_object_get_data (G_OBJECT (powermode_toggle), "menu-toggle-parts"));
+    WinomePowerMode detected = winome_power_get_active ();
+    WinomePowerMode active = (detected == WINOME_POWER_MODE_COUNT)
+                                 ? WINOME_POWER_BALANCED
+                                 : detected;
+    if (active != WINOME_POWER_BALANCED) {
+      g_object_set_data (G_OBJECT (quick_settings), "last-power-mode",
+                         GINT_TO_POINTER ((int)active + 1));
+    }
+    set_toggle_active_blocked (powermode_toggle,
+                               active != WINOME_POWER_BALANCED,
+                               G_CALLBACK (on_power_mode_toggled), quick_settings);
     if (parts) {
-      WinomePowerMode detected = winome_power_get_active ();
-      WinomePowerMode active = (detected == WINOME_POWER_MODE_COUNT)
-                                   ? WINOME_POWER_BALANCED
-                                   : detected;
       if (parts->subtitle_label) {
         gtk_label_set_text (GTK_LABEL (parts->subtitle_label),
                             winome_power_mode_label (active));

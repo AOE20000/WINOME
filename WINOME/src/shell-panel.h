@@ -28,19 +28,5 @@ void *winome_shell_panel_top_popover_hwnd (void);
 // ignore it instead of closing too (windowPreview/overview click handling).
 int winome_shell_panel_popover_just_closed (void);
 
-// Open a secondary menu (QuickToggleMenu) anchored under @anchor — the
-// ".quick-toggle-menu-button" arrow or the .power-item capsule that produced
-// it. @menu is consumed: the caller keeps its own reference if it still needs
-// one. Closes any menu already open, and is closed by the next click outside,
-// exactly like the quick-settings and calendar popovers.
-void winome_shell_panel_open_menu (GtkWidget *anchor, GtkWidget *menu);
-
-// Close the active secondary menu if it was opened for @anchor, returning
-// TRUE if one was closed.
-gboolean winome_shell_panel_close_menu_for (GtkWidget *anchor);
-
-// Close any active secondary menu.
-void winome_shell_panel_close_menu (void);
-
-// Close all open panel popovers and secondary menus.
+// Close all open panel popovers.
 void winome_shell_panel_close_popovers (void);

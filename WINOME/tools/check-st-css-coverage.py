@@ -87,15 +87,11 @@ GTK4_NATIVE = {
 DIRECTION_PSEUDO = re.compile(r':(rtl|ltr)\b')
 
 # Declarations whose meaning depends on another being present, keyed by the pair
-# as it appears in the *converted* St stylesheet. Note sassc has already turned
-# St's `width` into `min-width` (St treats width as a minimum), so a fixed-size
-# rule reads `min-width: 12em; max-width: 12em` — never `width` + `max-width`.
-# If only the minimum survives, the row stops aligning with its neighbours,
-# which is how the panel lost its grid rhythm.
-SEMANTIC_PAIRS = {
-    'min-width': 'max-width',
-    'min-height': 'max-height',
-}
+# Upper size bounds (`max-width`, `max-height`) are rejected by GTK4's
+# GtkCssProvider (7 parse errors in GNOME Shell's stylesheet). They are
+# intentionally dropped during GTK4 CSS conversion and enforced instead by C++
+# layout code reading upstream St lengths via StEngine.
+SEMANTIC_PAIRS = {}
 
 
 def parse_properties(css, skip_direction_rules=False):

@@ -31,8 +31,6 @@ ACCENT_VARS = {
 RENAME = {
     'height': 'min-height',
     'width': 'min-width',
-    'max-height': 'max-height',
-    'max-width': 'max-width',
 }
 
 # -natural-hpadding: X -> padding-left/right: X (expanded to two decls).
@@ -243,25 +241,37 @@ GTK4_BUTTON_OVERRIDE = """
    painted over but hidden. Clear the default gradient on GNOME-styled
    controls so the GNOME background-color shows through. */
 .quick-toggle.button,
-.quick-toggle-has-menu,
+.quick-toggle-has-menu .quick-toggle-menu-button,
 .quick-slider,
 .icon-button,
 .quick-settings-system-item .icon-button {
   background-image: none;
   border: none;
 }
+.quick-toggle-has-menu,
+.quick-toggle-has-menu:hover,
+.quick-toggle-has-menu:active,
+.quick-toggle-has-menu:checked,
+.quick-toggle-has-menu:focus,
+.quick-toggle-has-menu:focus-visible {
+  background-image: none;
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
 /* GNOME draws a focus ring only for keyboard navigation. GTK4's :focus also
    matches mouse clicks, so strip the box-shadow on plain :focus and keep it
    only on :focus-visible (keyboard focus). */
 .quick-toggle.button:focus,
-.quick-toggle-has-menu:focus,
+.quick-toggle-has-menu .quick-toggle-menu-button:focus,
 .icon-button:focus,
 .quick-settings-system-item .icon-button:focus {
   box-shadow: none;
   outline: none;
 }
 .quick-toggle.button:focus-visible,
-.quick-toggle-has-menu:focus-visible,
+.quick-toggle-has-menu .quick-toggle-menu-button:focus-visible,
 .icon-button:focus-visible,
 .quick-settings-system-item .icon-button:focus-visible {
   box-shadow: inset 0 0 0 2px rgba(134, 181, 239, 0.800);
@@ -294,8 +304,35 @@ GTK4_BUTTON_OVERRIDE = """
 /* GtkButton adds its own padding on top of the GNOME padding. Native has no
    padding on the buttons themselves (it lives in the inner box), so strip it;
    otherwise a has-menu toggle renders wider/taller than a plain toggle. */
+.quick-toggle-has-menu .quick-toggle-separator {
+  margin: 0;
+  border: none;
+  min-width: 1px;
+}
 .quick-toggle-has-menu {
   padding: 0;
+}
+
+/* Upstream .quick-toggle-menu is non-reactive (StBoxLayout), so hover/active
+   from the shared %tile rule never fires there; in GTK4 every GtkBox gets
+   :hover on pointer entry. Keep the drawer container calm on pointer hover. */
+.quick-toggle-menu,
+.quick-toggle-menu:hover,
+.quick-toggle-menu:active,
+.quick-toggle-menu:focus,
+.quick-toggle-menu:focus:hover,
+.quick-toggle-menu:active:hover,
+.quick-toggle-menu:active:focus {
+  background-color: #47474c;
+  box-shadow: none;
+  outline: none;
+}
+/* Non-active grid rows dim softly while an inline QuickToggleMenu drawer is open. */
+.quick-settings-grid .quick-settings-dimmed {
+  opacity: 0.4;
+  transition-property: opacity;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
 }
 
 /* Quick slider: rendered by the custom WinomeQuickSlider widget (GNOME
@@ -565,9 +602,11 @@ window#winomeToastWindow {
   box-shadow: none;
 }
 
-/* QuickToggleMenu inside its own BoxPointer window sits flush under the arrow. */
-window.quick-settings-popover-window .quick-toggle-menu {
-  margin-top: 0;
+/* Inline QuickToggleMenu sits cleanly in its own grid row (which already carries
+   12px row spacing above and below); strip the %tile margin so edges align flush
+   with the two-column grid. */
+.quick-settings .quick-toggle-menu {
+  margin: 0;
 }
 """
 
@@ -703,12 +742,12 @@ def process_declaration(prop, value):
         if m:
             return [('background-color', m.group(1))]
 
+    if prop in DROP:
+        return None
     if prop in RENAME:
         return [(RENAME[prop], eval_color_value(value))]
     if prop in EXPAND:
         return [(p, eval_color_value(value)) for p in EXPAND[prop]]
-    if prop in DROP:
-        return None
     return [(prop, eval_color_value(value))]
 
 

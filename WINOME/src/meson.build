@@ -56,7 +56,7 @@ subdir('theme')
 
 resources = gnome.compile_resources('winome-resources',
   'theme/winome.gresource.xml',
-  source_dir: meson.current_build_dir() / 'theme',
+  source_dir: [meson.current_build_dir() / 'theme', meson.current_source_dir() / 'theme'],
   dependencies: [gnome_shell_gtk4_css, gnome_shell_dark_css, cantarell_fonts],
 )
 

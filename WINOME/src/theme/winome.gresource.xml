@@ -7,5 +7,17 @@
     <file>Cantarell-Bold-2.ttf</file>
     <file>Cantarell-Oblique-4.ttf</file>
     <file>Cantarell-BoldOblique-3.ttf</file>
+    <file>icons/scalable/actions/carousel-arrow-next-symbolic.svg</file>
+    <file>icons/scalable/actions/carousel-arrow-previous-symbolic.svg</file>
+    <file>icons/scalable/actions/cog-wheel-symbolic.svg</file>
+    <file>icons/scalable/actions/dark-mode-symbolic.svg</file>
+    <file>icons/scalable/actions/group-collapse-symbolic.svg</file>
+    <file>icons/scalable/actions/notification-expand-symbolic.svg</file>
+    <file>icons/scalable/actions/ornament-check-symbolic.svg</file>
+    <file>icons/scalable/actions/preview-close-symbolic.svg</file>
+    <file>icons/scalable/actions/screenshooter-symbolic.svg</file>
+    <file>icons/scalable/status/check-symbolic.svg</file>
+    <file>icons/scalable/status/message-indicator-symbolic.svg</file>
+    <file>icons/scalable/status/no-notifications-symbolic.svg</file>
   </gresource>
 </gresources>

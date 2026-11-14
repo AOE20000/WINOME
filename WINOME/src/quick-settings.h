@@ -32,6 +32,12 @@ void winome_calendar_refresh (GtkWidget *calendar);
 // Refresh battery percentage and volume state in the quick settings.
 void winome_quick_settings_refresh (GtkWidget *quick_settings);
 
+// If Quick Settings currently has an inline accordion menu drawer open,
+// close it (animated when @animate is TRUE) and return TRUE; otherwise return
+// FALSE. Safe to call with any widget.
+gboolean winome_quick_settings_close_menu (GtkWidget *quick_settings,
+                                           gboolean animate);
+
 // Build a secondary menu popup for a `.quick-toggle-menu-button` arrow, from
 // @n_entries rows of @entries. The returned widget is the themed popup content
 // (.quick-toggle-menu > .popup-menu-box > .popup-menu-item); it is not a

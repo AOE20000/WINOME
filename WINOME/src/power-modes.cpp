@@ -146,7 +146,7 @@ winome_power_mode_icon (WinomePowerMode mode)
 {
   switch (mode) {
   case WINOME_POWER_SAVER:
-    return "power-profile-saver-symbolic";
+    return "power-profile-power-saver-symbolic";
   case WINOME_POWER_BALANCED:
     return "power-profile-balanced-symbolic";
   case WINOME_POWER_PERFORMANCE:
