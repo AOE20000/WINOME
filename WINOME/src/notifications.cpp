@@ -181,9 +181,9 @@ void position_banner_window(GtkWidget* window) {
   int min_h = 0, nat_h = 72;
   gtk_widget_measure(window, GTK_ORIENTATION_HORIZONTAL, -1,
                      &min_w, &nat_w, nullptr, nullptr);
-  gtk_widget_measure(window, GTK_ORIENTATION_VERTICAL, nat_w,
+  const int w = std::max(min_w, banner_min_width());
+  gtk_widget_measure(window, GTK_ORIENTATION_VERTICAL, w,
                      &min_h, &nat_h, nullptr, nullptr);
-  int w = std::max(nat_w, banner_min_width());
   int h = std::max(nat_h, 64);
 
   HMONITOR mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
@@ -234,11 +234,18 @@ void ensure_banner_window() {
   g_banner_app_label = gtk_label_new("");
   gtk_widget_add_css_class(g_banner_app_label, "message-source-title");
   gtk_label_set_xalign(GTK_LABEL(g_banner_app_label), 0.0f);
+  gtk_label_set_ellipsize(GTK_LABEL(g_banner_app_label), PANGO_ELLIPSIZE_END);
   gtk_box_append(GTK_BOX(header_content), g_banner_app_label);
   gtk_box_append(GTK_BOX(header), header_content);
 
-  GtkWidget* close_btn = gtk_button_new_from_icon_name("window-close-symbolic");
+  GtkWidget* close_btn = gtk_button_new();
+  GtkWidget* close_icon = gtk_image_new_from_icon_name("window-close-symbolic");
+  gtk_image_set_pixel_size(GTK_IMAGE(close_icon), 16);
+  gtk_button_set_child(GTK_BUTTON(close_btn), close_icon);
   gtk_widget_add_css_class(close_btn, "message-close-button");
+  gtk_widget_add_css_class(close_btn, "icon-button");
+  gtk_widget_set_halign(close_btn, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign(close_btn, GTK_ALIGN_CENTER);
   gtk_widget_set_focus_on_click(close_btn, FALSE);
   g_signal_connect(close_btn, "clicked",
                    G_CALLBACK(on_banner_close_clicked), nullptr);
@@ -265,8 +272,10 @@ void ensure_banner_window() {
   gtk_box_append(GTK_BOX(content), g_banner_title_label);
 
   g_banner_body_label = gtk_label_new("");
+  gtk_widget_add_css_class(g_banner_body_label, "message-body");
   gtk_label_set_xalign(GTK_LABEL(g_banner_body_label), 0.0f);
   gtk_label_set_wrap(GTK_LABEL(g_banner_body_label), TRUE);
+  gtk_label_set_wrap_mode(GTK_LABEL(g_banner_body_label), PANGO_WRAP_WORD_CHAR);
   gtk_label_set_lines(GTK_LABEL(g_banner_body_label), 3);
   gtk_label_set_ellipsize(GTK_LABEL(g_banner_body_label), PANGO_ELLIPSIZE_END);
   gtk_box_append(GTK_BOX(content), g_banner_body_label);

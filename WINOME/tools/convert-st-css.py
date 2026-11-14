@@ -608,6 +608,34 @@ window#winomeToastWindow {
 .quick-settings .quick-toggle-menu {
   margin: 0;
 }
+
+/* Non-interactive calendar container and label widgets extend %card_flat or
+   %flat_button; neutralize GTK4 pointer/focus pseudo-classes so GtkBox/GtkLabel
+   do not flash or show focus rings when the cursor moves across them. */
+.calendar:hover,
+.calendar:active,
+.calendar:focus,
+.calendar:focus-visible,
+.calendar .calendar-month-header .calendar-month-label:hover,
+.calendar .calendar-month-header .calendar-month-label:active,
+.calendar .calendar-month-header .calendar-month-label:focus,
+.calendar .calendar-month-header .calendar-month-label:focus-visible,
+.calendar .calendar-day-heading:hover,
+.calendar .calendar-day-heading:active,
+.calendar .calendar-day-heading:focus,
+.calendar .calendar-day-heading:focus-visible {
+  background-color: transparent;
+  box-shadow: none;
+  outline: none;
+}
+
+/* Upstream .message-list sets `border: solid ...; border-right-width: 1px;`
+   intending only a vertical divider on the calendar-facing edge. */
+.message-list {
+  border-top-width: 0;
+  border-bottom-width: 0;
+  border-left-width: 0;
+}
 """
 
 # em values in the stylesheet resolve against the St theme context font

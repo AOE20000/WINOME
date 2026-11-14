@@ -376,6 +376,46 @@ create_media_card (const winome::WinomeMediaInfo &media)
 }
 
 static GtkWidget *
+create_icon_button (const char *icon_name,
+                    int pixel_size,
+                    const char *cls1,
+                    const char *cls2,
+                    const char *cls3 = nullptr,
+                    const char *cls4 = nullptr)
+{
+  GtkWidget *btn = gtk_button_new ();
+  GtkWidget *img = gtk_image_new_from_icon_name (icon_name);
+  if (pixel_size > 0)
+    gtk_image_set_pixel_size (GTK_IMAGE (img), pixel_size);
+  gtk_button_set_child (GTK_BUTTON (btn), img);
+  const char *classes[4] = {cls1, cls2, cls3, cls4};
+  for (const char *cls : classes) {
+    if (cls != nullptr && cls[0] != '\0')
+      gtk_widget_add_css_class (btn, cls);
+  }
+  gtk_widget_set_halign (btn, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (btn, GTK_ALIGN_CENTER);
+  gtk_widget_set_focus_on_click (btn, FALSE);
+  return btn;
+}
+
+static void
+on_notif_expand_clicked (GtkButton *btn, gpointer G_GNUC_UNUSED user_data)
+{
+  GtkLabel *body = GTK_LABEL (g_object_get_data (G_OBJECT (btn), "body-label"));
+  if (body == nullptr)
+    return;
+  const bool collapsed = gtk_label_get_lines (body) >= 0;
+  gtk_label_set_lines (body, collapsed ? -1 : 3);
+  gtk_label_set_ellipsize (body, collapsed ? PANGO_ELLIPSIZE_NONE
+                                          : PANGO_ELLIPSIZE_END);
+  if (collapsed)
+    gtk_widget_add_css_class (GTK_WIDGET (btn), "expanded");
+  else
+    gtk_widget_remove_css_class (GTK_WIDGET (btn), "expanded");
+}
+
+static GtkWidget *
 create_notification_card (const winome::ShellNotification &notif,
                           int64_t now_unix)
 {
@@ -408,9 +448,33 @@ create_notification_card (const winome::ShellNotification &notif,
   gtk_box_append (GTK_BOX (hc), time_lbl);
   gtk_box_append (GTK_BOX (header), hc);
 
-  GtkWidget *close_btn = gtk_button_new_from_icon_name ("window-close-symbolic");
-  gtk_widget_add_css_class (close_btn, "message-close-button");
-  gtk_widget_set_focus_on_click (close_btn, FALSE);
+  GtkWidget *body = nullptr;
+  if (!notif.body.empty ()) {
+    body = gtk_label_new (notif.body.c_str ());
+    gtk_widget_add_css_class (body, "message-body");
+    gtk_label_set_xalign (GTK_LABEL (body), 0.0f);
+    gtk_label_set_wrap (GTK_LABEL (body), TRUE);
+    gtk_label_set_wrap_mode (GTK_LABEL (body), PANGO_WRAP_WORD_CHAR);
+    gtk_label_set_lines (GTK_LABEL (body), 3);
+    gtk_label_set_ellipsize (GTK_LABEL (body), PANGO_ELLIPSIZE_END);
+  }
+
+  const bool needs_expand =
+      body != nullptr &&
+      (notif.body.size () > 110 || notif.body.find ('\n') != std::string::npos);
+  if (needs_expand) {
+    GtkWidget *expand_btn = create_icon_button (
+        "notification-expand-symbolic", 16,
+        "message-expand-button", "icon-button");
+    g_object_set_data (G_OBJECT (expand_btn), "body-label", body);
+    g_signal_connect (expand_btn, "clicked",
+                      G_CALLBACK (on_notif_expand_clicked), nullptr);
+    gtk_box_append (GTK_BOX (header), expand_btn);
+  }
+
+  GtkWidget *close_btn = create_icon_button (
+      "window-close-symbolic", 16,
+      "message-close-button", "icon-button");
   g_object_set_data_full (G_OBJECT (close_btn), "notif-key",
                           new uint64_t (notif.key), free_notif_key);
   g_signal_connect (close_btn, "clicked",
@@ -430,16 +494,11 @@ create_notification_card (const winome::ShellNotification &notif,
     gtk_widget_add_css_class (title, "message-title");
     gtk_label_set_xalign (GTK_LABEL (title), 0.0f);
     gtk_label_set_wrap (GTK_LABEL (title), TRUE);
+    gtk_label_set_wrap_mode (GTK_LABEL (title), PANGO_WRAP_WORD_CHAR);
     gtk_box_append (GTK_BOX (content), title);
   }
-  if (!notif.body.empty ()) {
-    GtkWidget *body = gtk_label_new (notif.body.c_str ());
-    gtk_label_set_xalign (GTK_LABEL (body), 0.0f);
-    gtk_label_set_wrap (GTK_LABEL (body), TRUE);
-    gtk_label_set_lines (GTK_LABEL (body), 3);
-    gtk_label_set_ellipsize (GTK_LABEL (body), PANGO_ELLIPSIZE_END);
+  if (body != nullptr)
     gtk_box_append (GTK_BOX (content), body);
-  }
 
   gtk_box_append (GTK_BOX (body_row), content);
   gtk_box_append (GTK_BOX (card), body_row);
@@ -477,8 +536,10 @@ rebuild_message_list (CalendarData *data, bool force = false)
     gtk_widget_set_visible (data->message_scroll, has_content ? TRUE : FALSE);
   if (data->placeholder != nullptr)
     gtk_widget_set_visible (data->placeholder, has_content ? FALSE : TRUE);
-  if (data->clear_btn != nullptr)
+  if (data->clear_btn != nullptr) {
+    gtk_widget_set_visible (data->clear_btn, has_content ? TRUE : FALSE);
     gtk_widget_set_sensitive (data->clear_btn, !notifs.empty () ? TRUE : FALSE);
+  }
 }
 
 static void
@@ -542,6 +603,8 @@ calendar_rebuild (CalendarData *data)
       gtk_button_set_label (GTK_BUTTON (button), label);
 
       gtk_widget_add_css_class (button, "calendar-day");
+      gtk_widget_set_halign (button, GTK_ALIGN_CENTER);
+      gtk_widget_set_valign (button, GTK_ALIGN_CENTER);
       if (col == 0 || col == 6)
         gtk_widget_add_css_class (button, "calendar-weekend");
       if (m == data->selected_month + 1)
@@ -603,22 +666,21 @@ winome_calendar_new (void)
   gtk_grid_attach (GTK_GRID (data->grid), top_box, 0, 0, 7, 1);
   g_object_set_data (G_OBJECT (top_box), "row", GINT_TO_POINTER (0));
 
-  GtkWidget *back = gtk_button_new_from_icon_name ("pan-start-symbolic");
-  gtk_widget_add_css_class (back, "calendar-change-month-back");
-  gtk_widget_add_css_class (back, "pager-button");
-  gtk_widget_set_focus_on_click (back, FALSE);
+  GtkWidget *back = create_icon_button (
+      "pan-start-symbolic", -1,
+      "calendar-change-month-back", "pager-button", "icon-button", "flat");
   g_signal_connect (back, "clicked", G_CALLBACK (on_prev_month), data);
   gtk_box_append (GTK_BOX (top_box), back);
 
   data->month_label = gtk_label_new ("");
   gtk_widget_add_css_class (data->month_label, "calendar-month-label");
+  gtk_label_set_justify (GTK_LABEL (data->month_label), GTK_JUSTIFY_CENTER);
   gtk_widget_set_hexpand (data->month_label, TRUE);
   gtk_box_append (GTK_BOX (top_box), data->month_label);
 
-  GtkWidget *forward = gtk_button_new_from_icon_name ("pan-end-symbolic");
-  gtk_widget_add_css_class (forward, "calendar-change-month-forward");
-  gtk_widget_add_css_class (forward, "pager-button");
-  gtk_widget_set_focus_on_click (forward, FALSE);
+  GtkWidget *forward = create_icon_button (
+      "pan-end-symbolic", -1,
+      "calendar-change-month-forward", "pager-button", "icon-button", "flat");
   g_signal_connect (forward, "clicked", G_CALLBACK (on_next_month), data);
   gtk_box_append (GTK_BOX (top_box), forward);
 
@@ -665,7 +727,7 @@ winome_calendar_new (void)
   gtk_widget_set_halign (placeholder, GTK_ALIGN_CENTER);
   data->placeholder = placeholder;
 
-  GtkWidget *ph_icon = gtk_image_new_from_icon_name ("notifications-disabled-symbolic");
+  GtkWidget *ph_icon = gtk_image_new_from_icon_name ("no-notifications-symbolic");
   gtk_image_set_pixel_size (GTK_IMAGE (ph_icon), 96);
   gtk_box_append (GTK_BOX (placeholder), ph_icon);
 
@@ -694,7 +756,9 @@ winome_calendar_new (void)
 
   GtkWidget *clear_btn = gtk_button_new_with_label (is_zh () ? "清除" : "Clear");
   gtk_widget_add_css_class (clear_btn, "message-list-clear-button");
+  gtk_widget_add_css_class (clear_btn, "button");
   gtk_widget_set_focus_on_click (clear_btn, FALSE);
+  gtk_widget_set_visible (clear_btn, FALSE);
   gtk_widget_set_sensitive (clear_btn, FALSE);
   g_signal_connect (clear_btn, "clicked",
                     G_CALLBACK (on_clear_notifs_clicked), NULL);
@@ -772,8 +836,14 @@ winome_calendar_new (void)
 
   GtkWidget *clocks_grid = gtk_grid_new ();
   gtk_widget_add_css_class (clocks_grid, "world-clocks-grid");
-  gtk_grid_set_column_spacing (GTK_GRID (clocks_grid), 12);
-  gtk_grid_set_row_spacing (GTK_GRID (clocks_grid), 6);
+  gtk_grid_set_column_spacing (
+      GTK_GRID (clocks_grid),
+      lookup_cal_length ("world-clocks-button", "world-clocks-grid",
+                         "spacing-columns", 12));
+  gtk_grid_set_row_spacing (
+      GTK_GRID (clocks_grid),
+      lookup_cal_length ("world-clocks-button", "world-clocks-grid",
+                         "spacing-rows", 6));
 
   GtkWidget *utc_tz = gtk_label_new ("UTC");
   gtk_widget_add_css_class (utc_tz, "world-clocks-timezone");

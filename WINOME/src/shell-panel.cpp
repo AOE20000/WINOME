@@ -22,6 +22,7 @@
 #include "system-status.h"
 #include "wifi-networks.h"
 #include "quick-settings.h"
+#include "notifications.h"
 #include "systray.h"
 #include "overview-trigger.h"
 #include "overview.h"
@@ -1111,6 +1112,8 @@ typedef struct PanelStatus {
   guint status_timer_id;
   guint clock_timer_id;
   GtkWidget *clock_label;
+  GtkWidget *messages_indicator;
+  GtkWidget *messages_indicator_pad;
   GtkWidget *network_icon;
   GtkWidget *bluetooth_icon;
   GtkWidget *volume_icon;
@@ -1128,13 +1131,28 @@ typedef struct PanelStatus {
 // In GNOME the hover/active highlight lives on the .clock child (an St.Widget).
 // GtkLabel does not paint its CSS background in GTK4, so the .clock "label" is
 // a GtkBox (which does paint it) wrapping the actual text label.
+static void
+update_messages_indicator (PanelStatus *st)
+{
+  if (st == nullptr || st->messages_indicator == nullptr)
+    return;
+  bool dnd_on = false;
+  winome::get_do_not_disturb (&dnd_on);
+  const bool show = !dnd_on && !winome::notifications_get_all ().empty ();
+  gtk_widget_set_visible (st->messages_indicator, show ? TRUE : FALSE);
+  if (st->messages_indicator_pad != nullptr)
+    gtk_widget_set_visible (st->messages_indicator_pad, show ? TRUE : FALSE);
+}
+
 static GtkWidget *
 create_clock_button (PanelStatus *st, bool with_popover)
 {
   GtkWidget *button;
   GtkWidget *display_box;
+  GtkWidget *indicator_pad;
   GtkWidget *clock_box;
   GtkWidget *clock_label;
+  GtkWidget *indicator;
 
   button = gtk_button_new ();
   gtk_widget_add_css_class (button, "panel-button");
@@ -1149,6 +1167,13 @@ create_clock_button (PanelStatus *st, bool with_popover)
   // the .clock label is y-aligned CENTER).
   gtk_widget_set_valign (display_box, GTK_ALIGN_CENTER);
 
+  // Empty mirror widget sized to match .messages-indicator so showing the dot
+  // keeps the clock text centered in the monitor work area.
+  indicator_pad = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_widget_set_valign (indicator_pad, GTK_ALIGN_CENTER);
+  gtk_widget_set_visible (indicator_pad, FALSE);
+  gtk_box_append (GTK_BOX (display_box), indicator_pad);
+
   clock_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
   gtk_widget_add_css_class (clock_box, "clock");
   gtk_widget_set_valign (clock_box, GTK_ALIGN_CENTER);
@@ -1157,11 +1182,27 @@ create_clock_button (PanelStatus *st, bool with_popover)
   gtk_box_append (GTK_BOX (clock_box), clock_label);
   gtk_box_append (GTK_BOX (display_box), clock_box);
 
+  indicator = gtk_image_new_from_icon_name ("message-indicator-symbolic");
+  gtk_image_set_pixel_size (GTK_IMAGE (indicator), status_icon_size ());
+  gtk_widget_add_css_class (indicator, "messages-indicator");
+  gtk_widget_set_valign (indicator, GTK_ALIGN_CENTER);
+  gtk_widget_set_visible (indicator, FALSE);
+  gtk_box_append (GTK_BOX (display_box), indicator);
+
+  GtkSizeGroup *indicator_sg = gtk_size_group_new (GTK_SIZE_GROUP_HORIZONTAL);
+  gtk_size_group_add_widget (indicator_sg, indicator_pad);
+  gtk_size_group_add_widget (indicator_sg, indicator);
+  g_object_set_data_full (G_OBJECT (display_box), "indicator-size-group",
+                          indicator_sg, g_object_unref);
+
   gtk_button_set_child (GTK_BUTTON (button), display_box);
 
+  st->messages_indicator_pad = indicator_pad;
+  st->messages_indicator = indicator;
   st->clock_label = clock_label;
   st->clock_timer_id = g_timeout_add_seconds (1, update_clock, clock_label);
   update_clock (clock_label);
+  update_messages_indicator (st);
 
   if (with_popover) {
     // The clock opens the date/calendar popover (like DateMenuButton), centered
@@ -1333,6 +1374,7 @@ refresh_status (gpointer data)
 
   if (st->clock_label != nullptr)
     update_clock (st->clock_label);
+  update_messages_indicator (st);
   if (st->network_icon != nullptr)
     update_network_icon (st->network_icon);
   if (st->bluetooth_icon != nullptr)
@@ -1534,6 +1576,8 @@ create_tray_button (PanelStatus *st)
   gtk_widget_set_hexpand (title, TRUE);
 
   GtkWidget *refresh_btn = gtk_button_new_from_icon_name ("view-refresh-symbolic");
+  gtk_widget_add_css_class (refresh_btn, "button");
+  gtk_widget_add_css_class (refresh_btn, "icon-button");
   gtk_widget_set_focus_on_click (refresh_btn, FALSE);
   gtk_widget_set_tooltip_text (refresh_btn, winome::tr ("Refresh", "刷新"));
   g_signal_connect (refresh_btn, "clicked",
@@ -1541,6 +1585,7 @@ create_tray_button (PanelStatus *st)
 
   GtkWidget *overflow_btn =
       gtk_button_new_with_label (winome::tr ("Windows Tray", "原生托盘"));
+  gtk_widget_add_css_class (overflow_btn, "button");
   gtk_widget_set_focus_on_click (overflow_btn, FALSE);
   gtk_widget_set_tooltip_text (
       overflow_btn, winome::tr ("Open Windows system tray overflow", "打开 Windows 系统托盘溢出区"));
@@ -1707,6 +1752,7 @@ on_panel_destroy (GtkWidget *panel, gpointer user_data)
     if (st->clock_timer_id != 0)
       g_source_remove (st->clock_timer_id);
     winome::remove_config_listener (on_panel_config_changed, st);
+    winome::notifications_remove_listener (on_panel_status_event, st);
     if (st->is_primary) {
       winome::systray_remove_listener (on_systray_changed, st);
       winome::remove_volume_listener (on_panel_status_event, st);
@@ -1765,6 +1811,7 @@ build_shell_panel (bool primary)
     winome_wifi_add_listener (on_panel_status_event, status);
   }
   winome::add_config_listener (on_panel_config_changed, status);
+  winome::notifications_add_listener (on_panel_status_event, status);
   g_signal_connect (panel, "destroy", G_CALLBACK (on_panel_destroy), status);
 
   // Give the panel its own font map so the bundled Cantarell font is used.
