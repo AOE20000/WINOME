@@ -11,9 +11,12 @@
 #include "overview-dash.h"
 #include "overview-layout.h"
 #include "overview-thumbs.h"
+#include "st-engine.h"
 #include "systray.h"
 #include "virtual-desktop.h"
 #include "wifi-networks.h"
+
+#include <cmath>
 
 #include <windows.h>
 
@@ -500,6 +503,51 @@ void test_dash_favorites_and_thumbs_summary() {
   CHECK(t_multi.visible && t_multi.desktop_pills == 2 && t_multi.has_add_pill);
 }
 
+void test_st_engine_theme_metrics() {
+  const char* candidates[] = {
+    "../src/theme/gnome-shell-dark.css",
+    "../WINOME/src/theme/gnome-shell-dark.css",
+    "WINOME/src/theme/gnome-shell-dark.css",
+    "src/theme/gnome-shell-dark.css",
+  };
+  const char* css_path = nullptr;
+  for (const char* p : candidates) {
+    if (GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES) {
+      css_path = p;
+      break;
+    }
+  }
+  CHECK(css_path != nullptr);
+  if (!css_path)
+    return;
+
+  winome::StEngine engine;
+  CHECK(engine.load_stylesheet(css_path));
+
+  auto check_len = [&](const char* id, const char* cls, const char* prop,
+                       double expected) {
+    winome::StEngine::Node node(engine, nullptr, id, cls, "");
+    double v = -1.0;
+    CHECK(node.lookup_length(prop, &v));
+    CHECK(std::abs(v - expected) < 0.5);
+  };
+
+  check_len("panel", "", "height", 32.0);
+  check_len("", "quick-settings-grid", "spacing-rows", 12.0);
+  check_len("", "quick-settings-grid", "spacing-columns", 12.0);
+  check_len("", "slider", "-barlevel-height", 4.0);
+  check_len("", "window-close", "width", 32.0);
+  check_len("", "window-close", "height", 32.0);
+  check_len("", "workspace-switcher", "spacing", 12.0);
+
+  {
+    winome::StEngine::Node node(engine, nullptr, "", "popup-menu-content", "");
+    std::string color;
+    CHECK(node.lookup_color("background-color", &color));
+    CHECK(color == "#36363a");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -518,6 +566,7 @@ int main() {
   test_app_index_and_lru_cache();
   test_app_grid_pagination();
   test_dash_favorites_and_thumbs_summary();
+  test_st_engine_theme_metrics();
 
   if (g_failures == 0)
     std::printf("ALL WINOME UNIT TESTS PASSED\n");

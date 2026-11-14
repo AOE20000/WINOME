@@ -101,6 +101,45 @@ constexpr int kOverlayIdleHideMs = 750;  // WINDOW_OVERLAY_IDLE_HIDE_TIMEOUT
 // WINDOW_ACTIVE_SIZE_INC, in logical px.
 constexpr double kWindowPickerSpacing = 6.0;
 
+static int
+close_button_size ()
+{
+  StEngine *engine = StEngine::get ();
+  if (engine != nullptr) {
+    StEngine::Node node (*engine, nullptr, "", "window-close", "");
+    double v = 0;
+    if (node.lookup_length ("width", &v) && v > 0)
+      return (int)(v + 0.5);
+  }
+  return kCloseButtonSize;
+}
+
+static int
+close_icon_size ()
+{
+  StEngine *engine = StEngine::get ();
+  if (engine != nullptr) {
+    StEngine::Node node (*engine, nullptr, "", "window-close", "");
+    double v = 0;
+    if (node.lookup_length ("icon-size", &v) && v > 0)
+      return (int)(v + 0.5);
+  }
+  return kCloseIconSize;
+}
+
+static double
+window_picker_spacing ()
+{
+  StEngine *engine = StEngine::get ();
+  if (engine != nullptr) {
+    StEngine::Node node (*engine, nullptr, "", "window-picker", "");
+    double v = 0;
+    if (node.lookup_length ("spacing", &v) && v >= 0)
+      return v;
+  }
+  return kWindowPickerSpacing;
+}
+
 // overviewControls.js ratios.
 constexpr double kVerticalSpacingRatio = 0.02;
 constexpr double kThumbnailsAdjustTop = 0.6;
@@ -735,15 +774,16 @@ chrome_init (void)
                     G_CALLBACK (on_chrome_map), nullptr);
 
   // .window-close: 32x32 circle, icon at the medium 16px size.
+  int close_size = close_button_size ();
+  int icon_size = close_icon_size ();
   g_chrome_button = gtk_fixed_new ();
   gtk_widget_add_css_class (g_chrome_button, "window-close");
-  gtk_widget_set_size_request (g_chrome_button, kCloseButtonSize,
-                               kCloseButtonSize);
+  gtk_widget_set_size_request (g_chrome_button, close_size, close_size);
   GtkWidget *icon = gtk_image_new_from_icon_name ("window-close-symbolic");
-  gtk_image_set_pixel_size (GTK_IMAGE (icon), kCloseIconSize);
+  gtk_image_set_pixel_size (GTK_IMAGE (icon), icon_size);
   gtk_fixed_put (GTK_FIXED (g_chrome_button), icon,
-                 (kCloseButtonSize - kCloseIconSize) / 2,
-                 (kCloseButtonSize - kCloseIconSize) / 2);
+                 (close_size - icon_size) / 2,
+                 (close_size - icon_size) / 2);
   gtk_window_set_child (GTK_WINDOW (g_chrome_window), g_chrome_button);
 
   GtkGesture *click = gtk_gesture_click_new ();
@@ -769,7 +809,7 @@ chrome_show_at (const RECT &preview_rect)
   mi.cbSize = sizeof (mi);
   GetMonitorInfoW (monitor, &mi);
 
-  int size = kCloseButtonSize * scale;
+  int size = close_button_size () * scale;
   g_chrome_want.left = mi.rcMonitor.left + preview_rect.right - size / 2;
   g_chrome_want.top = mi.rcMonitor.top + preview_rect.top - size / 2;
   g_chrome_want.right = g_chrome_want.left + size;
@@ -1720,10 +1760,10 @@ place_overview_locked (bool opening)
   RECT workarea = {0, panel_height, w, h};
   int scale = gtk_widget_get_scale_factor (g_window);
   double chrome_oversize =
-      std::max ({kCloseButtonSize / 2.0,
+      std::max ({close_button_size () / 2.0,
                  kWindowIconSize * (1.0 - kIconOverlap)}) +
       kWindowActiveSizeInc;
-  double spacing = (kWindowPickerSpacing + chrome_oversize) * scale;
+  double spacing = (window_picker_spacing () + chrome_oversize) * scale;
 
   std::vector<OvSlot> slots;
   overview_compute_slots (windows, mi.rcMonitor, workarea, geo.ws_box,

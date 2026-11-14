@@ -38,7 +38,8 @@ WINOME 以 sassc 编译后的上游样式表 [gnome-shell-dark.css](../WINOME/sr
 | `max-width` / `max-height` | `max-width` / `max-height` | **必须单独映射到 `max-*`**；若误映射到 `min-*` 会丢失固定胶囊上限（例如 `.quick-toggle` 固定 12em 网格会垮掉） |
 | `-natural-hpadding` | `padding-left` + `padding-right` | 展开为两条声明 |
 | `:insensitive` | `:disabled` | 伪类重映射 |
-| `:overview` / `:unlock-screen` / `:rtl` / `:ltr` 等 | 整条规则丢弃 | 避免剥离伪类后误生效到默认态 |
+| `:overview` / `:unlock-screen` / `:rtl` 等 | 整条规则丢弃 | 避免剥离伪类后误生效到默认态 |
+| `:ltr` 与逗号分组中的可保留子选择器 | 按子选择器粒度过滤 | `_clean_subselector()` 与多行选择器续行保留有效 `:ltr` 与同组其余选择器 |
 | `!important` | 剥离 | GTK4 对 `box-shadow` 等不支持 |
 | 省略 `transition-property` 的计时规则 | `inject_transition_property()` 后处理补全 | St 省略时默认 `background-color`，GTK4 无默认值会导致 hover 硬跳变；按块补 `background-color, color, border-color, box-shadow` |
 
@@ -96,3 +97,17 @@ GTK4 没有内置动画框架（无 `GtkAnimation`），而上游广泛依赖 `C
   resY   = anchorBottom + boxpointer_gap                              // + 4px
   ```
   不能简单按锚点右缘对齐，否则多出的 `margin/2`（约 54px）会让菜单整体左偏。
+
+
+## 5. 全壳 UI 一致性管线（Phase 9–11 汇总）
+
+- **CSS 转换恢复与 Adwaita 隔离（`tools/convert-st-css.py`）**：
+  - `_clean_subselector()` 按逗号分组子选择器粒度保留 `:ltr` 与同类有效子选择器，修复 `main()` 多行选择器续行误丢弃问题（回归用例见 `tests/test-css-converter.py`）。
+  - `GTK4_BUTTON_OVERRIDE` 补全 Adwaita 按钮样式重置、`.page-indicator` 重置、`switch.toggle-switch` 与 `> slider` 样式、`.quick-settings-popover-window` 与 `.winome-overview` 内嵌滚动条样式，以及 `.winome-overview popover.background`、`window#winomeToastWindow` 透明与 `.quick-toggle-menu { margin-top: 0; }`（保证 `BoxPointer` 箭头紧贴弹出面板）；`tools/check-widget-classes.py` 纳入 `toggle-switch` 可选前缀。
+- **统一字体注入与控件状态对齐**：
+  - 全部 8 处壳层顶层窗口安装点（`shell-panel.cpp`、`notifications.cpp`、`quick-settings.cpp` 密码弹窗、`settings-window.cpp`、`ws-osd.cpp` 与 `overview.cpp` 的 `g_window` / `g_chrome_window` / `g_icon_window`）统一调用 `winome::install_bundled_fonts()`，并移除 `overview-dash.cpp`（`kDashCtxCss`）、`app-grid.cpp`（`kAppGridCss`）及 `#winomeToastWindow` 的内联覆盖 CSS。
+  - Wi-Fi 密码对话框按钮应用 `modal-dialog-linked-button`；`calendar.cpp` 为选中日期应用 `GTK_STATE_FLAG_SELECTED`，`dnd_switch` 启用 `toggle-switch` 与 `set_focus_on_click(FALSE)`。
+- **全壳 `StEngine` 运行时指标与 `BoxPointer` 箭头**：
+  - `shell-panel`、`quick-settings`（`.slider` 与 `.quick-settings-grid`）、`calendar`、`notifications`、`app-grid`（`.icon-grid` 与 `.page-indicator-icon`）、`ws-osd`（`.workspace-switcher` 与 `.ws-switcher-indicator`）及 `overview` / `overview-dash` / `overview-thumbs`（包含 `.window-close` 与 `.window-picker`）均已接入 `StEngine::get()`；因 `StEngine::Node` 以 `G_TYPE_OBJECT` 匹配，含 `StIcon` 等类型选择器的规则（如 `.window-close StIcon`）保留上游常量 fallback。
+  - `shell-panel.cpp` 读取 `-arrow-rise`、`-arrow-base`、`-arrow-border-radius`、`-arrow-border-width`、`-boxpointer-gap` 及菜单背景/边框色，通过 `draw_popover_arrow()` 以 Cairo 绘制 `BoxPointer` 箭头。
+  - `tests/test-main.cpp` 通过 `test_st_engine_theme_metrics()` 验证 `#panel`、`.quick-settings-grid`、`.slider`、`.window-close`、`.workspace-switcher` 与 `.popup-menu-content` 的主题指标解析。
