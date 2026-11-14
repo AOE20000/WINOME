@@ -366,6 +366,8 @@ rebuild_page_contents (WinomeAppGrid *self)
       GtkWidget *dot_btn = gtk_button_new ();
       gtk_widget_set_name (dot_btn, "winome-page-dot");
       gtk_widget_add_css_class (dot_btn, "page-indicator");
+      if (p == slice.page)
+        gtk_widget_add_css_class (dot_btn, "active");
       GtkWidget *dot = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
       gtk_widget_add_css_class (dot, "page-indicator-icon");
       gtk_widget_set_size_request (dot, dot_size, dot_size);

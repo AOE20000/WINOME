@@ -417,6 +417,7 @@ window.winome-overview-chrome {
 }
 .search-entry image {
   -gtk-icon-size: 16px;
+  padding: 0 4px;
 }
 
 /* .panel-button horizontal padding mirrors -natural-hpadding: 12px (the St
@@ -511,12 +512,20 @@ window.winome-overview-chrome {
 }
 
 /* Page indicator buttons should stay transparent around the dot indicator. */
-.page-indicator {
+.page-indicator,
+.page-indicator:hover,
+.page-indicator:active {
   background-color: transparent;
   box-shadow: none;
   padding: 6px;
   min-width: 12px;
   min-height: 12px;
+}
+.page-indicator:hover .page-indicator-icon {
+  opacity: 0.7;
+}
+.page-indicator.active .page-indicator-icon {
+  opacity: 1.0;
 }
 
 /* Match GNOME St switch (.toggle-switch + .handle) on GTK4 GtkSwitch. */

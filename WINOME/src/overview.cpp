@@ -276,11 +276,11 @@ std::vector<ScaleAnim> g_scale_anims;
 guint g_scale_anim_source = 0;
 int g_last_hovered_slot = -1;  // tracked for fade-out after hover leaves
 
-// Caption fade.
-double g_caption_opacity = 0.0;
-double g_caption_from = 0.0, g_caption_to = 0.0;
-gint64 g_caption_anim_start = 0;
-guint g_caption_anim_ms = 0;
+// Overlay fade (shared across close button, app icon, and caption pill).
+double g_overlay_opacity = 0.0;
+double g_overlay_from = 0.0, g_overlay_to = 0.0;
+gint64 g_overlay_anim_start = 0;
+guint g_overlay_anim_ms = 0;
 
 guint g_hover_idle_source = 0;  // WINDOW_OVERLAY_IDLE_HIDE_TIMEOUT
 
@@ -303,6 +303,9 @@ static void restack_locked (void);
 static void chrome_hide (void);
 static void icon_hide (void);
 static void caption_hide (void);
+static void overlay_hide_all (void);
+static void overlay_fade_start (double to);
+static void keep_hover_alive_from_chrome (void);
 
 // --- helpers -----------------------------------------------------------------
 
@@ -738,6 +741,17 @@ ensure_hwnd_topmost (HWND hwnd)
 }
 
 static void
+chrome_bind_owner (HWND hwnd)
+{
+  if (hwnd == nullptr || !IsWindow (hwnd) || hwnd == g_overview_hwnd ||
+      g_overview_hwnd == nullptr || !IsWindow (g_overview_hwnd))
+    return;
+  LONG_PTR owner = reinterpret_cast<LONG_PTR> (g_overview_hwnd);
+  if (GetWindowLongPtrW (hwnd, GWLP_HWNDPARENT) != owner)
+    SetWindowLongPtrW (hwnd, GWLP_HWNDPARENT, owner);
+}
+
+static void
 chrome_window_apply_want (GtkWidget *win, HWND hwnd, const RECT &want,
                           HWND insert_after)
 {
@@ -746,6 +760,7 @@ chrome_window_apply_want (GtkWidget *win, HWND hwnd, const RECT &want,
     return;
 
   chrome_apply_base_ex_styles (hwnd);
+  chrome_bind_owner (hwnd);
   ensure_hwnd_topmost (hwnd);
 
   int want_w = want.right - want.left;
@@ -761,9 +776,12 @@ chrome_window_apply_want (GtkWidget *win, HWND hwnd, const RECT &want,
                    cur.left == want.left && cur.top == want.top &&
                    cur.right == want.right && cur.bottom == want.bottom;
   bool vis = IsWindowVisible (hwnd) != FALSE;
-  if (!same_rect || !vis) {
-    SetWindowPos (hwnd, after, want.left, want.top, want_w, want_h,
-                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  HWND prev = GetWindow (hwnd, GW_HWNDPREV);
+  bool same_z = (after == HWND_TOPMOST) ? (prev == nullptr) : (prev == after);
+  if (!same_rect || !vis || !same_z) {
+    UINT flags = SWP_NOACTIVATE | (vis ? 0 : SWP_SHOWWINDOW) |
+                 (same_rect ? (SWP_NOMOVE | SWP_NOSIZE) : 0);
+    SetWindowPos (hwnd, after, want.left, want.top, want_w, want_h, flags);
   }
 }
 
@@ -825,6 +843,8 @@ on_chrome_window_realize (GtkWidget *widget, gpointer user_data)
   HWND hwnd = static_cast<HWND> (gdk_win32_surface_get_handle (surface));
   *hooks->hwnd = hwnd;
   chrome_apply_base_ex_styles (hwnd);
+  chrome_bind_owner (hwnd);
+  ensure_hwnd_topmost (hwnd);
   g_signal_connect (surface, "layout", G_CALLBACK (on_chrome_surface_layout),
                     hooks);
 }
@@ -859,7 +879,7 @@ attach_chrome_hover_motion (GtkWidget *widget)
                                      double x G_GNUC_UNUSED,
                                      double y G_GNUC_UNUSED,
                                      gpointer d G_GNUC_UNUSED) {
-                      cancel_hover_idle ();
+                      keep_hover_alive_from_chrome ();
                     }),
                     nullptr);
   g_signal_connect (motion, "motion",
@@ -867,7 +887,7 @@ attach_chrome_hover_motion (GtkWidget *widget)
                                      double x G_GNUC_UNUSED,
                                      double y G_GNUC_UNUSED,
                                      gpointer d G_GNUC_UNUSED) {
-                      cancel_hover_idle ();
+                      keep_hover_alive_from_chrome ();
                     }),
                     nullptr);
   g_signal_connect (motion, "leave",
@@ -926,9 +946,7 @@ on_chrome_click (GtkGestureClick *gesture G_GNUC_UNUSED,
     PostMessageW (g_chrome_target, WM_CLOSE, 0, 0);
     g_print ("[ov] close requested for slot window\n");
   }
-  chrome_hide ();
-  icon_hide ();
-  caption_hide ();
+  overlay_hide_all ();
   g_hover_index = -1;
   g_last_hovered_slot = -1;
   // Relayout after the window has (probably) closed.
@@ -947,18 +965,41 @@ chrome_init (void)
 {
   g_chrome_window = make_chrome_toplevel (&g_chrome_hooks);
 
-  // .window-close: 32x32 circle, icon at the medium 16px size.
-  int close_size = close_button_size ();
-  int icon_size = close_icon_size ();
-  g_chrome_button = gtk_fixed_new ();
+  // .window-close: circular close button with 16px preview-close-symbolic
+  // icon, wrapped with small shadow margins so CSS padding/border/drop-shadow
+  // are never clipped by the chrome HWND bounds.
+  constexpr int kCloseShadowPad = 4;
+  constexpr int kCloseShadowPadBottom = 6;
+  const char *close_icon_name = "window-close-symbolic";
+  GdkDisplay *display = gdk_display_get_default ();
+  if (display != nullptr) {
+    GtkIconTheme *theme = gtk_icon_theme_get_for_display (display);
+    if (theme != nullptr &&
+        gtk_icon_theme_has_icon (theme, "preview-close-symbolic")) {
+      close_icon_name = "preview-close-symbolic";
+    }
+  }
+
+  g_chrome_button = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
   gtk_widget_add_css_class (g_chrome_button, "window-close");
-  gtk_widget_set_size_request (g_chrome_button, close_size, close_size);
-  GtkWidget *icon = gtk_image_new_from_icon_name ("window-close-symbolic");
-  gtk_image_set_pixel_size (GTK_IMAGE (icon), icon_size);
-  gtk_fixed_put (GTK_FIXED (g_chrome_button), icon,
-                 (close_size - icon_size) / 2,
-                 (close_size - icon_size) / 2);
-  gtk_window_set_child (GTK_WINDOW (g_chrome_window), g_chrome_button);
+  gtk_widget_set_halign (g_chrome_button, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (g_chrome_button, GTK_ALIGN_CENTER);
+  gtk_widget_set_margin_start (g_chrome_button, kCloseShadowPad);
+  gtk_widget_set_margin_end (g_chrome_button, kCloseShadowPad);
+  gtk_widget_set_margin_top (g_chrome_button, kCloseShadowPad);
+  gtk_widget_set_margin_bottom (g_chrome_button, kCloseShadowPadBottom);
+
+  GtkWidget *icon = gtk_image_new_from_icon_name (close_icon_name);
+  gtk_image_set_pixel_size (GTK_IMAGE (icon), close_icon_size ());
+  gtk_widget_set_halign (icon, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (icon, GTK_ALIGN_CENTER);
+  gtk_widget_set_hexpand (icon, TRUE);
+  gtk_widget_set_vexpand (icon, TRUE);
+  gtk_box_append (GTK_BOX (g_chrome_button), icon);
+
+  GtkWidget *wrap = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_box_append (GTK_BOX (wrap), g_chrome_button);
+  gtk_window_set_child (GTK_WINDOW (g_chrome_window), wrap);
 
   GtkGesture *click = gtk_gesture_click_new ();
   g_signal_connect (click, "released", G_CALLBACK (on_chrome_click), nullptr);
@@ -972,8 +1013,23 @@ chrome_init (void)
 void
 chrome_show_at (const RECT &preview_rect)
 {
-  if (g_chrome_window == nullptr)
+  if (g_chrome_window == nullptr || g_chrome_button == nullptr ||
+      g_window == nullptr)
     return;
+
+  GtkWidget *wrap = gtk_window_get_child (GTK_WINDOW (g_chrome_window));
+  GtkRequisition wrap_nat{}, btn_nat{};
+  gtk_widget_get_preferred_size (wrap, nullptr, &wrap_nat);
+  gtk_widget_get_preferred_size (g_chrome_button, nullptr, &btn_nat);
+  int fallback = close_button_size ();
+  int want_def_w = std::max (wrap_nat.width, fallback);
+  int want_def_h = std::max (wrap_nat.height, fallback);
+  int cur_def_w = 0, cur_def_h = 0;
+  gtk_window_get_default_size (GTK_WINDOW (g_chrome_window), &cur_def_w,
+                               &cur_def_h);
+  if (cur_def_w != want_def_w || cur_def_h != want_def_h)
+    gtk_window_set_default_size (GTK_WINDOW (g_chrome_window), want_def_w,
+                                 want_def_h);
 
   int scale = gtk_widget_get_scale_factor (g_window);
   HMONITOR monitor = MonitorFromWindow (g_panel_hwnd, MONITOR_DEFAULTTONEAREST);
@@ -981,12 +1037,17 @@ chrome_show_at (const RECT &preview_rect)
   mi.cbSize = sizeof (mi);
   GetMonitorInfoW (monitor, &mi);
 
-  int size = close_button_size () * scale;
-  g_chrome_want.left = mi.rcMonitor.left + preview_rect.right - size / 2;
-  g_chrome_want.top = mi.rcMonitor.top + preview_rect.top - size / 2;
-  g_chrome_want.right = g_chrome_want.left + size;
-  g_chrome_want.bottom = g_chrome_want.top + size;
+  int w = want_def_w * scale;
+  int h = want_def_h * scale;
+  int pad = gtk_widget_get_margin_start (g_chrome_button);
+  int btn_cx = (pad + std::max (btn_nat.width, fallback) / 2) * scale;
+  int btn_cy = (pad + std::max (btn_nat.height, fallback) / 2) * scale;
+  g_chrome_want.left = mi.rcMonitor.left + preview_rect.right - btn_cx;
+  g_chrome_want.top = mi.rcMonitor.top + preview_rect.top - btn_cy;
+  g_chrome_want.right = g_chrome_want.left + w;
+  g_chrome_want.bottom = g_chrome_want.top + h;
 
+  gtk_widget_set_opacity (g_chrome_button, g_overlay_opacity);
   if (!gtk_widget_get_visible (g_chrome_window))
     gtk_widget_set_visible (g_chrome_window, TRUE);
   chrome_apply_want ();
@@ -1032,6 +1093,8 @@ icon_chrome_init (void)
   // The 64px application icon straddling the preview's bottom edge
   // (ICON_SIZE / ICON_OVERLAP), letterboxed inside its square.
   g_icon_picture = gtk_picture_new ();
+  gtk_widget_add_css_class (g_icon_picture, "window-icon");
+  gtk_widget_add_css_class (g_icon_picture, "icon-dropshadow");
   gtk_picture_set_content_fit (GTK_PICTURE (g_icon_picture),
                                GTK_CONTENT_FIT_CONTAIN);
   gtk_widget_set_size_request (g_icon_picture, kWindowIconSize,
@@ -1079,6 +1142,7 @@ icon_show_at (const RECT &preview_rect, HWND target)
     g_icon_target = target;
   }
 
+  gtk_widget_set_opacity (g_icon_picture, g_overlay_opacity);
   if (!gtk_widget_get_visible (g_icon_window))
     gtk_widget_set_visible (g_icon_window, TRUE);
   icon_chrome_apply_want ();
@@ -1125,6 +1189,9 @@ caption_chrome_init (void)
 
   g_caption = gtk_label_new ("");
   gtk_widget_add_css_class (g_caption, "window-caption");
+  gtk_label_set_single_line_mode (GTK_LABEL (g_caption), TRUE);
+  gtk_label_set_ellipsize (GTK_LABEL (g_caption), PANGO_ELLIPSIZE_END);
+  gtk_label_set_max_width_chars (GTK_LABEL (g_caption), 44);
   gtk_widget_set_halign (g_caption, GTK_ALIGN_CENTER);
   gtk_widget_set_valign (g_caption, GTK_ALIGN_CENTER);
   gtk_window_set_child (GTK_WINDOW (g_caption_window), g_caption);
@@ -1143,14 +1210,29 @@ caption_show_at (const RECT &preview_rect)
       g_window == nullptr)
     return;
 
+  int scale = gtk_widget_get_scale_factor (g_window);
+  HMONITOR monitor = MonitorFromWindow (g_panel_hwnd, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO mi{};
+  mi.cbSize = sizeof (mi);
+  GetMonitorInfoW (monitor, &mi);
+
+  int mon_w_logical =
+      std::max ((int)(mi.rcMonitor.right - mi.rcMonitor.left) / std::max (scale, 1),
+                120);
+  int preview_w_logical =
+      std::max ((int)(preview_rect.right - preview_rect.left) / std::max (scale, 1),
+                120);
+  int max_cap_w = std::min (mon_w_logical - 16,
+                            std::max (preview_w_logical + 120, 260));
+
   GtkRequisition natural{};
   gtk_widget_get_preferred_size (g_caption, nullptr, &natural);
-  if (natural.width <= 0 || natural.height <= 0 || g_caption_opacity <= 0.01) {
+  if (natural.width <= 0 || natural.height <= 0) {
     caption_hide ();
     return;
   }
 
-  int want_def_w = std::max (natural.width, 1);
+  int want_def_w = std::clamp (natural.width, 1, std::max (max_cap_w, 1));
   int want_def_h = std::max (natural.height, 1);
   int cur_def_w = 0, cur_def_h = 0;
   gtk_window_get_default_size (GTK_WINDOW (g_caption_window), &cur_def_w,
@@ -1159,12 +1241,6 @@ caption_show_at (const RECT &preview_rect)
     gtk_window_set_default_size (GTK_WINDOW (g_caption_window), want_def_w,
                                  want_def_h);
 
-  int scale = gtk_widget_get_scale_factor (g_window);
-  HMONITOR monitor = MonitorFromWindow (g_panel_hwnd, MONITOR_DEFAULTTONEAREST);
-  MONITORINFO mi{};
-  mi.cbSize = sizeof (mi);
-  GetMonitorInfoW (monitor, &mi);
-
   int w = want_def_w * scale;
   int h = want_def_h * scale;
   double cx = (preview_rect.left + preview_rect.right) / 2.0;
@@ -1172,12 +1248,20 @@ caption_show_at (const RECT &preview_rect)
                (kWindowIconSize * (1.0 - kIconOverlap) + kIconTitleSpacing) *
                    scale;
 
-  g_caption_want.left = mi.rcMonitor.left + (LONG)(cx - w / 2.0);
-  g_caption_want.top = mi.rcMonitor.top + (LONG)top;
-  g_caption_want.right = g_caption_want.left + w;
-  g_caption_want.bottom = g_caption_want.top + h;
+  LONG left = mi.rcMonitor.left + (LONG)(cx - w / 2.0);
+  LONG top_px = mi.rcMonitor.top + (LONG)top;
+  LONG min_left = mi.rcMonitor.left + 8 * scale;
+  LONG max_left = std::max (min_left, mi.rcMonitor.right - 8 * scale - w);
+  left = std::clamp (left, min_left, max_left);
+  LONG max_top = std::max (mi.rcMonitor.top, mi.rcMonitor.bottom - 8 * scale - h);
+  top_px = std::min (top_px, max_top);
 
-  gtk_widget_set_opacity (g_caption, g_caption_opacity);
+  g_caption_want.left = left;
+  g_caption_want.top = top_px;
+  g_caption_want.right = left + w;
+  g_caption_want.bottom = top_px + h;
+
+  gtk_widget_set_opacity (g_caption, g_overlay_opacity);
   if (!gtk_widget_get_visible (g_caption_window))
     gtk_widget_set_visible (g_caption_window, TRUE);
   caption_chrome_apply_want ();
@@ -1185,31 +1269,46 @@ caption_show_at (const RECT &preview_rect)
 
 // --- hover (caption + close button + icon) ---------------------------------------
 
-// Position the caption pill and both chrome windows against the current
+void
+overlay_hide_all (void)
+{
+  chrome_hide ();
+  icon_hide ();
+  caption_hide ();
+}
+
+void
+keep_hover_alive_from_chrome (void)
+{
+  cancel_hover_idle ();
+  if (g_hover_index < 0 && g_last_hovered_slot >= 0 &&
+      g_last_hovered_slot < (int)g_slots.size ()) {
+    set_hover (g_last_hovered_slot);
+  } else if (g_hover_index >= 0 && g_overlay_to < 1.0) {
+    overlay_fade_start (1.0);
+    hover_layout_chrome ();
+  }
+}
+
+// Position the close button, app icon, and caption pill against the current
 // scaled preview rect.
 void
 hover_layout_chrome (void)
 {
   int index = g_hover_index >= 0 ? g_hover_index : g_last_hovered_slot;
-  if (index < 0 || index >= (int)g_slots.size ()) {
-    caption_hide ();
+  if (index < 0 || index >= (int)g_slots.size () ||
+      !IsWindow (g_slots[index].target) ||
+      (g_overlay_opacity <= 0.001 && g_overlay_to <= 0.01)) {
+    overlay_hide_all ();
     return;
   }
 
   const SlotEntry &slot = g_slots[index];
-  if (!IsWindow (slot.target)) {
-    caption_hide ();
-    return;
-  }
-
   RECT disp = hover_display_rect ();
+  g_chrome_target = slot.target;
+  chrome_show_at (disp);
+  icon_show_at (disp, slot.target);
   caption_show_at (disp);
-
-  if (g_hover_index >= 0) {
-    g_chrome_target = slot.target;
-    chrome_show_at (disp);
-    icon_show_at (disp, slot.target);
-  }
   restack_locked ();
 }
 
@@ -1249,23 +1348,23 @@ hover_anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
                       }),
       g_scale_anims.end ());
 
-  // Caption fade.
-  if (g_caption_opacity != g_caption_to) {
-    double t = g_caption_anim_ms > 0
-                   ? (now - g_caption_anim_start) / 1000.0 /
-                         (double)g_caption_anim_ms
+  // Unified overlay fade across close button, app icon, and caption pill.
+  if (g_overlay_opacity != g_overlay_to) {
+    double t = g_overlay_anim_ms > 0
+                   ? (now - g_overlay_anim_start) / 1000.0 /
+                         (double)g_overlay_anim_ms
                    : 1.0;
     if (t < 0.0)
       t = 0.0;
     if (t > 1.0)
       t = 1.0;
     double e = ease_out_quad (t);
-    g_caption_opacity =
-        g_caption_from + (g_caption_to - g_caption_from) * e;
+    g_overlay_opacity =
+        g_overlay_from + (g_overlay_to - g_overlay_from) * e;
     if (t >= 1.0) {
-      g_caption_opacity = g_caption_to;
-      if (g_caption_to <= 0.01)
-        caption_hide ();
+      g_overlay_opacity = g_overlay_to;
+      if (g_overlay_to <= 0.01)
+        overlay_hide_all ();
     } else {
       active = true;
     }
@@ -1273,7 +1372,8 @@ hover_anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
 
   hover_layout_chrome ();
 
-  if (!active && g_scale_anims.empty () && g_caption_opacity == g_caption_to) {
+  if (!active && g_scale_anims.empty () &&
+      g_overlay_opacity == g_overlay_to) {
     if (g_hover_index < 0)
       g_last_hovered_slot = -1;
     g_scale_anim_source = 0;
@@ -1313,12 +1413,14 @@ hover_scale_start (int index, double to)
 }
 
 void
-caption_fade_start (double to)
+overlay_fade_start (double to)
 {
-  g_caption_from = g_caption_opacity;
-  g_caption_to = to;
-  g_caption_anim_start = g_get_monotonic_time ();
-  g_caption_anim_ms = kOverlayFadeMs;
+  if (to > 0.5 && g_overlay_opacity <= 0.01)
+    g_overlay_opacity = 0.02;
+  g_overlay_from = g_overlay_opacity;
+  g_overlay_to = to;
+  g_overlay_anim_start = g_get_monotonic_time ();
+  g_overlay_anim_ms = kOverlayFadeMs;
   hover_anim_ensure ();
 }
 
@@ -1350,9 +1452,7 @@ hover_idle_hide_cb (gpointer user_data)
   int index = g_hover_index;
   g_last_hovered_slot = index;
   g_hover_index = -1;
-  chrome_hide ();
-  icon_hide ();
-  caption_fade_start (0.0);
+  overlay_fade_start (0.0);
   hover_scale_start (index, 1.0);
   return G_SOURCE_REMOVE;
 }
@@ -1394,11 +1494,10 @@ set_hover (int index, bool immediate)
     }
     g_last_hovered_slot = -1;
     g_hover_index = -1;
-    g_caption_opacity = 0.0;
-    g_caption_to = 0.0;
-    caption_hide ();
-    chrome_hide ();
-    icon_hide ();
+    g_overlay_opacity = 0.0;
+    g_overlay_from = 0.0;
+    g_overlay_to = 0.0;
+    overlay_hide_all ();
     return;
   }
 
@@ -1412,8 +1511,8 @@ set_hover (int index, bool immediate)
            !gtk_widget_get_visible (g_icon_window)) ||
           (g_caption_window != nullptr &&
            !gtk_widget_get_visible (g_caption_window));
-      if (missing_chrome || g_caption_to < 1.0) {
-        caption_fade_start (1.0);
+      if (missing_chrome || g_overlay_to < 1.0) {
+        overlay_fade_start (1.0);
         hover_layout_chrome ();
       }
     }
@@ -1448,7 +1547,7 @@ set_hover (int index, bool immediate)
   // Caption pill below the preview.
   gtk_label_set_text (GTK_LABEL (g_caption),
                       hwnd_title_utf8 (slot.target).c_str ());
-  caption_fade_start (1.0);
+  overlay_fade_start (1.0);
 
   // Scale up the preview (WINDOW_SCALE_TIME EASE_OUT_QUAD); the previous
   // one shrinks back at the same time.
@@ -1875,10 +1974,13 @@ place_overview_locked (bool opening)
 
   GtkWidget *chrome_wins[] = {g_chrome_window, g_icon_window,
                               g_caption_window};
+  HWND chrome_hwnds[] = {g_chrome_hwnd, g_icon_hwnd, g_caption_hwnd};
   for (GtkWidget *cw : chrome_wins) {
     if (cw != nullptr && !gtk_widget_get_realized (cw))
       gtk_widget_realize (cw);
   }
+  for (HWND ch : chrome_hwnds)
+    chrome_bind_owner (ch);
 
   int w = mi.rcMonitor.right - mi.rcMonitor.left;
   int h = mi.rcMonitor.bottom - mi.rcMonitor.top;
@@ -2608,8 +2710,10 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
     return;
   }
 
-  if (g_app_grid_mode)
+  if (g_app_grid_mode) {
+    restack_locked ();
     return;
+  }
 
   POINT pt = {px, py};
 
@@ -2641,6 +2745,7 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
   // Dash band and search row handle their own input.
   if (py >= g_dash_top) {
     g_print ("[ov] click (%d,%d) ignored (dash band)\n", px, py);
+    restack_locked ();
     return;
   }
   if (pt.x >= g_search_rect.left && pt.x < g_search_rect.right &&
@@ -2655,6 +2760,7 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
       pt.x >= g_thumbs_rect.left && pt.x < g_thumbs_rect.right &&
       pt.y >= g_thumbs_rect.top && pt.y < g_thumbs_rect.bottom) {
     g_print ("[ov] click (%d,%d) ignored (thumbs row)\n", px, py);
+    restack_locked ();
     return;
   }
 
@@ -3009,10 +3115,20 @@ overview_init (HWND panel_hwnd)
 
   // Hover tracking for preview close buttons + captions.
   GtkEventController *motion = gtk_event_controller_motion_new ();
+  g_signal_connect (motion, "enter", G_CALLBACK (on_root_motion), nullptr);
   g_signal_connect (motion, "motion", G_CALLBACK (on_root_motion), nullptr);
   g_signal_connect (motion, "leave", G_CALLBACK (on_root_motion_leave),
                     nullptr);
   gtk_widget_add_controller (g_root, GTK_EVENT_CONTROLLER (motion));
+
+  g_signal_connect (
+      g_window, "notify::is-active",
+      G_CALLBACK (+[] (GtkWindow *win G_GNUC_UNUSED,
+                       GParamSpec *pspec G_GNUC_UNUSED,
+                       gpointer user_data G_GNUC_UNUSED) {
+        restack_locked ();
+      }),
+      nullptr);
 
   // Window drag-to-desktop + slot hit-testing (left click activate / middle
   // click close / blank click dismiss).
