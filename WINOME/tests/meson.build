@@ -5,6 +5,8 @@ winome_test_inc = include_directories('../src')
 
 test_deps = [
   gtk4_dep,
+  fontconfig_dep,
+  pangoft2_dep,
   cc.find_library('shell32', required: true),
   cc.find_library('user32', required: true),
   cc.find_library('gdi32', required: true),
@@ -33,6 +35,7 @@ winome_tests = executable('winome-tests',
     '../src/overview-layout.cpp',
     '../src/app-index.cpp',
     '../src/app-grid.cpp',
+    '../src/fonts.cpp',
     '../src/virtual-desktop.cpp',
   ),
   dependencies: test_deps,

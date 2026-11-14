@@ -415,6 +415,155 @@ window.winome-overview-chrome {
 #panel .panel-button.clock-display.open:hover .clock {
   background-color: rgba(255, 255, 255, 0.32);
 }
+
+/* Strip GTK4 Default-dark button gradient/border bleed on GNOME UI controls
+   whose upstream St selectors only set background-color/border-radius, and
+   suppress focus rings when focus is not keyboard-visible. */
+.calendar .calendar-day,
+.calendar .calendar-month-header .pager-button,
+.datemenu-today-button,
+.events-button,
+.world-clocks-button,
+.weather-button,
+.message,
+.message .message-header .message-close-button,
+.message .message-header .message-expand-button,
+.message-media-control,
+.message-list-clear-button,
+.overview-tile,
+.page-navigation-arrow,
+.page-indicator,
+.modal-dialog-linked-button,
+.cancel-button,
+.window-close {
+  background-image: none;
+  border-image: none;
+  border-style: none;
+}
+.calendar .calendar-day:focus:not(:focus-visible),
+.calendar .calendar-month-header .pager-button:focus:not(:focus-visible),
+.datemenu-today-button:focus:not(:focus-visible),
+.events-button:focus:not(:focus-visible),
+.world-clocks-button:focus:not(:focus-visible),
+.weather-button:focus:not(:focus-visible),
+.message:focus:not(:focus-visible),
+.message .message-header .message-close-button:focus:not(:focus-visible),
+.message .message-header .message-expand-button:focus:not(:focus-visible),
+.message-media-control:focus:not(:focus-visible),
+.message-list-clear-button:focus:not(:focus-visible),
+.overview-tile:focus:not(:focus-visible),
+.page-navigation-arrow:focus:not(:focus-visible),
+.page-indicator:focus:not(:focus-visible),
+.modal-dialog-linked-button:focus:not(:focus-visible),
+.cancel-button:focus:not(:focus-visible),
+.window-close:focus:not(:focus-visible) {
+  outline-style: none;
+  outline-width: 0;
+  box-shadow: none;
+}
+
+.popup-menu-item {
+  background-image: none;
+  border-image: none;
+  border-style: none;
+}
+.popup-menu-item:focus:not(:focus-visible) {
+  outline-style: none;
+  outline-width: 0;
+  box-shadow: none;
+}
+
+/* Page indicator buttons should stay transparent around the dot indicator. */
+.page-indicator {
+  background-color: transparent;
+  box-shadow: none;
+  padding: 6px;
+  min-width: 12px;
+  min-height: 12px;
+}
+
+/* Match GNOME St switch (.toggle-switch + .handle) on GTK4 GtkSwitch. */
+switch.toggle-switch {
+  min-width: 46px;
+  min-height: 26px;
+  padding: 0;
+  border: none;
+  box-shadow: none;
+  background-image: none;
+  border-radius: 999px;
+}
+switch.toggle-switch > slider {
+  min-width: 20px;
+  min-height: 20px;
+  margin: 3px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background-image: none;
+  background-color: #d7d7d8;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+switch.toggle-switch:checked > slider {
+  background-color: #ffffff;
+}
+switch.toggle-switch:focus:not(:focus-visible) {
+  outline-style: none;
+  outline-width: 0;
+}
+
+/* Match upstream StScrollBar thumb styling in scrollable shell surfaces. */
+window.quick-settings-popover-window scrollbar,
+window.winome-overview scrollbar {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+}
+window.quick-settings-popover-window scrollbar trough,
+window.winome-overview scrollbar trough {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  margin: 0;
+  padding: 2px;
+}
+window.quick-settings-popover-window scrollbar slider,
+window.winome-overview scrollbar slider {
+  min-width: 6px;
+  min-height: 24px;
+  border-radius: 8px;
+  border: none;
+  background-image: none;
+  background-color: #727275;
+}
+window.quick-settings-popover-window scrollbar slider:hover,
+window.winome-overview scrollbar slider:hover {
+  background-color: #9b9b9d;
+}
+window.quick-settings-popover-window scrollbar slider:active,
+window.winome-overview scrollbar slider:active {
+  background-color: #868689;
+}
+
+/* Overview context GtkPopovers delegate frame styling to .popup-menu-content. */
+window.winome-overview popover.background > contents {
+  background: transparent;
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+}
+window.winome-overview popover.background > arrow {
+  background: transparent;
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+/* Floating notification toast toplevel keeps a transparent frame around cards. */
+window#winomeToastWindow {
+  background-color: transparent;
+  box-shadow: none;
+}
 """
 
 # em values in the stylesheet resolve against the St theme context font
@@ -459,29 +608,27 @@ PANEL_PX_OVERRIDE = """
 
 
 # St state/language pseudo-classes with no GTK4 equivalent. Rules containing
-# only these are dropped (they describe St-specific states the panel does not
-# use). A rule may combine mapped and unmapped classes; we handle it below.
+# only these are dropped (they describe St-specific states the shell does not
+# use). A selector group may mix mapped and unmapped pseudo-classes on one line;
+# individual comma-separated sub-selectors are filtered below.
 UNKNOWN_PSEUDO_CLASSES = set([
-    ':overview', ':rtl', ':ltr', ':highlighted', ':logged-in', ':latched',
+    ':overview', ':rtl', ':highlighted', ':logged-in', ':latched',
     ':cast', ':second-in-stack', ':primary-monitor', ':lower-in-stack',
     ':drop',
 ])
 
 
-def process_selector(selector):
-    """Map St pseudo-classes to GTK4 names.
-
-    Returns (kind, text) where kind is 'keep', 'drop', or 'block-drop'.
-    """
-    # If the selector contains an unknown pseudo-class (St state like
-    # :overview/:unlock-screen), the entire rule must be dropped (not just the
-    # pseudo-class), because stripping it would change semantics and cause it
-    # to wrongly apply to the default state (e.g. background: transparent).
+def _clean_subselector(sub):
+    """Map one comma-separated sub-selector, or return None to drop it."""
     for cls in UNKNOWN_PSEUDO_CLASSES:
-        if cls in selector:
-            return ('drop', None)
+        if cls in sub:
+            return None
+    # Standalone ' :ltr' targets arbitrary LTR descendants; drop it so we do
+    # not mistakenly apply child offsets to the parent selector.
+    if re.search(r'(?<!\S):ltr\b', sub):
+        return None
 
-    out = selector
+    out = re.sub(r'(?<=\S):ltr\b', '', sub)
     for st_cls, gtk_cls in PSEUDO_CLASS_MAP.items():
         out = out.replace(st_cls, gtk_cls)
 
@@ -493,7 +640,39 @@ def process_selector(selector):
     if '#panel' in out:
         out = re.sub(r':focus(?!-visible)', ':focus-visible', out)
 
-    return ('keep', map_element_selectors(out))
+    return map_element_selectors(out)
+
+
+def process_selector(selector):
+    """Map St pseudo-classes to GTK4 names.
+
+    Returns (kind, text) where kind is 'keep' or 'drop'.
+    """
+    if '{' in selector:
+        head, _, tail = selector.partition('{')
+        indent = head[:len(head) - len(head.lstrip())]
+        kept = []
+        for part in head.split(','):
+            cleaned = _clean_subselector(part)
+            if cleaned is not None and cleaned.strip():
+                kept.append(cleaned.strip())
+        if not kept:
+            return ('drop', None)
+        return ('keep', f"{indent}{', '.join(kept)} {{{tail}")
+
+    stripped = selector.rstrip()
+    has_comma = stripped.endswith(',')
+    body = stripped[:-1] if has_comma else stripped
+    indent = body[:len(body) - len(body.lstrip())]
+    kept = []
+    for part in body.split(','):
+        cleaned = _clean_subselector(part)
+        if cleaned is not None and cleaned.strip():
+            kept.append(cleaned.strip())
+    if not kept:
+        return ('drop', None)
+    suffix = ',' if has_comma else ''
+    return ('keep', f"{indent}{', '.join(kept)}{suffix}")
 
 
 def process_declaration(prop, value):
@@ -650,10 +829,16 @@ def main():
         if '{' in stripped or ':' in line:
             kind, text = process_selector(line)
             if kind == 'drop':
-                # Drop this rule block entirely. Count the '{' (if any) and
-                # its matching '}'.
-                drop_depth = line.count('{') - line.count('}')
-                continue
+                if ('{' in line and out_lines
+                        and out_lines[-1].rstrip().endswith(',')):
+                    brace_idx = line.index('{')
+                    prev = re.sub(r',\s*$', '', out_lines.pop().rstrip())
+                    text = f'{prev} {line[brace_idx:].lstrip()}'
+                else:
+                    # Drop this rule block entirely. Count the '{' (if any) and
+                    # its matching '}'.
+                    drop_depth = line.count('{') - line.count('}')
+                    continue
             out_lines.append(text)
         elif stripped.endswith(',') and re.search(r'\bSt[A-Za-z]', line):
             # Continuation line of a multi-line selector group. The { line is

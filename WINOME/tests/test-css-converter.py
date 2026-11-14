@@ -36,6 +36,23 @@ def main():
 StBoxLayout.foo StLabel {
   font-size: 11pt;
 }
+
+.datemenu-calendar-column:ltr, .datemenu-calendar-column.rtl-drop:rtl {
+  margin-left: 6px;
+}
+
+.overview-tile:highlighted, .overview-tile:selected {
+  background-color: rgba(255, 255, 255, 0.15);
+}
+
+.entry :ltr {
+  padding-right: 2.5em;
+}
+
+.multi-keep:ltr,
+.multi-drop:rtl {
+  margin-right: 4px;
+}
 """
 
     with tempfile.TemporaryDirectory() as td:
@@ -61,6 +78,15 @@ StBoxLayout.foo StLabel {
     assert '.toggle-btn:disabled' in out, out
     assert ':insensitive' not in out, out
     assert 'box.foo label' in out, out
+    out_body = (out.split('\n#panel .panel-button')[0]
+                if '\n#panel .panel-button' in out else out)
+    assert '.datemenu-calendar-column {' in out_body, out_body
+    assert ':ltr' not in out_body, out_body
+    assert '.datemenu-calendar-column.rtl-drop' not in out_body, out_body
+    assert '.overview-tile:selected' in out_body, out_body
+    assert ':highlighted' not in out_body, out_body
+    assert '.entry {' not in out_body, out_body
+    assert '.multi-keep {' in out_body and '.multi-drop' not in out_body, out_body
     assert out.count('{') == out.count('}'), (
         f"unbalanced braces: {out.count('{')} vs {out.count('}')}")
     print('CSS converter regression tests passed.')

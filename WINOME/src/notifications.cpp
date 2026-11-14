@@ -5,6 +5,7 @@
 #include "notifications.h"
 
 #include "easing.h"
+#include "fonts.h"
 #include "i18n.h"
 #include "system-status.h"
 
@@ -152,15 +153,7 @@ void ensure_banner_window() {
   gtk_window_set_decorated(GTK_WINDOW(g_banner_window), FALSE);
   gtk_window_set_resizable(GTK_WINDOW(g_banner_window), FALSE);
   gtk_widget_set_focusable(g_banner_window, FALSE);
-
-  // Transparent background for the floating toplevel window only.
-  GtkCssProvider* css = gtk_css_provider_new();
-  gtk_css_provider_load_from_string(
-      css, "#winomeToastWindow { background-color: transparent; box-shadow: none; }");
-  gtk_style_context_add_provider_for_display(
-      gdk_display_get_default(), GTK_STYLE_PROVIDER(css),
-      GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-  g_object_unref(css);
+  install_bundled_fonts(g_banner_window);
 
   g_banner_wrap = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
   gtk_widget_add_css_class(g_banner_wrap, "notification-banner");

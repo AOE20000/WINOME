@@ -727,6 +727,7 @@ chrome_init (void)
   gtk_window_set_decorated (GTK_WINDOW (g_chrome_window), FALSE);
   gtk_window_set_resizable (GTK_WINDOW (g_chrome_window), FALSE);
   gtk_widget_add_css_class (g_chrome_window, "winome-overview-chrome");
+  install_bundled_fonts (g_chrome_window);
 
   g_signal_connect (g_chrome_window, "realize",
                     G_CALLBACK (on_chrome_realize), nullptr);
@@ -867,6 +868,7 @@ icon_chrome_init (void)
   gtk_window_set_decorated (GTK_WINDOW (g_icon_window), FALSE);
   gtk_window_set_resizable (GTK_WINDOW (g_icon_window), FALSE);
   gtk_widget_add_css_class (g_icon_window, "winome-overview-chrome");
+  install_bundled_fonts (g_icon_window);
 
   g_signal_connect (g_icon_window, "realize",
                     G_CALLBACK (on_icon_realize), nullptr);

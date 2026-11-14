@@ -10,6 +10,7 @@
 //          light, dark mode, do-not-disturb, keyboard, airplane mode.
 
 #include "quick-settings.h"
+#include "fonts.h"
 #include "i18n.h"
 #include "notifications.h"
 #include "settings-window.h"
@@ -1625,6 +1626,7 @@ show_wifi_password_dialog (const char *ssid, GtkWidget *panel)
   gtk_window_set_resizable (GTK_WINDOW (dlg), FALSE);
   gtk_window_set_title (GTK_WINDOW (dlg),
                         tr ("Connect to Wi-Fi", "连接到无线网络"));
+  winome::install_bundled_fonts (dlg);
 
   GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 12);
   gtk_widget_add_css_class (box, "modal-dialog");
@@ -1654,11 +1656,13 @@ show_wifi_password_dialog (const char *ssid, GtkWidget *panel)
 
   GtkWidget *cancel = gtk_button_new_with_label (tr ("Cancel", "取消"));
   gtk_widget_add_css_class (cancel, "cancel-button");
+  gtk_widget_add_css_class (cancel, "modal-dialog-linked-button");
   g_signal_connect (cancel, "clicked", G_CALLBACK (on_wifi_pwd_cancel), dlg);
   gtk_box_append (GTK_BOX (btns), cancel);
 
   GtkWidget *connect_btn = gtk_button_new_with_label (tr ("Connect", "连接"));
   gtk_widget_add_css_class (connect_btn, "default");
+  gtk_widget_add_css_class (connect_btn, "modal-dialog-linked-button");
   gtk_box_append (GTK_BOX (btns), connect_btn);
   gtk_box_append (GTK_BOX (box), btns);
 

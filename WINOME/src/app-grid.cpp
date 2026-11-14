@@ -13,39 +13,6 @@ namespace winome {
 
 namespace {
 
-constexpr const char *kAppGridCss =
-    "#winome-app-tile {"
-    "  background-image: none;"
-    "  border: none;"
-    "  box-shadow: none;"
-    "  min-width: 112px;"
-    "  min-height: 112px;"
-    "}"
-    "#winome-app-nav-arrow {"
-    "  background-image: none;"
-    "  border: none;"
-    "  box-shadow: none;"
-    "}"
-    "#winome-page-dot {"
-    "  background: none;"
-    "  border: none;"
-    "  box-shadow: none;"
-    "  padding: 6px;"
-    "  min-width: 12px;"
-    "  min-height: 12px;"
-    "}"
-    "#winome-app-ctx-item {"
-    "  background: none;"
-    "  border: none;"
-    "  box-shadow: none;"
-    "  color: #fafafb;"
-    "  padding: 6px 12px;"
-    "  border-radius: 6px;"
-    "}"
-    "#winome-app-ctx-item:hover {"
-    "  background-color: rgba(255, 255, 255, 0.12);"
-    "}";
-
 struct WinomeAppGrid {
   GtkBox parent_instance;
 
@@ -57,7 +24,6 @@ struct WinomeAppGrid {
   GtkWidget *empty_label = nullptr;
   GtkWidget *indicators_box = nullptr;
   GtkWidget *active_menu = nullptr;
-  GtkCssProvider *css = nullptr;
 
   std::string query_lower;
   std::vector<AppEntry> all_apps;
@@ -412,11 +378,6 @@ winome_app_grid_dispose (GObject *object)
 {
   WinomeAppGrid *self = WINOME_APP_GRID (object);
   app_grid_close_menu (GTK_WIDGET (self));
-  if (self->css != nullptr) {
-    gtk_style_context_remove_provider_for_display (
-        gdk_display_get_default (), GTK_STYLE_PROVIDER (self->css));
-    g_clear_object (&self->css);
-  }
   G_OBJECT_CLASS (winome_app_grid_parent_class)->dispose (object);
 }
 
@@ -428,14 +389,6 @@ winome_app_grid_init (WinomeAppGrid *self)
   gtk_box_set_spacing (GTK_BOX (self), 12);
   gtk_widget_set_halign (GTK_WIDGET (self), GTK_ALIGN_CENTER);
   gtk_widget_set_valign (GTK_WIDGET (self), GTK_ALIGN_CENTER);
-
-  if (GdkDisplay *disp = gdk_display_get_default ()) {
-    self->css = gtk_css_provider_new ();
-    gtk_css_provider_load_from_string (self->css, kAppGridCss);
-    gtk_style_context_add_provider_for_display (
-        disp, GTK_STYLE_PROVIDER (self->css),
-        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 2);
-  }
 
   self->body_row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
   gtk_widget_set_halign (self->body_row, GTK_ALIGN_CENTER);

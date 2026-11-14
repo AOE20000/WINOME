@@ -23,6 +23,7 @@
 // own animated relayout and never trigger the OSD.
 
 #include "ws-osd.h"
+#include "fonts.h"
 #include "overview.h"
 #include "virtual-desktop.h"
 
@@ -313,6 +314,7 @@ ws_osd_init ()
   g_window = gtk_window_new ();
   gtk_window_set_decorated (GTK_WINDOW (g_window), FALSE);
   gtk_window_set_resizable (GTK_WINDOW (g_window), FALSE);
+  install_bundled_fonts (g_window);
 
   g_signal_connect (g_window, "realize", G_CALLBACK (on_osd_realize),
                     nullptr);

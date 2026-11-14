@@ -77,6 +77,7 @@ OPTIONAL_PREFIXES = (
     'polkit-',
     'run-dialog',
     'restart-message',
+    'toggle-switch',
     'unlock-dialog',
     'user-widget',
     'weather-',

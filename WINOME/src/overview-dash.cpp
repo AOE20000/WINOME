@@ -48,19 +48,6 @@ constexpr int kDotSize = 5;
 constexpr int kLabelHoverTimeoutMs = 300; // DASH_ITEM_HOVER_TIMEOUT
 constexpr int kLabelOffset = 8;           // .dash-label -y-offset
 
-constexpr const char *kDashCtxCss =
-    "#winome-dash-ctx-item {"
-    "  background: none;"
-    "  border: none;"
-    "  box-shadow: none;"
-    "  color: #fafafb;"
-    "  padding: 6px 12px;"
-    "  border-radius: 6px;"
-    "}"
-    "#winome-dash-ctx-item:hover {"
-    "  background-color: rgba(255, 255, 255, 0.12);"
-    "}";
-
 // PKEY_AppUserModel_ID (propsys), defined locally to avoid header churn.
 constexpr GUID kPKEY_AppUserModel_ID_fmt = {
     0x9F4C2855, 0x9F79, 0x4B39,
@@ -86,7 +73,6 @@ struct WinomeDash {
   GtkWidget *label;       // .dash-label GtkLabel
   guint label_timeout;    // hover delay source
   GtkWidget *active_menu; // right-click GtkPopover
-  GtkCssProvider *ctx_css;
 
   std::vector<DashApp> apps;
   int pinned_count = 0;    // items [0..pinned_count) are persisted favorites
@@ -861,13 +847,6 @@ winome_dash_dispose (GObject *object)
   WinomeDash *self = WINOME_DASH (object);
   overview_dash_close_menu (GTK_WIDGET (self));
   hide_label (self);
-  if (self->ctx_css != nullptr) {
-    if (GdkDisplay *disp = gdk_display_get_default ()) {
-      gtk_style_context_remove_provider_for_display (
-          disp, GTK_STYLE_PROVIDER (self->ctx_css));
-    }
-    g_clear_object (&self->ctx_css);
-  }
   if (self->label != nullptr) {
     gtk_fixed_remove (GTK_FIXED (self->root_fixed), self->label);
     self->label = nullptr;
@@ -943,14 +922,6 @@ overview_dash_new (GtkWidget *root_fixed)
   WinomeDash *self =
       (WinomeDash *)g_object_new (winome_dash_get_type (), nullptr);
   self->root_fixed = root_fixed;
-
-  if (GdkDisplay *disp = gdk_display_get_default ()) {
-    self->ctx_css = gtk_css_provider_new ();
-    gtk_css_provider_load_from_string (self->ctx_css, kDashCtxCss);
-    gtk_style_context_add_provider_for_display (
-        disp, GTK_STYLE_PROVIDER (self->ctx_css),
-        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 2);
-  }
 
   // Hover label (.dash-label pill), floating above the dash.
   self->label = gtk_label_new ("");
