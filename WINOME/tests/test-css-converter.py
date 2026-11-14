@@ -181,6 +181,21 @@ def verify_full_theme_with_gtk4(converter):
         gobject.g_object_unref(prov)
         assert not errors, f'GTK4 CSS parse errors ({len(errors)}): {errors[:10]}'
 
+        with open(full_gtk4, 'r', encoding='utf-8') as f:
+            full_text = f.read()
+        for expected_rule in (
+            'window#winomeToastWindow',
+            'window#winomeModalDialogWindow',
+            '.modal-dialog-button',
+            '.prompt-dialog .prompt-dialog-password-entry',
+            '.search-entry image',
+            '.page-indicator.active .page-indicator-icon',
+            '.calendar:hover',
+            '.message-list',
+        ):
+            assert expected_rule in full_text, (
+                f'missing GTK4 override rule: {expected_rule}')
+
         gresource_xml = os.path.join(theme_dir, 'winome.gresource.xml')
         tree = ET.parse(gresource_xml)
         bundled_icons = []
