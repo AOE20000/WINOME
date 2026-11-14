@@ -161,6 +161,22 @@ on_quick_menu_item_activated (GtkGestureClick *gesture, int n_press,
 static GtkWidget *
 make_quick_menu_item (const WinomeMenuEntry *entry)
 {
+  if (entry->label == NULL) {
+    GtkWidget *sep_row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class (sep_row, "popup-separator-menu-item");
+    gtk_widget_set_margin_top (sep_row, 6);
+    gtk_widget_set_margin_bottom (sep_row, 6);
+    gtk_widget_set_margin_start (sep_row, 12);
+    gtk_widget_set_margin_end (sep_row, 12);
+
+    GtkWidget *sep_line = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class (sep_line, "popup-separator-menu-item-separator");
+    gtk_widget_set_hexpand (sep_line, TRUE);
+    gtk_widget_set_valign (sep_line, GTK_ALIGN_CENTER);
+    gtk_box_append (GTK_BOX (sep_row), sep_line);
+    return sep_row;
+  }
+
   GtkWidget *item;
   GtkWidget *box;
   GtkWidget *icon = NULL;
@@ -1453,15 +1469,25 @@ winome_quick_settings_grid_attach (GtkWidget *grid, GtkWidget *child,
 // --- Panel widget ------------------------------------------------------------
 
 // Power menu (the GNOME power-off / end-session rows reached from the system
-// item): Suspend, Log Out, Restart, Power Off. These act immediately — GNOME's
-// end-session items use the default 'user' session mode, so no confirmation
-// dialog sits between the click and the action.
+// item): Suspend, Restart, Power Off, separator, Log Out, Quit WINOME. These
+// act immediately — GNOME's end-session items use the default 'user' session
+// mode, so no confirmation dialog sits between the click and the action.
 typedef enum {
   POWER_ACTION_SUSPEND,
   POWER_ACTION_LOGOUT,
   POWER_ACTION_RESTART,
-  POWER_ACTION_SHUTDOWN
+  POWER_ACTION_SHUTDOWN,
+  POWER_ACTION_QUIT_SHELL
 } PowerAction;
+
+static gboolean
+idle_quit_winome_shell (gpointer G_GNUC_UNUSED data)
+{
+  GApplication *app = g_application_get_default ();
+  if (app != NULL)
+    g_application_quit (app);
+  return G_SOURCE_REMOVE;
+}
 
 static void
 on_power_action (gpointer user_data)
@@ -1479,13 +1505,16 @@ on_power_action (gpointer user_data)
   case POWER_ACTION_SHUTDOWN:
     winome::shutdown_system ();
     break;
+  case POWER_ACTION_QUIT_SHELL:
+    g_idle_add (idle_quit_winome_shell, NULL);
+    break;
   }
 }
 
 static GtkWidget *
 build_power_menu (gpointer user_data)
 {
-  WinomeMenuEntry items[4];
+  WinomeMenuEntry items[6] = {};
 
   (void)user_data;
 
@@ -1495,23 +1524,33 @@ build_power_menu (gpointer user_data)
   items[0].callback = on_power_action;
   items[0].user_data = GINT_TO_POINTER (POWER_ACTION_SUSPEND);
 
-  items[1].label = tr ("Log Out", "注销");
-  items[1].icon_name = "system-log-out-symbolic";
+  items[1].label = tr ("Restart", "重启");
+  items[1].icon_name = "system-reboot-symbolic";
   items[1].checked = FALSE;
   items[1].callback = on_power_action;
-  items[1].user_data = GINT_TO_POINTER (POWER_ACTION_LOGOUT);
+  items[1].user_data = GINT_TO_POINTER (POWER_ACTION_RESTART);
 
-  items[2].label = tr ("Restart", "重启");
-  items[2].icon_name = "system-reboot-symbolic";
+  items[2].label = tr ("Power Off", "关机");
+  items[2].icon_name = "system-shutdown-symbolic";
   items[2].checked = FALSE;
   items[2].callback = on_power_action;
-  items[2].user_data = GINT_TO_POINTER (POWER_ACTION_RESTART);
+  items[2].user_data = GINT_TO_POINTER (POWER_ACTION_SHUTDOWN);
 
-  items[3].label = tr ("Power Off", "关机");
-  items[3].icon_name = "system-shutdown-symbolic";
-  items[3].checked = FALSE;
-  items[3].callback = on_power_action;
-  items[3].user_data = GINT_TO_POINTER (POWER_ACTION_SHUTDOWN);
+  // Separate system power actions from session / shell exit actions, matching
+  // GNOME's ShutdownItem separator before Log Out.
+  items[3].label = NULL;
+
+  items[4].label = tr ("Log Out", "注销");
+  items[4].icon_name = "system-log-out-symbolic";
+  items[4].checked = FALSE;
+  items[4].callback = on_power_action;
+  items[4].user_data = GINT_TO_POINTER (POWER_ACTION_LOGOUT);
+
+  items[5].label = tr ("Quit WINOME", "退出 WINOME");
+  items[5].icon_name = "application-exit-symbolic";
+  items[5].checked = FALSE;
+  items[5].callback = on_power_action;
+  items[5].user_data = GINT_TO_POINTER (POWER_ACTION_QUIT_SHELL);
 
   // Header mirrors upstream's setHeader() calls: GNOME labels this menu
   // "Power Off Menu" with the shutdown glyph in the badge.
