@@ -9,7 +9,9 @@
 #include "i18n.h"
 
 #include <gtk/gtk.h>
+#include <gdk/win32/gdkwin32.h>
 #include <windows.h>
+#include <dwmapi.h>
 #include <shellapi.h>
 
 #include <cstdio>
@@ -112,11 +114,22 @@ void ensure_settings_css() {
   padding: 8px 12px;
   margin-bottom: 2px;
   color: #ddddda;
+  transition: background-color 120ms ease;
+}
+#winomeSettingsWindow stacksidebar row:hover {
+  background-color: rgba(255, 255, 255, 0.06);
 }
 #winomeSettingsWindow stacksidebar row:selected {
   background-color: rgba(255, 255, 255, 0.12);
   color: #ffffff;
   font-weight: 600;
+}
+#winomeSettingsWindow stacksidebar row:selected:hover {
+  background-color: rgba(255, 255, 255, 0.16);
+}
+#winomeSettingsWindow stacksidebar row:focus:not(:focus-visible) {
+  outline-style: none;
+  box-shadow: none;
 }
 #winomeSettingsPage {
   padding: 20px 24px;
@@ -148,13 +161,95 @@ void ensure_settings_css() {
 }
 #winomeSettingsButton {
   background-color: #383838;
+  background-image: none;
   color: #ffffff;
   border-radius: 8px;
   padding: 6px 14px;
   border: 1px solid rgba(255, 255, 255, 0.1);
+  transition: background-color 120ms ease;
 }
 #winomeSettingsButton:hover {
   background-color: #454545;
+}
+#winomeSettingsButton:active {
+  background-color: #525252;
+}
+#winomeSettingsButton:focus:not(:focus-visible) {
+  outline-style: none;
+  box-shadow: none;
+}
+#winomeSettingsCard separator {
+  background-color: rgba(255, 255, 255, 0.08);
+  min-height: 1px;
+}
+#winomeSettingsWindow switch {
+  min-width: 46px;
+  min-height: 26px;
+  padding: 0;
+  border: none;
+  box-shadow: none;
+  background-image: none;
+  background-color: rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  transition: background-color 150ms ease;
+}
+#winomeSettingsWindow switch:checked {
+  background-color: #3584e4;
+}
+#winomeSettingsWindow switch > slider {
+  min-width: 20px;
+  min-height: 20px;
+  margin: 3px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background-image: none;
+  background-color: #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+#winomeSettingsWindow switch:focus:not(:focus-visible) {
+  outline-style: none;
+  box-shadow: none;
+}
+#winomeSettingsWindow entry,
+#winomeSettingsWindow spinbutton,
+#winomeSettingsWindow dropdown > button {
+  background-color: #383838;
+  background-image: none;
+  color: #eeeeec;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+#winomeSettingsWindow entry:hover,
+#winomeSettingsWindow spinbutton:hover,
+#winomeSettingsWindow dropdown > button:hover {
+  background-color: #424242;
+}
+#winomeSettingsWindow entry:focus-within,
+#winomeSettingsWindow spinbutton:focus-within {
+  border-color: #3584e4;
+}
+#winomeSettingsWindow dropdown popover > contents {
+  background-color: #2c2c2c;
+  color: #eeeeec;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+#winomeSettingsWindow scrollbar {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+}
+#winomeSettingsWindow scrollbar slider {
+  min-width: 6px;
+  min-height: 24px;
+  border-radius: 8px;
+  border: none;
+  background-image: none;
+  background-color: rgba(255, 255, 255, 0.28);
+}
+#winomeSettingsWindow scrollbar slider:hover {
+  background-color: rgba(255, 255, 255, 0.42);
 }
 )";
 
@@ -164,6 +259,22 @@ void ensure_settings_css() {
       gdk_display_get_default(), GTK_STYLE_PROVIDER(provider),
       GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
   g_object_unref(provider);
+}
+
+// Enable Win32 dark title bar chrome (Win11 / Win10 2004+, with 1903 fallback)
+// so the native window frame matches the dark #1e1e1e GTK content area.
+void apply_dark_titlebar(GtkWidget* win) {
+  if (win == nullptr)
+    return;
+  GdkSurface* surf = gtk_native_get_surface(GTK_NATIVE(win));
+  if (surf == nullptr)
+    return;
+  HWND hwnd = gdk_win32_surface_get_handle(surf);
+  if (hwnd == nullptr)
+    return;
+  BOOL dark = TRUE;
+  if (FAILED(DwmSetWindowAttribute(hwnd, 20, &dark, sizeof(dark))))
+    DwmSetWindowAttribute(hwnd, 19, &dark, sizeof(dark));
 }
 
 GtkWidget* make_section_label(const char* text) {
@@ -196,6 +307,7 @@ GtkWidget* make_row(const char* title, const char* subtitle, GtkWidget* control)
     gtk_widget_set_name(sub_lbl, "winomeSettingsDim");
     gtk_label_set_xalign(GTK_LABEL(sub_lbl), 0.0f);
     gtk_label_set_wrap(GTK_LABEL(sub_lbl), TRUE);
+    gtk_label_set_wrap_mode(GTK_LABEL(sub_lbl), PANGO_WRAP_WORD_CHAR);
     gtk_box_append(GTK_BOX(text_box), sub_lbl);
   }
 
@@ -682,6 +794,8 @@ void open_settings_window() {
   g_signal_connect(win, "destroy", G_CALLBACK(on_window_destroy), nullptr);
 
   sync_ui_from_config();
+  gtk_widget_realize(win);
+  apply_dark_titlebar(win);
   gtk_window_present(GTK_WINDOW(win));
 }
 

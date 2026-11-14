@@ -471,6 +471,7 @@ window.winome-overview-chrome {
 .overview-tile,
 .page-navigation-arrow,
 .page-indicator,
+.modal-dialog-button,
 .modal-dialog-linked-button,
 .cancel-button,
 .window-close {
@@ -492,6 +493,7 @@ window.winome-overview-chrome {
 .overview-tile:focus:not(:focus-visible),
 .page-navigation-arrow:focus:not(:focus-visible),
 .page-indicator:focus:not(:focus-visible),
+.modal-dialog-button:focus:not(:focus-visible),
 .modal-dialog-linked-button:focus:not(:focus-visible),
 .cancel-button:focus:not(:focus-visible),
 .window-close:focus:not(:focus-visible) {
@@ -609,6 +611,24 @@ window.winome-overview popover.background > arrow {
 window#winomeToastWindow {
   background-color: transparent;
   box-shadow: none;
+}
+
+/* Floating modal dialogs keep a transparent frame around rounded .modal-dialog. */
+window#winomeModalDialogWindow {
+  background-color: transparent;
+  box-shadow: none;
+  font: 11pt "Cantarell";
+}
+.prompt-dialog .prompt-dialog-password-entry {
+  background-image: none;
+  border-image: none;
+}
+.prompt-dialog .prompt-dialog-password-entry:focus-within {
+  outline-style: none;
+}
+.prompt-dialog .prompt-dialog-password-entry image {
+  -gtk-icon-size: 16px;
+  padding: 0 4px;
 }
 
 /* Inline QuickToggleMenu sits cleanly in its own grid row (which already carries

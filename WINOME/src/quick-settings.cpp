@@ -1799,6 +1799,60 @@ on_wifi_pwd_cancel (GtkButton *b G_GNUC_UNUSED, gpointer user_data)
     gtk_window_destroy (GTK_WINDOW (dlg));
 }
 
+// Close the modal Wi-Fi prompt when the user presses Escape.
+static gboolean
+on_wifi_pwd_key_pressed (GtkEventControllerKey *ctrl G_GNUC_UNUSED,
+                         guint keyval,
+                         guint keycode G_GNUC_UNUSED,
+                         GdkModifierType state G_GNUC_UNUSED,
+                         gpointer user_data)
+{
+  if (keyval != GDK_KEY_Escape)
+    return FALSE;
+  GtkWidget *dlg = GTK_WIDGET (user_data);
+  if (dlg != nullptr)
+    gtk_window_destroy (GTK_WINDOW (dlg));
+  return TRUE;
+}
+
+// Mirror upstream NetworkSecretDialog._updateOkButton: Connect requires a
+// non-empty password so the :disabled state stays visually distinct.
+static void
+on_wifi_pwd_changed (GtkEditable *editable, gpointer user_data)
+{
+  const char *pwd = gtk_editable_get_text (editable);
+  gtk_widget_set_sensitive (GTK_WIDGET (user_data),
+                            pwd != nullptr && pwd[0] != '\0');
+}
+
+// Configure Win32 extended styles and center the realized modal window on the
+// primary work area before presenting.
+static void
+center_modal_window (GtkWidget *dlg, int dlg_w, int dlg_h)
+{
+  GdkSurface *surf = gtk_native_get_surface (GTK_NATIVE (dlg));
+  if (surf == nullptr)
+    return;
+  HWND hwnd = gdk_win32_surface_get_handle (surf);
+  if (hwnd == nullptr)
+    return;
+
+  LONG_PTR ex = GetWindowLongPtrW (hwnd, GWL_EXSTYLE);
+  SetWindowLongPtrW (hwnd, GWL_EXSTYLE,
+                     (ex | WS_EX_TOOLWINDOW | WS_EX_TOPMOST) & ~WS_EX_APPWINDOW);
+  RECT wa = {};
+  SystemParametersInfoW (SPI_GETWORKAREA, 0, &wa, 0);
+  RECT wr = {};
+  GetWindowRect (hwnd, &wr);
+  const int scale = std::max (1, gtk_widget_get_scale_factor (dlg));
+  const int w = (wr.right - wr.left) > 32 ? (wr.right - wr.left) : dlg_w * scale;
+  const int h = (wr.bottom - wr.top) > 32 ? (wr.bottom - wr.top) : dlg_h * scale;
+  const int x = wa.left + ((wa.right - wa.left) - w) / 2;
+  const int y = wa.top + ((wa.bottom - wa.top) - h) / 2;
+  SetWindowPos (hwnd, HWND_TOPMOST, x, y, 0, 0,
+                SWP_NOSIZE | SWP_SHOWWINDOW);
+}
+
 static void
 on_wifi_pwd_submit (GtkWidget *w G_GNUC_UNUSED, gpointer user_data)
 {
@@ -1806,8 +1860,10 @@ on_wifi_pwd_submit (GtkWidget *w G_GNUC_UNUSED, gpointer user_data)
   if (p == nullptr)
     return;
   const char *pwd = gtk_editable_get_text (GTK_EDITABLE (p->entry));
+  if (pwd == nullptr || pwd[0] == '\0')
+    return;
   std::string ssid = p->ssid ? p->ssid : "";
-  std::string pass = pwd ? pwd : "";
+  std::string pass = pwd;
   GtkWidget *panel = p->panel;
   GtkWidget *dlg = p->dialog;
   if (dlg != nullptr)
@@ -1821,49 +1877,80 @@ static void
 show_wifi_password_dialog (const char *ssid, GtkWidget *panel)
 {
   GtkWidget *dlg = gtk_window_new ();
+  gtk_widget_set_name (dlg, "winomeModalDialogWindow");
   gtk_window_set_decorated (GTK_WINDOW (dlg), FALSE);
   gtk_window_set_resizable (GTK_WINDOW (dlg), FALSE);
   gtk_window_set_title (GTK_WINDOW (dlg),
                         tr ("Connect to Wi-Fi", "连接到无线网络"));
   winome::install_bundled_fonts (dlg);
 
-  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 12);
+  // Outer transparent padding gives .modal-dialog's 18px corners and drop
+  // shadow room to render unclipped on the undecorated Win32 toplevel.
+  GtkWidget *wrap = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_set_margin_start (wrap, 16);
+  gtk_widget_set_margin_end (wrap, 16);
+  gtk_widget_set_margin_top (wrap, 16);
+  gtk_widget_set_margin_bottom (wrap, 16);
+
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class (box, "modal-dialog");
   gtk_widget_add_css_class (box, "prompt-dialog");
-  gtk_widget_set_size_request (box, 340, -1);
+  gtk_widget_set_size_request (box, 360, -1);
 
-  GtkWidget *content = gtk_box_new (GTK_ORIENTATION_VERTICAL, 8);
+  GtkWidget *content = gtk_box_new (GTK_ORIENTATION_VERTICAL, 12);
   gtk_widget_add_css_class (content, "modal-dialog-content-box");
 
-  gchar *heading = g_strdup_printf (
-      tr ("Enter password for “%s”", "输入 “%s” 的密码"), ssid);
-  GtkWidget *lbl = gtk_label_new (heading);
-  g_free (heading);
-  gtk_widget_add_css_class (lbl, "prompt-dialog-info-label");
-  gtk_label_set_xalign (GTK_LABEL (lbl), 0.0f);
-  gtk_label_set_wrap (GTK_LABEL (lbl), TRUE);
-  gtk_box_append (GTK_BOX (content), lbl);
+  GtkWidget *msg_content = gtk_box_new (GTK_ORIENTATION_VERTICAL, 12);
+  gtk_widget_add_css_class (msg_content, "message-dialog-content");
+
+  GtkWidget *title_lbl = gtk_label_new (
+      tr ("Connect to Wi-Fi", "连接到无线网络"));
+  gtk_widget_add_css_class (title_lbl, "message-dialog-title");
+  gtk_label_set_justify (GTK_LABEL (title_lbl), GTK_JUSTIFY_CENTER);
+  gtk_label_set_xalign (GTK_LABEL (title_lbl), 0.5f);
+  gtk_label_set_wrap (GTK_LABEL (title_lbl), TRUE);
+  gtk_label_set_wrap_mode (GTK_LABEL (title_lbl), PANGO_WRAP_WORD_CHAR);
+  gtk_box_append (GTK_BOX (msg_content), title_lbl);
+
+  gchar *desc = g_strdup_printf (
+      tr ("Enter password for “%s”", "输入 “%s” 的密码"),
+      ssid ? ssid : "");
+  GtkWidget *desc_lbl = gtk_label_new (desc);
+  g_free (desc);
+  gtk_widget_add_css_class (desc_lbl, "message-dialog-description");
+  gtk_label_set_justify (GTK_LABEL (desc_lbl), GTK_JUSTIFY_CENTER);
+  gtk_label_set_xalign (GTK_LABEL (desc_lbl), 0.5f);
+  gtk_label_set_wrap (GTK_LABEL (desc_lbl), TRUE);
+  gtk_label_set_wrap_mode (GTK_LABEL (desc_lbl), PANGO_WRAP_WORD_CHAR);
+  gtk_box_append (GTK_BOX (msg_content), desc_lbl);
 
   GtkWidget *entry = gtk_password_entry_new ();
+  gtk_widget_add_css_class (entry, "prompt-dialog-password-entry");
+  gtk_widget_set_hexpand (entry, TRUE);
   gtk_password_entry_set_show_peek_icon (GTK_PASSWORD_ENTRY (entry), TRUE);
-  gtk_box_append (GTK_BOX (content), entry);
+  gtk_box_append (GTK_BOX (msg_content), entry);
+  gtk_box_append (GTK_BOX (content), msg_content);
   gtk_box_append (GTK_BOX (box), content);
 
-  GtkWidget *btns = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
+  GtkWidget *btns = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
+  gtk_box_set_homogeneous (GTK_BOX (btns), TRUE);
   gtk_widget_add_css_class (btns, "modal-dialog-button-box");
-  gtk_widget_set_halign (btns, GTK_ALIGN_END);
 
   GtkWidget *cancel = gtk_button_new_with_label (tr ("Cancel", "取消"));
+  gtk_widget_set_hexpand (cancel, TRUE);
   gtk_widget_add_css_class (cancel, "cancel-button");
-  gtk_widget_add_css_class (cancel, "modal-dialog-linked-button");
+  gtk_widget_add_css_class (cancel, "modal-dialog-button");
   g_signal_connect (cancel, "clicked", G_CALLBACK (on_wifi_pwd_cancel), dlg);
   gtk_box_append (GTK_BOX (btns), cancel);
 
   GtkWidget *connect_btn = gtk_button_new_with_label (tr ("Connect", "连接"));
+  gtk_widget_set_hexpand (connect_btn, TRUE);
   gtk_widget_add_css_class (connect_btn, "default");
-  gtk_widget_add_css_class (connect_btn, "modal-dialog-linked-button");
+  gtk_widget_add_css_class (connect_btn, "modal-dialog-button");
+  gtk_widget_set_sensitive (connect_btn, FALSE);
   gtk_box_append (GTK_BOX (btns), connect_btn);
   gtk_box_append (GTK_BOX (box), btns);
+  gtk_box_append (GTK_BOX (wrap), box);
 
   WifiPasswordPrompt *p = g_new0 (WifiPasswordPrompt, 1);
   p->dialog = dlg;
@@ -1873,30 +1960,30 @@ show_wifi_password_dialog (const char *ssid, GtkWidget *panel)
   g_object_set_data_full (G_OBJECT (dlg), "wifi-prompt", p,
                           wifi_password_prompt_free);
 
+  g_signal_connect (entry, "changed", G_CALLBACK (on_wifi_pwd_changed),
+                    connect_btn);
   g_signal_connect (connect_btn, "clicked", G_CALLBACK (on_wifi_pwd_submit), p);
   g_signal_connect (entry, "activate", G_CALLBACK (on_wifi_pwd_submit), p);
 
-  gtk_window_set_child (GTK_WINDOW (dlg), box);
+  GtkEventController *key_ctrl = gtk_event_controller_key_new ();
+  g_signal_connect (key_ctrl, "key-pressed",
+                    G_CALLBACK (on_wifi_pwd_key_pressed), dlg);
+  gtk_widget_add_controller (dlg, key_ctrl);
+
+  gtk_window_set_child (GTK_WINDOW (dlg), wrap);
+
+  int min_w = 0, nat_w = 392;
+  int min_h = 0, nat_h = 220;
+  gtk_widget_measure (wrap, GTK_ORIENTATION_HORIZONTAL, -1,
+                      &min_w, &nat_w, nullptr, nullptr);
+  const int dlg_w = std::max (nat_w, min_w);
+  gtk_widget_measure (wrap, GTK_ORIENTATION_VERTICAL, dlg_w,
+                      &min_h, &nat_h, nullptr, nullptr);
+  const int dlg_h = std::max (nat_h, min_h);
+  gtk_window_set_default_size (GTK_WINDOW (dlg), dlg_w, dlg_h);
+
   gtk_widget_realize (dlg);
-  GdkSurface *surf = gtk_native_get_surface (GTK_NATIVE (dlg));
-  if (surf != nullptr) {
-    HWND hwnd = gdk_win32_surface_get_handle (surf);
-    if (hwnd != nullptr) {
-      LONG_PTR ex = GetWindowLongPtrW (hwnd, GWL_EXSTYLE);
-      SetWindowLongPtrW (hwnd, GWL_EXSTYLE,
-                         (ex | WS_EX_TOOLWINDOW | WS_EX_TOPMOST) & ~WS_EX_APPWINDOW);
-      RECT wa = {};
-      SystemParametersInfoW (SPI_GETWORKAREA, 0, &wa, 0);
-      RECT wr = {};
-      GetWindowRect (hwnd, &wr);
-      int w = std::max<int> (wr.right - wr.left, 360);
-      int h = std::max<int> (wr.bottom - wr.top, 160);
-      int x = wa.left + ((wa.right - wa.left) - w) / 2;
-      int y = wa.top + ((wa.bottom - wa.top) - h) / 2;
-      SetWindowPos (hwnd, HWND_TOPMOST, x, y, 0, 0,
-                    SWP_NOSIZE | SWP_SHOWWINDOW);
-    }
-  }
+  center_modal_window (dlg, dlg_w, dlg_h);
   gtk_widget_set_visible (dlg, TRUE);
   gtk_window_present (GTK_WINDOW (dlg));
   gtk_widget_grab_focus (entry);
