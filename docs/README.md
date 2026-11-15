@@ -10,8 +10,10 @@
 | [architecture.md](architecture.md) | 宿主启动流程、任务栏隐藏、顶栏/弹出窗、Activities 概览、虚拟桌面 COM、数据源与性能基线 |
 | [theme-and-ui.md](theme-and-ui.md) | 双 CSS 管线（`st-compat` + `convert-st-css.py`）、构建期自检、Clutter 动效层与快速设置菜单规范 |
 | [pitfalls.md](pitfalls.md) | 工程硬约束、Win32/GTK4/GCC LTO 踩坑汇总、样式排查方法论与已评估暂缓项 |
-| [roadmap.md](roadmap.md) | 生产级完善开发计划（P0–P5 六阶段路线图与验收标准） |
-| `dev-logs/` | 阶段调研与排障日志归档：[2026-10-11](dev-logs/2026-10-11.md)、[2026-10-13](dev-logs/2026-10-13.md) |
+| [roadmap.md](roadmap.md) | 生产级完善开发计划（P0–P5 六阶段路线图、验收标准与已交付汇总） |
+| [long-term-plan.md](long-term-plan.md) | 长期演进蓝图（Shell 闭环、性能事件化、窗口管理与文件/媒体探索参考） |
+| [file-manager-research.md](file-manager-research.md) | Nautilus / Windows 原生文件管理方案调研参考 |
+| `dev-logs/` | 阶段调研与排障日志归档：[2026-10-11](dev-logs/2026-10-11.md)、[2026-10-13](dev-logs/2026-10-13.md)、[2026-11-16](dev-logs/2026-11-16.md) |
 
 ## 项目开发约定
 

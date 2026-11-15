@@ -76,21 +76,21 @@ ninja -C build
 - [x] 宿主进程骨架 + 置顶全宽顶栏（Activities 圆点 + 时钟 + 状态区图标 + 悬停/点击动画）
 - [x] 崩溃自愈与单实例 IPC：独立 `--watchdog` 看门狗、`--restore` 急救、`MiniDumpWriteDump` 转储、命名互斥体及 `--show-overview` / `--settings` / `--reload` / `--quit` 控制指令
 - [x] 隐藏原生任务栏、事件钩子防重现、系统托盘兼容层（`systray.cpp` 在顶栏状态区提供折叠/弹出式托盘图标与右键交互）
-- [x] 概览触发接入（**Win 键**、**左上角热角**触发，`Win+Tab` 打开开始菜单，其余 Win 组合键透传，均受 `config.json` 开关控制）
+- [x] **概览触发接入**（**Win 键**单按开合 `WINDOW_PICKER`、**550ms 内双击 Win 键**丝滑进阶至 `APP_GRID`、**左上角热角**触发，`Win+Tab` 打开开始菜单，其余 Win 组合键透传，均受 `config.json` 开关控制）
 - [x] 概览显示**最小化窗口**；面板与弹出窗位于概览之上；顶栏保留工作区；面板按显示器独立判断全屏自动隐藏；隐藏于 Alt-Tab（`WS_EX_TOOLWINDOW`）
 - [x] 多显示器与事件驱动：多屏顶栏/工作区、`WM_DISPLAYCHANGE` / `WM_DPICHANGED` / `WM_SETTINGCHANGE` / `WTSRegisterSessionNotification` 响应，WASAPI 音量与 `WlanRegisterNotification` 事件驱动更新
-- [x] 快速设置全量闭环：电量/电源模式/电源动作（含 `SE_SHUTDOWN_NAME`）、WASAPI 音量与静音、WMI/DXVA2 屏幕亮度、Wlan 枚举与加密网络密码输入连接、WinRT 蓝牙设备切换、深色主题/勿扰/夜间模式/飞行模式
-- [x] 日期与通知中心：双栏 DateMenu（SMTC 媒体控制卡片 + Windows 通知列表 + 勿扰联动与日历）、实时桌面通知横幅
-- [x] **Activities 概览完全体**：`Ctrl+F`/直输搜索（开始菜单 `.lnk`/AUMID 应用 + 打开窗口）、Dash 固定 Favorites 持久化/右键菜单与图标 LRU 缓存、宿主内分页应用网格、窗口中键关闭、拖拽窗口缩略图跨桌面移动及 `+`/`×` 新建/删除虚拟桌面
+- [x] **快速设置与视觉对齐**：电量/电源模式/电源动作（含 `SE_SHUTDOWN_NAME` 与 Quit WINOME）、WASAPI 音量与静音、WMI/DXVA2 屏幕亮度、Wlan 枚举与加密网络模态密码弹窗连接、WinRT 蓝牙设备切换、深色主题/勿扰/夜间模式/飞行模式；内置 GNOME symbolic SVG 图标并复刻 `QuickToggleMenu` 两阶段居中展开抽屉动效
+- [x] 日期与通知中心：双栏 DateMenu（SMTC 媒体控制卡片 + Windows 通知列表 + 勿扰联动与日历）、实时桌面通知横幅与上游对齐空状态/今日圆点样式
+- [x] **Activities 概览完全体**：`ControlsState` 三态（`HIDDEN` / `WINDOW_PICKER` / `APP_GRID`）统一打断过渡与预热、`Ctrl+F`/直输搜索（`.lnk` + `FOLDERID_AppsFolder` UWP 应用与打开窗口）、Dash Favorites 持久化/右键菜单、1024 条 `GdkTexture` 高清图标 LRU 缓存与 `WinomeAppIcon` GPU 三线性缩放、宿主内分页应用网格与右键 AppMenu、窗口中键关闭、拖拽窗口缩略图跨桌面移动及 `+`/`×` 新建/删除虚拟桌面
 - [x] **Windows 虚拟桌面兼容**：基于 `RtlGetVersion` 区分 Win11 22621 / 24H2+ COM 接口槽位表（支持查询、切换、固定、移动窗口与创建/移除桌面）
-- [x] 配置、多语言与原生地设置页：`%LOCALAPPDATA%\WINOME\config.json` 热重载、`i18n.cpp` 多语言、Adwaita-dark GTK4 设置窗口
-- [x] 自动化测试、CI 与便携打包：`meson test` 单元测试、GitHub Actions CI（`.github/workflows/ci.yml`）及 `WINOME/package.sh` 自包含便携包
+- [x] 配置、多语言与原生地设置页：`%LOCALAPPDATA%\WINOME\config.json` 热重载、`i18n.cpp` 多语言、深色 Adwaita GTK4 设置窗口
+- [x] 自动化测试、CI 与便携打包：`meson test` 单元测试（`winome:unit-tests`）与 CSS 转换测试（`winome:css-converter`）、`check-widget-classes.py` 样式检查、GitHub Actions CI（`.github/workflows/ci.yml`）及 `WINOME/package.sh` 自包含便携包
 
 ## 快捷键与交互
 
 | 按键 / 操作 | 行为 |
 |------|------|
-| **Win**（单独按下松开） | 切换概览（Activities） |
+| **Win**（单独按下松开） | 打开/关闭概览（`WINDOW_PICKER`）；打开后 **550ms 内再次按下 Win** 丝滑切换至应用网格（`APP_GRID`） |
 | **鼠标移到左上角热角** | 打开概览 |
 | **Win+Tab** | 打开开始菜单 |
 | **Win+E / Win+R / Win+D …** | 透传给 Windows（组合键保留） |

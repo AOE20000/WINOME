@@ -18,7 +18,9 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 
 ### 键盘钩子（`src/overview-trigger.cpp`）
 
-- 吞掉单独的 `Win` `WM_KEYDOWN`，阻止系统直接弹出开始菜单；若在 `WM_KEYUP` 判定为裸 `Win` 按下松开，则切换概览。
+- 吞掉单独的 `Win` `WM_KEYDOWN`，阻止系统直接弹出开始菜单；若在 `WM_KEYUP` 判定为裸 `Win` 按下松开：
+  - 概览未打开时记录时间戳并打开概览（`WINDOW_PICKER`）；
+  - 概览正在打开或处于 `WINDOW_PICKER` 且 **550ms 内再次按下裸 `Win`** 时，调用 `overview_can_shift_to_app_grid()` + `overview_shift_to_app_grid_async()` 丝滑打断过渡到 `APP_GRID`；其余情况关闭概览。
 - 若期间检测到与其他键组合，重新注入带 `dwExtraInfo` 标记的 `Win` 键，让系统照常处理 `Win+E`、`Win+R`、`Win+D`、`Win+Ctrl+←/→`、`Win+Alt+Tab` 等组合键。
 - `Win+Tab` 通过 `SendInput` 合成带标记的裸 `Win` 键打开开始菜单。
 - `Esc` 在概览激活时关闭概览。
@@ -43,23 +45,23 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 
 ## 4. 原生 Activities 概览（`src/overview*.cpp`）
 
-已全面替代早期基于 DLL 注入的 `extracted/WinOverview/` 方案，在宿主进程内基于 `overviewControls.js`（`WINDOW_PICKER` 状态）与 `workspace.js` 逐组件移植。
+已全面替代早期基于 DLL 注入的 `extracted/WinOverview/` 方案，在宿主进程内基于 `overviewControls.js`（三态 `ControlsState::HIDDEN` / `WINDOW_PICKER` / `APP_GRID`）与 `workspace.js` 逐组件移植。
 
 ### 布局与交互模块
 
 | 模块 | 上游参考 | 职责 |
 |------|----------|------|
-| `overview.cpp` | `overviewControls.js`, `windowPreview.js` | 搜索输入过滤（应用+打开窗口）、工作区背景盒与 0→30px 圆角插值、DWM 实时缩略图飞入/开合动画、`GtkGestureDrag` 跨桌面拖拽、中键关窗、快捷键（`Ctrl+F` / `Ctrl+Shift+N` / `PageUp` / `PageDown` / `Esc`） |
+| `overview.cpp` | `overviewControls.js`, `windowPreview.js` | 搜索输入过滤（应用+打开窗口）、工作区背景盒与 0→30px 圆角插值（`APP_GRID` 时收起为顶部 15% 工作区缩略条）、单遍双槽位（`picker_rect` / `grid_rect`）计算、DWM 实时缩略图飞入/开合动画、`GtkGestureDrag` 跨桌面拖拽、中键关窗、chrome 淡出与 z-order 管理、快捷键（`Ctrl+F` / `Ctrl+Shift+N` / `PageUp` / `PageDown` / `Esc`） |
 | `overview-layout.cpp` | `workspace.js` (`UnalignedLayoutStrategy`) | `lerp(1.5, 1)` 窗口缩放、行搜索最优 scale/space、`WINDOW_PREVIEW_MAXIMUM_SCALE = 0.95`、像素对齐、有效间距（主题 6px + chrome oversize） |
 | `overview-dash.cpp` | `dash.js` | Favorites 固定列表持久化（`pinned_apps`）+ `.dash-separator` 分割线 + 未固定运行应用、右键菜单、9 点应用网格切换（Shift+点击回退开始菜单）、LRU 图标缓存与 300ms 悬停标签 |
-| `app-index.cpp` | `appSystem.js`, `appSearch.js` | 异步索引系统开始菜单 `.lnk` 与 AUMID、规范化去重与排序搜索、Win32/管理员启动与定位、96 条上限 `GdkTexture` LRU 缓存与共享 `HICON`/`HBITMAP` 转码 |
-| `app-grid.cpp` | `appDisplay.js` | 宿主内分页应用网格（`.icon-grid` / `.overview-tile` / 翻页指示点 / 滚轮翻页 / 右键固定或启动 / 响应式 6×4・5×3・4×3 排布） |
+| `app-index.cpp` | `appSystem.js`, `appSearch.js` | 异步索引开始菜单 `.lnk` 与 `FOLDERID_AppsFolder`（UWP/Store/系统应用、`PKEY_AppUserModel_ID`）、规范化去重与排序搜索、Win32/UWP/管理员启动与定位、`IShellItemImageFactory` → `SHIL_JUMBO` → `PrivateExtractIconsW` → `SHGetFileInfoW` 高清图标提取、`1024` 条上限 `GdkTexture` LRU 缓存与后台线程安全 `RawDecodedIcon` 解码 |
+| `app-grid.cpp` | `appDisplay.js` | 宿主内分页应用网格（`.icon-grid` / `.overview-tile` / `WinomeAppIcon` + `GSK_SCALING_FILTER_TRILINEAR` / 按当前页优先的异步分批图标加载 / 结构缓存与 `app_grid_prewarm()` / `.app-grid-running-dot` 运行点指示 / 右键 AppMenu 上下文菜单与多窗口列表 / 滚轮与指示点翻页 / 响应式 6×4・5×3・4×3 排布） |
 | `overview-thumbs.cpp` | `workspaceThumbnail.js` | 虚拟桌面壁纸药丸行（支持拖拽落点高亮、仅 1 个桌面拖拽时自动展开 `[Desktop 1] [+]`、`+` 新建与悬停 `×`/中键关闭桌面、活动桌面指示器与迷你 DWM 预览） |
 | `ws-osd.cpp` | `workspaceSwitcherPopup.js` | 概览外 `Win+Ctrl+←/→` 切换桌面时，主屏底部中央（4em 边距）显示圆点 OSD（100ms EASE_OUT_QUAD 淡入 → 600ms 常驻 → 100ms 淡出，连续切换重置计时） |
 
 ### 关键实现细节
 
-- **开合动画**：`250ms`（开 `EASE_OUT_SINE` / 关 `EASE_OUT_QUAD`）；窗口以 `gtk_window_fullscreen` 创建保持 surface 与显示器一致；布局 idle 使用 `G_PRIORITY_HIGH_IDLE` 抢在首帧重绘前就绪，避免黑闪；关闭后保留控件几何以便重开首帧铺满壁纸。
+- **统一三态开合与打断过渡**：`ControlsState` 驱动 `HIDDEN ↔ WINDOW_PICKER ↔ APP_GRID` 在 `250ms` 帧时钟动画内无缝互转或中途打断（打开概览时提前调用 `app_grid_prewarm()` 预建/预解码当前页图标）；窗口以 `gtk_window_fullscreen` 创建保持 surface 与显示器一致；布局 idle 使用 `G_PRIORITY_HIGH_IDLE` 抢在首帧重绘前就绪，避免黑闪；关闭后保留控件几何以便重开首帧铺满壁纸。
 - **最小化窗口**：使用 `GetWindowPlacement().rcNormalPosition` 作为原矩形并按恢复矩形归属显示器，避免 `GetWindowRect` 返回离屏坐标；开合动画从工作区角落展开并淡入；点击激活时先 `SW_RESTORE` 再 `SetForegroundWindow`。
 - **排除自身窗口**：枚举窗口时用 `is_our_process()` 过滤本进程所有窗口（面板、弹出窗、概览与 chrome 窗口）。
 - **悬停 chrome 独立顶层窗**：因为 DWM 缩略图合成在窗口自绘内容之上，关闭按钮（32px）与应用图标（64px，`WM_GETICON` / `IShellItemImageFactory`）置于独立透明顶层窗（`WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST`）浮于缩略图之上，指针离开 `750ms` 后淡出；关闭按钮发送 `WM_CLOSE` 并触发重排。
@@ -87,7 +89,7 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 | **系统状态**（`src/system-status.cpp`） | 电量 `GetSystemPowerStatus`、音量 WASAPI `IAudioEndpointVolumeCallback`（事件驱动与静音切换）、屏幕亮度 WMI (`ROOT\WMI`) + `dxva2.dll` DDC/CI、电源操作自动申请 `SE_SHUTDOWN_NAME` | 外接显示器/台式机无物理亮度调节能力时动态隐藏亮度滑块行 |
 | **WinRT 与通知中心**（`src/winrt-bridge.cpp`、`src/notifications.cpp`、`src/calendar.cpp`） | 异步探测并桥接 Windows Radio（蓝牙开关/已配对列表）、SMTC 媒体控制与 `UserNotificationListener` | 在顶栏弹出双栏 DateMenu（SMTC 媒体卡片 + 通知列表/勿扰开关 + 日历）并在非勿扰/非全屏下显示顶部通知横幅 |
 | **系统托盘**（`src/systray.cpp`） | 代理提取 Windows 系统托盘常驻图标与文本提示并在面板状态区弹出展示 | 支持点击与右键消息转发，唤起第三方托盘程序窗口或菜单 |
-| **多屏、配置与设置**（`src/monitor-manager.cpp`、`src/config.cpp`、`src/i18n.cpp`、`src/settings-window.cpp`） | `EnumDisplayMonitors` 管理多屏面板与 DPI 变化；`%LOCALAPPDATA%\WINOME\config.json` 热重载；Adwaita-dark GTK4 设置窗 | 支持单/全屏顶栏策略、热角与 Win 键策略、时钟/电量选项与桌面重启自恢复 |
+| **多屏、配置与设置**（`src/monitor-manager.cpp`、`src/config.cpp`、`src/i18n.cpp`、`src/settings-window.cpp`） | `EnumDisplayMonitors` 管理多屏面板与 DPI 变化；`%LOCALAPPDATA%\WINOME\config.json` 热重载；深色 Adwaita GTK4 设置窗（深色标题栏与设置页卡片） | 支持单/全屏顶栏策略、热角与 Win 键策略、时钟/电量选项与桌面重启自恢复 |
 
 ---
 

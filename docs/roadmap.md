@@ -44,7 +44,7 @@ flowchart LR
 | **P4** | 补齐 GNOME 概览核心工作流（搜索、应用网格、桌面管理） | 已完成（Phase 7） | 键盘直搜应用与窗口；分页应用网格；Dash Favorites 持久化与右键菜单/LRU 缓存；跨桌面拖拽、中键关闭与 Win11 22621/24H2+ 兼容 |
 | **P5** | 工程化交付、回归保障与终端用户安装包 | 已完成（Phase 3/8） | `config.json` 与 GTK4 设置窗、`i18n.cpp`、`meson test` 单元测试、GitHub Actions CI（`.github/workflows/ci.yml`）与 `WINOME/package.sh` 自包含便携打包 |
 
-> 注：以上各阶段已按工程实施节奏（Phase 1–8）分阶段交付验证并本地提交 Git；下方保留完整技术设计规格说明供维护参考。
+> 注：以上 P0–P5 阶段已全部落地并通过自动化测试；后续围绕 UI 深度复刻（内置 GNOME symbolic 图标、`QuickToggleMenu` 居中展开抽屉、WinRT 蓝牙/通知、`FOLDERID_AppsFolder` UWP 应用与 `AppGrid` 三态切换/高清图标）亦已交付（详见 [theme-and-ui.md](theme-and-ui.md#6-视觉对齐与应用网格迭代post-phase-11-汇总) 与 [dev-logs/2026-11-16.md](dev-logs/2026-11-16.md)）。下一周期长期演进方向请参阅 [long-term-plan.md](long-term-plan.md)；下方保留 P0–P5 原型演进阶段详细设计供历史追溯。
 
 ---
 

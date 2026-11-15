@@ -41,6 +41,8 @@
   - 弹层被挂入窗口后由窗口容器管理引用，调用方不得再额外 `g_object_unref`；
   - 传递数组出参使用「指针 + 显式 count」（不用三重指针或哨兵启发式）；
   - 菜单回调所需上下文或条目数据应堆分配并绑定到菜单/面板销毁回调（如 `g_object_set_data_full`），避免传栈变量地址或 `static` 局部数组引起悬空指针或不可重入问题。
+- **自定义 GObject 内嵌 C++ 成员必须显式 placement-new 与析构**：`g_object_new()` 只做零初始化（zero-init），不会调用 C++ 字段（如 `std::vector`、`std::string`）的构造函数或析构函数；必须在 `*_init()` 中对每个非平凡成员执行 placement `new`，并在 `*_finalize()` 中显式调用析构函数再串联 `parent_class->finalize`（参见 `app-grid.cpp` 与 `overview-dash.cpp`）。
+- **WinRT `UserNotificationListener` 与无打包桌面策略**：`winrt-bridge.cpp` 在独立 MTA 工作线程通过 `combase.dll` 动态加载并按裸 vtable 调用 WinRT 接口（遵循同款 GCC LTO 去虚拟化约束）；非商店打包宿主可能被系统策略拒绝通知监听访问，调用方必须检查 `access_allowed` 并静默降级，不得阻塞 UI。
 
 ---
 
@@ -50,11 +52,11 @@
 2. **优先静态对照查证**：比对上游 `.scss` + 上游 `.js` 节点结构 + 产物 `gnome-shell-gtk4.css`，比运行时盲探更准确。
 3. **验证探针有效性**：切勿用 `gtk_style_context_lookup_color` 检测 `:checked` 等状态伪类——它在标准对照组（`GtkToggleButton` + `button.quick-toggle:checked`）上同样返回失败。当探针在对照组上失效时，应立即否定探针而非据此修改业务逻辑。
 4. **验证构建期检查器有效性**：每次为 `check-st-css-coverage.py` 或 `check-widget-classes.py` 添加规则时，必须通过**人为注入已知缺陷**确认脚本确实报错；仅靠“绿灯通过”不能证明检查有效，同时注意增量构建不会重跑未修改的规则，必要时删除产物强行重编。
-5. **GUI exe 输出行为**：由于工程启用了 `win_subsystem: 'windows'`，在 bash 下直接运行无法把 stdout 落盘到控制台，诊断输出默认追加写入 `%TEMP%\winome.log`。
+5. **GUI exe 输出行为**：由于工程启用了 `win_subsystem: 'windows'`，在 bash 下直接运行无法把 stdout 落盘到控制台，诊断输出默认按 `5MB` 上限轮转追加写入 `%LOCALAPPDATA%\WINOME\winome.log`（旧日志保留为 `winome.prev.log`）。
 
 ---
 
-## 5. 明确暂缓项与本机环境事实
+## 5. WinRT 桥接现状与本机环境事实
 
-- **蓝牙二级菜单与真实数据源（暂缓）**：MinGW / UCRT64 工具链不包含 WinRT 头文件（`ucrt64/include/winrt` 不存在），而 Windows 枚举蓝牙 radio 与发现设备需依赖 WinRT `Windows.Devices.Bluetooth` API；`bluetoothapis.h` 仅面向已配对设备且无法控制 radio 开关。待确定独立后端桥接方案后再行接入，不做虚假 stub。
+- **蓝牙 / SMTC / 通知真实数据源（已落地）**：针对 UCRT64 缺少 `ucrt64/include/winrt` 头文件的问题，`winrt-bridge.cpp` 通过运行时加载 `combase.dll`（`RoGetActivationFactory` / `WindowsCreateStringReference`）与裸 COM/WinRT vtable 指针在后台 MTA 线程访问 `Windows.Devices.Radios.Radio`、SMTC 与 `UserNotificationListener`，无需引入 C++/WinRT 编译依赖即可工作；若系统策略禁用未打包进程访问通知监听，按 `access_allowed == false` 安静降级。
 - **本机无线调试环境**：本机具备真实无线网卡（Intel Dual Band Wireless-AC 7265），可在实机验证 `wlanapi.dll` 扫描与连接流程。

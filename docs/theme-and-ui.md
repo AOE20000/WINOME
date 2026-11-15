@@ -52,9 +52,10 @@ WINOME 以 sassc 编译后的上游样式表 [gnome-shell-dark.css](../WINOME/sr
    - `pass-through`：声明为 GTK4 原生的属性必须真正进入输出；
    - `semantics`：同时设定 `min-width` + `max-width`（或 `min-height` + `max-height`）的规则不可丢失上限；
    - `transitions`：输出中所有带 `transition-duration` 的规则数不得超过带 `transition-property` 的规则数（采用**数量比较**而非存在性检查，防止面板硬编码或残留规则掩盖回归）。
-   - 当前基线：`OK 83 upstream properties all accounted for; 40 reached the GTK4 stylesheet.`
+   - 当前基线：`OK  83 upstream properties all accounted for; 46 reached the GTK4 stylesheet.`
 2. **控件类名结构检查**（[check-widget-classes.py](../WINOME/tools/check-widget-classes.py)）：
    - 交叉核对 `gnome-shell-gtk4.css` 中的作用域样式类与 C++ 源码中的 `gtk_widget_*_css_class` 调用，抓出「样式存在但代码未建节点」或「代码加了但样式表未定义的死类」。
+   - 当前基线：`OK  137 styled classes; 63 created by the source; 0 optional, 68 styled-but-unused.`
 
 ---
 
@@ -66,7 +67,8 @@ GTK4 没有内置动画框架（无 `GtkAnimation`），而上游广泛依赖 `C
 - **求解**：Newton-Raphson + **二分法兜底**（`ease_out_back` 导数趋零会导致纯 Newton 停滞）。
 - **驱动**：`gtk_widget_add_tick_callback` 对齐显示器 vblank，tween 状态随 widget 销毁释放。
 - **上游时长常量**：`QUICK_SETTINGS_ANIMATION_TIME = 400`（`quickSettings.js:17`）、`BOXPOPOVER_ANIMATION_TIME = 150`（`boxpointer.js:14`）。
-- **菜单两阶段串行开合**（`quickSettings.js:464 / :500`）：
+- **菜单两阶段串行居中展开/收起**（`quickSettings.js:464 / :500`）：
+  - 在 `quick-settings.cpp` 中复刻 `QuickToggleMenu` 内联手风琴抽屉的两阶段展开与淡入（高度补间与内容显隐同步控制，呈现从中心向外展开的质感而非整块向下滑动）；
   - open：先做高度补间，完成后淡入；
   - close：先淡出（`opacity → 0`），完成后收起高度并隐藏窗口。
   - **不能在关动画前调 `gtk_widget_set_visible(FALSE)`**，否则窗口掉出 topmost 队形且淡出不可见；完成回调仅持 window 引用，不碰已随窗口销毁释放的 `PanelPopover`。
@@ -111,3 +113,10 @@ GTK4 没有内置动画框架（无 `GtkAnimation`），而上游广泛依赖 `C
   - `shell-panel`、`quick-settings`（`.slider` 与 `.quick-settings-grid`）、`calendar`、`notifications`、`app-grid`（`.icon-grid` 与 `.page-indicator-icon`）、`ws-osd`（`.workspace-switcher` 与 `.ws-switcher-indicator`）及 `overview` / `overview-dash` / `overview-thumbs`（包含 `.window-close` 与 `.window-picker`）均已接入 `StEngine::get()`；因 `StEngine::Node` 以 `G_TYPE_OBJECT` 匹配，含 `StIcon` 等类型选择器的规则（如 `.window-close StIcon`）保留上游常量 fallback。
   - `shell-panel.cpp` 读取 `-arrow-rise`、`-arrow-base`、`-arrow-border-radius`、`-arrow-border-width`、`-boxpointer-gap` 及菜单背景/边框色，通过 `draw_popover_arrow()` 以 Cairo 绘制 `BoxPointer` 箭头。
   - `tests/test-main.cpp` 通过 `test_st_engine_theme_metrics()` 验证 `#panel`、`.quick-settings-grid`、`.slider`、`.window-close`、`.workspace-switcher` 与 `.popup-menu-content` 的主题指标解析。
+
+## 6. 视觉对齐与应用网格迭代（Post-Phase 11 汇总）
+
+- **内置图标资源与占位图（`src/theme/winome.gresource.xml`）**：随包嵌入 12 个上游 GNOME symbolic SVG（`carousel-arrow-*`、`cog-wheel`、`dark-mode`、`group-collapse`、`notification-expand`、`ornament-check`、`preview-close`、`screenshooter`、`check`、`message-indicator`、`no-notifications`）及 `calendar-today.svg`、`workspace-placeholder.svg`，彻底摆脱外部系统图标主题缺失导致的方块或尺寸错乱。
+- **顶栏、通知与快速设置细化**：`QuickSettings` 电源子菜单支持 `Quit WINOME`；Wi-Fi 加密接入改用模态密码弹窗（对齐 `.modal-dialog`）；`SettingsWindow` 采用深色 Adwaita 标题栏与设置页视觉风格；时钟指示器、今日圆点、通知列表空状态与折叠按钮对齐上游节点树。
+- **概览 Chrome 与应用网格 / 右键菜单对齐**：修复概览悬停标题被 DWM 缩略图遮挡与标题过长省略、`workspace-placeholder` 空桌面占位；为 `AppGrid` 接入自定义 `WinomeAppIcon`（`GSK_SCALING_FILTER_TRILINEAR`）避免低清模糊，完善应用右键 AppMenu popover（白字对比度、打开的窗口分组、管理员启动、固定到 Dash 与打开位置）以及双击 Win 键平滑切入 `APP_GRID`。
+- **CSS 覆盖与回归校验**：`convert-st-css.py` 扩展了 `APP_GRID`、上下文 popover、模态窗及 `QuickToggleMenu` 所需规则，由 `tests/test-css-converter.py` 自动回归保护；全套上游 St 属性已有 `46 / 83` 进入转换后 GTK4 样式表。
