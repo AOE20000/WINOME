@@ -357,6 +357,12 @@ std::string serialize_config(const WinomeConfig& cfg) {
   out += cfg.win_key_overview ? "true" : "false";
   out += ",\n  \"multi_monitor_panels\": ";
   out += cfg.multi_monitor_panels ? "true" : "false";
+  out += ",\n  \"end_session_confirm\": ";
+  out += cfg.end_session_confirm ? "true" : "false";
+  out += ",\n  \"unify_dark_titlebars\": ";
+  out += cfg.unify_dark_titlebars ? "true" : "false";
+  out += ",\n  \"unify_rounded_corners\": ";
+  out += cfg.unify_rounded_corners ? "true" : "false";
   out += ",\n  \"pinned_apps\": [";
   for (size_t i = 0; i < cfg.pinned_apps.size(); ++i) {
     if (i > 0)
@@ -409,6 +415,12 @@ bool parse_config(const std::string& json, WinomeConfig* out) {
       ok = parse_json_bool(json, &pos, &cfg.win_key_overview);
     else if (key == "multi_monitor_panels")
       ok = parse_json_bool(json, &pos, &cfg.multi_monitor_panels);
+    else if (key == "end_session_confirm")
+      ok = parse_json_bool(json, &pos, &cfg.end_session_confirm);
+    else if (key == "unify_dark_titlebars")
+      ok = parse_json_bool(json, &pos, &cfg.unify_dark_titlebars);
+    else if (key == "unify_rounded_corners")
+      ok = parse_json_bool(json, &pos, &cfg.unify_rounded_corners);
     else if (key == "pinned_apps")
       ok = parse_json_string_array(json, &pos, &cfg.pinned_apps);
     else

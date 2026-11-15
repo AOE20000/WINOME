@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <ctime>
 #include <mutex>
@@ -46,8 +47,24 @@ struct NotifState {
 
 NotifState g_state;
 std::atomic<bool> g_running{false};
-std::atomic<bool> g_poll_in_flight{false};
+std::atomic<bool> g_toast_allowed_last{false};
+std::atomic<bool> g_media_active_last{false};
 guint g_poll_timer_id = 0;
+int g_poll_interval_sec = 2;
+
+struct NotifWorker {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::thread thread;
+  bool started = false;
+  bool stop = false;
+  bool poll_requested = false;
+  bool clear_all_pending = false;
+  std::vector<uint32_t> remove_ids;
+  std::vector<WinomeMediaAction> media_actions;
+};
+
+NotifWorker g_worker;
 
 constexpr int kBannerAnimMs = 200; // messageTray.js ANIMATION_TIME
 constexpr int kBannerTimeoutMs = 4500;
@@ -367,7 +384,10 @@ struct PollApplyData {
   WinomeMediaInfo media;
   std::vector<WinomeSystemNotification> sys_notifs;
   bool got_notifs = false;
+  bool toast_allowed = false;
 };
+
+gboolean poll_tick_forwarder(gpointer data);
 
 bool media_equals(const WinomeMediaInfo& a, const WinomeMediaInfo& b) {
   return a.active == b.active && a.playing == b.playing &&
@@ -376,7 +396,7 @@ bool media_equals(const WinomeMediaInfo& a, const WinomeMediaInfo& b) {
 }
 
 gboolean apply_poll_on_main(gpointer user_data) {
-  std::unique_ptr<PollApplyData> data(static_cast<PollApplyData*>(user_data));
+  auto* data = static_cast<PollApplyData*>(user_data);
   if (!g_running.load())
     return G_SOURCE_REMOVE;
 
@@ -463,24 +483,77 @@ gboolean apply_poll_on_main(gpointer user_data) {
   if (!newly_arrived.empty())
     show_banner_main(newly_arrived.front());
 
+  // Adapt background WinRT polling cadence: 2s when active media or OS toast
+  // access is permitted, relaxing to 6s when idle & toast access is denied.
+  g_toast_allowed_last.store(data->toast_allowed, std::memory_order_release);
+  g_media_active_last.store(data->media.active, std::memory_order_release);
+  const int want_sec = (data->toast_allowed || data->media.active) ? 2 : 6;
+  if (g_poll_timer_id != 0 && want_sec != g_poll_interval_sec) {
+    g_source_remove(g_poll_timer_id);
+    g_poll_interval_sec = want_sec;
+    g_poll_timer_id = g_timeout_add_seconds(static_cast<guint>(want_sec),
+                                            poll_tick_forwarder, nullptr);
+  }
+
   return G_SOURCE_REMOVE;
+}
+
+void notif_worker_main() {
+  for (;;) {
+    bool do_poll = false;
+    bool do_clear = false;
+    std::vector<uint32_t> remove_ids;
+    std::vector<WinomeMediaAction> media_actions;
+    {
+      std::unique_lock<std::mutex> lock(g_worker.mu);
+      g_worker.cv.wait(lock, [] {
+        return g_worker.stop || g_worker.poll_requested ||
+               !g_worker.remove_ids.empty() || g_worker.clear_all_pending ||
+               !g_worker.media_actions.empty();
+      });
+      if (g_worker.stop)
+        break;
+      do_poll = g_worker.poll_requested;
+      g_worker.poll_requested = false;
+      do_clear = g_worker.clear_all_pending;
+      g_worker.clear_all_pending = false;
+      remove_ids.swap(g_worker.remove_ids);
+      media_actions.swap(g_worker.media_actions);
+    }
+
+    for (uint32_t id : remove_ids)
+      winrt_remove_notification(id);
+    if (do_clear)
+      winrt_clear_notifications();
+    if (!media_actions.empty()) {
+      for (WinomeMediaAction act : media_actions)
+        winrt_media_control(act);
+      Sleep(120);
+      do_poll = true;
+    }
+
+    if (do_poll && g_running.load()) {
+      auto* payload = new PollApplyData();
+      winrt_get_media_info(&payload->media);
+      bool allowed = false;
+      payload->got_notifs =
+          winrt_get_notifications(&payload->sys_notifs, &allowed);
+      payload->toast_allowed = allowed;
+      g_idle_add_full(
+          G_PRIORITY_DEFAULT_IDLE, apply_poll_on_main, payload,
+          +[](gpointer ud) { delete static_cast<PollApplyData*>(ud); });
+    }
+  }
 }
 
 void trigger_background_poll() {
   if (!g_running.load())
     return;
-  bool expected = false;
-  if (!g_poll_in_flight.compare_exchange_strong(expected, true))
+  std::lock_guard<std::mutex> lock(g_worker.mu);
+  if (g_worker.stop)
     return;
-
-  std::thread([] {
-    auto* payload = new PollApplyData();
-    winrt_get_media_info(&payload->media);
-    bool allowed = false;
-    payload->got_notifs = winrt_get_notifications(&payload->sys_notifs, &allowed);
-    g_poll_in_flight.store(false);
-    g_idle_add(apply_poll_on_main, payload);
-  }).detach();
+  g_worker.poll_requested = true;
+  g_worker.cv.notify_one();
 }
 
 gboolean poll_tick(gpointer G_GNUC_UNUSED data) {
@@ -488,12 +561,26 @@ gboolean poll_tick(gpointer G_GNUC_UNUSED data) {
   return G_SOURCE_CONTINUE;
 }
 
+gboolean poll_tick_forwarder(gpointer data) {
+  return poll_tick(data);
+}
+
 }  // namespace
 
 void notifications_init() {
   if (g_running.exchange(true))
     return;
-  trigger_background_poll();
+  {
+    std::lock_guard<std::mutex> lock(g_worker.mu);
+    if (!g_worker.started) {
+      g_worker.stop = false;
+      g_worker.poll_requested = true;
+      g_worker.started = true;
+      g_worker.thread = std::thread(notif_worker_main);
+    }
+  }
+  g_worker.cv.notify_one();
+  g_poll_interval_sec = 2;
   g_poll_timer_id = g_timeout_add_seconds(2, poll_tick, nullptr);
 }
 
@@ -504,6 +591,19 @@ void notifications_shutdown() {
     g_source_remove(g_poll_timer_id);
     g_poll_timer_id = 0;
   }
+  std::thread to_join;
+  {
+    std::lock_guard<std::mutex> lock(g_worker.mu);
+    if (g_worker.started) {
+      g_worker.stop = true;
+      g_worker.started = false;
+      to_join = std::move(g_worker.thread);
+    }
+  }
+  g_worker.cv.notify_all();
+  if (to_join.joinable())
+    to_join.join();
+
   dismiss_banner_immediately();
   if (g_banner_window != nullptr) {
     gtk_window_destroy(GTK_WINDOW(g_banner_window));
@@ -576,7 +676,11 @@ void notifications_dismiss(uint64_t key) {
   if (found)
     notify_listeners_main();
   if (remove_winrt) {
-    std::thread([winrt_id] { winrt_remove_notification(winrt_id); }).detach();
+    std::lock_guard<std::mutex> lock(g_worker.mu);
+    if (!g_worker.stop) {
+      g_worker.remove_ids.push_back(winrt_id);
+      g_worker.cv.notify_one();
+    }
   }
 }
 
@@ -595,15 +699,21 @@ void notifications_clear_all() {
   }
   if (had_any)
     notify_listeners_main();
-  std::thread([] { winrt_clear_notifications(); }).detach();
+  {
+    std::lock_guard<std::mutex> lock(g_worker.mu);
+    if (!g_worker.stop) {
+      g_worker.clear_all_pending = true;
+      g_worker.cv.notify_one();
+    }
+  }
 }
 
 void notifications_media_action(WinomeMediaAction action) {
-  std::thread([action] {
-    winrt_media_control(action);
-    Sleep(120);
-    trigger_background_poll();
-  }).detach();
+  std::lock_guard<std::mutex> lock(g_worker.mu);
+  if (!g_worker.stop) {
+    g_worker.media_actions.push_back(action);
+    g_worker.cv.notify_one();
+  }
 }
 
 void notifications_add_listener(NotificationsChangedCallback cb, void* user_data) {

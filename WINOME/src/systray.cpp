@@ -3,6 +3,7 @@
 // Safe Windows System Tray discovery & activation without DLL injection.
 
 #include "systray.h"
+#include "perf-metrics.h"
 
 #include <windows.h>
 #include <commctrl.h>
@@ -582,6 +583,15 @@ void worker_main() {
   if (com_ok) {
     CoCreateInstance(kClsidCUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
                      kIidIUIAutomation, reinterpret_cast<void**>(&uia));
+  }
+  if (!com_ok) {
+    capability_set(SubsystemId::SysTray, CapabilityState::Degraded,
+                   "COM init failed; UIA tray disabled");
+  } else if (uia == nullptr) {
+    capability_set(SubsystemId::SysTray, CapabilityState::Degraded,
+                   "IUIAutomation unavailable; classic toolbar fallback only");
+  } else {
+    capability_set(SubsystemId::SysTray, CapabilityState::Active);
   }
 
   for (;;) {

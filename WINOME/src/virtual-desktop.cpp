@@ -23,13 +23,17 @@
 // the GTK main loop.
 
 #include "virtual-desktop.h"
+#include "perf-metrics.h"
 
+#include <glib.h>
 #include <objbase.h>
 
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -130,6 +134,7 @@ struct Job {
   enum class Op {
     Desktops,
     CurrentIndex,
+    Snapshot,
     WindowDesktopIndex,
     WindowOnCurrent,
     SwitchTo,
@@ -197,6 +202,8 @@ struct ComState {
                                      kIID_IServiceProvider, &obj);
       if (FAILED (hr) || obj == nullptr) {
         disabled = true;
+        capability_set (SubsystemId::VirtualDesktop, CapabilityState::Degraded,
+                        "ImmersiveShell unavailable (single-workspace fallback)");
         return false;
       }
       provider = obj;
@@ -209,6 +216,8 @@ struct ComState {
                                    &kIID_IVirtualDesktopManagerInternal, &obj);
       if (FAILED (hr) || obj == nullptr) {
         disabled = true;  // build without this interface; never retry
+        capability_set (SubsystemId::VirtualDesktop, CapabilityState::Degraded,
+                        "IVirtualDesktopManagerInternal unsupported");
         return false;
       }
       internal = obj;
@@ -221,10 +230,25 @@ struct ComState {
                                    &kIID_IVirtualDesktopManager, &obj);
       if (FAILED (hr) || obj == nullptr) {
         disabled = true;
+        capability_set (SubsystemId::VirtualDesktop, CapabilityState::Degraded,
+                        "IVirtualDesktopManager unsupported");
         return false;
       }
       manager = obj;
     }
+
+    const uint32_t build = windows_build_number ();
+    const VtableProfile prof = vtable_slots_for_build (build);
+    char detail_buf[128] {};
+    std::snprintf (detail_buf, sizeof (detail_buf),
+                   prof.can_manage_desktops
+                       ? "build %u (full VD + create/remove)"
+                       : "build %u (read-only switch/query)",
+                   build);
+    capability_set (SubsystemId::VirtualDesktop,
+                    prof.can_manage_desktops ? CapabilityState::Active
+                                             : CapabilityState::Degraded,
+                    detail_buf);
 
     return true;
   }
@@ -476,10 +500,13 @@ ComState g_com;  // worker-thread-only
 
 std::mutex g_queue_mu;
 std::condition_variable g_cv;
-Job *g_pending = nullptr;       // queued job (single slot)
-std::vector<Job *> g_done;      // completed jobs awaiting pickup
+std::shared_ptr<Job> g_pending;            // queued job (single slot)
+std::vector<std::shared_ptr<Job>> g_done;  // completed jobs awaiting pickup
 bool g_worker_quit = false;
-bool g_worker_stuck = false;    // a call never returned; abandon the module
+bool g_worker_stuck = false;  // a call never returned; abandon the module
+
+// Forward-declared for mutation paths below; implemented in observer section.
+void obs_schedule_hint_async (void);
 
 // Execute @job on the worker thread. Blocks until COMPLETION (not pickup —
 // waking on pickup raced with the worker still writing the results), with a
@@ -487,7 +514,7 @@ bool g_worker_stuck = false;    // a call never returned; abandon the module
 // callers at a lower integrity level than the shell); rather than freezing
 // the GTK main thread, give up after the timeout and disable the module.
 void
-run_on_worker (Job *job)
+run_on_worker (const std::shared_ptr<Job> &job)
 {
   static std::once_flag worker_once;
   static std::thread worker;
@@ -505,14 +532,14 @@ run_on_worker (Job *job)
         if (g_worker_quit)
           break;
 
-        Job *job = g_pending;
-        g_pending = nullptr;
+        std::shared_ptr<Job> cur = std::move (g_pending);
+        g_pending.reset ();
         lock.unlock ();
 
-        switch (job->op) {
+        switch (cur->op) {
         case Job::Op::Desktops: {
-          job->out_desktops = g_com.desktops ();
-          job->ok = !job->out_desktops.empty ();
+          cur->out_desktops = g_com.desktops ();
+          cur->ok = !cur->out_desktops.empty ();
           break;
         }
         case Job::Op::CurrentIndex: {
@@ -520,8 +547,8 @@ run_on_worker (Job *job)
           // explorer VD service hangs when GetCurrentDesktop is the first
           // call after Connect (verified empirically; the enumerate-then-
           // query order is reliable).
-          auto desktops = g_com.desktops ();
-          if (!g_com.ensure () || desktops.empty ())
+          auto ds = g_com.desktops ();
+          if (!g_com.ensure () || ds.empty ())
             break;
           void *d = nullptr;
           HRESULT hr = vcall<HRESULT> (g_com.internal, kSlotGetCurrentDesktop,
@@ -531,14 +558,39 @@ run_on_worker (Job *job)
             bool got = SUCCEEDED (vcall<HRESULT> (d, kSlotGetId, &id));
             vrelease (d);
             if (got) {
-              for (const DesktopInfo &info : desktops)
+              for (const DesktopInfo &info : ds)
                 if (IsEqualGUID (info.id, id)) {
-                  job->out_index = info.index;
-                  job->ok = true;
+                  cur->out_index = info.index;
+                  cur->ok = true;
                   break;
                 }
             }
           }
+          break;
+        }
+        case Job::Op::Snapshot: {
+          auto ds = g_com.desktops ();
+          if (!g_com.ensure () || ds.empty ())
+            break;
+          int active_idx = -1;
+          void *d = nullptr;
+          HRESULT hr = vcall<HRESULT> (g_com.internal, kSlotGetCurrentDesktop,
+                                       &d);
+          if (SUCCEEDED (hr) && d != nullptr) {
+            GUID id{};
+            bool got = SUCCEEDED (vcall<HRESULT> (d, kSlotGetId, &id));
+            vrelease (d);
+            if (got) {
+              for (const DesktopInfo &info : ds)
+                if (IsEqualGUID (info.id, id)) {
+                  active_idx = info.index;
+                  break;
+                }
+            }
+          }
+          cur->out_desktops = std::move (ds);
+          cur->out_index = active_idx >= 0 ? active_idx : 0;
+          cur->ok = true;
           break;
         }
         case Job::Op::WindowDesktopIndex: {
@@ -546,13 +598,13 @@ run_on_worker (Job *job)
             break;
           GUID id{};
           if (SUCCEEDED (vcall<HRESULT> (g_com.manager, kSlotDesktopByWindow,
-                                         job->in_hwnd, &id))) {
+                                         cur->in_hwnd, &id))) {
             GUID zero{};
             if (!IsEqualGUID (id, zero)) {
               int idx = g_com.index_of (id);
               if (idx >= 0) {
-                job->out_index = idx;
-                job->ok = true;
+                cur->out_index = idx;
+                cur->ok = true;
               }
             }
           }
@@ -563,9 +615,9 @@ run_on_worker (Job *job)
             break;
           BOOL on = FALSE;
           if (SUCCEEDED (vcall<HRESULT> (g_com.manager, kSlotIsOnCurrent,
-                                         job->in_hwnd, &on))) {
-            job->out_bool = on != FALSE;
-            job->ok = true;
+                                         cur->in_hwnd, &on))) {
+            cur->out_bool = on != FALSE;
+            cur->ok = true;
           }
           break;
         }
@@ -581,13 +633,13 @@ run_on_worker (Job *job)
             break;
           UINT n = 0;
           vcall<HRESULT> (arr, kSlotGetCount, &n);
-          if (job->in_index >= 0 && (UINT)job->in_index < n) {
+          if (cur->in_index >= 0 && (UINT)cur->in_index < n) {
             void *d = nullptr;
             if (SUCCEEDED (vcall<HRESULT> (arr, kSlotGetAt,
-                                           (UINT)job->in_index,
+                                           (UINT)cur->in_index,
                                            &kIID_IVirtualDesktop, &d)) &&
                 d != nullptr) {
-              job->ok = SUCCEEDED (
+              cur->ok = SUCCEEDED (
                   vcall<HRESULT> (g_com.internal, kSlotSwitchDesktop, d));
               vrelease (d);
             }
@@ -596,30 +648,32 @@ run_on_worker (Job *job)
           break;
         }
         case Job::Op::PinWindow: {
-          job->ok = g_com.set_window_pin_state (job->in_hwnd, kSlotPinView);
+          cur->ok = g_com.set_window_pin_state (cur->in_hwnd, kSlotPinView);
           break;
         }
         case Job::Op::UnpinWindow: {
-          job->ok = g_com.set_window_pin_state (job->in_hwnd, kSlotUnpinView);
+          cur->ok = g_com.set_window_pin_state (cur->in_hwnd, kSlotUnpinView);
           break;
         }
         case Job::Op::MoveWindowToDesktop: {
-          job->ok = g_com.move_window_to_desktop (job->in_hwnd, job->in_index);
+          cur->ok = g_com.move_window_to_desktop (cur->in_hwnd, cur->in_index);
           break;
         }
         case Job::Op::CreateDesktop: {
-          job->ok = g_com.create_desktop ();
+          cur->ok = g_com.create_desktop ();
           break;
         }
         case Job::Op::RemoveDesktop: {
-          job->ok = g_com.remove_desktop (job->in_index);
+          cur->ok = g_com.remove_desktop (cur->in_index);
           break;
         }
         }
 
         lock.lock ();
-        g_done.push_back (job);
-        g_cv.notify_all ();
+        if (!g_worker_stuck) {
+          g_done.push_back (std::move (cur));
+          g_cv.notify_all ();
+        }
       }
     });
     worker.detach ();  // never join: Release after combase teardown crashes
@@ -627,25 +681,223 @@ run_on_worker (Job *job)
 
   std::unique_lock<std::mutex> lock (g_queue_mu);
   if (g_worker_stuck) {
-    delete job;  // worker parked inside explorer; caller sees failure
+    job->ok = false;
     return;
   }
   g_pending = job;
   g_cv.notify_all ();
   // 8s is far above a healthy round trip (single-digit ms) and below any
   // user-tolerable UI freeze.
-  bool done = g_cv.wait_for (lock, std::chrono::seconds (8), [job] {
+  bool done = g_cv.wait_for (lock, std::chrono::seconds (8), [&job] {
     return std::find (g_done.begin (), g_done.end (), job) != g_done.end ();
   });
   if (done) {
-    g_done.erase (std::find (g_done.begin (), g_done.end (), job));
-    // Results read by the caller; ownership stays with the caller.
+    auto it = std::find (g_done.begin (), g_done.end (), job);
+    if (it != g_done.end ())
+      g_done.erase (it);
   } else {
-    // Explorer never answered: disable the module. The worker may still
-    // complete this job later — it owns the memory now, and pushes it to
-    // g_done where nobody picks it up (one small leak, once).
     g_worker_stuck = true;
+    winome::capability_set (winome::SubsystemId::VirtualDesktop,
+                            winome::CapabilityState::Tripped,
+                            "Explorer VD COM call timed out (>8s)");
   }
+}
+
+// --- Centralized event-driven virtual desktop observer -----------------------
+
+struct ListenerEntry {
+  DesktopChangedCallback cb = nullptr;
+  void *user_data = nullptr;
+};
+
+struct ObserverState {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::vector<ListenerEntry> listeners;
+  DesktopSnapshot snapshot{1, 0, false};
+  std::thread worker;
+  bool worker_started = false;
+  bool worker_stop = false;
+  bool probe_requested = false;
+  bool main_notify_queued = false;
+  HWINEVENTHOOK desktop_hook = nullptr;
+  guint init_delay_id = 0;
+  guint fallback_timer_id = 0;
+  guint debounce_id = 0;
+};
+
+ObserverState &
+obs_state (void)
+{
+  static ObserverState s;
+  return s;
+}
+
+gboolean
+obs_deliver_main (gpointer user_data)
+{
+  (void)user_data;
+  std::vector<ListenerEntry> copy;
+  DesktopSnapshot snap;
+  {
+    ObserverState &s = obs_state ();
+    std::lock_guard<std::mutex> lock (s.mu);
+    s.main_notify_queued = false;
+    if (s.listeners.empty () || !s.snapshot.valid)
+      return G_SOURCE_REMOVE;
+    copy = s.listeners;
+    snap = s.snapshot;
+  }
+  for (const ListenerEntry &e : copy) {
+    if (e.cb != nullptr)
+      e.cb (snap.count, snap.active_index, e.user_data);
+  }
+  return G_SOURCE_REMOVE;
+}
+
+void
+obs_worker_main (void)
+{
+  ObserverState &s = obs_state ();
+  for (;;) {
+    {
+      std::unique_lock<std::mutex> lock (s.mu);
+      s.cv.wait (lock, [&] { return s.worker_stop || s.probe_requested; });
+      if (s.worker_stop)
+        break;
+      s.probe_requested = false;
+      if (s.listeners.empty ())
+        continue;
+    }
+
+    auto job = std::make_shared<Job> ();
+    job->op = Job::Op::Snapshot;
+    run_on_worker (job);
+
+    DesktopSnapshot fresh;
+    if (job->ok && !job->out_desktops.empty ()) {
+      fresh.count = static_cast<int> (job->out_desktops.size ());
+      fresh.active_index = (job->out_index >= 0) ? job->out_index : 0;
+      fresh.valid = true;
+    }
+
+    bool should_schedule = false;
+    {
+      std::lock_guard<std::mutex> lock (s.mu);
+      if (!s.worker_stop && fresh.valid) {
+        bool changed = !s.snapshot.valid ||
+                       s.snapshot.count != fresh.count ||
+                       s.snapshot.active_index != fresh.active_index;
+        s.snapshot = fresh;
+        if (changed && !s.listeners.empty () && !s.main_notify_queued) {
+          s.main_notify_queued = true;
+          should_schedule = true;
+        }
+      }
+    }
+    if (should_schedule)
+      g_idle_add (obs_deliver_main, nullptr);
+  }
+}
+
+void
+obs_request_probe_now (void)
+{
+  ObserverState &s = obs_state ();
+  {
+    std::lock_guard<std::mutex> lock (s.mu);
+    if (s.listeners.empty () || !s.worker_started || s.worker_stop)
+      return;
+    s.probe_requested = true;
+  }
+  s.cv.notify_one ();
+}
+
+gboolean
+obs_debounce_cb (gpointer user_data)
+{
+  (void)user_data;
+  {
+    ObserverState &s = obs_state ();
+    std::lock_guard<std::mutex> lock (s.mu);
+    s.debounce_id = 0;
+  }
+  obs_request_probe_now ();
+  return G_SOURCE_REMOVE;
+}
+
+void
+obs_schedule_debounced (guint delay_ms)
+{
+  ObserverState &s = obs_state ();
+  std::lock_guard<std::mutex> lock (s.mu);
+  if (s.listeners.empty () || s.worker_stop)
+    return;
+  if (s.debounce_id != 0)
+    return;
+  s.debounce_id = g_timeout_add (delay_ms, obs_debounce_cb, nullptr);
+}
+
+gboolean
+obs_init_delay_cb (gpointer user_data)
+{
+  (void)user_data;
+  {
+    ObserverState &s = obs_state ();
+    std::lock_guard<std::mutex> lock (s.mu);
+    s.init_delay_id = 0;
+  }
+  obs_request_probe_now ();
+  return G_SOURCE_REMOVE;
+}
+
+gboolean
+obs_fallback_tick_cb (gpointer user_data)
+{
+  (void)user_data;
+  {
+    ObserverState &s = obs_state ();
+    std::lock_guard<std::mutex> lock (s.mu);
+    if (s.listeners.empty () || s.worker_stop) {
+      s.fallback_timer_id = 0;
+      return G_SOURCE_REMOVE;
+    }
+  }
+  obs_request_probe_now ();
+  return G_SOURCE_CONTINUE;
+}
+
+void CALLBACK
+on_desktop_winevent (HWINEVENTHOOK hook, DWORD event, HWND hwnd,
+                     LONG id_object, LONG id_child, DWORD thread, DWORD ms)
+{
+  (void)hook;
+  (void)event;
+  (void)hwnd;
+  (void)id_object;
+  (void)id_child;
+  (void)thread;
+  (void)ms;
+  // Explorer updates GetCurrentDesktop synchronously or within tens of ms
+  // after EVENT_SYSTEM_DESKTOPSWITCH fires.
+  obs_schedule_debounced (40);
+}
+
+void
+obs_schedule_hint_async (void)
+{
+  {
+    ObserverState &s = obs_state ();
+    std::lock_guard<std::mutex> lock (s.mu);
+    if (s.listeners.empty () || s.worker_stop)
+      return;
+  }
+  g_idle_add (
+      +[] (gpointer) -> gboolean {
+        obs_schedule_debounced (60);
+        return G_SOURCE_REMOVE;
+      },
+      nullptr);
 }
 
 }  // namespace
@@ -653,11 +905,10 @@ run_on_worker (Job *job)
 std::vector<DesktopInfo>
 desktops (void)
 {
-  Job *job = new Job{Job::Op::Desktops};
+  auto job = std::make_shared<Job> ();
+  job->op = Job::Op::Desktops;
   run_on_worker (job);
-  std::vector<DesktopInfo> out = std::move (job->out_desktops);
-  delete job;
-  return out;
+  return std::move (job->out_desktops);
 }
 
 int
@@ -669,44 +920,42 @@ count (void)
 int
 current_index (void)
 {
-  Job *job = new Job{Job::Op::CurrentIndex};
+  auto job = std::make_shared<Job> ();
+  job->op = Job::Op::CurrentIndex;
   run_on_worker (job);
-  int out = job->ok ? job->out_index : -1;
-  delete job;
-  return out;
+  return job->ok ? job->out_index : -1;
 }
 
 int
 window_desktop_index (HWND hwnd)
 {
-  Job *job = new Job{Job::Op::WindowDesktopIndex};
+  auto job = std::make_shared<Job> ();
+  job->op = Job::Op::WindowDesktopIndex;
   job->in_hwnd = hwnd;
   run_on_worker (job);
-  int out = job->ok ? job->out_index : -1;
-  delete job;
-  return out;
+  return job->ok ? job->out_index : -1;
 }
 
 bool
 window_on_current (HWND hwnd)
 {
-  Job *job = new Job{Job::Op::WindowOnCurrent};
+  auto job = std::make_shared<Job> ();
+  job->op = Job::Op::WindowOnCurrent;
   job->in_hwnd = hwnd;
   run_on_worker (job);
-  bool out = job->ok ? job->out_bool : false;
-  delete job;
-  return out;
+  return job->ok ? job->out_bool : false;
 }
 
 bool
 switch_to (int index)
 {
-  Job *job = new Job{Job::Op::SwitchTo};
+  auto job = std::make_shared<Job> ();
+  job->op = Job::Op::SwitchTo;
   job->in_index = index;
   run_on_worker (job);
-  bool out = job->ok;
-  delete job;
-  return out;
+  if (job->ok)
+    obs_schedule_hint_async ();
+  return job->ok;
 }
 
 bool
@@ -714,12 +963,11 @@ pin_window (HWND hwnd)
 {
   if (hwnd == nullptr)
     return false;
-  Job *job = new Job{Job::Op::PinWindow};
+  auto job = std::make_shared<Job> ();
+  job->op = Job::Op::PinWindow;
   job->in_hwnd = hwnd;
   run_on_worker (job);
-  bool out = job->ok;
-  delete job;
-  return out;
+  return job->ok;
 }
 
 VtableProfile
@@ -770,13 +1018,11 @@ unpin_window (HWND hwnd)
 {
   if (hwnd == nullptr)
     return false;
-  Job *job = new Job ();
+  auto job = std::make_shared<Job> ();
   job->op = Job::Op::UnpinWindow;
   job->in_hwnd = hwnd;
   run_on_worker (job);
-  bool out = job->ok;
-  delete job;
-  return out;
+  return job->ok;
 }
 
 bool
@@ -784,25 +1030,23 @@ move_window_to_desktop (HWND hwnd, int target_index)
 {
   if (hwnd == nullptr || target_index < 0)
     return false;
-  Job *job = new Job ();
+  auto job = std::make_shared<Job> ();
   job->op = Job::Op::MoveWindowToDesktop;
   job->in_hwnd = hwnd;
   job->in_index = target_index;
   run_on_worker (job);
-  bool out = job->ok;
-  delete job;
-  return out;
+  return job->ok;
 }
 
 bool
 create_desktop (void)
 {
-  Job *job = new Job ();
+  auto job = std::make_shared<Job> ();
   job->op = Job::Op::CreateDesktop;
   run_on_worker (job);
-  bool out = job->ok;
-  delete job;
-  return out;
+  if (job->ok)
+    obs_schedule_hint_async ();
+  return job->ok;
 }
 
 bool
@@ -810,13 +1054,121 @@ remove_desktop (int index)
 {
   if (index < 0)
     return false;
-  Job *job = new Job ();
+  auto job = std::make_shared<Job> ();
   job->op = Job::Op::RemoveDesktop;
   job->in_index = index;
   run_on_worker (job);
-  bool out = job->ok;
-  delete job;
-  return out;
+  if (job->ok)
+    obs_schedule_hint_async ();
+  return job->ok;
+}
+
+DesktopSnapshot
+cached_snapshot (void)
+{
+  ObserverState &s = obs_state ();
+  std::lock_guard<std::mutex> lock (s.mu);
+  return s.snapshot;
+}
+
+void
+add_change_listener (DesktopChangedCallback cb, void *user_data)
+{
+  if (cb == nullptr)
+    return;
+
+  DesktopSnapshot immediate;
+  bool deliver_immediate = false;
+  bool first = false;
+
+  ObserverState &s = obs_state ();
+  {
+    std::lock_guard<std::mutex> lock (s.mu);
+    for (const ListenerEntry &e : s.listeners) {
+      if (e.cb == cb && e.user_data == user_data)
+        return;
+    }
+    first = s.listeners.empty ();
+    s.listeners.push_back ({cb, user_data});
+    if (s.snapshot.valid) {
+      immediate = s.snapshot;
+      deliver_immediate = true;
+    }
+    if (first) {
+      if (!s.worker_started) {
+        s.worker_stop = false;
+        s.worker = std::thread (obs_worker_main);
+        s.worker_started = true;
+      }
+      if (s.desktop_hook == nullptr) {
+        s.desktop_hook = SetWinEventHook (
+            EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH, nullptr,
+            on_desktop_winevent, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+      }
+      // Defer initial COM connect slightly so startup avoids contending with
+      // early Explorer initialization.
+      if (s.init_delay_id == 0)
+        s.init_delay_id = g_timeout_add (1500, obs_init_delay_cb, nullptr);
+      // Single shared low-frequency backstop for Win+Tab Task View mutations.
+      if (s.fallback_timer_id == 0)
+        s.fallback_timer_id = g_timeout_add (1500, obs_fallback_tick_cb, nullptr);
+    }
+  }
+
+  if (deliver_immediate)
+    cb (immediate.count, immediate.active_index, user_data);
+}
+
+void
+remove_change_listener (DesktopChangedCallback cb, void *user_data)
+{
+  std::thread to_join;
+  HWINEVENTHOOK hook_to_remove = nullptr;
+  guint rm_init = 0, rm_fallback = 0, rm_debounce = 0;
+
+  ObserverState &s = obs_state ();
+  {
+    std::lock_guard<std::mutex> lock (s.mu);
+    s.listeners.erase (
+        std::remove_if (s.listeners.begin (), s.listeners.end (),
+                        [cb, user_data] (const ListenerEntry &e) {
+                          return e.cb == cb && e.user_data == user_data;
+                        }),
+        s.listeners.end ());
+    if (s.listeners.empty () && s.worker_started) {
+      s.worker_stop = true;
+      s.worker_started = false;
+      to_join = std::move (s.worker);
+      hook_to_remove = s.desktop_hook;
+      s.desktop_hook = nullptr;
+      rm_init = s.init_delay_id;
+      s.init_delay_id = 0;
+      rm_fallback = s.fallback_timer_id;
+      s.fallback_timer_id = 0;
+      rm_debounce = s.debounce_id;
+      s.debounce_id = 0;
+    }
+  }
+
+  if (rm_init != 0)
+    g_source_remove (rm_init);
+  if (rm_fallback != 0)
+    g_source_remove (rm_fallback);
+  if (rm_debounce != 0)
+    g_source_remove (rm_debounce);
+  if (hook_to_remove != nullptr)
+    UnhookWinEvent (hook_to_remove);
+  if (to_join.joinable ()) {
+    s.cv.notify_all ();
+    to_join.join ();
+  }
+}
+
+void
+notify_change_hint_async (void)
+{
+  obs_schedule_hint_async ();
 }
 
 bool

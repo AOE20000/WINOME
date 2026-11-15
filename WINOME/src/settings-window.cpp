@@ -7,6 +7,9 @@
 #include "config.h"
 #include "fonts.h"
 #include "i18n.h"
+#include "perf-metrics.h"
+#include "virtual-desktop.h"
+#include "window-theming.h"
 
 #include <gtk/gtk.h>
 #include <gdk/win32/gdkwin32.h>
@@ -16,6 +19,7 @@
 
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace winome {
 namespace {
@@ -31,11 +35,17 @@ struct SettingsUi {
   GtkWidget* clock_sec_switch = nullptr;
   GtkWidget* battery_pct_switch = nullptr;
   GtkWidget* multimon_switch = nullptr;
+  GtkWidget* dark_titlebars_switch = nullptr;
+  GtkWidget* rounded_corners_switch = nullptr;
 
   // Behavior controls
   GtkWidget* hot_corner_switch = nullptr;
   GtkWidget* hot_cooldown_spin = nullptr;
   GtkWidget* win_key_switch = nullptr;
+  GtkWidget* end_session_confirm_switch = nullptr;
+
+  // Diagnostics readout container
+  GtkWidget* diag_box = nullptr;
 
   // Switches / spins update on config notify.
   bool syncing = false;
@@ -361,6 +371,14 @@ void sync_ui_from_config() {
     gtk_switch_set_active(GTK_SWITCH(g_ui.multimon_switch),
                           cfg.multi_monitor_panels ? TRUE : FALSE);
   }
+  if (g_ui.dark_titlebars_switch != nullptr) {
+    gtk_switch_set_active(GTK_SWITCH(g_ui.dark_titlebars_switch),
+                          cfg.unify_dark_titlebars ? TRUE : FALSE);
+  }
+  if (g_ui.rounded_corners_switch != nullptr) {
+    gtk_switch_set_active(GTK_SWITCH(g_ui.rounded_corners_switch),
+                          cfg.unify_rounded_corners ? TRUE : FALSE);
+  }
   if (g_ui.hot_corner_switch != nullptr) {
     gtk_switch_set_active(GTK_SWITCH(g_ui.hot_corner_switch),
                           cfg.hot_corner_enabled ? TRUE : FALSE);
@@ -374,6 +392,10 @@ void sync_ui_from_config() {
   if (g_ui.win_key_switch != nullptr) {
     gtk_switch_set_active(GTK_SWITCH(g_ui.win_key_switch),
                           cfg.win_key_overview ? TRUE : FALSE);
+  }
+  if (g_ui.end_session_confirm_switch != nullptr) {
+    gtk_switch_set_active(GTK_SWITCH(g_ui.end_session_confirm_switch),
+                          cfg.end_session_confirm ? TRUE : FALSE);
   }
 
   g_ui.syncing = false;
@@ -470,6 +492,128 @@ gboolean on_win_key_set(GtkSwitch* sw G_GNUC_UNUSED, gboolean state, gpointer ud
   return FALSE;
 }
 
+gboolean on_dark_titlebars_set(GtkSwitch* sw G_GNUC_UNUSED, gboolean state, gpointer ud G_GNUC_UNUSED) {
+  if (g_ui.syncing)
+    return FALSE;
+  WinomeConfig cfg = get_config();
+  cfg.unify_dark_titlebars = state != FALSE;
+  update_config(cfg);
+  window_theming_sync_all();
+  return FALSE;
+}
+
+gboolean on_rounded_corners_set(GtkSwitch* sw G_GNUC_UNUSED, gboolean state, gpointer ud G_GNUC_UNUSED) {
+  if (g_ui.syncing)
+    return FALSE;
+  WinomeConfig cfg = get_config();
+  cfg.unify_rounded_corners = state != FALSE;
+  update_config(cfg);
+  window_theming_sync_all();
+  return FALSE;
+}
+
+gboolean on_end_session_confirm_set(GtkSwitch* sw G_GNUC_UNUSED, gboolean state, gpointer ud G_GNUC_UNUSED) {
+  if (g_ui.syncing)
+    return FALSE;
+  WinomeConfig cfg = get_config();
+  cfg.end_session_confirm = state != FALSE;
+  update_config(cfg);
+  return FALSE;
+}
+
+void populate_diagnostics_box() {
+  if (g_ui.diag_box == nullptr)
+    return;
+  while (GtkWidget* ch = gtk_widget_get_first_child(g_ui.diag_box))
+    gtk_box_remove(GTK_BOX(g_ui.diag_box), ch);
+
+  const ProcessTelemetry tel = perf_sample_process_telemetry();
+  const StartupTimings st = perf_get_startup_timings();
+  const FrameTimeTracker::Stats fs = perf_get_overview_frame_stats();
+  const vd::DesktopSnapshot ds = vd::cached_snapshot();
+  const auto caps = capability_snapshot_all();
+
+  auto format_mib = [](uint64_t bytes, char* buf, size_t n) {
+    std::snprintf(buf, n, "%.1f MiB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+  };
+
+  gtk_box_append(GTK_BOX(g_ui.diag_box),
+                 make_section_label(tr("Process & Render Telemetry", "进程与渲染遥测")));
+  GtkWidget* perf_card = make_card();
+  char buf[256];
+
+  char ws_buf[64];
+  char priv_buf[64];
+  format_mib(tel.working_set_bytes, ws_buf, sizeof(ws_buf));
+  format_mib(tel.private_bytes, priv_buf, sizeof(priv_buf));
+  std::snprintf(buf, sizeof(buf), "RSS: %s | Private Commit: %s | GDI: %lu | USER: %lu",
+                ws_buf, priv_buf,
+                static_cast<unsigned long>(tel.gdi_objects),
+                static_cast<unsigned long>(tel.user_objects));
+  append_row_to_card(
+      perf_card,
+      make_row(tr("Memory & Win32 Handles", "内存与句柄占用"), buf, nullptr),
+      false);
+
+  std::snprintf(buf, sizeof(buf),
+                "Total %.1f ms | Fontconfig %.1f ms (%d files / %d fontset) | "
+                "Panel %.1f ms | Overview %.1f ms | IPC %.1f ms",
+                st.total_startup_ms, st.fontmap_ms, st.fonts_loaded_files,
+                st.fonts_family_count, st.panel_ms, st.overview_init_ms,
+                st.ipc_ms);
+  append_row_to_card(
+      perf_card,
+      make_row(tr("Startup Phase Timings", "启动阶段耗时"), buf, nullptr),
+      true);
+
+  std::snprintf(buf, sizeof(buf),
+                "Frames: %llu | Dropped (>20ms): %llu | Avg %.2f ms | P95 %.2f ms | Max %.2f ms",
+                static_cast<unsigned long long>(fs.frames),
+                static_cast<unsigned long long>(fs.dropped_frames),
+                fs.avg_frame_ms, fs.p95_frame_ms, fs.max_frame_ms);
+  append_row_to_card(
+      perf_card,
+      make_row(tr("Overview Animation Frame Budget", "概览动画帧耗时统计"), buf, nullptr),
+      true);
+
+  std::snprintf(buf, sizeof(buf),
+                "Observer: %s | Desktops: %d | Active: %d",
+                ds.valid ? "ready" : "pending/fallback",
+                ds.count, ds.active_index + 1);
+  append_row_to_card(
+      perf_card,
+      make_row(tr("Virtual Desktop Cache", "虚拟桌面缓存状态"), buf, nullptr),
+      true);
+  gtk_box_append(GTK_BOX(g_ui.diag_box), perf_card);
+
+  gtk_box_append(GTK_BOX(g_ui.diag_box),
+                 make_section_label(tr("Subsystem Capabilities & Circuit Breakers",
+                                       "子系统能力与熔断状态")));
+  GtkWidget* cap_card = make_card();
+  for (size_t i = 0; i < caps.size(); ++i) {
+    const CapabilityStatus& c = caps[i];
+    std::snprintf(buf, sizeof(buf), "%s",
+                  c.detail.empty() ? "-" : c.detail.c_str());
+    char title_buf[128];
+    std::snprintf(title_buf, sizeof(title_buf), "%s  [%s | err=%lu]",
+                  c.name != nullptr ? c.name : "?",
+                  capability_state_label(c.state),
+                  static_cast<unsigned long>(c.failure_count));
+    append_row_to_card(cap_card, make_row(title_buf, buf, nullptr), i > 0);
+  }
+  gtk_box_append(GTK_BOX(g_ui.diag_box), cap_card);
+}
+
+void on_diag_refresh_clicked(GtkButton* btn G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
+  populate_diagnostics_box();
+}
+
+void on_stack_page_changed(GObject* obj, GParamSpec* pspec G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
+  const char* name = gtk_stack_get_visible_child_name(GTK_STACK(obj));
+  if (name != nullptr && std::string(name) == "diagnostics")
+    populate_diagnostics_box();
+}
+
 void on_open_win_settings(GtkButton* btn G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
   ShellExecuteW(nullptr, L"open", L"ms-settings:", nullptr, nullptr, SW_SHOWNORMAL);
 }
@@ -507,9 +651,13 @@ void on_window_destroy(GtkWidget* widget G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSE
   g_ui.clock_sec_switch = nullptr;
   g_ui.battery_pct_switch = nullptr;
   g_ui.multimon_switch = nullptr;
+  g_ui.dark_titlebars_switch = nullptr;
+  g_ui.rounded_corners_switch = nullptr;
   g_ui.hot_corner_switch = nullptr;
   g_ui.hot_cooldown_spin = nullptr;
   g_ui.win_key_switch = nullptr;
+  g_ui.end_session_confirm_switch = nullptr;
+  g_ui.diag_box = nullptr;
 }
 
 GtkWidget* build_appearance_page() {
@@ -584,6 +732,35 @@ GtkWidget* build_appearance_page() {
       true);
 
   gtk_box_append(GTK_BOX(page), panel_card);
+
+  gtk_box_append(GTK_BOX(page),
+                 make_section_label(tr("Window Unification (Opt-in)",
+                                       "应用窗口统一外观（实验性可选）")));
+  GtkWidget* win_card = make_card();
+
+  g_ui.dark_titlebars_switch = gtk_switch_new();
+  g_signal_connect(g_ui.dark_titlebars_switch, "state-set",
+                   G_CALLBACK(on_dark_titlebars_set), nullptr);
+  append_row_to_card(
+      win_card,
+      make_row(tr("Dark Titlebars for Desktop Apps", "强制第三方窗口使用暗色标题栏"),
+               tr("Apply DWM dark titlebar hint cleanly via SetWinEventHook (no injection)",
+                  "通过 SetWinEventHook 应用 DWM 暗色标题栏提示（零 DLL 注入）"),
+               g_ui.dark_titlebars_switch),
+      false);
+
+  g_ui.rounded_corners_switch = gtk_switch_new();
+  g_signal_connect(g_ui.rounded_corners_switch, "state-set",
+                   G_CALLBACK(on_rounded_corners_set), nullptr);
+  append_row_to_card(
+      win_card,
+      make_row(tr("Unify Windows 11 Rounded Corners", "统一 Windows 11 窗口圆角"),
+               tr("Prefer standard DWM rounded corners on external app windows",
+                  "为外部桌面窗口优先请求标准 Win11 DWM 圆角外观"),
+               g_ui.rounded_corners_switch),
+      true);
+
+  gtk_box_append(GTK_BOX(page), win_card);
   return page;
 }
 
@@ -630,7 +807,51 @@ GtkWidget* build_behavior_page() {
                g_ui.win_key_switch),
       true);
 
+  g_ui.end_session_confirm_switch = gtk_switch_new();
+  g_signal_connect(g_ui.end_session_confirm_switch, "state-set",
+                   G_CALLBACK(on_end_session_confirm_set), nullptr);
+  append_row_to_card(
+      trig_card,
+      make_row(tr("End-Session 60s Confirmation", "注销 / 重启 / 关机前 60 秒确认弹窗"),
+               tr("Show GNOME-style 60-second countdown modal before Restart, Power Off, or Log Out",
+                  "在执行重启、关机或注销前显示 GNOME 风格 60 秒倒计时确认弹窗"),
+               g_ui.end_session_confirm_switch),
+      true);
+
   gtk_box_append(GTK_BOX(page), trig_card);
+
+  gtk_box_append(GTK_BOX(page),
+                 make_section_label(tr("Keyboard Shortcuts", "常用快捷键一览")));
+  GtkWidget* keys_card = make_card();
+  append_row_to_card(
+      keys_card,
+      make_row("Super (Win)  /  2x Win",
+               tr("Toggle Activities Overview / double-tap smoothly transitions to App Grid",
+                  "单按切换概览视图 / 快速双击平滑进入全部应用网格"),
+               nullptr),
+      false);
+  append_row_to_card(
+      keys_card,
+      make_row("Win + PageUp / PageDown",
+               tr("Switch to previous or next virtual workspace",
+                  "切换到上一个或下一个虚拟桌面工作区"),
+               nullptr),
+      true);
+  append_row_to_card(
+      keys_card,
+      make_row("Win + Shift + PageUp / PageDown",
+               tr("Move active foreground window to adjacent workspace and follow it",
+                  "将当前活动窗口移动到相邻工作区并跟随切换"),
+               nullptr),
+      true);
+  append_row_to_card(
+      keys_card,
+      make_row("Win + Tab  /  Win + Ctrl + Arrow",
+               tr("Open Windows Start Menu  /  Native Windows desktop shortcuts",
+                  "Win+Tab 打开系统开始菜单 / Win+Ctrl+方向键同步通知虚拟桌面切换"),
+               nullptr),
+      true);
+  gtk_box_append(GTK_BOX(page), keys_card);
 
   gtk_box_append(GTK_BOX(page),
                  make_section_label(tr("System & Configuration", "系统与配置")));
@@ -739,12 +960,35 @@ GtkWidget* build_about_page() {
   return page;
 }
 
+GtkWidget* build_diagnostics_page() {
+  GtkWidget* page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+  gtk_widget_set_name(page, "winomeSettingsPage");
+
+  GtkWidget* hdr = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+  GtkWidget* title = make_section_label(
+      tr("Runtime Health & Performance", "运行时健康状态与性能遥测"));
+  gtk_widget_set_hexpand(title, TRUE);
+  GtkWidget* refresh_btn = gtk_button_new_with_label(tr("Refresh", "刷新"));
+  gtk_widget_set_name(refresh_btn, "winomeSettingsButton");
+  g_signal_connect(refresh_btn, "clicked",
+                   G_CALLBACK(on_diag_refresh_clicked), nullptr);
+  gtk_box_append(GTK_BOX(hdr), title);
+  gtk_box_append(GTK_BOX(hdr), refresh_btn);
+  gtk_box_append(GTK_BOX(page), hdr);
+
+  g_ui.diag_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+  gtk_box_append(GTK_BOX(page), g_ui.diag_box);
+  populate_diagnostics_box();
+  return page;
+}
+
 }  // namespace
 
 void open_settings_window() {
   if (g_ui.window != nullptr) {
     gtk_window_present(GTK_WINDOW(g_ui.window));
     sync_ui_from_config();
+    populate_diagnostics_box();
     return;
   }
 
@@ -780,8 +1024,12 @@ void open_settings_window() {
                        "appearance", tr("Appearance", "外观与顶栏"));
   gtk_stack_add_titled(GTK_STACK(stack), wrap_scroll(build_behavior_page()),
                        "behavior", tr("Behavior", "行为与交互"));
+  gtk_stack_add_titled(GTK_STACK(stack), wrap_scroll(build_diagnostics_page()),
+                       "diagnostics", tr("Diagnostics", "诊断与遥测"));
   gtk_stack_add_titled(GTK_STACK(stack), wrap_scroll(build_about_page()),
                        "about", tr("About", "关于 WINOME"));
+  g_signal_connect(stack, "notify::visible-child-name",
+                   G_CALLBACK(on_stack_page_changed), nullptr);
 
   GtkWidget* sidebar = gtk_stack_sidebar_new();
   g_ui.sidebar = sidebar;
@@ -797,6 +1045,17 @@ void open_settings_window() {
   gtk_widget_realize(win);
   apply_dark_titlebar(win);
   gtk_window_present(GTK_WINDOW(win));
+}
+
+void open_settings_window_page(const char* page_name) {
+  open_settings_window();
+  if (g_ui.stack != nullptr && page_name != nullptr && page_name[0] != '\0') {
+    if (gtk_stack_get_child_by_name(GTK_STACK(g_ui.stack), page_name) != nullptr) {
+      gtk_stack_set_visible_child_name(GTK_STACK(g_ui.stack), page_name);
+      if (std::string(page_name) == "diagnostics")
+        populate_diagnostics_box();
+    }
+  }
 }
 
 void close_settings_window() {

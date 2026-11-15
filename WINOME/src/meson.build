@@ -6,6 +6,7 @@ winome_sources = files(
   'fonts.cpp',
   'native-taskbar.cpp',
   'host-utils.cpp',
+  'perf-metrics.cpp',
   'win-event-hook.cpp',
   'overview-trigger.cpp',
   'overview.cpp',
@@ -28,6 +29,9 @@ winome_sources = files(
   'systray.cpp',
   'settings-window.cpp',
   'quick-settings.cpp',
+  'end-session-dialog.cpp',
+  'shell-ipc.cpp',
+  'window-theming.cpp',
   'calendar.cpp',
   'st-engine.cpp',
 )

@@ -1036,6 +1036,18 @@ app_icon_cache_clear (void)
   g_cache_map.clear ();
 }
 
+void
+app_icon_cache_trim (size_t max_keep)
+{
+  std::lock_guard<std::mutex> lock (g_cache_mu);
+  while (g_cache_lru.size () > max_keep) {
+    auto last = std::prev (g_cache_lru.end ());
+    g_cache_map.erase (last->key);
+    g_clear_object (&last->texture);
+    g_cache_lru.erase (last);
+  }
+}
+
 size_t
 app_icon_cache_count (void)
 {

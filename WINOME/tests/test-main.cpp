@@ -5,26 +5,34 @@
 #include "app-grid.h"
 #include "app-index.h"
 #include "config.h"
+#include "end-session-dialog.h"
+#include "fonts.h"
+#include "hot-corner.h"
 #include "i18n.h"
 #include "monitor-manager.h"
 #include "notifications.h"
 #include "overview-dash.h"
 #include "overview-layout.h"
 #include "overview-thumbs.h"
+#include "perf-metrics.h"
+#include "shell-ipc.h"
 #include "st-engine.h"
 #include "systray.h"
 #include "virtual-desktop.h"
 #include "wifi-networks.h"
+#include "window-theming.h"
 
 #include <cmath>
 
 #include <windows.h>
+#include <pango/pangocairo.h>
 
 #include <algorithm>
-#include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -75,6 +83,11 @@ struct ScopedTempConfigDir {
 };
 
 void test_config_roundtrip() {
+  winome::WinomeConfig def;
+  CHECK(def.end_session_confirm == true);
+  CHECK(def.unify_dark_titlebars == false);
+  CHECK(def.unify_rounded_corners == false);
+
   winome::WinomeConfig src;
   src.language = "zh";
   src.clock_format = "24h";
@@ -84,6 +97,9 @@ void test_config_roundtrip() {
   src.hot_corner_cooldown_ms = 1250;
   src.win_key_overview = false;
   src.multi_monitor_panels = false;
+  src.end_session_confirm = false;
+  src.unify_dark_titlebars = true;
+  src.unify_rounded_corners = true;
   src.pinned_apps = {
     "C:\\Program Files\\\"Demo\"\\demo.exe",
     "notepad.exe",
@@ -101,7 +117,17 @@ void test_config_roundtrip() {
   CHECK(dst.hot_corner_cooldown_ms == src.hot_corner_cooldown_ms);
   CHECK(dst.win_key_overview == src.win_key_overview);
   CHECK(dst.multi_monitor_panels == src.multi_monitor_panels);
+  CHECK(dst.end_session_confirm == src.end_session_confirm);
+  CHECK(dst.unify_dark_titlebars == src.unify_dark_titlebars);
+  CHECK(dst.unify_rounded_corners == src.unify_rounded_corners);
   CHECK(dst.pinned_apps == src.pinned_apps);
+
+  // Legacy configs without new keys preserve safe defaults.
+  winome::WinomeConfig legacy;
+  CHECK(winome::parse_config("{\"language\":\"en\"}", &legacy));
+  CHECK(legacy.end_session_confirm == true);
+  CHECK(legacy.unify_dark_titlebars == false);
+  CHECK(legacy.unify_rounded_corners == false);
 }
 
 void test_config_sanitization_and_unknown_keys() {
@@ -694,6 +720,279 @@ void test_st_engine_theme_metrics() {
   }
 }
 
+void test_perf_metrics_and_isolated_fontmap() {
+  winome::FrameTimeTracker tracker(20000);
+  tracker.record_frame_time_us(1000000);
+  tracker.record_frame_time_us(1016000);  // 16ms
+  tracker.record_frame_time_us(1032000);  // 16ms
+  tracker.record_frame_time_us(1062000);  // 30ms -> dropped
+  tracker.record_frame_time_us(1500000);  // gap >250ms -> ignored
+  tracker.record_frame_time_us(1510000);  // 10ms
+  auto fstats = tracker.snapshot();
+  CHECK(fstats.frames == 4);
+  CHECK(fstats.dropped_frames == 1);
+  CHECK(fstats.max_frame_ms >= 29.5 && fstats.max_frame_ms <= 30.5);
+
+  winome::capability_set(winome::SubsystemId::Wlan, winome::CapabilityState::Active, "test-wlan");
+  winome::capability_record_failure(winome::SubsystemId::SysTray, "fail-1", 2);
+  CHECK(winome::capability_get(winome::SubsystemId::SysTray).state ==
+        winome::CapabilityState::Degraded);
+  winome::capability_record_failure(winome::SubsystemId::SysTray, "fail-2", 2);
+  CHECK(winome::capability_get(winome::SubsystemId::SysTray).state ==
+        winome::CapabilityState::Tripped);
+
+  auto mem = winome::perf_sample_process_telemetry();
+  CHECK(mem.private_bytes > 0);
+  CHECK(mem.working_set_bytes > 0);
+
+  // Verify isolated Fontconfig map initializes cleanly, stays lightweight,
+  // and resolves ASCII + Simplified/Traditional Chinese + UI symbols without
+  // missing glyphs (resources in winome-tests don't bundle gresource TTFs, so
+  // check fallback/system CJK + fontset integrity directly).
+  PangoFontMap* fmap = winome::bundled_font_map();
+  CHECK(fmap != nullptr);
+  if (fmap != nullptr) {
+    PangoContext* pctx = pango_font_map_create_context(fmap);
+    CHECK(pctx != nullptr);
+    if (pctx != nullptr) {
+      PangoLayout* layout = pango_layout_new(pctx);
+      PangoFontDescription* desc =
+          pango_font_description_from_string("Cantarell, Sans 11");
+      pango_layout_set_font_description(layout, desc);
+      pango_layout_set_text(
+          layout, "Activities 概览 繁體中文 設定 Quick Settings 12:34", -1);
+      CHECK(pango_layout_get_unknown_glyphs_count(layout) == 0);
+      pango_font_description_free(desc);
+      g_object_unref(layout);
+      g_object_unref(pctx);
+    }
+  }
+}
+
+void test_hot_corner_hit_test() {
+  const RECT primary{0, 0, 1920, 1080};
+  CHECK(winome::hot_corner_hit_test(0, 0, primary, 5));
+  CHECK(winome::hot_corner_hit_test(5, 5, primary, 5));
+  CHECK(!winome::hot_corner_hit_test(6, 0, primary, 5));
+  CHECK(!winome::hot_corner_hit_test(0, 6, primary, 5));
+  CHECK(!winome::hot_corner_hit_test(-1, 0, primary, 5));
+
+  // Secondary monitor positioned left of primary still hits its own top-left.
+  const RECT left_mon{-1920, 0, 0, 1080};
+  CHECK(winome::hot_corner_hit_test(-1920, 0, left_mon, 5));
+  CHECK(winome::hot_corner_hit_test(-1915, 5, left_mon, 5));
+  CHECK(!winome::hot_corner_hit_test(-1914, 0, left_mon, 5));
+  CHECK(!winome::hot_corner_hit_test(0, 0, left_mon, 5));
+
+  const RECT invalid{10, 10, 10, 20};
+  CHECK(!winome::hot_corner_hit_test(10, 10, invalid, 5));
+  CHECK(!winome::hot_corner_hit_test(0, 0, primary, -1));
+}
+
+void test_end_session_formatting() {
+  CHECK(winome::end_session_format_title(winome::EndSessionAction::Restart, false) ==
+        "Restart");
+  CHECK(winome::end_session_format_title(winome::EndSessionAction::PowerOff, false) ==
+        "Power Off");
+  CHECK(winome::end_session_format_title(winome::EndSessionAction::LogOut, false) ==
+        "Log Out");
+  CHECK(winome::end_session_format_title(winome::EndSessionAction::Restart, true) ==
+        "重启");
+  CHECK(winome::end_session_format_title(winome::EndSessionAction::PowerOff, true) ==
+        "关机");
+  CHECK(winome::end_session_format_title(winome::EndSessionAction::LogOut, true) ==
+        "注销");
+
+  CHECK(winome::end_session_confirm_label(winome::EndSessionAction::PowerOff, false) ==
+        "Power Off");
+
+  const std::string en_60 = winome::end_session_format_description(
+      winome::EndSessionAction::PowerOff, 60, false);
+  CHECK(en_60.find("60 seconds.") != std::string::npos);
+
+  const std::string en_1 = winome::end_session_format_description(
+      winome::EndSessionAction::Restart, 1, false);
+  CHECK(en_1.find("1 second.") != std::string::npos);
+
+  const std::string en_neg = winome::end_session_format_description(
+      winome::EndSessionAction::LogOut, -5, false);
+  CHECK(en_neg.find("0 seconds.") != std::string::npos);
+
+  const std::string zh_desc = winome::end_session_format_description(
+      winome::EndSessionAction::PowerOff, 12, true);
+  CHECK(zh_desc.find("12 秒") != std::string::npos);
+}
+
+void test_window_theming_hwnd_filter() {
+  CHECK(winome::should_apply_dwm_theming_to_hwnd_info(
+      L"Notepad", WS_OVERLAPPEDWINDOW, 0, true, false));
+  CHECK(!winome::should_apply_dwm_theming_to_hwnd_info(
+      L"Notepad", WS_OVERLAPPEDWINDOW, 0, false, false));
+  CHECK(!winome::should_apply_dwm_theming_to_hwnd_info(
+      L"Notepad", WS_OVERLAPPEDWINDOW, 0, true, true));
+  CHECK(!winome::should_apply_dwm_theming_to_hwnd_info(
+      L"Notepad", WS_CHILD | WS_CAPTION, 0, true, false));
+  CHECK(!winome::should_apply_dwm_theming_to_hwnd_info(
+      L"Notepad", WS_OVERLAPPEDWINDOW, WS_EX_TOOLWINDOW, true, false));
+  CHECK(!winome::should_apply_dwm_theming_to_hwnd_info(
+      L"#32768", WS_POPUP | WS_CAPTION, 0, true, false));
+  CHECK(!winome::should_apply_dwm_theming_to_hwnd_info(
+      L"Shell_TrayWnd", WS_OVERLAPPEDWINDOW, 0, true, false));
+  CHECK(!winome::should_apply_dwm_theming_to_hwnd_info(
+      L"WINOME_Panel", WS_OVERLAPPEDWINDOW, 0, true, false));
+  CHECK(!winome::should_apply_dwm_theming_to_hwnd_info(
+      L"gdkSurfaceToplevel", WS_OVERLAPPEDWINDOW, 0, true, false));
+  CHECK(!winome::should_apply_dwm_theming_to_hwnd_info(
+      nullptr, WS_OVERLAPPEDWINDOW, 0, true, false));
+}
+
+struct IpcTestSink {
+  int ov_open = 0;
+  int ov_close = 0;
+  int ov_toggle = 0;
+  int ov_grid = 0;
+  int cfg_reload = 0;
+  int switch_arg = -1;
+  int quit_calls = 0;
+  bool is_open = false;
+  std::string settings_page;
+  std::string notify_title;
+  std::string notify_body;
+  std::string notify_app;
+};
+
+IpcTestSink g_ipc_sink;
+
+void test_ipc_dispatch_and_named_pipe_roundtrip() {
+  g_ipc_sink = IpcTestSink{};
+  g_ipc_sink.is_open = true;
+
+  winome::IpcCallbacks cbs{};
+  cbs.overview_open = +[]() { ++g_ipc_sink.ov_open; };
+  cbs.overview_close = +[]() { ++g_ipc_sink.ov_close; };
+  cbs.overview_toggle = +[]() { ++g_ipc_sink.ov_toggle; };
+  cbs.overview_app_grid = +[]() { ++g_ipc_sink.ov_grid; };
+  cbs.overview_is_open = +[]() { return g_ipc_sink.is_open; };
+  cbs.settings_open = +[](const std::string& p) { g_ipc_sink.settings_page = p; };
+  cbs.config_reload = +[]() { ++g_ipc_sink.cfg_reload; };
+  cbs.desktop_switch = +[](int idx) {
+    g_ipc_sink.switch_arg = idx;
+    return idx >= 0 && idx < 4;
+  };
+  cbs.desktop_list = +[]() -> std::vector<winome::vd::DesktopInfo> {
+    return {{0, GUID{}}, {1, GUID{}}};
+  };
+  cbs.desktop_active = +[]() { return 1; };
+  cbs.notify = +[](const std::string& t, const std::string& b, const std::string& a) {
+    g_ipc_sink.notify_title = t;
+    g_ipc_sink.notify_body = b;
+    g_ipc_sink.notify_app = a;
+  };
+  cbs.quit = +[]() { ++g_ipc_sink.quit_calls; };
+
+  const std::string ping = winome::ipc_dispatch_request_json("{\"cmd\":\"ping\"}", cbs);
+  CHECK(ping.find("\"ok\":true") != std::string::npos);
+  CHECK(ping.find("\"pong\":true") != std::string::npos);
+
+  const std::string st = winome::ipc_dispatch_request_json("{\"cmd\":\"status\"}", cbs);
+  CHECK(st.find("\"ok\":true") != std::string::npos);
+  CHECK(st.find("\"overview_open\":true") != std::string::npos);
+  CHECK(st.find("\"capabilities\":[") != std::string::npos);
+  CHECK(st.find("\"telemetry\":{") != std::string::npos);
+  CHECK(st.find("\"startup\":{") != std::string::npos);
+
+  CHECK(winome::ipc_dispatch_request_json("{\"cmd\":\"overview.open\"}", cbs)
+            .find("\"ok\":true") != std::string::npos);
+  CHECK(winome::ipc_dispatch_request_json("{\"cmd\":\"overview.close\"}", cbs)
+            .find("\"ok\":true") != std::string::npos);
+  CHECK(winome::ipc_dispatch_request_json("{\"cmd\":\"overview.toggle\"}", cbs)
+            .find("\"ok\":true") != std::string::npos);
+  CHECK(winome::ipc_dispatch_request_json("{\"cmd\":\"overview.app_grid\"}", cbs)
+            .find("\"ok\":true") != std::string::npos);
+  CHECK(g_ipc_sink.ov_open == 1 && g_ipc_sink.ov_close == 1 &&
+        g_ipc_sink.ov_toggle == 1 && g_ipc_sink.ov_grid == 1);
+
+  CHECK(winome::ipc_dispatch_request_json(
+            "{\"cmd\":\"settings.open\",\"page\":\"diagnostics\"}", cbs)
+            .find("\"ok\":true") != std::string::npos);
+  CHECK(g_ipc_sink.settings_page == "diagnostics");
+
+  const std::string cfg_get = winome::ipc_dispatch_request_json("{\"cmd\":\"config.get\"}", cbs);
+  CHECK(cfg_get.find("\"ok\":true") != std::string::npos);
+  CHECK(cfg_get.find("\"end_session_confirm\"") != std::string::npos);
+  CHECK(winome::ipc_dispatch_request_json("{\"cmd\":\"config.reload\"}", cbs)
+            .find("\"ok\":true") != std::string::npos);
+  CHECK(g_ipc_sink.cfg_reload == 1);
+
+  const std::string dlist = winome::ipc_dispatch_request_json("{\"cmd\":\"desktop.list\"}", cbs);
+  CHECK(dlist.find("\"count\":2") != std::string::npos);
+  CHECK(dlist.find("\"active\":1") != std::string::npos);
+  CHECK(winome::ipc_dispatch_request_json(
+            "{\"cmd\":\"desktop.switch\",\"index\":2}", cbs)
+            .find("\"ok\":true") != std::string::npos);
+  CHECK(g_ipc_sink.switch_arg == 2);
+  CHECK(winome::ipc_dispatch_request_json(
+            "{\"cmd\":\"desktop.switch\",\"index\":-1}", cbs)
+            .find("\"ok\":false") != std::string::npos);
+
+  CHECK(winome::ipc_dispatch_request_json(
+            "{\"cmd\":\"notify\",\"title\":\"Hi\",\"body\":\"World\",\"app\":\"CLI\"}",
+            cbs)
+            .find("\"ok\":true") != std::string::npos);
+  CHECK(g_ipc_sink.notify_title == "Hi");
+  CHECK(g_ipc_sink.notify_body == "World");
+  CHECK(g_ipc_sink.notify_app == "CLI");
+  CHECK(winome::ipc_dispatch_request_json("{\"cmd\":\"notify\"}", cbs)
+            .find("\"ok\":false") != std::string::npos);
+
+  CHECK(winome::ipc_dispatch_request_json("not json", cbs)
+            .find("\"ok\":false") != std::string::npos);
+  CHECK(winome::ipc_dispatch_request_json("{\"cmd\":\"nonexistent\"}", cbs)
+            .find("\"unknown command\"") != std::string::npos);
+
+  // Exercise live Named Pipe server + client roundtrip.
+  CHECK(winome::ipc_server_start(cbs));
+  std::string pipe_reply;
+  bool connected = false;
+  for (int attempt = 0; attempt < 25; ++attempt) {
+    if (winome::ipc_query_running_shell("{\"cmd\":\"ping\"}", &pipe_reply, 500)) {
+      connected = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+  }
+  CHECK(connected);
+  CHECK(pipe_reply.find("\"pong\":true") != std::string::npos);
+
+  std::string pipe_status;
+  CHECK(winome::ipc_query_running_shell("{\"cmd\":\"status\"}", &pipe_status, 1000));
+  CHECK(pipe_status.find("\"capabilities\":[") != std::string::npos);
+  winome::ipc_server_stop();
+}
+
+void test_vd_vtable_profiles_and_cache_trim() {
+  const auto p23 = winome::vd::vtable_slots_for_build(22621);
+  CHECK(p23.can_manage_desktops);
+
+  const auto p24 = winome::vd::vtable_slots_for_build(26100);
+  CHECK(p24.can_manage_desktops);
+
+  const auto p_old = winome::vd::vtable_slots_for_build(19045);
+  CHECK(!p_old.can_manage_desktops);
+
+  int cb_hits = 0;
+  winome::vd::DesktopChangedCallback dummy_cb = [](int, int, void* ud) {
+    ++(*static_cast<int*>(ud));
+  };
+  winome::vd::add_change_listener(dummy_cb, &cb_hits);
+  winome::vd::remove_change_listener(dummy_cb, &cb_hits);
+
+  // Ensure cache trimming handles zero/bounds safely when cache is empty.
+  winome::app_icon_cache_trim(16);
+  winome::app_icon_cache_trim(0);
+  winome::app_icon_cache_clear();
+}
+
 }  // namespace
 
 int main() {
@@ -714,6 +1013,12 @@ int main() {
   test_app_grid_and_running_window_matching();
   test_dash_favorites_and_thumbs_summary();
   test_st_engine_theme_metrics();
+  test_perf_metrics_and_isolated_fontmap();
+  test_hot_corner_hit_test();
+  test_end_session_formatting();
+  test_window_theming_hwnd_filter();
+  test_ipc_dispatch_and_named_pipe_roundtrip();
+  test_vd_vtable_profiles_and_cache_trim();
 
   if (g_failures == 0)
     std::printf("ALL WINOME UNIT TESTS PASSED\n");

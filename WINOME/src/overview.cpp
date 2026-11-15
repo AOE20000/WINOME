@@ -56,6 +56,7 @@
 #include "app-index.h"
 #include "easing.h"
 #include "i18n.h"
+#include "perf-metrics.h"
 #include "overview-layout.h"
 #include "overview-dash.h"
 #include "overview-thumbs.h"
@@ -75,6 +76,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -198,10 +201,16 @@ bool g_drag_just_ended = false;
 bool g_drag_thumbs_revealed = false;
 std::string g_search_query;       // lowercased UTF-8 live search filter
 
-// Virtual desktops (virtual-desktop.cpp), refreshed on every placement.
+// Virtual desktops (virtual-desktop.cpp), refreshed on every placement and
+// updated via centralized observer callbacks.
 std::vector<vd::DesktopInfo> g_desktops;
 int g_desktop_active = -1;   // index of the desktop the layout was built for
-guint g_desktop_poll = 0;    // external-switch watch while visible
+
+// Stage 2 animation frame telemetry, redundant-layout guard, & idle trim.
+FrameTimeTracker g_anim_tracker (20000);
+int g_grid_last_moved_y = INT_MIN;
+guint g_idle_trim_timer = 0;
+void on_overview_desktop_changed (int count, int active_index, void *user_data);
 
 // Workspace-background geometry (physical px, overview client space) and the
 // animated corner radius (logical px).
@@ -338,7 +347,6 @@ static void set_mini_opacity (BYTE opacity);
 static void rebuild_now (void);
 static void start_state_transition (ControlsState to_state, guint duration_ms);
 static void finish_hide (void);
-static gboolean desktop_poll_cb (gpointer user_data);
 static void restack_locked (void);
 static void chrome_hide (void);
 static void icon_hide (void);
@@ -738,9 +746,48 @@ load_wallpaper (void)
     int n = WideCharToMultiByte (CP_UTF8, 0, path, -1, utf8, sizeof (utf8),
                                  nullptr, nullptr);
     if (n > 0) {
-      GFile *file = g_file_new_for_path (utf8);
-      GdkTexture *texture = gdk_texture_new_from_file (file, nullptr);
-      g_object_unref (file);
+      // Bound uncompressed wallpaper memory to monitor cover resolution so
+      // 4K/8K desktop wallpapers do not bloat RSS when overview only fills
+      // one display.
+      int target_w = g_monitor_w > 0 ? g_monitor_w : GetSystemMetrics (SM_CXSCREEN);
+      int target_h = g_monitor_h > 0 ? g_monitor_h : GetSystemMetrics (SM_CYSCREEN);
+      target_w = std::max (target_w, 1280);
+      target_h = std::max (target_h, 720);
+
+      GdkTexture *texture = nullptr;
+      int img_w = 0, img_h = 0;
+      if (gdk_pixbuf_get_file_info (utf8, &img_w, &img_h) != nullptr &&
+          img_w > target_w && img_h > target_h) {
+        double cover = std::max (static_cast<double> (target_w) / img_w,
+                                 static_cast<double> (target_h) / img_h);
+        if (cover < 1.0) {
+          int scaled_w = std::max (1, static_cast<int> (std::ceil (img_w * cover)));
+          int scaled_h = std::max (1, static_cast<int> (std::ceil (img_h * cover)));
+          GdkPixbuf *pb = gdk_pixbuf_new_from_file_at_scale (
+              utf8, scaled_w, scaled_h, FALSE, nullptr);
+          if (pb != nullptr) {
+            const bool has_alpha = gdk_pixbuf_get_has_alpha (pb) != FALSE;
+            const int rowstride = gdk_pixbuf_get_rowstride (pb);
+            const int pw = gdk_pixbuf_get_width (pb);
+            const int ph = gdk_pixbuf_get_height (pb);
+            const gsize byte_len =
+                static_cast<gsize> (rowstride) * static_cast<gsize> (ph);
+            GBytes *bytes = g_bytes_new (gdk_pixbuf_get_pixels (pb), byte_len);
+            texture = gdk_memory_texture_new (
+                pw, ph, has_alpha ? GDK_MEMORY_R8G8B8A8 : GDK_MEMORY_R8G8B8,
+                bytes, static_cast<gsize> (rowstride));
+            g_bytes_unref (bytes);
+            g_object_unref (pb);
+          }
+        }
+      }
+
+      if (texture == nullptr) {
+        GFile *file = g_file_new_for_path (utf8);
+        texture = gdk_texture_new_from_file (file, nullptr);
+        g_object_unref (file);
+      }
+
       if (texture != nullptr) {
         g_clear_object (&g_wallpaper);
         g_wallpaper = texture;
@@ -2415,6 +2462,7 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
   // Frame clock keeps the 250ms transition locked to the compositor's
   // cadence (a fixed 16ms timer beats against the display refresh).
   gint64 now = gdk_frame_clock_get_frame_time (clock);
+  g_anim_tracker.record_frame_time_us (now);
   double t = (now - anim.start_us) / 1000.0 / (double)anim.duration_ms;
   if (t < 0.0)
     t = 0.0;   // frame timestamp can predate the anim start
@@ -2446,8 +2494,11 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
       anim.grid_slide_from + (anim.grid_slide_to - anim.grid_slide_from) * e;
   if (g_app_grid != nullptr && gtk_widget_get_visible (g_app_grid)) {
     gtk_widget_set_opacity (g_app_grid, std::clamp (g_grid_cur_opacity, 0.0, 1.0));
-    gtk_fixed_move (GTK_FIXED (g_root), g_app_grid, g_grid_x,
-                    g_grid_y + (int)(g_grid_cur_slide_y + 0.5));
+    int target_move_y = g_grid_y + (int)(g_grid_cur_slide_y + 0.5);
+    if (target_move_y != g_grid_last_moved_y) {
+      g_grid_last_moved_y = target_move_y;
+      gtk_fixed_move (GTK_FIXED (g_root), g_app_grid, g_grid_x, target_move_y);
+    }
   }
 
   for (SlotEntry &s : g_slots) {
@@ -2459,6 +2510,14 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
 
   if (t >= 1.0) {
     anim.source = 0;
+    auto fstats = g_anim_tracker.snapshot ();
+    if (fstats.frames > 0) {
+      perf_record_overview_frame_stats (fstats);
+      g_print ("[perf] overview anim frames=%llu dropped=%llu avg=%.2fms p95=%.2fms max=%.2fms\n",
+               static_cast<unsigned long long> (fstats.frames),
+               static_cast<unsigned long long> (fstats.dropped_frames),
+               fstats.avg_frame_ms, fstats.p95_frame_ms, fstats.max_frame_ms);
+    }
     if (anim.to_state == ControlsState::HIDDEN) {
       finish_hide ();
       return G_SOURCE_REMOVE;
@@ -2471,6 +2530,7 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
       set_mini_opacity (0);
       if (g_app_grid != nullptr) {
         gtk_widget_set_opacity (g_app_grid, 1.0);
+        g_grid_last_moved_y = g_grid_y;
         gtk_fixed_move (GTK_FIXED (g_root), g_app_grid, g_grid_x, g_grid_y);
       }
       g_grid_cur_opacity = 1.0;
@@ -2640,6 +2700,8 @@ start_state_transition (ControlsState to_state, guint duration_ms)
   g_anim.to_state = to_state;
   g_anim.duration_ms = std::max (duration_ms, 1u);
   g_anim.start_us = g_get_monotonic_time ();
+  g_anim_tracker.reset ();
+  g_grid_last_moved_y = INT_MIN;
 
   // Snapshot live visual state so mid-flight interruptions are completely
   // seamless with zero jump.
@@ -2714,6 +2776,16 @@ start_state_transition (ControlsState to_state, guint duration_ms)
       gtk_widget_add_tick_callback (g_window, anim_tick, nullptr, nullptr);
 }
 
+gboolean
+overview_idle_trim_cb (gpointer user_data)
+{
+  (void)user_data;
+  g_idle_trim_timer = 0;
+  if (g_window == nullptr || !gtk_widget_get_visible (g_window))
+    app_icon_cache_trim (256);
+  return G_SOURCE_REMOVE;
+}
+
 void
 finish_hide (void)
 {
@@ -2725,6 +2797,8 @@ finish_hide (void)
   destroy_previews ();
   switch_cancel ();
   destroy_mini_previews ();
+  g_slots.shrink_to_fit ();
+  g_mini_slots.shrink_to_fit ();
   g_placed = false;
   g_target_state = ControlsState::HIDDEN;
   g_pending_show_state = ControlsState::WINDOW_PICKER;
@@ -2748,11 +2822,12 @@ finish_hide (void)
   }
   g_grid_cur_opacity = 0.0;
   g_grid_cur_slide_y = kGridSlideOffsetPx;
+  g_grid_last_moved_y = INT_MIN;
   g_app_grid_mode = false;
-  if (g_desktop_poll != 0) {
-    g_source_remove (g_desktop_poll);
-    g_desktop_poll = 0;
-  }
+  if (g_idle_trim_timer != 0)
+    g_source_remove (g_idle_trim_timer);
+  g_idle_trim_timer =
+      g_timeout_add_seconds (15, overview_idle_trim_cb, nullptr);
   // The side controls stay VISIBLE at their end-of-close geometry (the
   // background rests on the full work area, radius 0): the window keeps its
   // fullscreen size while hidden, so the first frame of the next open shows
@@ -3072,16 +3147,15 @@ on_overview_map (GtkWidget *widget, gpointer user_data)
 {
   (void)widget;
   (void)user_data;
+  if (g_idle_trim_timer != 0) {
+    g_source_remove (g_idle_trim_timer);
+    g_idle_trim_timer = 0;
+  }
   // G_PRIORITY_HIGH_IDLE (100) sorts BEFORE the frame clock's repaint source
   // (G_PRIORITY_REDRAW 120): the placement runs before the first post-map
   // paint, so the first frame is the placed overview, not a dark flash.
   g_idle_add_full (G_PRIORITY_HIGH_IDLE, overview_place_opening_idle, nullptr,
                    nullptr);
-
-  // Watch for desktop switches made elsewhere while the overview is open
-  // (Win+Ctrl+Left/Right); the overview relayouts to the new desktop.
-  if (g_desktop_poll == 0)
-    g_desktop_poll = g_timeout_add (400, desktop_poll_cb, nullptr);
 }
 
 // ThumbnailsBox click action -> Workspace.activate: switch the desktop and
@@ -3168,22 +3242,22 @@ on_app_grid_pins_changed (void *user_data G_GNUC_UNUSED)
   }
 }
 
-// Relayout when the active desktop changed outside the overview.
-gboolean
-desktop_poll_cb (gpointer user_data)
+// Relayout when the active desktop changed outside the overview (event-driven
+// via centralized VD observer).
+void
+on_overview_desktop_changed (int count, int active_index, void *user_data)
 {
+  (void)count;
   (void)user_data;
-  if (g_window == nullptr || !gtk_widget_get_visible (g_window)) {
-    g_desktop_poll = 0;
-    return G_SOURCE_REMOVE;
+  if (g_window == nullptr || !gtk_widget_get_visible (g_window))
+    return;
+  if (g_desktops.empty () || active_index < 0 ||
+      active_index == g_desktop_active) {
+    return;
   }
-  int cur = g_desktops.empty () ? -1 : vd::current_index ();
-  if (cur >= 0 && cur != g_desktop_active) {
-    g_print ("[ov] desktop changed %d -> %d (external)\n", g_desktop_active,
-             cur);
-    switch_workspace_animated (cur);
-  }
-  return G_SOURCE_CONTINUE;
+  g_print ("[ov] desktop changed %d -> %d (external event)\n",
+           g_desktop_active, active_index);
+  switch_workspace_animated (active_index);
 }
 
 // Relayout without animation (window closed via the chrome button etc.).
@@ -3496,6 +3570,18 @@ overview_init (HWND panel_hwnd)
   g_signal_connect (keys, "key-pressed", G_CALLBACK (on_overview_key_pressed),
                     nullptr);
   gtk_widget_add_controller (g_window, keys);
+
+  vd::add_change_listener (on_overview_desktop_changed, nullptr);
+  g_signal_connect (
+      g_window, "destroy",
+      G_CALLBACK (+[] (GtkWidget *w G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
+        if (g_idle_trim_timer != 0) {
+          g_source_remove (g_idle_trim_timer);
+          g_idle_trim_timer = 0;
+        }
+        vd::remove_change_listener (on_overview_desktop_changed, nullptr);
+      }),
+      nullptr);
 }
 
 void

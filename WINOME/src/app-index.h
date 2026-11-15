@@ -107,6 +107,7 @@ GdkTexture *app_icon_cache_lookup (const std::string &cache_key, int size);
 void app_icon_cache_store (const std::string &cache_key, int size,
                            GdkTexture *texture);
 void app_icon_cache_clear (void);
+void app_icon_cache_trim (size_t max_keep);
 size_t app_icon_cache_count (void);
 size_t app_icon_cache_capacity (void);
 

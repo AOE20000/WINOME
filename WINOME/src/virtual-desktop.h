@@ -82,5 +82,28 @@ bool create_desktop (void);
 // desktop). Refuses when count <= 1 or build vtable layout is unrecognized.
 bool remove_desktop (int index);
 
+// --- Centralized event-driven desktop observer ----------------------------
+
+struct DesktopSnapshot {
+  int count = 1;
+  int active_index = 0;
+  bool valid = false;
+};
+
+using DesktopChangedCallback = void (*) (int count, int active_index,
+                                         void *user_data);
+
+// Last observed desktop count / active index without blocking on COM.
+DesktopSnapshot cached_snapshot (void);
+
+// Subscribe to virtual desktop count / active-index transitions. Replaces
+// per-module polling timers with a single WinEvent + hotkey + safety observer.
+void add_change_listener (DesktopChangedCallback cb, void *user_data);
+void remove_change_listener (DesktopChangedCallback cb, void *user_data);
+
+// Safe to call from any thread (e.g. WH_KEYBOARD_LL): schedules an immediate
+// desktop-state check and notifies listeners if anything changed.
+void notify_change_hint_async (void);
+
 }  // namespace vd
 }  // namespace winome

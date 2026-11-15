@@ -33,6 +33,7 @@ struct MonitorRuntimeCallbacks {
   void (*on_display_changed)(const RECT& primary_monitor_rect) = nullptr;
   void (*on_wallpaper_changed)() = nullptr;
   void (*on_theme_changed)() = nullptr;
+  void (*on_workarea_changed)() = nullptr;
 };
 
 // Enumerate active display monitors (primary monitor sorted first).

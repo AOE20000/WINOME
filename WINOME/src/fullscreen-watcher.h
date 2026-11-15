@@ -24,6 +24,9 @@ void set_session_locked(bool locked);
 // Re-evaluate all panels immediately (called on display or lock changes).
 void evaluate_fullscreen_state(void);
 
+// Immediately re-assert panel workarea & toolwindow style (e.g. SPI_SETWORKAREA).
+void reassert_panel_workarea_now(void);
+
 // True while the primary panel is hidden (fullscreen app on primary or locked).
 bool panel_hidden(void);
 

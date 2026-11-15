@@ -15,10 +15,13 @@
 
 #include "config.h"
 #include "app-index.h"
+#include "end-session-dialog.h"
 #include "host-utils.h"
 #include "native-taskbar.h"
 #include "overview-trigger.h"
 #include "overview.h"
+#include "perf-metrics.h"
+#include "shell-ipc.h"
 #include "shell-panel.h"
 #include "win-event-hook.h"
 #include "fullscreen-watcher.h"
@@ -29,6 +32,7 @@
 #include "systray.h"
 #include "system-status.h"
 #include "wifi-networks.h"
+#include "window-theming.h"
 #include "ws-osd.h"
 #include "virtual-desktop.h"
 #include "winrt-bridge.h"
@@ -406,7 +410,10 @@ position_panel (GtkWidget *panel)
   SystemParametersInfoW (SPI_SETWORKAREA, 0, &work, 0);
 
   // Create the in-host Activities overview, z-ordered below the panel.
+  const gint64 ov_t0 = g_get_monotonic_time ();
   winome::overview_init (hwnd);
+  winome::perf_record_phase_ms (
+      "overview_init", (g_get_monotonic_time () - ov_t0) / 1000.0);
 
   // Auto-hide the panel while a fullscreen window or the lock screen is
   // active; it stays visible everywhere else, including over the overview.
@@ -434,10 +441,12 @@ position_panel (GtkWidget *panel)
   };
   mm_cbs.on_display_changed = [] (const RECT &primary_rect) {
     g_primary_monitor = primary_rect;
-    save_recovery_workarea (primary_rect);
+    save_recovery_workarea (g_primary_monitor);
+    winome::hot_corner_refresh_bounds ();
     winome::evaluate_fullscreen_state ();
     winome::overview_reposition ();
   };
+  mm_cbs.on_workarea_changed = winome::reassert_panel_workarea_now;
   mm_cbs.on_wallpaper_changed = winome::overview_invalidate_wallpaper;
   winome::monitor_manager_init (hwnd, mm_cbs);
 }
@@ -543,6 +552,54 @@ destroy_control_window (void)
   UnregisterClassW (kControlWindowClass, GetModuleHandleW (nullptr));
 }
 
+static gboolean
+idle_open_settings_page (gpointer data)
+{
+  auto *page = static_cast<std::string *> (data);
+  winome::open_settings_window_page (page != nullptr ? page->c_str () : "");
+  delete page;
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
+idle_ipc_overview_open (gpointer G_GNUC_UNUSED data)
+{
+  winome::open_overview ("ipc");
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
+idle_ipc_overview_close (gpointer G_GNUC_UNUSED data)
+{
+  winome::close_overview ("ipc");
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
+idle_ipc_overview_toggle (gpointer G_GNUC_UNUSED data)
+{
+  winome::toggle_overview ("ipc");
+  return G_SOURCE_REMOVE;
+}
+
+struct IpcNotifyData {
+  std::string title;
+  std::string body;
+  std::string app;
+};
+
+static gboolean
+idle_ipc_notify (gpointer data)
+{
+  auto *nd = static_cast<IpcNotifyData *> (data);
+  if (nd != nullptr) {
+    winome::notify_shell (nd->title, nd->body,
+                          nd->app.empty () ? "WINOME" : nd->app);
+    delete nd;
+  }
+  return G_SOURCE_REMOVE;
+}
+
 static void
 on_activate (GtkApplication      *app,
              gpointer G_GNUC_UNUSED user_data)
@@ -550,6 +607,7 @@ on_activate (GtkApplication      *app,
   g_gtk_app = app;
   create_control_window ();
 
+  const gint64 panel_t0 = g_get_monotonic_time ();
   GtkWidget *panel = winome_shell_panel_new ();
 
   gtk_window_set_application (GTK_WINDOW (panel), app);
@@ -557,8 +615,10 @@ on_activate (GtkApplication      *app,
   gtk_widget_set_visible (panel, TRUE);
 
   position_panel (panel);
+  winome::perf_record_phase_ms (
+      "panel", (g_get_monotonic_time () - panel_t0) / 1000.0);
 
-  // Workspace-switch OSD (workspaceSwitcherPopup.js) + desktop poll.
+  // Workspace-switch OSD (workspaceSwitcherPopup.js) + event-driven VD sync.
   winome::ws_osd_init ();
 
   // Live WinRT notifications + toast banner + SMTC store.
@@ -569,6 +629,57 @@ on_activate (GtkApplication      *app,
 
   // Event-driven WASAPI master volume & default audio endpoint monitor.
   winome::start_volume_monitor ();
+
+  // Opt-in DWM window unification (dark titlebars / Win11 rounded corners).
+  winome::window_theming_init ();
+
+  // Bidirectional Named Pipe IPC server (\\.\pipe\WINOME_Shell_IPC).
+  const gint64 ipc_t0 = g_get_monotonic_time ();
+  winome::IpcCallbacks ipc_cbs {};
+  ipc_cbs.overview_open = +[] () {
+    g_idle_add (idle_ipc_overview_open, nullptr);
+  };
+  ipc_cbs.overview_close = +[] () {
+    g_idle_add (idle_ipc_overview_close, nullptr);
+  };
+  ipc_cbs.overview_toggle = +[] () {
+    g_idle_add (idle_ipc_overview_toggle, nullptr);
+  };
+  ipc_cbs.overview_app_grid = +[] () {
+    winome::overview_shift_to_app_grid_async ();
+  };
+  ipc_cbs.overview_is_open = +[] () -> bool {
+    return winome::overview_active ();
+  };
+  ipc_cbs.settings_open = +[] (const std::string &page) {
+    g_idle_add (idle_open_settings_page, new std::string (page));
+  };
+  ipc_cbs.config_reload = +[] () {
+    g_idle_add (idle_reload_config, nullptr);
+  };
+  ipc_cbs.desktop_switch = +[] (int index) -> bool {
+    const bool ok = winome::vd::switch_to (index);
+    if (ok)
+      winome::vd::notify_change_hint_async ();
+    return ok;
+  };
+  ipc_cbs.desktop_list = +[] () {
+    return winome::vd::desktops ();
+  };
+  ipc_cbs.desktop_active = +[] () -> int {
+    return winome::vd::current_index ();
+  };
+  ipc_cbs.notify = +[] (const std::string &title,
+                        const std::string &body,
+                        const std::string &app) {
+    g_idle_add (idle_ipc_notify, new IpcNotifyData {title, body, app});
+  };
+  ipc_cbs.quit = +[] () {
+    g_idle_add (idle_quit_app, nullptr);
+  };
+  winome::ipc_server_start (ipc_cbs);
+  winome::perf_record_phase_ms (
+      "ipc", (g_get_monotonic_time () - ipc_t0) / 1000.0);
 
   // Pin the shell chrome to all virtual desktops (see pin_shell_windows).
   // Delayed: the first COM call can block up to the vd module's 8s timeout
@@ -587,18 +698,29 @@ on_activate (GtkApplication      *app,
     g_open_settings_on_start = false;
     g_idle_add (idle_open_settings, nullptr);
   }
+
+  g_idle_add (
+      +[] (gpointer) -> gboolean {
+        winome::perf_finish_startup ();
+        return G_SOURCE_REMOVE;
+      },
+      nullptr);
 }
 
 static void
 on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
              gpointer G_GNUC_UNUSED user_data)
 {
+  winome::ipc_server_stop ();
   destroy_control_window ();
   g_gtk_app = nullptr;
 
+  winome::close_end_session_dialog ();
   winome::close_settings_window ();
+  winome::window_theming_shutdown ();
   winome::app_icon_cache_clear ();
   winome::monitor_manager_shutdown ();
+  winome::stop_hot_corner ();
   winome::stop_fullscreen_watcher ();
   winome::systray_shutdown ();
   winome::stop_volume_monitor ();
@@ -627,6 +749,7 @@ on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
 int
 main (int argc, char **argv)
 {
+  winome::perf_mark_process_start ();
   // Recovery mode: restore native taskbar and any saved work area, then exit.
   for (int i = 1; i < argc; ++i) {
     if (std::string (argv[i]) == "--restore") {
@@ -645,6 +768,22 @@ main (int argc, char **argv)
           apply_and_clear_recovery (true);
       }
       return 0;
+    }
+    if (std::string (argv[i]) == "--status") {
+      if (GetFileType (GetStdHandle (STD_OUTPUT_HANDLE)) == FILE_TYPE_UNKNOWN &&
+          AttachConsole (ATTACH_PARENT_PROCESS)) {
+        std::freopen ("CONOUT$", "w", stdout);
+      }
+      std::string resp;
+      if (winome::ipc_query_running_shell ("{\"cmd\":\"status\"}", &resp)) {
+        std::fwrite (resp.data (), 1, resp.size (), stdout);
+        std::fputc ('\n', stdout);
+        std::fflush (stdout);
+        return 0;
+      }
+      std::printf ("{\"ok\":false,\"error\":\"not_running\"}\n");
+      std::fflush (stdout);
+      return 1;
     }
   }
 

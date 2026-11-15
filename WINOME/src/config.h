@@ -18,6 +18,9 @@ struct WinomeConfig {
   int hot_corner_cooldown_ms = 500;
   bool win_key_overview = true;
   bool multi_monitor_panels = true;
+  bool end_session_confirm = true;
+  bool unify_dark_titlebars = false;
+  bool unify_rounded_corners = false;
   std::vector<std::string> pinned_apps;
 };
 

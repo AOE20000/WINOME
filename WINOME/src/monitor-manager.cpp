@@ -174,6 +174,12 @@ gboolean idle_handle_theme_change(gpointer G_GNUC_UNUSED data) {
   return G_SOURCE_REMOVE;
 }
 
+gboolean idle_handle_workarea_change(gpointer G_GNUC_UNUSED data) {
+  if (g_mm.cbs.on_workarea_changed != nullptr)
+    g_mm.cbs.on_workarea_changed();
+  return G_SOURCE_REMOVE;
+}
+
 gboolean idle_handle_session_lock(gpointer data) {
   bool locked = reinterpret_cast<gintptr>(data) != 0;
   if (g_mm.cbs.on_session_lock_changed != nullptr)
@@ -205,6 +211,8 @@ LRESULT CALLBACK watcher_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
       const wchar_t* area = reinterpret_cast<const wchar_t*>(lParam);
       if (is_wallpaper) {
         g_idle_add(idle_handle_wallpaper_change, nullptr);
+      } else if (wParam == SPI_SETWORKAREA) {
+        g_idle_add(idle_handle_workarea_change, nullptr);
       } else if (area != nullptr &&
                  (_wcsicmp(area, L"ImmersiveColorSet") == 0 ||
                   _wcsicmp(area, L"Environment") == 0)) {

@@ -3,6 +3,7 @@
 // Wi-Fi data source over the native WLAN API (wlanapi.dll).
 
 #include "wifi-networks.h"
+#include "perf-metrics.h"
 
 #include <windows.h>
 #include <wlanapi.h>
@@ -175,8 +176,12 @@ ensure_wlan_notifications (HANDLE client)
 bool
 ensure_client (HANDLE *out)
 {
-  if (!load_api ())
+  if (!load_api ()) {
+    winome::capability_set (winome::SubsystemId::Wlan,
+                            winome::CapabilityState::Degraded,
+                            "wlanapi.dll unavailable");
     return false;
+  }
 
   if (g_client == nullptr) {
     DWORD version = 0;
@@ -185,13 +190,23 @@ ensure_client (HANDLE *out)
     //                 phClientHandle) — the negotiated version is an OUTPUT.
     // Requesting 2 is what Windows 7+ expects; the DLL negotiates downwards
     // if the service is older.
-    if (g_api.OpenHandle (2, nullptr, &version, &client) != ERROR_SUCCESS)
+    if (g_api.OpenHandle (2, nullptr, &version, &client) != ERROR_SUCCESS) {
+      winome::capability_set (winome::SubsystemId::Wlan,
+                              winome::CapabilityState::Degraded,
+                              "WLAN AutoConfig service unavailable");
       return false;
-    if (client == nullptr)
+    }
+    if (client == nullptr) {
+      winome::capability_set (winome::SubsystemId::Wlan,
+                              winome::CapabilityState::Degraded,
+                              "WLAN client handle null");
       return false;
+    }
     g_client = client;
   }
 
+  winome::capability_set (winome::SubsystemId::Wlan,
+                          winome::CapabilityState::Active);
   ensure_wlan_notifications (g_client);
   *out = g_client;
   return true;

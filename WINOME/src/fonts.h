@@ -18,4 +18,8 @@ PangoFontMap *bundled_font_map (void);
 // the window is shown.
 void install_bundled_fonts (GtkWidget *window);
 
+// Introspection helpers for startup telemetry & automated tests.
+int fonts_loaded_file_count (void);
+double fonts_cold_init_ms (void);
+
 }  // namespace winome

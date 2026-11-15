@@ -4,6 +4,7 @@
 // worker thread so it never deadlocks or conflicts with GTK's STA thread.
 
 #include "winrt-bridge.h"
+#include "perf-metrics.h"
 
 #include <windows.h>
 
@@ -307,6 +308,9 @@ class WinRtWorker {
   ComPtr smtc_manager_;
   ComPtr notif_listener_;
   bool notif_access_requested_ = false;
+  bool notif_denied_cached_ = false;
+  std::chrono::steady_clock::time_point notif_denied_until_{};
+  bool toast_allowed_last_ = false;
 
  private:
   struct TaskState {
@@ -407,23 +411,46 @@ ComPtr get_notification_listener(bool request_if_needed, bool* access_allowed) {
     *access_allowed = false;
 
   WinRtWorker& w = WinRtWorker::instance();
+  auto now = std::chrono::steady_clock::now();
+  if (w.notif_denied_cached_ && now < w.notif_denied_until_) {
+    return {};
+  }
+
   if (!w.notif_listener_) {
     ComPtr statics = get_activation_factory(
         L"Windows.UI.Notifications.Management.UserNotificationListener",
         kIID_IUserNotificationListenerStatics);
-    if (!statics)
+    if (!statics) {
+      capability_set(SubsystemId::WinRtNotifications, CapabilityState::Degraded,
+                     "UserNotificationListener WinRT factory unavailable");
+      w.notif_denied_cached_ = true;
+      w.notif_denied_until_ = now + std::chrono::seconds(60);
       return {};
+    }
     ComPtr raw;
-    if (FAILED(vcall<HRESULT>(statics.ptr, 6, raw.put())) || !raw)
+    if (FAILED(vcall<HRESULT>(statics.ptr, 6, raw.put())) || !raw) {
+      capability_set(SubsystemId::WinRtNotifications, CapabilityState::Degraded,
+                     "UserNotificationListener::get_Current failed");
+      w.notif_denied_cached_ = true;
+      w.notif_denied_until_ = now + std::chrono::seconds(60);
       return {};
+    }
     w.notif_listener_ = qi(raw.ptr, kIID_IUserNotificationListener);
-    if (!w.notif_listener_)
+    if (!w.notif_listener_) {
+      capability_set(SubsystemId::WinRtNotifications, CapabilityState::Degraded,
+                     "UserNotificationListener interface unavailable");
+      w.notif_denied_cached_ = true;
+      w.notif_denied_until_ = now + std::chrono::seconds(60);
       return {};
+    }
   }
 
   int32_t access = kNotifAccessUnspecified;
-  if (FAILED(vcall<HRESULT>(w.notif_listener_.ptr, 7, &access)))
+  if (FAILED(vcall<HRESULT>(w.notif_listener_.ptr, 7, &access))) {
+    capability_set(SubsystemId::WinRtNotifications, CapabilityState::Degraded,
+                   "GetAccessStatus query failed");
     return {};
+  }
 
   if (access == kNotifAccessUnspecified && request_if_needed &&
       !w.notif_access_requested_) {
@@ -436,9 +463,16 @@ ComPtr get_notification_listener(bool request_if_needed, bool* access_allowed) {
     }
   }
 
-  if (access != kNotifAccessAllowed)
+  if (access != kNotifAccessAllowed) {
+    w.notif_denied_cached_ = true;
+    w.notif_denied_until_ = now + std::chrono::seconds(60);
+    capability_set(SubsystemId::WinRtNotifications, CapabilityState::Degraded,
+                   "Toast listener access denied (privacy policy or unpackaged identity)");
     return {};
+  }
 
+  w.notif_denied_cached_ = false;
+  capability_set(SubsystemId::WinRtNotifications, CapabilityState::Active);
   if (access_allowed != nullptr)
     *access_allowed = true;
   return qi(w.notif_listener_.ptr, kIID_IUserNotificationListener);
@@ -520,25 +554,54 @@ bool bluetooth_radio_op(bool do_set, bool target_enabled,
 }  // namespace
 
 bool winrt_get_bluetooth_radio(bool* present, bool* enabled) {
-  bool ok = false;
-  bool local_present = false;
-  bool local_enabled = false;
-  WinRtWorker::instance().run([&] {
-    ok = bluetooth_radio_op(false, false, &local_present, &local_enabled);
+  struct State {
+    bool ok = false;
+    bool present = false;
+    bool enabled = false;
+  };
+  auto st = std::make_shared<State>();
+  const bool completed = WinRtWorker::instance().run([st] {
+    st->ok = bluetooth_radio_op(false, false, &st->present, &st->enabled);
   });
+  if (!completed) {
+    capability_record_failure(SubsystemId::WinRtBluetooth,
+                              "Bluetooth radio WinRT query timed out");
+    if (present != nullptr)
+      *present = false;
+    if (enabled != nullptr)
+      *enabled = false;
+    return false;
+  }
+  if (!combase().loaded) {
+    capability_set(SubsystemId::WinRtBluetooth, CapabilityState::Degraded,
+                   "combase.dll unavailable");
+  } else {
+    capability_set(SubsystemId::WinRtBluetooth,
+                   st->present ? CapabilityState::Active
+                               : CapabilityState::Degraded,
+                   st->present ? std::string{} : "No Bluetooth radio adapter");
+  }
   if (present != nullptr)
-    *present = local_present;
+    *present = st->present;
   if (enabled != nullptr)
-    *enabled = local_enabled;
-  return ok;
+    *enabled = st->enabled;
+  return st->ok;
 }
 
 bool winrt_set_bluetooth_radio(bool enabled) {
-  bool ok = false;
-  WinRtWorker::instance().run([&] {
-    ok = bluetooth_radio_op(true, enabled, nullptr, nullptr);
+  struct State {
+    bool ok = false;
+  };
+  auto st = std::make_shared<State>();
+  const bool completed = WinRtWorker::instance().run([st, enabled] {
+    st->ok = bluetooth_radio_op(true, enabled, nullptr, nullptr);
   }, 4000);
-  return ok;
+  if (!completed) {
+    capability_record_failure(SubsystemId::WinRtBluetooth,
+                              "Bluetooth radio toggle timed out");
+    return false;
+  }
+  return st->ok;
 }
 
 bool winrt_get_media_info(WinomeMediaInfo* out) {
@@ -546,16 +609,24 @@ bool winrt_get_media_info(WinomeMediaInfo* out) {
     return false;
   *out = WinomeMediaInfo{};
 
-  bool ok = false;
-  WinomeMediaInfo info;
-  WinRtWorker::instance().run([&] {
+  struct State {
+    bool ok = false;
+    bool mgr_ok = false;
+    WinomeMediaInfo info;
+  };
+  auto st = std::make_shared<State>();
+  const bool completed = WinRtWorker::instance().run([st] {
+    ComPtr mgr = get_smtc_manager();
+    st->mgr_ok = static_cast<bool>(mgr);
+    if (!mgr)
+      return;
     ComPtr session = get_current_smtc_session();
     if (!session)
       return;
 
     WINOME_HSTRING h_app = nullptr;
     if (SUCCEEDED(vcall<HRESULT>(session.ptr, 6, &h_app)))
-      info.app_id = consume_hstring(h_app);
+      st->info.app_id = consume_hstring(h_app);
 
     ComPtr pb_raw;
     if (SUCCEEDED(vcall<HRESULT>(session.ptr, 9, pb_raw.put())) && pb_raw) {
@@ -563,7 +634,7 @@ bool winrt_get_media_info(WinomeMediaInfo* out) {
       if (pb) {
         int32_t pb_status = 0;
         if (SUCCEEDED(vcall<HRESULT>(pb.ptr, 7, &pb_status)))
-          info.playing = (pb_status == kPlaybackPlaying);
+          st->info.playing = (pb_status == kPlaybackPlaying);
       }
     }
 
@@ -577,28 +648,43 @@ bool winrt_get_media_info(WinomeMediaInfo* out) {
           WINOME_HSTRING h_artist = nullptr;
           WINOME_HSTRING h_album = nullptr;
           if (SUCCEEDED(vcall<HRESULT>(props.ptr, 6, &h_title)))
-            info.title = consume_hstring(h_title);
+            st->info.title = consume_hstring(h_title);
           if (SUCCEEDED(vcall<HRESULT>(props.ptr, 9, &h_artist)))
-            info.artist = consume_hstring(h_artist);
+            st->info.artist = consume_hstring(h_artist);
           if (SUCCEEDED(vcall<HRESULT>(props.ptr, 10, &h_album)))
-            info.album = consume_hstring(h_album);
+            st->info.album = consume_hstring(h_album);
         }
       }
     }
 
-    if (!info.title.empty() || !info.artist.empty() || info.playing) {
-      info.active = true;
-      ok = true;
+    if (!st->info.title.empty() || !st->info.artist.empty() ||
+        st->info.playing) {
+      st->info.active = true;
+      st->ok = true;
     }
   }, 2000);
 
-  *out = std::move(info);
-  return ok;
+  if (!completed) {
+    capability_record_failure(SubsystemId::WinRtSmtc,
+                              "WinRT SMTC query timed out");
+    return false;
+  }
+  if (!combase().loaded || !st->mgr_ok) {
+    capability_set(SubsystemId::WinRtSmtc, CapabilityState::Degraded,
+                   "WinRT SMTC session manager unavailable");
+  } else {
+    capability_set(SubsystemId::WinRtSmtc, CapabilityState::Active);
+  }
+  *out = std::move(st->info);
+  return st->ok;
 }
 
 bool winrt_media_control(WinomeMediaAction action) {
-  bool ok = false;
-  WinRtWorker::instance().run([&] {
+  struct State {
+    bool ok = false;
+  };
+  auto st = std::make_shared<State>();
+  const bool completed = WinRtWorker::instance().run([st, action] {
     ComPtr session = get_current_smtc_session();
     if (!session)
       return;
@@ -613,10 +699,15 @@ bool winrt_media_control(WinomeMediaAction action) {
     if (SUCCEEDED(vcall<HRESULT>(session.ptr, slot, op.put())) && op) {
       uint8_t bool_res = 0;
       if (await_operation_result(op.ptr, &bool_res, 1500))
-        ok = (bool_res != 0);
+        st->ok = (bool_res != 0);
     }
   }, 2000);
-  return ok;
+  if (!completed) {
+    capability_record_failure(SubsystemId::WinRtSmtc,
+                              "WinRT SMTC control action timed out");
+    return false;
+  }
+  return st->ok;
 }
 
 bool winrt_get_notifications(std::vector<WinomeSystemNotification>* out,
@@ -625,12 +716,15 @@ bool winrt_get_notifications(std::vector<WinomeSystemNotification>* out,
     return false;
   out->clear();
 
-  bool ok = false;
-  bool allowed = false;
-  std::vector<WinomeSystemNotification> list;
+  struct State {
+    bool ok = false;
+    bool allowed = false;
+    std::vector<WinomeSystemNotification> list;
+  };
+  auto st = std::make_shared<State>();
 
-  WinRtWorker::instance().run([&] {
-    ComPtr listener = get_notification_listener(true, &allowed);
+  const bool completed = WinRtWorker::instance().run([st] {
+    ComPtr listener = get_notification_listener(true, &st->allowed);
     if (!listener)
       return;
 
@@ -730,37 +824,50 @@ bool winrt_get_notifications(std::vector<WinomeSystemNotification>* out,
       }
 
       if (!item.title.empty() || !item.body.empty())
-        list.push_back(std::move(item));
+        st->list.push_back(std::move(item));
     }
-    ok = true;
+    st->ok = true;
   }, 2000);
 
+  if (!completed) {
+    capability_record_failure(SubsystemId::WinRtNotifications,
+                              "WinRT UserNotificationListener timed out");
+    if (access_allowed != nullptr)
+      *access_allowed = false;
+    return false;
+  }
   if (access_allowed != nullptr)
-    *access_allowed = allowed;
-  *out = std::move(list);
-  return ok;
+    *access_allowed = st->allowed;
+  *out = std::move(st->list);
+  return st->ok;
 }
 
 bool winrt_remove_notification(uint32_t id) {
-  bool ok = false;
-  WinRtWorker::instance().run([&] {
+  struct State {
+    bool ok = false;
+  };
+  auto st = std::make_shared<State>();
+  const bool completed = WinRtWorker::instance().run([st, id] {
     bool allowed = false;
     ComPtr listener = get_notification_listener(false, &allowed);
     if (listener && allowed)
-      ok = SUCCEEDED(vcall<HRESULT>(listener.ptr, 13, id));
+      st->ok = SUCCEEDED(vcall<HRESULT>(listener.ptr, 13, id));
   }, 1500);
-  return ok;
+  return completed && st->ok;
 }
 
 bool winrt_clear_notifications() {
-  bool ok = false;
-  WinRtWorker::instance().run([&] {
+  struct State {
+    bool ok = false;
+  };
+  auto st = std::make_shared<State>();
+  const bool completed = WinRtWorker::instance().run([st] {
     bool allowed = false;
     ComPtr listener = get_notification_listener(false, &allowed);
     if (listener && allowed)
-      ok = SUCCEEDED(vcall<HRESULT>(listener.ptr, 12));
+      st->ok = SUCCEEDED(vcall<HRESULT>(listener.ptr, 12));
   }, 1500);
-  return ok;
+  return completed && st->ok;
 }
 
 void winrt_shutdown() {

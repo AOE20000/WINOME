@@ -10,7 +10,9 @@
 //          light, dark mode, do-not-disturb, keyboard, airplane mode.
 
 #include "quick-settings.h"
+#include "config.h"
 #include "easing.h"
+#include "end-session-dialog.h"
 #include "fonts.h"
 #include "i18n.h"
 #include "notifications.h"
@@ -1835,20 +1837,50 @@ idle_quit_winome_shell (gpointer G_GNUC_UNUSED data)
 }
 
 static void
+on_end_session_confirmed (winome::EndSessionAction action,
+                          gpointer G_GNUC_UNUSED user_data)
+{
+  switch (action) {
+  case winome::EndSessionAction::LogOut:
+    winome::log_out ();
+    break;
+  case winome::EndSessionAction::Restart:
+    winome::restart_system ();
+    break;
+  case winome::EndSessionAction::PowerOff:
+    winome::shutdown_system ();
+    break;
+  }
+}
+
+static void
 on_power_action (gpointer user_data)
 {
+  const bool confirm = winome::get_config ().end_session_confirm;
   switch (GPOINTER_TO_INT (user_data)) {
   case POWER_ACTION_SUSPEND:
     winome::suspend_system ();
     break;
   case POWER_ACTION_LOGOUT:
-    winome::log_out ();
+    if (confirm)
+      winome::show_end_session_dialog (winome::EndSessionAction::LogOut,
+                                       on_end_session_confirmed, nullptr);
+    else
+      winome::log_out ();
     break;
   case POWER_ACTION_RESTART:
-    winome::restart_system ();
+    if (confirm)
+      winome::show_end_session_dialog (winome::EndSessionAction::Restart,
+                                       on_end_session_confirmed, nullptr);
+    else
+      winome::restart_system ();
     break;
   case POWER_ACTION_SHUTDOWN:
-    winome::shutdown_system ();
+    if (confirm)
+      winome::show_end_session_dialog (winome::EndSessionAction::PowerOff,
+                                       on_end_session_confirmed, nullptr);
+    else
+      winome::shutdown_system ();
     break;
   case POWER_ACTION_QUIT_SHELL:
     g_idle_add (idle_quit_winome_shell, NULL);

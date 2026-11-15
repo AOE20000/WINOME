@@ -3,6 +3,7 @@
 // Event-driven per-monitor fullscreen detection & lock-screen panel hiding.
 
 #include "fullscreen-watcher.h"
+#include "hot-corner.h"
 #include "overview-trigger.h"
 #include "overview.h"
 
@@ -27,6 +28,7 @@ bool g_session_locked = false;
 guint g_tick_source = 0;
 HWINEVENTHOOK g_fg_hook = nullptr;
 HWINEVENTHOOK g_loc_hook = nullptr;
+HWINEVENTHOOK g_state_hook = nullptr;
 
 bool belongs_to_process(HWND hwnd, const wchar_t* name) {
   DWORD pid = 0;
@@ -190,6 +192,8 @@ void evaluate_fullscreen_state(void) {
     if (want_hide != entry.hidden) {
       entry.hidden = want_hide;
       ShowWindow(entry.hwnd, want_hide ? SW_HIDE : SW_SHOWNOACTIVATE);
+      if (entry.is_primary)
+        hot_corner_set_suppressed(want_hide || g_session_locked);
     }
   }
 }
@@ -216,7 +220,12 @@ void unregister_panel_window(HWND panel_hwnd) {
 
 void set_session_locked(bool locked) {
   g_session_locked = locked;
+  hot_corner_set_suppressed(locked || panel_hidden());
   evaluate_fullscreen_state();
+}
+
+void reassert_panel_workarea_now(void) {
+  reassert_primary_workarea_and_styles();
 }
 
 bool panel_hidden(void) {
@@ -254,11 +263,18 @@ void start_fullscreen_watcher(HWND primary_panel_hwnd) {
         EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, nullptr,
         fg_win_event_proc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
   }
+  if (g_state_hook == nullptr) {
+    g_state_hook = SetWinEventHook(
+        EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZEEND, nullptr,
+        fg_win_event_proc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+  }
 
   reassert_primary_workarea_and_styles();
   evaluate_fullscreen_state();
+  // Low-frequency 10s safety backstop (foreground, location, minimize, lock,
+  // and SPI_SETWORKAREA events drive immediate transitions with zero 600ms churn).
   if (g_tick_source == 0)
-    g_tick_source = g_timeout_add(600, maintenance_tick, nullptr);
+    g_tick_source = g_timeout_add(10000, maintenance_tick, nullptr);
 }
 
 void stop_fullscreen_watcher(void) {
@@ -273,6 +289,10 @@ void stop_fullscreen_watcher(void) {
   if (g_loc_hook != nullptr) {
     UnhookWinEvent(g_loc_hook);
     g_loc_hook = nullptr;
+  }
+  if (g_state_hook != nullptr) {
+    UnhookWinEvent(g_state_hook);
+    g_state_hook = nullptr;
   }
   g_panels.clear();
   g_session_locked = false;

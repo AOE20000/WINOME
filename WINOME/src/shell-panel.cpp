@@ -1176,7 +1176,6 @@ typedef struct PanelStatus {
   bool is_primary;
   guint status_timer_id;
   guint clock_timer_id;
-  guint vd_timer_id;
   GtkWidget *activities_indicators;
   int desktop_count;
   int active_desktop;
@@ -1200,13 +1199,13 @@ typedef struct PanelStatus {
 // Sync Activities workspace dots with active Windows virtual desktops
 // (upstream panel.js WorkspaceIndicators).
 static void
-sync_activities_dots (PanelStatus *st)
+apply_activities_dots (PanelStatus *st, int count, int active)
 {
   if (st == nullptr || st->activities_indicators == nullptr)
     return;
 
-  int count = std::max (1, winome::vd::count ());
-  int active = count > 1 ? winome::vd::current_index () : 0;
+  if (count < 1)
+    count = 1;
   if (active < 0 || active >= count)
     active = 0;
 
@@ -1245,11 +1244,19 @@ sync_activities_dots (PanelStatus *st)
   }
 }
 
-static gboolean
-sync_activities_timer_cb (gpointer data)
+static void
+sync_activities_dots (PanelStatus *st)
 {
-  sync_activities_dots (static_cast<PanelStatus *> (data));
-  return G_SOURCE_CONTINUE;
+  const auto snap = winome::vd::cached_snapshot ();
+  apply_activities_dots (st, snap.valid ? snap.count : 1,
+                         snap.valid ? snap.active_index : 0);
+}
+
+static void
+on_panel_desktop_changed (int count, int active_index, void *user_data)
+{
+  apply_activities_dots (static_cast<PanelStatus *> (user_data), count,
+                         active_index);
 }
 
 // In GNOME the hover/active highlight lives on the .clock child (an St.Widget).
@@ -1880,8 +1887,7 @@ on_panel_destroy (GtkWidget *panel, gpointer user_data)
       g_source_remove (st->status_timer_id);
     if (st->clock_timer_id != 0)
       g_source_remove (st->clock_timer_id);
-    if (st->vd_timer_id != 0)
-      g_source_remove (st->vd_timer_id);
+    winome::vd::remove_change_listener (on_panel_desktop_changed, st);
     winome::remove_config_listener (on_panel_config_changed, st);
     winome::notifications_remove_listener (on_panel_status_event, st);
     if (st->is_primary) {
@@ -1928,7 +1934,7 @@ build_shell_panel (bool primary)
   gtk_box_append (GTK_BOX (left_box),
                   create_activities_button (&status->activities_indicators));
   sync_activities_dots (status);
-  status->vd_timer_id = g_timeout_add (350, sync_activities_timer_cb, status);
+  winome::vd::add_change_listener (on_panel_desktop_changed, status);
   gtk_box_append (GTK_BOX (center_box), create_clock_button (status, primary));
   if (primary) {
     gtk_box_append (GTK_BOX (right_box), create_tray_button (status));

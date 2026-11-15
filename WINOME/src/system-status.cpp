@@ -3,6 +3,7 @@
 // Windows data sources for the GNOME-style system status indicators.
 
 #include "system-status.h"
+#include "perf-metrics.h"
 #include "wifi-networks.h"
 #include "host-utils.h"
 #include "winrt-bridge.h"
@@ -485,24 +486,35 @@ void wide_to_utf8(const wchar_t *src, char *dst, int dst_size) {
 
 bool has_brightness_control() {
   double value = 0.0;
-  return get_lcd_brightness(&value) || get_dxva2_brightness(&value);
+  bool ok = get_lcd_brightness(&value) || get_dxva2_brightness(&value);
+  capability_set(SubsystemId::Brightness,
+                 ok ? CapabilityState::Active : CapabilityState::Degraded,
+                 ok ? std::string{} : "No LCD IOCTL or DDC/CI display brightness device");
+  return ok;
 }
 
 bool get_brightness(double* out) {
   double value = s_cached_brightness;
   if (get_lcd_brightness(&value) || get_dxva2_brightness(&value)) {
     s_cached_brightness = value;
+    capability_set(SubsystemId::Brightness, CapabilityState::Active);
     if (out != nullptr)
       *out = value;
     return true;
   }
+  capability_set(SubsystemId::Brightness, CapabilityState::Degraded,
+                 "Display brightness read failed");
   return false;
 }
 
 bool set_brightness(double fraction) {
   double clamped = std::clamp(fraction, 0.0, 1.0);
   s_cached_brightness = clamped;
-  return set_lcd_brightness(clamped) || set_dxva2_brightness(clamped);
+  bool ok = set_lcd_brightness(clamped) || set_dxva2_brightness(clamped);
+  capability_set(SubsystemId::Brightness,
+                 ok ? CapabilityState::Active : CapabilityState::Degraded,
+                 ok ? std::string{} : "Display brightness write failed");
+  return ok;
 }
 
 bool get_dark_mode(bool* out) {

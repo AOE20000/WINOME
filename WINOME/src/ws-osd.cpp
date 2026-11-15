@@ -18,9 +18,9 @@
 // border-radius 999px (capsule). The 4em bottom margin of the default
 // 11pt shell font is ~60px.
 //
-// The popup is detected by polling the virtual-desktop index (400ms);
-// switches made while the overview is open are handled by the overview's
-// own animated relayout and never trigger the OSD.
+// The popup reacts to virtual-desktop change notifications (via virtual-desktop.cpp's
+// unified WinEvent + hotkey observer); switches made while the overview is open
+// are handled by the overview's own animated relayout and never trigger the OSD.
 
 #include "ws-osd.h"
 #include "fonts.h"
@@ -42,7 +42,6 @@ namespace {
 // workspaceSwitcherPopup.js constants.
 constexpr int kAnimMs = 100;        // ANIMATION_TIME (fade in/out)
 constexpr int kDisplayTimeoutMs = 600;  // DISPLAY_TIMEOUT
-constexpr int kPollMs = 400;       // desktop-switch poll interval
 
 // _workspace-switcher.scss values (LOGICAL px).
 constexpr double kPaddingY = 12.0;  // base_padding * 2
@@ -133,7 +132,6 @@ guint g_fade_source = 0;
 gint64 g_fade_start_us = 0;
 guint g_fade_duration_ms = 0;
 double g_fade_from = 0.0, g_fade_to = 0.0;
-guint g_poll_tick = 0;
 
 double
 ease_out_quad (double t)
@@ -292,40 +290,34 @@ osd_display (int active)
     fade_to (1.0);
 }
 
-// --- poll -----------------------------------------------------------------------
+// --- event-driven observer ---------------------------------------------------
 
-static gboolean
-ws_osd_poll (gpointer user_data)
+static void
+on_ws_osd_desktop_changed (int count, int cur, void *user_data G_GNUC_UNUSED)
 {
-  (void)user_data;
-
-  // Slow channel: refresh the workspace count (COM enumeration) only every
-  // ~5s — the fast channel below queries the current index every tick.
-  if ((g_poll_tick++ % 12) == 0 || g_count == 0)
-    g_count = (int)vd::desktops ().size ();
-
-  if (g_count <= 1)
-    return G_SOURCE_CONTINUE;
+  g_count = count;
+  if (g_count <= 1) {
+    g_last_index = cur;
+    return;
+  }
 
   // Switches made from the overview (pill clicks, animated relayout) must
   // not trigger the OSD: upstream only mutter's own switch actions do.
   if (overview_is_open () != 0) {
-    g_last_index = -1;  // resync on the next poll after it closes
-    return G_SOURCE_CONTINUE;
+    g_last_index = -1;  // resync after overview closes
+    return;
   }
 
-  int cur = vd::current_index ();
   if (cur < 0)
-    return G_SOURCE_CONTINUE;
+    return;
   if (g_last_index < 0) {
     g_last_index = cur;
-    return G_SOURCE_CONTINUE;
+    return;
   }
   if (cur != g_last_index) {
     g_last_index = cur;
     osd_display (cur);
   }
-  return G_SOURCE_CONTINUE;
 }
 
 // --- window ---------------------------------------------------------------------
@@ -358,18 +350,6 @@ on_osd_map (GtkWidget *widget, gpointer user_data)
   }, nullptr);
 }
 
-// The first virtual-desktop enumeration runs late: on systems where the
-// explorer-side RPC would deadlock (non-admin), vd::desktops() blocks until
-// the module's 8s timeout auto-disables it — keep that away from the
-// startup path.
-static gboolean
-ws_osd_start_polling (gpointer user_data)
-{
-  (void)user_data;
-  g_timeout_add (kPollMs, ws_osd_poll, nullptr);
-  return G_SOURCE_REMOVE;
-}
-
 }  // namespace
 
 void
@@ -389,7 +369,7 @@ ws_osd_init ()
                                   nullptr, nullptr);
   gtk_window_set_child (GTK_WINDOW (g_window), g_area);
 
-  g_timeout_add (2000, ws_osd_start_polling, nullptr);
+  vd::add_change_listener (on_ws_osd_desktop_changed, nullptr);
 }
 
 }  // namespace winome
