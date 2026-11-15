@@ -479,6 +479,21 @@ void test_app_grid_pagination() {
   CHECK(d_lg.cols == 6 && d_lg.rows == 4 && d_lg.page_size == 24);
   auto d_sm = winome::compute_app_grid_dimensions(700, 380);
   CHECK(d_sm.cols == 4 && d_sm.rows == 3 && d_sm.page_size == 12);
+
+  if (gtk_init_check()) {
+    GtkWidget* grid = winome::app_grid_new(nullptr, nullptr, nullptr);
+    CHECK(grid != nullptr);
+    g_object_ref_sink(grid);
+    winome::app_grid_set_query(grid, "");
+    winome::app_grid_set_query(grid, "win");
+    winome::app_grid_set_query(grid, "");
+    winome::app_grid_rebuild(grid, 1000, 560);
+    winome::app_grid_next_page(grid);
+    winome::app_grid_prev_page(grid);
+    winome::app_grid_reset_page(grid);
+    winome::app_grid_close_menu(grid);
+    g_object_unref(grid);
+  }
 }
 
 void test_dash_favorites_and_thumbs_summary() {

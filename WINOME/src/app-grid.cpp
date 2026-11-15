@@ -9,6 +9,7 @@
 #include "st-engine.h"
 
 #include <algorithm>
+#include <new>
 #include <vector>
 
 namespace winome {
@@ -74,50 +75,55 @@ clear_grid_children (GtkWidget *grid)
     gtk_grid_remove (GTK_GRID (grid), child);
 }
 
+WinomeAppGrid *
+close_tile_menu_extract (gpointer user_data, AppEntry *out_entry)
+{
+  auto *ctx = static_cast<TileActionCtx *> (user_data);
+  WinomeAppGrid *self = ctx->self;
+  if (out_entry != nullptr)
+    *out_entry = ctx->entry;
+  app_grid_close_menu (GTK_WIDGET (self));
+  return self;
+}
+
 void
 on_tile_action_launch (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 {
-  auto *ctx = static_cast<TileActionCtx *> (user_data);
-  if (ctx->self->active_menu != nullptr)
-    gtk_popover_popdown (GTK_POPOVER (ctx->self->active_menu));
-  if (app_index_launch (ctx->entry, false) &&
-      ctx->self->on_launch_done != nullptr) {
-    ctx->self->on_launch_done (ctx->self->user_data);
+  AppEntry entry;
+  WinomeAppGrid *self = close_tile_menu_extract (user_data, &entry);
+  if (app_index_launch (entry, false) && self->on_launch_done != nullptr) {
+    self->on_launch_done (self->user_data);
   }
 }
 
 void
 on_tile_action_admin (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 {
-  auto *ctx = static_cast<TileActionCtx *> (user_data);
-  if (ctx->self->active_menu != nullptr)
-    gtk_popover_popdown (GTK_POPOVER (ctx->self->active_menu));
-  if (app_index_launch (ctx->entry, true) &&
-      ctx->self->on_launch_done != nullptr) {
-    ctx->self->on_launch_done (ctx->self->user_data);
+  AppEntry entry;
+  WinomeAppGrid *self = close_tile_menu_extract (user_data, &entry);
+  if (app_index_launch (entry, true) && self->on_launch_done != nullptr) {
+    self->on_launch_done (self->user_data);
   }
 }
 
 void
 on_tile_action_pin (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 {
-  auto *ctx = static_cast<TileActionCtx *> (user_data);
-  toggle_app_id_pinned (ctx->entry.id);
-  if (ctx->self->active_menu != nullptr)
-    gtk_popover_popdown (GTK_POPOVER (ctx->self->active_menu));
-  if (ctx->self->on_pins_changed != nullptr)
-    ctx->self->on_pins_changed (ctx->self->user_data);
+  AppEntry entry;
+  WinomeAppGrid *self = close_tile_menu_extract (user_data, &entry);
+  toggle_app_id_pinned (entry.id);
+  if (self->on_pins_changed != nullptr)
+    self->on_pins_changed (self->user_data);
 }
 
 void
 on_tile_action_location (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 {
-  auto *ctx = static_cast<TileActionCtx *> (user_data);
-  if (ctx->self->active_menu != nullptr)
-    gtk_popover_popdown (GTK_POPOVER (ctx->self->active_menu));
-  app_index_open_location (ctx->entry);
-  if (ctx->self->on_launch_done != nullptr)
-    ctx->self->on_launch_done (ctx->self->user_data);
+  AppEntry entry;
+  WinomeAppGrid *self = close_tile_menu_extract (user_data, &entry);
+  app_index_open_location (entry);
+  if (self->on_launch_done != nullptr)
+    self->on_launch_done (self->user_data);
 }
 
 GtkWidget *
@@ -408,8 +414,28 @@ winome_app_grid_dispose (GObject *object)
 }
 
 void
+winome_app_grid_finalize (GObject *object)
+{
+  WinomeAppGrid *self = WINOME_APP_GRID (object);
+  using StringT = std::string;
+  using AppVecT = std::vector<AppEntry>;
+  self->filtered.~AppVecT ();
+  self->all_apps.~AppVecT ();
+  self->query_lower.~StringT ();
+  G_OBJECT_CLASS (winome_app_grid_parent_class)->finalize (object);
+}
+
+void
 winome_app_grid_init (WinomeAppGrid *self)
 {
+  // g_object_new zero-fills C structs without running C++ constructors or
+  // default member initializers.
+  new (&self->query_lower) std::string ();
+  new (&self->all_apps) std::vector<AppEntry> ();
+  new (&self->filtered) std::vector<AppEntry> ();
+  self->avail_w = 1000;
+  self->avail_h = 560;
+
   gtk_orientable_set_orientation (GTK_ORIENTABLE (self),
                                   GTK_ORIENTATION_VERTICAL);
   gtk_box_set_spacing (GTK_BOX (self), 12);
@@ -498,7 +524,9 @@ winome_app_grid_init (WinomeAppGrid *self)
 void
 winome_app_grid_class_init (WinomeAppGridClass *klass)
 {
-  G_OBJECT_CLASS (klass)->dispose = winome_app_grid_dispose;
+  GObjectClass *object_class = G_OBJECT_CLASS (klass);
+  object_class->dispose = winome_app_grid_dispose;
+  object_class->finalize = winome_app_grid_finalize;
 }
 
 }  // namespace

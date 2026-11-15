@@ -24,6 +24,7 @@
 #include <shobjidl.h>
 
 #include <algorithm>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -543,19 +544,24 @@ void
 on_dash_menu_activate (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 {
   auto *ctx = static_cast<DashMenuCtx *> (user_data);
-  overview_dash_close_menu (GTK_WIDGET (ctx->self));
-  activate_app (ctx->self, ctx->index);
+  WinomeDash *self = ctx->self;
+  int index = ctx->index;
+  overview_dash_close_menu (GTK_WIDGET (self));
+  activate_app (self, index);
 }
 
 void
 on_dash_menu_new_window (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 {
   auto *ctx = static_cast<DashMenuCtx *> (user_data);
-  overview_dash_close_menu (GTK_WIDGET (ctx->self));
-  if (app_index_launch_id (ctx->app_id, false) ||
-      (!ctx->exe_path.empty () &&
+  WinomeDash *self = ctx->self;
+  std::string app_id = ctx->app_id;
+  std::wstring exe_path = ctx->exe_path;
+  overview_dash_close_menu (GTK_WIDGET (self));
+  if (app_index_launch_id (app_id, false) ||
+      (!exe_path.empty () &&
        reinterpret_cast<INT_PTR> (ShellExecuteW (
-           nullptr, L"open", ctx->exe_path.c_str (), nullptr, nullptr,
+           nullptr, L"open", exe_path.c_str (), nullptr, nullptr,
            SW_SHOWNORMAL)) > 32)) {
     close_overview ("dash-new-window");
   }
@@ -868,7 +874,14 @@ winome_dash_measure (GtkWidget *widget, GtkOrientation orientation,
 static void
 winome_dash_init (WinomeDash *self)
 {
+  // g_object_new zero-fills C structs without running C++ constructors or
+  // default member initializers.
+  new (&self->apps) std::vector<DashApp> ();
+  new (&self->tile_rects) std::vector<DashTileRect> ();
+  self->separator_x = -1;
+  self->icon_size = 64;
   self->hover_index = -1;
+  self->last_max_height = 96;
   gtk_widget_set_cursor_from_name (GTK_WIDGET (self), "default");
 }
 
@@ -892,6 +905,17 @@ winome_dash_dispose (GObject *object)
 }
 
 static void
+winome_dash_finalize (GObject *object)
+{
+  WinomeDash *self = WINOME_DASH (object);
+  using DashAppVecT = std::vector<DashApp>;
+  using RectVecT = std::vector<DashTileRect>;
+  self->tile_rects.~RectVecT ();
+  self->apps.~DashAppVecT ();
+  G_OBJECT_CLASS (winome_dash_parent_class)->finalize (object);
+}
+
+static void
 winome_dash_class_init (WinomeDashClass *klass)
 {
   GtkWidgetClass *widget_class = GTK_WIDGET_CLASS (klass);
@@ -900,6 +924,7 @@ winome_dash_class_init (WinomeDashClass *klass)
 
   GObjectClass *object_class = G_OBJECT_CLASS (klass);
   object_class->dispose = winome_dash_dispose;
+  object_class->finalize = winome_dash_finalize;
 }
 
 std::string

@@ -15,6 +15,7 @@
 #include "st-engine.h"
 
 #include <algorithm>
+#include <new>
 #include <vector>
 
 namespace winome {
@@ -393,16 +394,39 @@ winome_thumbs_dispose (GObject *object)
 }
 
 static void
+winome_thumbs_finalize (GObject *object)
+{
+  WinomeThumbs *self = WINOME_THUMBS (object);
+  using ThumbVecT = std::vector<ThumbRect>;
+  self->pills.~ThumbVecT ();
+  G_OBJECT_CLASS (winome_thumbs_parent_class)->finalize (object);
+}
+
+static void
 winome_thumbs_class_init (WinomeThumbsClass *klass)
 {
   GTK_WIDGET_CLASS (klass)->snapshot = winome_thumbs_snapshot;
   GTK_WIDGET_CLASS (klass)->measure = winome_thumbs_measure;
-  G_OBJECT_CLASS (klass)->dispose = winome_thumbs_dispose;
+  GObjectClass *object_class = G_OBJECT_CLASS (klass);
+  object_class->dispose = winome_thumbs_dispose;
+  object_class->finalize = winome_thumbs_finalize;
 }
 
 static void
 winome_thumbs_init (WinomeThumbs *self)
 {
+  // g_object_new zero-fills C structs without running C++ constructors or
+  // default member initializers.
+  new (&self->pills) std::vector<ThumbRect> ();
+  self->active = -1;
+  self->hover_index = -1;
+  self->drop_target = -1;
+  self->indicator_value = -1.0;
+  self->spacing = kSpacingFallback;
+  self->padding = kPaddingFallback;
+  self->thumb_radius = kThumbRadiusFallback;
+  self->indicator_width = kIndicatorWidthFallback;
+  self->indicator_radius = kIndicatorRadiusFallback;
   GtkEventController *motion = gtk_event_controller_motion_new ();
   g_signal_connect (motion, "enter", G_CALLBACK (winome_thumbs_motion), self);
   g_signal_connect (motion, "motion", G_CALLBACK (winome_thumbs_motion), self);
