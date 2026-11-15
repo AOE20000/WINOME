@@ -120,3 +120,6 @@ GTK4 没有内置动画框架（无 `GtkAnimation`），而上游广泛依赖 `C
 - **顶栏、通知与快速设置细化**：`QuickSettings` 电源子菜单支持 `Quit WINOME`；Wi-Fi 加密接入改用模态密码弹窗（对齐 `.modal-dialog`）；`SettingsWindow` 采用深色 Adwaita 标题栏与设置页视觉风格；时钟指示器、今日圆点、通知列表空状态与折叠按钮对齐上游节点树。
 - **概览 Chrome 与应用网格 / 右键菜单对齐**：修复概览悬停标题被 DWM 缩略图遮挡与标题过长省略、`workspace-placeholder` 空桌面占位；为 `AppGrid` 接入自定义 `WinomeAppIcon`（`GSK_SCALING_FILTER_TRILINEAR`）避免低清模糊，完善应用右键 AppMenu popover（白字对比度、打开的窗口分组、管理员启动、固定到 Dash 与打开位置）以及双击 Win 键平滑切入 `APP_GRID`。
 - **CSS 覆盖与回归校验**：`convert-st-css.py` 扩展了 `APP_GRID`、上下文 popover、模态窗及 `QuickToggleMenu` 所需规则，由 `tests/test-css-converter.py` 自动回归保护；全套上游 St 属性已有 `46 / 83` 进入转换后 GTK4 样式表。
+- **阶段 1 新增 UI 组件**：
+  - **EndSession 60 秒确认弹窗**（`src/end-session-dialog.{h,cpp}`）：复用 `.modal-dialog`、`.modal-dialog-content-box`、`.message-dialog-content`、`.message-dialog-title`、`.message-dialog-description` 与 `.modal-dialog-button-box`，内置 1s 倒计时更新、`Esc` 取消、工作区居中置顶及中/英文单复数格式；
+  - **Settings 外观统一与诊断页**（`src/settings-window.cpp`、`src/window-theming.{h,cpp}`）：外观页提供零注入可选开关（`unify_dark_titlebars`、`unify_rounded_corners`），行为页提供 `end_session_confirm` 开关与快捷键一览，新增 `Diagnostics` 标签页集中展示进程内存/GDI/USER、启动各阶段耗时、概览动画帧统计及 `SubsystemId` 健康熔断状态。

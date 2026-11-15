@@ -24,7 +24,7 @@
 └── LICENSE / README.md
 ```
 
-- **宿主进程**：`WINOME/src/`（C++17 + GTK4，单进程含配置、i18n、设置窗、系统托盘与多屏管理）
+- **宿主进程**：`WINOME/src/`（C++17 + GTK4，单进程含配置、i18n、设置窗、系统托盘、`shell-ipc` 双向 Named Pipe、60s 会话结束确认弹窗、`window-theming` 可选 DWM 统一样式、`perf-metrics` 遥测/熔断与多屏管理）
 - **概览（Activities）**：`WINOME/src/overview*.cpp` + `app-index.cpp` + `app-grid.cpp`（搜索、分页应用网格、Dash Favorites、DWM 缩略图与跨桌面拖拽）
 - **St CSS 引擎复刻**：`WINOME/st-compat/`（libcroco + st-theme-node，去 Clutter/Cogl）
 - **隐藏/替换 Windows 原生界面**：`WINOME/src/`（`native-taskbar.cpp` + `win-event-hook.cpp`，独立实现，思路受 Seelen-UI 启发）
@@ -43,7 +43,7 @@
 
 | 方案 | 配置 | 构建目录 | 说明 |
 |------|------|----------|------|
-| `release` 生产 | release + LTO + NDEBUG | `WINOME/build-release/` | 最小体积、最快指令（约 1.9MB） |
+| `release` 生产 | release + LTO + NDEBUG | `WINOME/build-release/` | 最小体积、最快指令（约 2.2MB） |
 | `test` 测试 | debugoptimized | `WINOME/build/` | 项目默认，保留 `g_print` 诊断日志 |
 | `debug` 调试 | debug（-O0 -g） | `WINOME/build-debug/` | GDB 友好 |
 
@@ -55,7 +55,8 @@
 # 运行单元测试与 CSS 转换测试
 meson test -C WINOME/build --print-errorlogs
 
-# 检查 C++ 源码中使用的样式类覆盖率
+# 检查 St → GTK4 属性覆盖与 C++ 源码样式类覆盖率
+python3 WINOME/tools/check-st-css-coverage.py WINOME/build/src/theme/gnome-shell-dark.css WINOME/build/src/theme/gnome-shell-gtk4.css
 python3 WINOME/tools/check-widget-classes.py WINOME/build/src/theme/gnome-shell-gtk4.css WINOME/src/*.cpp
 
 # 生成自包含便携目录与 zip 安装包（默认先执行 ./build.sh release，可传 --no-build 复用）
@@ -74,17 +75,19 @@ ninja -C build
 ## 当前状态
 
 - [x] 宿主进程骨架 + 置顶全宽顶栏（Activities 圆点 + 时钟 + 状态区图标 + 悬停/点击动画）
-- [x] 崩溃自愈与单实例 IPC：独立 `--watchdog` 看门狗、`--restore` 急救、`MiniDumpWriteDump` 转储、命名互斥体及 `--show-overview` / `--settings` / `--reload` / `--quit` 控制指令
+- [x] **崩溃自愈与双向控制总线**：独立 `--watchdog` 看门狗、`--restore` 急救、`MiniDumpWriteDump` 转储、命名互斥体、传统控制指令（`--show-overview` / `--settings` / `--reload` / `--quit`）及双向 Named Pipe IPC（`\\.\pipe\WINOME_Shell_IPC`、`--status`、`ping`/`status`/`desktop.*`/`notify`/`settings.open` 等 JSON 协议）
+- [x] **EndSession 60 秒确认弹窗与 DWM 窗口外观统一（可选）**：重启/关机/注销前弹出 GNOME `.modal-dialog` 60 秒倒计时确认弹窗（支持 `config.json` `end_session_confirm` 开关与 `Esc` 取消）；`window-theming.cpp` 提供零注入可选 `unify_dark_titlebars` 与 `unify_rounded_corners` 统一样式
 - [x] 隐藏原生任务栏、事件钩子防重现、系统托盘兼容层（`systray.cpp` 在顶栏状态区提供折叠/弹出式托盘图标与右键交互）
-- [x] **概览触发接入**（**Win 键**单按开合 `WINDOW_PICKER`、**550ms 内双击 Win 键**丝滑进阶至 `APP_GRID`、**左上角热角**触发，`Win+Tab` 打开开始菜单，其余 Win 组合键透传，均受 `config.json` 开关控制）
+- [x] **概览触发与工作区快捷键**：**Win 键**单按开合 `WINDOW_PICKER`、**550ms 内双击 Win 键**丝滑进阶至 `APP_GRID`、**左上角热角**（`WH_MOUSE_LL`，全屏隐藏时自动卸钩）、`Win+PageUp/PageDown` 切换工作区、`Win+Shift+PageUp/PageDown` 移动活动窗口到相邻工作区并跟随，`Win+Tab` 打开开始菜单，其余 Win 组合键透传，均受 `config.json` 开关控制
 - [x] 概览显示**最小化窗口**；面板与弹出窗位于概览之上；顶栏保留工作区；面板按显示器独立判断全屏自动隐藏；隐藏于 Alt-Tab（`WS_EX_TOOLWINDOW`）
 - [x] 多显示器与事件驱动：多屏顶栏/工作区、`WM_DISPLAYCHANGE` / `WM_DPICHANGED` / `WM_SETTINGCHANGE` / `WTSRegisterSessionNotification` 响应，WASAPI 音量与 `WlanRegisterNotification` 事件驱动更新
 - [x] **快速设置与视觉对齐**：电量/电源模式/电源动作（含 `SE_SHUTDOWN_NAME` 与 Quit WINOME）、WASAPI 音量与静音、WMI/DXVA2 屏幕亮度、Wlan 枚举与加密网络模态密码弹窗连接、WinRT 蓝牙设备切换、深色主题/勿扰/夜间模式/飞行模式；内置 GNOME symbolic SVG 图标并复刻 `QuickToggleMenu` 两阶段居中展开抽屉动效
 - [x] 日期与通知中心：双栏 DateMenu（SMTC 媒体控制卡片 + Windows 通知列表 + 勿扰联动与日历）、实时桌面通知横幅与上游对齐空状态/今日圆点样式
 - [x] **Activities 概览完全体**：`ControlsState` 三态（`HIDDEN` / `WINDOW_PICKER` / `APP_GRID`）统一打断过渡与预热、`Ctrl+F`/直输搜索（`.lnk` + `FOLDERID_AppsFolder` UWP 应用与打开窗口）、Dash Favorites 持久化/右键菜单、1024 条 `GdkTexture` 高清图标 LRU 缓存与 `WinomeAppIcon` GPU 三线性缩放、宿主内分页应用网格与右键 AppMenu、窗口中键关闭、拖拽窗口缩略图跨桌面移动及 `+`/`×` 新建/删除虚拟桌面
 - [x] **Windows 虚拟桌面兼容**：基于 `RtlGetVersion` 区分 Win11 22621 / 24H2+ COM 接口槽位表（支持查询、切换、固定、移动窗口与创建/移除桌面）
-- [x] 配置、多语言与原生地设置页：`%LOCALAPPDATA%\WINOME\config.json` 热重载、`i18n.cpp` 多语言、深色 Adwaita GTK4 设置窗口
-- [x] 自动化测试、CI 与便携打包：`meson test` 单元测试（`winome:unit-tests`）与 CSS 转换测试（`winome:css-converter`）、`check-widget-classes.py` 样式检查、GitHub Actions CI（`.github/workflows/ci.yml`）及 `WINOME/package.sh` 自包含便携包
+- [x] **事件驱动架构、性能遥测与熔断健康度**：消除 `hot-corner` / `overview` / `shell-panel` / `ws-osd` 轮询定时器；`fullscreen-watcher` 接入 `EVENT_SYSTEM_MINIMIZEEND` 与 `SPI_SETWORKAREA`；隔离 `FcConfigCreate()` Fontconfig 映射、壁纸按屏缩放与 15s 闲置 `app_icon_cache_trim`；修复 `vd` 与 `WinRT` 超时栈 UAF，在 `Settings -> Diagnostics` 与 `--status` 实时暴露遥测及子系统熔断状态
+- [x] 配置、多语言与原生地设置页：`%LOCALAPPDATA%\WINOME\config.json` 热重载、`i18n.cpp` 多语言、深色 Adwaita GTK4 设置窗口（含外观统一开关与 `Diagnostics` 诊断页）
+- [x] 自动化测试、CI 与便携打包：`meson test` 单元测试（`winome:unit-tests`）与 CSS 转换测试（`winome:css-converter`）、`check-st-css-coverage.py` / `check-widget-classes.py` 样式检查、GitHub Actions CI（`.github/workflows/ci.yml`）及 `WINOME/package.sh` 自包含便携包
 
 ## 快捷键与交互
 
@@ -93,9 +96,11 @@ ninja -C build
 | **Win**（单独按下松开） | 打开/关闭概览（`WINDOW_PICKER`）；打开后 **550ms 内再次按下 Win** 丝滑切换至应用网格（`APP_GRID`） |
 | **鼠标移到左上角热角** | 打开概览 |
 | **Win+Tab** | 打开开始菜单 |
+| **Win+PageUp / PageDown** | 切换到上一个 / 下一个虚拟桌面 |
+| **Win+Shift+PageUp / PageDown** | 将当前活动窗口移动到相邻虚拟桌面并跟随切换 |
 | **Win+E / Win+R / Win+D …** | 透传给 Windows（组合键保留） |
 | **Win+Alt+Tab** | 任务视图（透传） |
-| **Win+Ctrl+←/→** | 切换虚拟桌面（透传；概览打开时自动跟随重排） |
+| **Win+Ctrl+←/→ / D / F4** | 原生虚拟桌面快捷键（透传；同时触发集中式 VD 观察者即时同步） |
 | **Alt+Tab** | 切换窗口（透传，切换器不被抑制） |
 | **Ctrl+F**（概览内） | 聚焦概览搜索框 |
 | **Ctrl+Shift+N**（概览内） | 新建虚拟桌面 |

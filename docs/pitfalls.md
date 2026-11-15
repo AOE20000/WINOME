@@ -15,7 +15,10 @@
 7. **无 GTK 主题环境下控件自绘**：`GtkScale` 等依赖系统 GTK 主题的控件在本环境会退化失效，使用自绘（如 `WinomeQuickSlider`）而非尝试更换 GTK 主题。
 8. **按钮必须关闭点击聚焦**：`gtk_widget_set_focus_on_click(FALSE)`，避免 `:focus` 与 `:hover` 共用高亮导致点击后高亮粘滞。
 9. **高频路径重绘守卫**：图标刷新前检查名称是否变化（`set_icon_name_if_changed`）；纯透明度渐变帧跳过 `gtk_fixed_move`，避免触发无意义容器 relayout。
-10. **启动关键路径避开 COM**：VD 首次枚举延后 2s、壳层窗口 pin 延后 3s，防止低完整性下 explorer RPC 死锁卡住启动。
+10. **启动关键路径避开 COM**：VD 首次枚举延后 1.5s–2s、壳层窗口 pin 延后 3s，防止低完整性下 explorer RPC 死锁卡住启动。
+11. **异步超时任务禁止捕获栈引用**：带超时的后台任务（如 `winrt-bridge.cpp`、8s 超时的 `virtual-desktop.cpp`）若主线程先返回，栈引用立即悬空——状态/任务体必须使用 `std::shared_ptr` 托管。
+12. **键盘钩子禁止同步调用 Explorer COM**：`WH_KEYBOARD_LL` 超时会触发 Windows 自动摘钩；`Win(+Shift)+PageUp/PageDown` 等跨桌面快捷键必须投递到持久化 `HotkeyWorker` 线程异步执行。
+13. **避免已弃用 GTK4 纹理 API**：GTK 4.10+ 在 `warning_level=2` 下会对 `gdk_texture_new_for_pixbuf` 触发 `-Wdeprecated-declarations`，解码像素应直接使用 `gdk_pixbuf_get_pixels` + `g_bytes_new` + `gdk_memory_texture_new`。
 
 ---
 
@@ -28,6 +31,7 @@
 - **WLAN 同名 BSSID 去重与扫描缓存**：Windows 按 BSSID 返回多行，需按 SSID 合并保留最强信号；可见网络列表受 Windows 驱动扫描缓存影响，有时仅返回当前 AP 的若干 BSSID，每次打开菜单重新扫描即可。
 - **PowrProf 方案 GUID 与头文件**：节能 `a1841308…`、均衡 `381b4222…`（Win11 另有随机化均衡 GUID `b9a9a03a…`）、性能 `8c5e7fda…`；`PowerEnumerate` 首参 `HKEY` 传 `NULL`、枚举标志用 `ACCESS_SCHEME`；`PowerGetActiveScheme(HKEY, GUID**)` 位于 `powersetting.h`，返回的 GUID 需 `LocalFree`。
 - **检查 Win32 `BOOL` 返回值**：`ExitWindowsEx`、`SetSuspendState` 等操作受会话权限与电源策略限制，务必检查返回状态。
+- **UAC 清单对 CLI 子命令的影响**：由于 `winome.exe` 清单声明 `requireAdministrator`，非提权控制台直接启动 `winome.exe --status` 会触发 UAC 提权错误；运行时诊断可从已提权终端查询，或直接连接 `\\.\pipe\WINOME_Shell_IPC` 进行 IPC 通信。
 
 ---
 

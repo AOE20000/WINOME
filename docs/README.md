@@ -28,6 +28,7 @@
    - 虚拟桌面 COM 与窗口移动/创建/关闭 → `WINOME/src/virtual-desktop.cpp`
    - 系统数据源 → `WINOME/src/system-status.cpp`、`wifi-networks.cpp`、`power-modes.cpp`
    - 配置、国际化与设置窗口 → `WINOME/src/config.cpp`、`i18n.cpp`、`settings-window.cpp`
+   - 宿主通信、会话弹窗与窗口统一样式 → `WINOME/src/shell-ipc.cpp`、`end-session-dialog.cpp`、`window-theming.cpp`、`perf-metrics.cpp`
 4. **构建清单同步**：新增源码文件必须同步加入 [WINOME/src/meson.build](../WINOME/src/meson.build) 的 `winome_sources`；引入新的 Win32 系统库须同步添加 `cc.find_library(...)`。
 5. **状态清单单一事实源**：功能完成状态统一维护在根目录 [README.md](../README.md)，避免多处 README 各自维护导致漂移。
-6. **数据刷新模型**：WASAPI 音量与 `WlanRegisterNotification` Wi-Fi 采用事件驱动回调，显示器/DPI/会话切换响应 OS 广播消息；轻量轮询仅保留在低开销巡检场景（`fullscreen-watcher` `400ms`、左上角热角 `100ms`）。
+6. **数据刷新模型**：WASAPI 音量、`WlanRegisterNotification` Wi-Fi、显示器/DPI/工作区（`SPI_SETWORKAREA`）与最小化结束（`EVENT_SYSTEM_MINIMIZEEND`）、以及热角（`WH_MOUSE_LL`，全屏隐藏时自动卸钩）均采用事件驱动回调；虚拟桌面通过单一共享 WinEvent + 快捷键提示 + `1.5s` 安全校对器广播同步；通知中心后台可 join 工作线程按活动/闲置自适应间隔（`2s`/`6s`）同步；全屏巡检与 z-order 兜底周期放宽至 `10s`。

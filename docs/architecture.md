@@ -6,11 +6,11 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 
 ## 1. 宿主启动、自愈与退出流程（`src/main.cpp`）
 
-1. **CLI 与自愈入口**：支持 `--restore`（恢复原任务栏与工作区后立即退出）、`--watchdog <pid>`（轻量监听主进程意外退出并自动按 `recovery.dat` 还原桌面），以及单实例控制指令 `--show-overview`、`--settings`、`--reload`、`--quit`（通过隐藏控制窗类 `WINOME_ControlWindow` 投递消息）。
-2. **单实例、配置与日志**：通过互斥体 `Local\WINOME_Shell_SingleInstance` 保证单实例；加载 `%LOCALAPPDATA%\WINOME\config.json`（`src/config.cpp`）与 i18n（`src/i18n.cpp`）；`setup_log_file()` 将 stdout / stderr 重定向至 `%LOCALAPPDATA%\WINOME\winome.log`（超过 5MB 自动轮转为 `winome.prev.log`）；注册 `SetUnhandledExceptionFilter` 生成 MiniDump 到 `crashes\` 并响应 `WM_QUERYENDSESSION` / `WM_ENDSESSION`。
-3. **系统接入**：启用 Per-Monitor DPI Awareness v2（`src/host-utils.cpp`），尝试 `SeTcbPrivilege`，隐藏原生任务栏（`src/native-taskbar.cpp`），启动事件钩子（`src/win-event-hook.cpp`）与可配置的全局键盘钩子（`src/overview-trigger.cpp`）。
-4. **多屏面板与概览**：创建主屏顶栏面板及副屏精简顶栏（`src/shell-panel.cpp`、`src/monitor-manager.cpp`），按各显示器独立保留工作区，初始化概览、全屏监视器（`src/fullscreen-watcher.cpp`）、左上角热角（`src/hot-corner.cpp`）、系统托盘采集（`src/systray.cpp`）与通知横幅服务（`src/notifications.cpp`）。
-5. **延迟初始化与退出清理**：虚拟桌面 COM 延后至主循环启动后初始化并固定自身全部顶层窗；正常退出（`on_shutdown`）释放 `app_icon_cache_clear()`、撤销钩子并收拢工作线程、恢复工作区与原生任务栏并清理 `recovery.dat`。
+1. **CLI 与双向 IPC 入口**：支持 `--restore`（恢复原任务栏与工作区后立即退出）、`--watchdog <pid>`（轻量监听主进程意外退出并自动按 `recovery.dat` 还原桌面）、`--status`（经 Named Pipe 查询运行中宿主遥测与健康状态 JSON），以及单实例控制指令 `--show-overview`、`--settings`、`--reload`、`--quit`（通过隐藏控制窗类 `WINOME_ControlWindow` 投递）；`src/shell-ipc.{h,cpp}` 提供双向 Named Pipe IPC 服务端（`\\.\pipe\WINOME_Shell_IPC`），支持 `ping`、`status`、`overview.*`、`desktop.*`、`settings.open`、`config.*`、`notify` 与 `quit` JSON 指令。
+2. **单实例、配置、遥测与日志**：通过互斥体 `Local\WINOME_Shell_SingleInstance` 保证单实例；加载 `%LOCALAPPDATA%\WINOME\config.json`（`src/config.cpp`）与 i18n（`src/i18n.cpp`）；`src/perf-metrics.{h,cpp}` 统计各阶段启动耗时、进程工作集/私有提交与 GDI/USER 句柄，并维护子系统 ABI 健康与熔断器（`SubsystemId` / `CapabilityState`）；`setup_log_file()` 将 stdout / stderr 重定向至 `%LOCALAPPDATA%\WINOME\winome.log`（超过 5MB 自动轮转为 `winome.prev.log`）；注册 `SetUnhandledExceptionFilter` 生成 MiniDump 到 `crashes\` 并响应 `WM_QUERYENDSESSION` / `WM_ENDSESSION`。
+3. **系统接入**：启用 Per-Monitor DPI Awareness v2（`src/host-utils.cpp`），尝试 `SeTcbPrivilege`，隐藏原生任务栏（`src/native-taskbar.cpp`），启动事件钩子（`src/win-event-hook.cpp`）、可选零注入 DWM 窗口外观统一（`src/window-theming.{h,cpp}`）与全局键盘钩子（`src/overview-trigger.cpp`）。
+4. **多屏面板、弹窗与概览**：创建主屏顶栏面板及副屏精简顶栏（`src/shell-panel.cpp`、`src/monitor-manager.cpp`），按各显示器独立保留工作区；接入 60 秒倒计时会话结束确认弹窗（`src/end-session-dialog.{h,cpp}`）、概览、全屏监视器（`src/fullscreen-watcher.cpp`）、`WH_MOUSE_LL` 左上角热角（`src/hot-corner.cpp`）、系统托盘采集（`src/systray.cpp`）与事件/自适应工作线程通知服务（`src/notifications.cpp`）。
+5. **延迟初始化与退出清理**：虚拟桌面 COM 延后至主循环启动后初始化并固定自身全部顶层窗；正常退出（`on_shutdown`）依次停止 `ipc_server_stop()`、关闭设置窗与会话确认弹窗、释放 `window_theming_shutdown()` 与 `app_icon_cache_clear()`、撤销钩子并收拢工作线程、恢复工作区与原生任务栏并清理 `recovery.dat`。
 
 ---
 
@@ -21,13 +21,14 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 - 吞掉单独的 `Win` `WM_KEYDOWN`，阻止系统直接弹出开始菜单；若在 `WM_KEYUP` 判定为裸 `Win` 按下松开：
   - 概览未打开时记录时间戳并打开概览（`WINDOW_PICKER`）；
   - 概览正在打开或处于 `WINDOW_PICKER` 且 **550ms 内再次按下裸 `Win`** 时，调用 `overview_can_shift_to_app_grid()` + `overview_shift_to_app_grid_async()` 丝滑打断过渡到 `APP_GRID`；其余情况关闭概览。
-- 若期间检测到与其他键组合，重新注入带 `dwExtraInfo` 标记的 `Win` 键，让系统照常处理 `Win+E`、`Win+R`、`Win+D`、`Win+Ctrl+←/→`、`Win+Alt+Tab` 等组合键。
+- `Win+PageUp` / `Win+PageDown` 切换到相邻虚拟桌面；`Win+Shift+PageUp` / `Win+Shift+PageDown` 将当前前景应用窗口移动到相邻桌面并跟随切换（均投递给持久化 `HotkeyWorker` 后台线程异步执行，绝不阻塞 `WH_KEYBOARD_LL`）。
+- 若期间检测到与其他键组合，重新注入带 `dwExtraInfo` 标记的 `Win` 键，让系统照常处理 `Win+E`、`Win+R`、`Win+D`、`Win+Ctrl+←/→/D/F4`（同步发送 `vd::notify_change_hint_async()` 触发立即刷新）、`Win+Alt+Tab` 等组合键。
 - `Win+Tab` 通过 `SendInput` 合成带标记的裸 `Win` 键打开开始菜单。
 - `Esc` 在概览激活时关闭概览。
 
 ### 左上角热角（`src/hot-corner.cpp`）
 
-每 `100ms` 轮询鼠标坐标，进入主显示器左上角热角时打开概览（带 `2s` 冷却；面板全屏隐藏时热角不触发）。
+独立线程监听 `WH_MOUSE_LL` 指针坐标，进入主显示器左上角 `5px` 热角（纯函数 `hot_corner_hit_test` 校验）时打开概览（默认 `2s` 冷却）；当开关关闭或主屏面板因全屏隐藏（`hot_corner_set_suppressed(true)`）时自动摘除鼠标钩子，空闲与全屏游戏零开销。
 
 ---
 
@@ -57,15 +58,15 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 | `app-index.cpp` | `appSystem.js`, `appSearch.js` | 异步索引开始菜单 `.lnk` 与 `FOLDERID_AppsFolder`（UWP/Store/系统应用、`PKEY_AppUserModel_ID`）、规范化去重与排序搜索、Win32/UWP/管理员启动与定位、`IShellItemImageFactory` → `SHIL_JUMBO` → `PrivateExtractIconsW` → `SHGetFileInfoW` 高清图标提取、`1024` 条上限 `GdkTexture` LRU 缓存与后台线程安全 `RawDecodedIcon` 解码 |
 | `app-grid.cpp` | `appDisplay.js` | 宿主内分页应用网格（`.icon-grid` / `.overview-tile` / `WinomeAppIcon` + `GSK_SCALING_FILTER_TRILINEAR` / 按当前页优先的异步分批图标加载 / 结构缓存与 `app_grid_prewarm()` / `.app-grid-running-dot` 运行点指示 / 右键 AppMenu 上下文菜单与多窗口列表 / 滚轮与指示点翻页 / 响应式 6×4・5×3・4×3 排布） |
 | `overview-thumbs.cpp` | `workspaceThumbnail.js` | 虚拟桌面壁纸药丸行（支持拖拽落点高亮、仅 1 个桌面拖拽时自动展开 `[Desktop 1] [+]`、`+` 新建与悬停 `×`/中键关闭桌面、活动桌面指示器与迷你 DWM 预览） |
-| `ws-osd.cpp` | `workspaceSwitcherPopup.js` | 概览外 `Win+Ctrl+←/→` 切换桌面时，主屏底部中央（4em 边距）显示圆点 OSD（100ms EASE_OUT_QUAD 淡入 → 600ms 常驻 → 100ms 淡出，连续切换重置计时） |
+| `ws-osd.cpp` | `workspaceSwitcherPopup.js` | 概览外切换桌面时，通过 `vd::add_change_listener()` 在主屏底部中央显示圆点 OSD（100ms EASE_OUT_QUAD 淡入 → 600ms 常驻 → 100ms 淡出，连续切换重置计时） |
 
 ### 关键实现细节
 
-- **统一三态开合与打断过渡**：`ControlsState` 驱动 `HIDDEN ↔ WINDOW_PICKER ↔ APP_GRID` 在 `250ms` 帧时钟动画内无缝互转或中途打断（打开概览时提前调用 `app_grid_prewarm()` 预建/预解码当前页图标）；窗口以 `gtk_window_fullscreen` 创建保持 surface 与显示器一致；布局 idle 使用 `G_PRIORITY_HIGH_IDLE` 抢在首帧重绘前就绪，避免黑闪；关闭后保留控件几何以便重开首帧铺满壁纸。
+- **统一三态开合与打断过渡**：`ControlsState` 驱动 `HIDDEN ↔ WINDOW_PICKER ↔ APP_GRID` 在 `250ms` 帧时钟动画内无缝互转或中途打断（打开概览时提前调用 `app_grid_prewarm()` 预建/预解码当前页图标）；窗口以 `gtk_window_fullscreen` 创建保持 surface 与显示器一致；布局 idle 使用 `G_PRIORITY_HIGH_IDLE` 抢在首帧重绘前就绪，避免黑闪；关闭后保留控件几何并在闲置 `15s` 后自动执行 `app_icon_cache_trim(256)` + `shrink_to_fit()` 释放非热点纹理；壁纸解码按目标显示器缩放加载并改用非弃用的 `gdk_memory_texture_new`。
 - **最小化窗口**：使用 `GetWindowPlacement().rcNormalPosition` 作为原矩形并按恢复矩形归属显示器，避免 `GetWindowRect` 返回离屏坐标；开合动画从工作区角落展开并淡入；点击激活时先 `SW_RESTORE` 再 `SetForegroundWindow`。
 - **排除自身窗口**：枚举窗口时用 `is_our_process()` 过滤本进程所有窗口（面板、弹出窗、概览与 chrome 窗口）。
 - **悬停 chrome 独立顶层窗**：因为 DWM 缩略图合成在窗口自绘内容之上，关闭按钮（32px）与应用图标（64px，`WM_GETICON` / `IShellItemImageFactory`）置于独立透明顶层窗（`WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST`）浮于缩略图之上，指针离开 `750ms` 后淡出；关闭按钮发送 `WM_CLOSE` 并触发重排。
-- **工作区切换动画**（`switch_workspace_animated`）：概览内切换桌面时，旧桌面缩略图移入离场组，与新桌面同步横向滑动（`250ms EASE_OUT_CUBIC`），背景盒随行平移，缩略图指示器连续插值滑动；外部切换由 400ms 轮询跟随重排。
+- **工作区切换动画与事件同步**（`switch_workspace_animated`）：概览内切换桌面时，旧桌面缩略图移入离场组，与新桌面同步横向滑动（`250ms EASE_OUT_CUBIC`），背景盒随行平移，缩略图指示器连续插值滑动；概览、`shell-panel` 与 `ws-osd` 统一订阅 `vd::add_change_listener()`，不再各自维持定时器轮询。
 
 ---
 
@@ -75,7 +76,7 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 
 - **接口获取**：`CoIncrementMTAUsage` → `CLSID_ImmersiveShell` → `QueryService` 获取 `IVirtualDesktopManagerInternal`（枚举/切换/移动/增删）与 `IVirtualDesktopManager`（窗口归属）。
 - **版本感知槽位表（`VtableProfile`）**：通过 `ntdll!RtlGetVersion` 读取 OS Build 号并由 `vtable_slots_for_build()` 动态绑定 Win11 `22621..25999` 与 `26100+`（24H2，slot 10 起偏移 `+1`）的方法槽位；`< 22621` 安全跳过创建/删除与内部视图调用。提供 `move_window_to_desktop()`、`create_desktop()`、`remove_desktop()` 与 `unpin_window()`，全部基于索引与 `IApplicationViewCollection` / `GetAt()` 执行。
-- **调用顺序与稳定保护**：枚举优先于 `GetCurrentDesktop`；全部 COM 调用经裸函数指针（防 GCC LTO 去虚拟化）并在专用工作线程带 `8s` 超时顺序执行，异常或超时后平滑降级单工作区布局。
+- **调用顺序、稳定保护与集中式观察者**：枚举优先于 `GetCurrentDesktop`；全部 COM 调用经裸函数指针（防 GCC LTO 去虚拟化）并在专用工作线程（`std::shared_ptr<Job>` 防超时竞态销毁）带 `8s` 超时顺序执行，异常或超时触发 `SubsystemId::VirtualDesktop` 熔断器并平滑降级单工作区布局；内置单一共享 `EVENT_SYSTEM_DESKTOPSWITCH` + 热键提示 + `1.5s` 安全校对器广播变更给订阅者。
 - **跨桌面固定（`pin_window`）**：通过 `IVirtualDesktopPinnedApps`（IID `4CE81583`）与 `IApplicationViewCollection`（IID `1841C6D7`）将壳层全部窗口固定到所有桌面。
 
 ---
@@ -84,12 +85,12 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 
 | 模块 | 实现机制 | 备注与降级策略 |
 |------|----------|----------------|
-| **Wi-Fi**（`src/wifi-networks.cpp`） | 运行时加载 `wlanapi.dll`，进程常驻 `WlanOpenHandle` 并注册 `WlanRegisterNotification` 事件通知 | 无网卡或缺失 `wlanapi.dll` 时安静降级；支持异步扫描、BSSID 信号合并、已存 Profile 与内嵌密码输入生成 WLAN XML 连接、断开网络 |
+| **Wi-Fi**（`src/wifi-networks.cpp`） | 运行时加载 `wlanapi.dll`，进程常驻 `WlanOpenHandle` 并注册 `WlanRegisterNotification` 事件通知 | 无网卡或缺失 `wlanapi.dll` 时触发状态报告并安静降级；支持异步扫描、BSSID 信号合并、已存 Profile 与内嵌密码输入生成 WLAN XML 连接、断开网络 |
 | **电源模式**（`src/power-modes.cpp`） | `PowrProf` + `powersetting.h` 枚举并切换节能 / 均衡（含 Win11 GUID）/ 性能 | `PowerEnumerate` 探测缺失的方案不显示；无法识别时副标题回退显示均衡 |
-| **系统状态**（`src/system-status.cpp`） | 电量 `GetSystemPowerStatus`、音量 WASAPI `IAudioEndpointVolumeCallback`（事件驱动与静音切换）、屏幕亮度 WMI (`ROOT\WMI`) + `dxva2.dll` DDC/CI、电源操作自动申请 `SE_SHUTDOWN_NAME` | 外接显示器/台式机无物理亮度调节能力时动态隐藏亮度滑块行 |
-| **WinRT 与通知中心**（`src/winrt-bridge.cpp`、`src/notifications.cpp`、`src/calendar.cpp`） | 异步探测并桥接 Windows Radio（蓝牙开关/已配对列表）、SMTC 媒体控制与 `UserNotificationListener` | 在顶栏弹出双栏 DateMenu（SMTC 媒体卡片 + 通知列表/勿扰开关 + 日历）并在非勿扰/非全屏下显示顶部通知横幅 |
-| **系统托盘**（`src/systray.cpp`） | 代理提取 Windows 系统托盘常驻图标与文本提示并在面板状态区弹出展示 | 支持点击与右键消息转发，唤起第三方托盘程序窗口或菜单 |
-| **多屏、配置与设置**（`src/monitor-manager.cpp`、`src/config.cpp`、`src/i18n.cpp`、`src/settings-window.cpp`） | `EnumDisplayMonitors` 管理多屏面板与 DPI 变化；`%LOCALAPPDATA%\WINOME\config.json` 热重载；深色 Adwaita GTK4 设置窗（深色标题栏与设置页卡片） | 支持单/全屏顶栏策略、热角与 Win 键策略、时钟/电量选项与桌面重启自恢复 |
+| **系统状态与会话弹窗**（`src/system-status.cpp`、`src/end-session-dialog.cpp`） | 电量 `GetSystemPowerStatus`、音量 WASAPI `IAudioEndpointVolumeCallback`（事件驱动与静音切换）、屏幕亮度 WMI (`ROOT\WMI`) + `dxva2.dll` DDC/CI、电源操作自动申请 `SE_SHUTDOWN_NAME` | 外接显示器/台式机无物理亮度调节能力时动态隐藏亮度滑块行；Restart / Power Off / Log Out 在 `end_session_confirm` 开启时先显示 GNOME `.modal-dialog` 60 秒确认弹窗 |
+| **WinRT 与通知中心**（`src/winrt-bridge.cpp`、`src/notifications.cpp`、`src/calendar.cpp`） | 异步探测并桥接 Windows Radio（蓝牙开关/已配对列表）、SMTC 媒体控制与 `UserNotificationListener`（`std::shared_ptr<State>` 防超时 UAF、`60s` 拒绝冷却、`NotifWorker` 可 join 单线程 `2s`/`6s` 自适应刷新） | 在顶栏弹出双栏 DateMenu（SMTC 媒体卡片 + 通知列表/勿扰开关 + 日历）并在非勿扰/非全屏下显示顶部通知横幅 |
+| **系统托盘**（`src/systray.cpp`） | 代理提取 Windows 系统托盘常驻图标与文本提示并在面板状态区弹出展示 | 支持点击与右键消息转发；探测异常时报告至子系统健康度 |
+| **多屏、外观统一、配置与设置**（`src/monitor-manager.cpp`、`src/window-theming.cpp`、`src/config.cpp`、`src/i18n.cpp`、`src/settings-window.cpp`） | `EnumDisplayMonitors` 与 `SPI_SETWORKAREA`（`on_workarea_changed`）管理多屏面板与 DPI 变化；`window-theming` 通过 `SetWinEventHook` 零注入应用 DWM 暗色标题栏/圆角（默认关闭）；`%LOCALAPPDATA%\WINOME\config.json` 热重载；深色 Adwaita GTK4 设置窗 | 支持单/全屏顶栏策略、热角与 Win 键策略、可选窗口外观统一、时钟/电量选项、`Diagnostics` 遥测页与桌面重启自恢复 |
 
 ---
 
@@ -97,13 +98,13 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 
 ### 性能优化措施
 
-- **动画走帧时钟**：概览开合、悬停 chrome、菜单开合均使用 `gtk_widget_add_tick_callback`（对齐显示器 vblank），空闲零开销。
-- **z-order 漂移门控**：`fullscreen-watcher` 每 `400ms` 先用 `GetWindow(GW_HWNDPREV)` 校验 `popover > panel > chrome > overview` 链，链路完整则直接跳过 `SetWindowPos`，消除无意义的 `WM_NCCALCSIZE` 往返。
-- **重绘守卫**：状态图标使用 `set_icon_name_if_changed` 避免相同图标名触发重绘节点失效；悬停标题药丸在纯淡入/淡出帧跳过 `gtk_fixed_move`。
-- **GPU 渲染与内存基线**：
+- **动画走帧时钟与帧预算监控**：概览开合、悬停 chrome、菜单开合均使用 `gtk_widget_add_tick_callback`（对齐显示器 vblank），`overview.cpp` 以 `FrameTimeTracker(20000)` 统计平均/P95/最大帧耗时与掉帧计数。
+- **z-order 漂移门控与事件化自愈**：`fullscreen-watcher` 接入 `EVENT_SYSTEM_MINIMIZEEND` 与工作区变更即时重断言，并将后台维护巡检 `maintenance_tick` 放宽至 `10s`；重断言前校验 `popover > panel > chrome > overview` 链，链路完整即跳过 `SetWindowPos`。
+- **隔离 Fontconfig 与空闲纹理收缩**：`fonts.cpp` 使用 `FcConfigCreate()` 隔离 Fontconfig 实例并加载捆绑字体与精选 CJK/Emoji 回退链（测试进程 `winome-tests` 测得 `57.8ms`–`58.3ms`，主宿主场景实测 `1226.1ms`）；概览关闭闲置 `15s` 后收敛图标缓存至 256 条并收缩桌面壁纸按屏解码，纯透明淡入跳过 `gtk_fixed_move`。
+- **GPU 渲染与产物基线**：
   - 关键窗口由 OpenGL（`GskGLRenderer` / `ngl`）硬件绘制，`[gpu]` 启动日志记录渲染器与 GL 厂商；
-  - **开发构建（`test`）**：约 `450MB`（Pango fontmap 枚举全系统约 290 族字体并在约 6s 后稳定驻留，属正常内存数据库占用而非泄漏）；
-  - **生产构建（`release` + LTO）**：约 `30MB`。
+  - **测试构建（`test` / `debugoptimized`）**：`winome.exe` 约 `17MB`；
+  - **生产构建（`release` + LTO + NDEBUG）**：`winome.exe` 约 `2.2MB`。
 
 ### 权限要求
 
