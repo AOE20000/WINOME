@@ -585,13 +585,47 @@ on_dash_menu_close_all (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 {
   auto *ctx = static_cast<DashMenuCtx *> (user_data);
   WinomeDash *self = ctx->self;
-  for (HWND hwnd : ctx->windows) {
-    if (IsWindow (hwnd))
-      PostMessageW (hwnd, WM_CLOSE, 0, 0);
-  }
+  std::vector<HWND> hwnds = ctx->windows;
   overview_dash_close_menu (GTK_WIDGET (self));
+  app_index_close_windows (hwnds);
   g_object_ref (self);
   g_timeout_add (140, deferred_notify_changed, self);
+}
+
+struct DashWindowCtx {
+  WinomeDash *self = nullptr;
+  HWND hwnd = nullptr;
+};
+
+void
+on_dash_menu_window (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
+{
+  auto *wctx = static_cast<DashWindowCtx *> (user_data);
+  WinomeDash *self = wctx->self;
+  HWND hwnd = wctx->hwnd;
+  overview_dash_close_menu (GTK_WIDGET (self));
+  if (app_index_activate_hwnd (hwnd))
+    close_overview ("dash-activate-window");
+}
+
+void
+on_dash_menu_location (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
+{
+  auto *ctx = static_cast<DashMenuCtx *> (user_data);
+  WinomeDash *self = ctx->self;
+  std::string app_id = ctx->app_id;
+  overview_dash_close_menu (GTK_WIDGET (self));
+  AppEntry entry;
+  if (app_index_find_by_id (app_id, &entry) && app_index_open_location (entry))
+    close_overview ("dash-open-location");
+}
+
+GtkWidget *
+make_dash_sep (void)
+{
+  GtkWidget *sep = gtk_separator_new (GTK_ORIENTATION_HORIZONTAL);
+  gtk_widget_add_css_class (sep, "popup-separator-menu-item");
+  return sep;
 }
 
 void
@@ -625,22 +659,66 @@ show_dash_context_menu (WinomeDash *self, int index)
       [] (gpointer p) { delete static_cast<DashMenuCtx *> (p); });
 
   bool is_running = !app.windows.empty ();
-  gtk_box_append (
-      GTK_BOX (box),
-      make_dash_menu_btn (is_running ? tr ("Show Window", "显示窗口")
-                                     : tr ("Open", "打开"),
-                          G_CALLBACK (on_dash_menu_activate), ctx));
+  AppEntry matched_entry;
+  bool has_entry = app_index_find_by_id (app.id, &matched_entry);
 
+  // Section 1 (upstream AppMenu): open window list when running.
   if (is_running) {
-    AppEntry tmp;
-    if (!app.exe_path.empty () || app_index_find_by_id (app.id, &tmp)) {
+    GtkWidget *hdr = gtk_label_new (tr ("Open Windows", "打开的窗口"));
+    gtk_label_set_xalign (GTK_LABEL (hdr), 0.0f);
+    gtk_widget_add_css_class (hdr, "popup-menu-item");
+    gtk_widget_add_css_class (hdr, "popup-inactive-menu-item");
+    gtk_widget_set_sensitive (hdr, FALSE);
+    gtk_box_append (GTK_BOX (box), hdr);
+
+    int shown = 0;
+    for (HWND hwnd : app.windows) {
+      if (!IsWindow (hwnd) || shown >= 8)
+        continue;
+      wchar_t wtitle[256] = L"";
+      GetWindowTextW (hwnd, wtitle, 256);
+      std::string title = app_wide_to_utf8 (wtitle);
+      if (title.empty ())
+        title = app.name;
+      auto *wctx = new DashWindowCtx{self, hwnd};
+      GtkWidget *wbtn = gtk_button_new_with_label (title.c_str ());
+      gtk_widget_set_name (wbtn, "winome-dash-ctx-item");
+      gtk_widget_add_css_class (wbtn, "popup-menu-item");
+      GtkWidget *lbl = gtk_button_get_child (GTK_BUTTON (wbtn));
+      if (GTK_IS_LABEL (lbl)) {
+        gtk_label_set_xalign (GTK_LABEL (lbl), 0.0f);
+        gtk_label_set_max_width_chars (GTK_LABEL (lbl), 30);
+        gtk_label_set_ellipsize (GTK_LABEL (lbl), PANGO_ELLIPSIZE_END);
+      }
+      g_object_set_data_full (
+          G_OBJECT (wbtn), "winome-dash-win-ctx", wctx,
+          [] (gpointer p) { delete static_cast<DashWindowCtx *> (p); });
+      g_signal_connect (wbtn, "clicked", G_CALLBACK (on_dash_menu_window),
+                        wctx);
+      gtk_box_append (GTK_BOX (box), wbtn);
+      ++shown;
+    }
+    gtk_box_append (GTK_BOX (box), make_dash_sep ());
+  }
+
+  // Section 2: New Window / Open.
+  if (is_running) {
+    if (!app.exe_path.empty () || has_entry) {
       gtk_box_append (
           GTK_BOX (box),
           make_dash_menu_btn (tr ("New Window", "新建窗口"),
                               G_CALLBACK (on_dash_menu_new_window), ctx));
+      gtk_box_append (GTK_BOX (box), make_dash_sep ());
     }
+  } else {
+    gtk_box_append (
+        GTK_BOX (box),
+        make_dash_menu_btn (tr ("Open", "打开"),
+                            G_CALLBACK (on_dash_menu_activate), ctx));
+    gtk_box_append (GTK_BOX (box), make_dash_sep ());
   }
 
+  // Section 3: Pin / Unpin & Open File Location.
   WinomeConfig cfg = get_config ();
   bool pinned = app.pinned || is_app_id_pinned (cfg.pinned_apps, app.id);
   gtk_box_append (
@@ -649,10 +727,22 @@ show_dash_context_menu (WinomeDash *self, int index)
                                  : tr ("Pin to Dash", "固定到程序坞"),
                           G_CALLBACK (on_dash_menu_toggle_pin), ctx));
 
-  if (is_running) {
+  if (has_entry && !matched_entry.is_uwp &&
+      (!matched_entry.target_exe.empty () ||
+       (!matched_entry.launch_path.empty () &&
+        matched_entry.launch_path.rfind (L"shell:", 0) != 0))) {
     gtk_box_append (
         GTK_BOX (box),
-        make_dash_menu_btn (tr ("Close All Windows", "关闭全部窗口"),
+        make_dash_menu_btn (tr ("Open File Location", "打开文件所在位置"),
+                            G_CALLBACK (on_dash_menu_location), ctx));
+  }
+
+  // Section 4: Quit (close all windows) when running.
+  if (is_running) {
+    gtk_box_append (GTK_BOX (box), make_dash_sep ());
+    gtk_box_append (
+        GTK_BOX (box),
+        make_dash_menu_btn (tr ("Quit", "退出"),
                             G_CALLBACK (on_dash_menu_close_all), ctx));
   }
 

@@ -464,6 +464,110 @@ void test_app_index_and_lru_cache() {
   CHECK(winome::app_icon_cache_count() == 0);
 }
 
+void test_app_grid_and_running_window_matching() {
+  // 1. match_entry_running_windows: AUMID match, multi-PWA isolation, exe fallback, and FrameHost guard.
+  winome::AppEntry pwa_mail;
+  pwa_mail.id = "msedge.mail.aumid";
+  pwa_mail.aumid = L"MSEdge.Mail.AUMID";
+  pwa_mail.target_exe = L"C:\\Program Files\\Edge\\msedge_proxy.exe";
+
+  winome::AppEntry desktop_app;
+  desktop_app.id = "c:\\tools\\editor.exe";
+  desktop_app.target_exe = L"C:\\Tools\\Editor.exe";
+
+  winome::AppEntry uwp_calc;
+  uwp_calc.id = "microsoft.windowscalculator_8wekyb3d8bbwe!app";
+  uwp_calc.aumid = L"Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
+  uwp_calc.target_exe = L"C:\\Windows\\System32\\ApplicationFrameHost.exe";
+  uwp_calc.is_uwp = true;
+
+  winome::RunningWindow w_mail;
+  w_mail.hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(0x1001));
+  w_mail.title = "Mail PWA";
+  w_mail.canonical_id = "msedge.mail.aumid";
+  w_mail.aumid_norm = "msedge.mail.aumid";
+  w_mail.exe_norm = "c:\\program files\\edge\\msedge_proxy.exe";
+  w_mail.exe_base_lower = "msedge_proxy.exe";
+
+  winome::RunningWindow w_calendar;
+  w_calendar.hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(0x1002));
+  w_calendar.title = "Calendar PWA";
+  w_calendar.canonical_id = "msedge.calendar.aumid";
+  w_calendar.aumid_norm = "msedge.calendar.aumid";
+  w_calendar.exe_norm = "c:\\program files\\edge\\msedge_proxy.exe";
+  w_calendar.exe_base_lower = "msedge_proxy.exe";
+
+  winome::RunningWindow w_editor;
+  w_editor.hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(0x1003));
+  w_editor.title = "Editor";
+  w_editor.canonical_id = "c:\\tools\\editor.exe";
+  w_editor.exe_norm = "c:\\tools\\editor.exe";
+  w_editor.exe_base_lower = "editor.exe";
+
+  winome::RunningWindow w_other_uwp;
+  w_other_uwp.hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(0x1004));
+  w_other_uwp.title = "Photos";
+  w_other_uwp.canonical_id = "c:\\windows\\system32\\applicationframehost.exe";
+  w_other_uwp.aumid_norm = "";
+  w_other_uwp.exe_norm = "c:\\windows\\system32\\applicationframehost.exe";
+  w_other_uwp.exe_base_lower = "applicationframehost.exe";
+
+  winome::RunningWindow w_calc;
+  w_calc.hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(0x1005));
+  w_calc.title = "Calculator";
+  w_calc.canonical_id = "microsoft.windowscalculator_8wekyb3d8bbwe!app";
+  w_calc.aumid_norm = "microsoft.windowscalculator_8wekyb3d8bbwe!app";
+  w_calc.exe_norm = "c:\\windows\\system32\\applicationframehost.exe";
+  w_calc.exe_base_lower = "applicationframehost.exe";
+
+  std::vector<winome::RunningWindow> windows = {
+      w_mail, w_calendar, w_editor, w_other_uwp, w_calc};
+
+  auto mail_hits = winome::match_entry_running_windows(pwa_mail, windows);
+  CHECK(mail_hits.size() == 1 && mail_hits[0].title == "Mail PWA");
+
+  auto editor_hits = winome::match_entry_running_windows(desktop_app, windows);
+  CHECK(editor_hits.size() == 1 && editor_hits[0].title == "Editor");
+
+  auto calc_hits = winome::match_entry_running_windows(uwp_calc, windows);
+  CHECK(calc_hits.size() == 1 && calc_hits[0].title == "Calculator");
+
+  // 2. compute_app_grid_dimensions across desktop and portrait viewports.
+  auto d_xl = winome::compute_app_grid_dimensions(1320, 920);
+  CHECK(d_xl.cols == 6 && d_xl.rows == 4 && d_xl.icon_size == 96 &&
+        d_xl.page_size == 24);
+
+  auto d_md = winome::compute_app_grid_dimensions(1320, 670);
+  CHECK(d_md.cols == 6 && d_md.rows == 4 && d_md.icon_size == 72 &&
+        d_md.page_size == 24);
+
+  auto d_mid = winome::compute_app_grid_dimensions(1000, 560);
+  CHECK(d_mid.cols == 5 && d_mid.rows == 3 && d_mid.icon_size == 80 &&
+        d_mid.page_size == 15);
+
+  auto d_port = winome::compute_app_grid_dimensions(500, 760);
+  CHECK(d_port.cols == 4 && d_port.rows == 5 && d_port.icon_size == 56 &&
+        d_port.page_size == 20);
+
+  // 3. GTK4 AppGrid pagination, running refresh, and disposal lifecycle.
+  if (gtk_init_check()) {
+    GtkWidget* grid = winome::app_grid_new(nullptr, nullptr, nullptr);
+    CHECK(grid != nullptr);
+    if (grid != nullptr) {
+      g_object_ref_sink(grid);
+      winome::app_grid_set_query(grid, "");
+      winome::app_grid_rebuild(grid, 1320, 670);
+      winome::app_grid_last_page(grid);
+      winome::app_grid_first_page(grid);
+      winome::app_grid_next_page(grid);
+      winome::app_grid_prev_page(grid);
+      winome::app_grid_refresh_running(grid);
+      winome::app_grid_close_menu(grid);
+      g_object_unref(grid);
+    }
+  }
+}
+
 void test_app_grid_pagination() {
   CHECK(winome::compute_app_grid_page_count(0, 24) == 1);
   CHECK(winome::compute_app_grid_page_count(24, 24) == 1);
@@ -580,6 +684,7 @@ int main() {
   test_virtual_desktop_profiles();
   test_app_index_and_lru_cache();
   test_app_grid_pagination();
+  test_app_grid_and_running_window_matching();
   test_dash_favorites_and_thumbs_summary();
   test_st_engine_theme_metrics();
 

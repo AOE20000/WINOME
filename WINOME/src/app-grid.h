@@ -38,7 +38,10 @@ void app_grid_set_query (GtkWidget *grid, const std::string &query_lower);
 void app_grid_rebuild (GtkWidget *grid, int avail_w, int avail_h);
 void app_grid_next_page (GtkWidget *grid);
 void app_grid_prev_page (GtkWidget *grid);
+void app_grid_first_page (GtkWidget *grid);
+void app_grid_last_page (GtkWidget *grid);
 void app_grid_reset_page (GtkWidget *grid);
+void app_grid_refresh_running (GtkWidget *grid);
 bool app_grid_launch_first (GtkWidget *grid);
 void app_grid_close_menu (GtkWidget *grid);
 

@@ -4,11 +4,11 @@
 #include "app-grid.h"
 #include "app-index.h"
 #include "config.h"
-#include "easing.h"
 #include "i18n.h"
 #include "st-engine.h"
 
 #include <algorithm>
+#include <cmath>
 #include <new>
 #include <vector>
 
@@ -23,18 +23,25 @@ struct WinomeAppGrid {
   GtkWidget *prev_btn = nullptr;
   GtkWidget *next_btn = nullptr;
   GtkWidget *center_box = nullptr;
-  GtkWidget *grid = nullptr;
+  GtkWidget *pages_stack = nullptr;
   GtkWidget *empty_label = nullptr;
   GtkWidget *indicators_box = nullptr;
   GtkWidget *active_menu = nullptr;
+  GtkWidget *menu_tile = nullptr;
 
   std::string query_lower;
   std::vector<AppEntry> all_apps;
   std::vector<AppEntry> filtered;
+  std::vector<RunningWindow> running_windows;
+  std::vector<GtkWidget *> page_dots;
   int page = 0;
+  int total_pages = 1;
   int avail_w = 1000;
   int avail_h = 560;
   bool index_loaded = false;
+  bool can_scroll = true;
+  guint scroll_timer = 0;
+  guint refresh_timer = 0;
 
   void (*on_launch_done) (void *) = nullptr;
   void (*on_pins_changed) (void *) = nullptr;
@@ -55,7 +62,8 @@ struct TileActionCtx {
   AppEntry entry;
 };
 
-void rebuild_page_contents (WinomeAppGrid *self);
+void rebuild_all_pages (WinomeAppGrid *self);
+void update_running_dots_in_place (WinomeAppGrid *self);
 
 void
 clear_box_children (GtkWidget *box)
@@ -67,12 +75,25 @@ clear_box_children (GtkWidget *box)
 }
 
 void
-clear_grid_children (GtkWidget *grid)
+clear_stack_children (GtkWidget *stack)
 {
-  if (grid == nullptr)
+  if (stack == nullptr)
     return;
-  while (GtkWidget *child = gtk_widget_get_first_child (grid))
-    gtk_grid_remove (GTK_GRID (grid), child);
+  while (GtkWidget *child = gtk_widget_get_first_child (stack))
+    gtk_stack_remove (GTK_STACK (stack), child);
+}
+
+void
+clear_menu_tile_highlight (WinomeAppGrid *self)
+{
+  if (self == nullptr || self->menu_tile == nullptr)
+    return;
+  GtkWidget *tile = self->menu_tile;
+  g_object_remove_weak_pointer (G_OBJECT (tile),
+                                reinterpret_cast<gpointer *> (&self->menu_tile));
+  self->menu_tile = nullptr;
+  if (GTK_IS_WIDGET (tile))
+    gtk_widget_remove_css_class (tile, "checked");
 }
 
 WinomeAppGrid *
@@ -86,14 +107,27 @@ close_tile_menu_extract (gpointer user_data, AppEntry *out_entry)
   return self;
 }
 
+bool
+activate_or_launch_entry (const AppEntry &entry, bool force_new_window)
+{
+  if (!force_new_window) {
+    std::vector<RunningWindow> wins =
+        app_index_running_windows_for_entry (entry);
+    for (const RunningWindow &w : wins) {
+      if (app_index_activate_hwnd (w.hwnd))
+        return true;
+    }
+  }
+  return app_index_launch (entry, false);
+}
+
 void
 on_tile_action_launch (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 {
   AppEntry entry;
   WinomeAppGrid *self = close_tile_menu_extract (user_data, &entry);
-  if (app_index_launch (entry, false) && self->on_launch_done != nullptr) {
+  if (app_index_launch (entry, false) && self->on_launch_done != nullptr)
     self->on_launch_done (self->user_data);
-  }
 }
 
 void
@@ -101,9 +135,8 @@ on_tile_action_admin (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 {
   AppEntry entry;
   WinomeAppGrid *self = close_tile_menu_extract (user_data, &entry);
-  if (app_index_launch (entry, true) && self->on_launch_done != nullptr) {
+  if (app_index_launch (entry, true) && self->on_launch_done != nullptr)
     self->on_launch_done (self->user_data);
-  }
 }
 
 void
@@ -126,17 +159,78 @@ on_tile_action_location (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
     self->on_launch_done (self->user_data);
 }
 
+struct WindowMenuCtx {
+  WinomeAppGrid *self = nullptr;
+  HWND hwnd = nullptr;
+};
+
+void
+on_tile_action_window (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
+{
+  auto *wctx = static_cast<WindowMenuCtx *> (user_data);
+  WinomeAppGrid *self = wctx->self;
+  HWND hwnd = wctx->hwnd;
+  app_grid_close_menu (GTK_WIDGET (self));
+  if (app_index_activate_hwnd (hwnd) && self->on_launch_done != nullptr)
+    self->on_launch_done (self->user_data);
+}
+
+struct QuitMenuCtx {
+  WinomeAppGrid *self = nullptr;
+  std::vector<HWND> hwnds;
+};
+
+gboolean
+on_quit_refresh_cb (gpointer user_data)
+{
+  WinomeAppGrid *self = WINOME_APP_GRID (user_data);
+  self->refresh_timer = 0;
+  app_grid_refresh_running (GTK_WIDGET (self));
+  if (self->on_pins_changed != nullptr)
+    self->on_pins_changed (self->user_data);
+  return G_SOURCE_REMOVE;
+}
+
+void
+on_tile_action_quit (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
+{
+  auto *qctx = static_cast<QuitMenuCtx *> (user_data);
+  WinomeAppGrid *self = qctx->self;
+  std::vector<HWND> hwnds = qctx->hwnds;
+  app_grid_close_menu (GTK_WIDGET (self));
+  app_index_close_windows (hwnds);
+  if (self->refresh_timer != 0) {
+    g_source_remove (self->refresh_timer);
+    self->refresh_timer = 0;
+  }
+  self->refresh_timer = g_timeout_add (180, on_quit_refresh_cb, self);
+}
+
 GtkWidget *
-make_menu_button (const char *text, GCallback cb, TileActionCtx *ctx)
+make_menu_button (const char *text, GCallback cb, gpointer data,
+                  bool ellipsize = false)
 {
   GtkWidget *btn = gtk_button_new_with_label (text);
   gtk_widget_set_name (btn, "winome-app-ctx-item");
   gtk_widget_add_css_class (btn, "popup-menu-item");
   GtkWidget *lbl = gtk_button_get_child (GTK_BUTTON (btn));
-  if (GTK_IS_LABEL (lbl))
+  if (GTK_IS_LABEL (lbl)) {
     gtk_label_set_xalign (GTK_LABEL (lbl), 0.0f);
-  g_signal_connect (btn, "clicked", cb, ctx);
+    if (ellipsize) {
+      gtk_label_set_max_width_chars (GTK_LABEL (lbl), 30);
+      gtk_label_set_ellipsize (GTK_LABEL (lbl), PANGO_ELLIPSIZE_END);
+    }
+  }
+  g_signal_connect (btn, "clicked", cb, data);
   return btn;
+}
+
+GtkWidget *
+make_menu_separator (void)
+{
+  GtkWidget *sep = gtk_separator_new (GTK_ORIENTATION_HORIZONTAL);
+  gtk_widget_add_css_class (sep, "popup-separator-menu-item");
+  return sep;
 }
 
 void
@@ -148,7 +242,8 @@ show_tile_context_menu (GtkWidget *tile, WinomeAppGrid *self,
   GtkWidget *popover = gtk_popover_new ();
   gtk_widget_add_css_class (popover, "winome-context-popover");
   gtk_widget_set_parent (popover, tile);
-  gtk_popover_set_has_arrow (GTK_POPOVER (popover), FALSE);
+  gtk_popover_set_has_arrow (GTK_POPOVER (popover), TRUE);
+  gtk_popover_set_position (GTK_POPOVER (popover), GTK_POS_BOTTOM);
   gtk_popover_set_autohide (GTK_POPOVER (popover), TRUE);
 
   GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
@@ -158,41 +253,127 @@ show_tile_context_menu (GtkWidget *tile, WinomeAppGrid *self,
       G_OBJECT (popover), "winome-tile-ctx", ctx,
       [] (gpointer p) { delete static_cast<TileActionCtx *> (p); });
 
-  WinomeConfig cfg = get_config ();
-  bool pinned = is_app_id_pinned (cfg.pinned_apps, entry.id);
+  std::vector<RunningWindow> running =
+      app_index_running_windows_for_entry (entry);
 
-  gtk_box_append (GTK_BOX (box),
-                  make_menu_button (tr ("Open", "打开"),
-                                    G_CALLBACK (on_tile_action_launch), ctx));
+  // Section 1 (upstream AppMenu): open window list when running.
+  if (!running.empty ()) {
+    GtkWidget *hdr = gtk_label_new (tr ("Open Windows", "打开的窗口"));
+    gtk_label_set_xalign (GTK_LABEL (hdr), 0.0f);
+    gtk_widget_add_css_class (hdr, "popup-menu-item");
+    gtk_widget_add_css_class (hdr, "popup-inactive-menu-item");
+    gtk_widget_set_sensitive (hdr, FALSE);
+    gtk_box_append (GTK_BOX (box), hdr);
+
+    int shown = 0;
+    for (const RunningWindow &rw : running) {
+      if (shown >= 8)
+        break;
+      const char *title =
+          !rw.title.empty () ? rw.title.c_str () : entry.name.c_str ();
+      auto *wctx = new WindowMenuCtx{self, rw.hwnd};
+      GtkWidget *wbtn =
+          make_menu_button (title, G_CALLBACK (on_tile_action_window), wctx,
+                            true);
+      g_object_set_data_full (
+          G_OBJECT (wbtn), "winome-win-ctx", wctx,
+          [] (gpointer p) { delete static_cast<WindowMenuCtx *> (p); });
+      gtk_box_append (GTK_BOX (box), wbtn);
+      ++shown;
+    }
+    gtk_box_append (GTK_BOX (box), make_menu_separator ());
+  }
+
+  // Section 2: Open / New Window + Run as Administrator (for classic apps).
+  bool is_running = !running.empty ();
   gtk_box_append (
       GTK_BOX (box),
-      make_menu_button (tr ("Run as Administrator", "以管理员身份运行"),
-                        G_CALLBACK (on_tile_action_admin), ctx));
+      make_menu_button (is_running ? tr ("New Window", "新建窗口")
+                                   : tr ("Open", "打开"),
+                        G_CALLBACK (on_tile_action_launch), ctx));
+
+  bool has_disk_path =
+      !entry.is_uwp &&
+      (!entry.target_exe.empty () ||
+       (!entry.launch_path.empty () &&
+        entry.launch_path.rfind (L"shell:", 0) != 0));
+  if (has_disk_path) {
+    gtk_box_append (
+        GTK_BOX (box),
+        make_menu_button (tr ("Run as Administrator", "以管理员身份运行"),
+                          G_CALLBACK (on_tile_action_admin), ctx));
+  }
+
+  gtk_box_append (GTK_BOX (box), make_menu_separator ());
+
+  // Section 3: Pin to Dash / Unpin & Open File Location.
+  WinomeConfig cfg = get_config ();
+  bool pinned = is_app_id_pinned (cfg.pinned_apps, entry.id);
   gtk_box_append (
       GTK_BOX (box),
       make_menu_button (pinned ? tr ("Unpin from Dash", "从程序坞取消固定")
                                : tr ("Pin to Dash", "固定到程序坞"),
                         G_CALLBACK (on_tile_action_pin), ctx));
-  gtk_box_append (
-      GTK_BOX (box),
-      make_menu_button (tr ("Open File Location", "打开文件所在位置"),
-                        G_CALLBACK (on_tile_action_location), ctx));
+
+  if (has_disk_path) {
+    gtk_box_append (
+        GTK_BOX (box),
+        make_menu_button (tr ("Open File Location", "打开文件所在位置"),
+                          G_CALLBACK (on_tile_action_location), ctx));
+  }
+
+  // Section 4: Quit (close all windows) when running.
+  if (is_running) {
+    gtk_box_append (GTK_BOX (box), make_menu_separator ());
+    std::vector<HWND> hwnds;
+    hwnds.reserve (running.size ());
+    for (const RunningWindow &rw : running)
+      hwnds.push_back (rw.hwnd);
+    auto *qctx = new QuitMenuCtx{self, std::move (hwnds)};
+    GtkWidget *qbtn = make_menu_button (tr ("Quit", "退出"),
+                                        G_CALLBACK (on_tile_action_quit), qctx);
+    g_object_set_data_full (
+        G_OBJECT (qbtn), "winome-quit-ctx", qctx,
+        [] (gpointer p) { delete static_cast<QuitMenuCtx *> (p); });
+    gtk_box_append (GTK_BOX (box), qbtn);
+  }
 
   gtk_popover_set_child (GTK_POPOVER (popover), box);
-  g_signal_connect (popover, "closed", G_CALLBACK (+[] (GtkPopover *p, gpointer d) {
-                      auto *g = WINOME_APP_GRID (d);
-                      if (g->active_menu == GTK_WIDGET (p))
-                        g->active_menu = nullptr;
-                      if (gtk_widget_get_parent (GTK_WIDGET (p)) != nullptr)
-                        gtk_widget_unparent (GTK_WIDGET (p));
-                    }),
-                    self);
+  g_signal_connect (
+      popover, "closed", G_CALLBACK (+[] (GtkPopover *p, gpointer d) {
+        auto *g = WINOME_APP_GRID (d);
+        if (g->active_menu == GTK_WIDGET (p))
+          g->active_menu = nullptr;
+        clear_menu_tile_highlight (g);
+        if (gtk_widget_get_parent (GTK_WIDGET (p)) != nullptr)
+          gtk_widget_unparent (GTK_WIDGET (p));
+      }),
+      self);
+
+  self->menu_tile = tile;
+  gtk_widget_add_css_class (tile, "checked");
+  g_object_add_weak_pointer (G_OBJECT (tile),
+                             reinterpret_cast<gpointer *> (&self->menu_tile));
+
   self->active_menu = popover;
   gtk_popover_popup (GTK_POPOVER (popover));
 }
 
 void
 on_tile_clicked (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
+{
+  auto *ctx = static_cast<TileActionCtx *> (user_data);
+  bool ctrl = (GetKeyState (VK_CONTROL) & 0x8000) != 0;
+  if (activate_or_launch_entry (ctx->entry, ctrl) &&
+      ctx->self->on_launch_done != nullptr) {
+    ctx->self->on_launch_done (ctx->self->user_data);
+  }
+}
+
+void
+on_tile_middle_click (GtkGestureClick *gesture G_GNUC_UNUSED,
+                      int n_press G_GNUC_UNUSED, double x G_GNUC_UNUSED,
+                      double y G_GNUC_UNUSED, gpointer user_data)
 {
   auto *ctx = static_cast<TileActionCtx *> (user_data);
   if (app_index_launch (ctx->entry, false) &&
@@ -202,14 +383,31 @@ on_tile_clicked (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 }
 
 void
-on_tile_right_click (GtkGestureClick *gesture G_GNUC_UNUSED, int n_press G_GNUC_UNUSED,
+on_tile_right_click (GtkGestureClick *gesture, int n_press G_GNUC_UNUSED,
                      double x G_GNUC_UNUSED, double y G_GNUC_UNUSED,
                      gpointer user_data)
 {
   auto *ctx = static_cast<TileActionCtx *> (user_data);
-  GtkWidget *tile = gtk_event_controller_get_widget (
-      GTK_EVENT_CONTROLLER (gesture));
+  GtkWidget *tile =
+      gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (gesture));
   show_tile_context_menu (tile, ctx->self, ctx->entry);
+}
+
+gboolean
+on_tile_key_pressed (GtkEventControllerKey *ctrl, guint keyval,
+                     guint keycode G_GNUC_UNUSED, GdkModifierType state,
+                     gpointer user_data)
+{
+  bool is_menu_key =
+      keyval == GDK_KEY_Menu ||
+      (keyval == GDK_KEY_F10 && (state & GDK_SHIFT_MASK) != 0);
+  if (!is_menu_key)
+    return GDK_EVENT_PROPAGATE;
+  auto *ctx = static_cast<TileActionCtx *> (user_data);
+  GtkWidget *tile =
+      gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (ctrl));
+  show_tile_context_menu (tile, ctx->self, ctx->entry);
+  return GDK_EVENT_STOP;
 }
 
 void
@@ -230,16 +428,51 @@ struct PageDotCtx {
 };
 
 void
+update_page_controls (WinomeAppGrid *self)
+{
+  int total = std::max (self->total_pages, 1);
+  bool multi_page = total > 1;
+  bool has_prev = self->page > 0;
+  bool has_next = self->page + 1 < total;
+
+  gtk_widget_set_visible (self->prev_btn, multi_page);
+  gtk_widget_set_visible (self->next_btn, multi_page);
+  gtk_widget_set_sensitive (self->prev_btn, has_prev);
+  gtk_widget_set_can_target (self->prev_btn, has_prev);
+  gtk_widget_set_opacity (self->prev_btn, has_prev ? 1.0 : 0.0);
+  gtk_widget_set_sensitive (self->next_btn, has_next);
+  gtk_widget_set_can_target (self->next_btn, has_next);
+  gtk_widget_set_opacity (self->next_btn, has_next ? 1.0 : 0.0);
+  gtk_widget_set_visible (self->indicators_box, multi_page);
+
+  for (int p = 0; p < (int)self->page_dots.size (); ++p) {
+    GtkWidget *dot_btn = self->page_dots[p];
+    if (dot_btn == nullptr)
+      continue;
+    if (p == self->page)
+      gtk_widget_add_css_class (dot_btn, "active");
+    else
+      gtk_widget_remove_css_class (dot_btn, "active");
+  }
+}
+
+void
 switch_to_page (WinomeAppGrid *self, int target_page)
 {
-  if (self == nullptr || target_page == self->page)
+  if (self == nullptr)
     return;
-  self->page = target_page;
-  rebuild_page_contents (self);
-  if (self->grid != nullptr) {
-    gtk_widget_set_opacity (self->grid, 0.0);
-    tween_opacity (self->grid, 0.0, 1.0, 200, Ease::ease_out_cubic);
+  int clamped = std::clamp (target_page, 0, std::max (self->total_pages - 1, 0));
+  if (clamped == self->page)
+    return;
+  app_grid_close_menu (GTK_WIDGET (self));
+  self->page = clamped;
+  if (self->pages_stack != nullptr) {
+    std::string page_name = "page-" + std::to_string (self->page);
+    gtk_stack_set_visible_child_full (
+        GTK_STACK (self->pages_stack), page_name.c_str (),
+        GTK_STACK_TRANSITION_TYPE_SLIDE_LEFT_RIGHT);
   }
+  update_page_controls (self);
 }
 
 void
@@ -250,25 +483,58 @@ on_page_dot_clicked (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 }
 
 gboolean
+on_scroll_cooldown_cb (gpointer user_data)
+{
+  WinomeAppGrid *self = WINOME_APP_GRID (user_data);
+  self->scroll_timer = 0;
+  self->can_scroll = true;
+  return G_SOURCE_REMOVE;
+}
+
+gboolean
 on_grid_scroll (GtkEventControllerScroll *ctrl G_GNUC_UNUSED, double dx,
                 double dy, gpointer user_data)
 {
   WinomeAppGrid *self = WINOME_APP_GRID (user_data);
-  double delta = (dy != 0.0) ? dy : dx;
-  if (delta > 0.1) {
+  double delta = (std::abs (dy) >= std::abs (dx)) ? dy : dx;
+  if (std::abs (delta) <= 0.1)
+    return FALSE;
+  if (!self->can_scroll)
+    return TRUE;
+
+  if (delta > 0.1)
     app_grid_next_page (GTK_WIDGET (self));
-    return TRUE;
-  }
-  if (delta < -0.1) {
+  else if (delta < -0.1)
     app_grid_prev_page (GTK_WIDGET (self));
-    return TRUE;
+
+  // SCROLL_TIMEOUT_TIME = 150ms (upstream appDisplay.js).
+  self->can_scroll = false;
+  if (self->scroll_timer != 0) {
+    g_source_remove (self->scroll_timer);
+    self->scroll_timer = 0;
   }
-  return FALSE;
+  self->scroll_timer = g_timeout_add (150, on_scroll_cooldown_cb, self);
+  return TRUE;
+}
+
+int
+lookup_icon_label_spacing (void)
+{
+  if (StEngine *e = StEngine::get ()) {
+    StEngine::Node tile (*e, nullptr, "", "overview-tile", "");
+    StEngine::Node icon (*e, &tile, "", "overview-icon",
+                         "overview-icon-with-label");
+    StEngine::Node box (*e, &icon, "StBoxLayout", "", "");
+    double v = 0.0;
+    if (box.lookup_length ("spacing", &v) && v >= 0.0)
+      return (int)(v + 0.5);
+  }
+  return 6;
 }
 
 GtkWidget *
 build_app_tile (WinomeAppGrid *self, const AppEntry &entry, int icon_size,
-                int tile_w, int tile_h)
+                int tile_w, int tile_h, int label_spacing, bool is_running)
 {
   GtkWidget *btn = gtk_button_new ();
   gtk_widget_set_name (btn, "winome-app-tile");
@@ -276,12 +542,17 @@ build_app_tile (WinomeAppGrid *self, const AppEntry &entry, int icon_size,
   gtk_widget_set_size_request (btn, tile_w, tile_h);
   gtk_widget_set_halign (btn, GTK_ALIGN_CENTER);
   gtk_widget_set_valign (btn, GTK_ALIGN_CENTER);
+  gtk_widget_set_tooltip_text (btn, entry.name.c_str ());
 
-  GtkWidget *content = gtk_box_new (GTK_ORIENTATION_VERTICAL, 8);
+  GtkWidget *overlay = gtk_overlay_new ();
+
+  GtkWidget *content =
+      gtk_box_new (GTK_ORIENTATION_VERTICAL, label_spacing);
   gtk_widget_add_css_class (content, "overview-icon");
   gtk_widget_add_css_class (content, "overview-icon-with-label");
   gtk_widget_set_halign (content, GTK_ALIGN_CENTER);
   gtk_widget_set_valign (content, GTK_ALIGN_CENTER);
+  gtk_widget_set_margin_bottom (content, 6);
 
   GdkTexture *tex = app_icon_for_entry (entry, icon_size);
   GtkWidget *icon_w = nullptr;
@@ -305,13 +576,29 @@ build_app_tile (WinomeAppGrid *self, const AppEntry &entry, int icon_size,
   gtk_widget_set_halign (lbl, GTK_ALIGN_CENTER);
   gtk_box_append (GTK_BOX (content), lbl);
 
-  gtk_button_set_child (GTK_BUTTON (btn), content);
+  gtk_overlay_set_child (GTK_OVERLAY (overlay), content);
+
+  GtkWidget *dot = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_widget_add_css_class (dot, "app-grid-running-dot");
+  gtk_widget_set_halign (dot, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (dot, GTK_ALIGN_END);
+  gtk_widget_set_visible (dot, is_running);
+  gtk_overlay_add_overlay (GTK_OVERLAY (overlay), dot);
+
+  gtk_button_set_child (GTK_BUTTON (btn), overlay);
 
   auto *ctx = new TileActionCtx{self, entry};
   g_object_set_data_full (
       G_OBJECT (btn), "winome-tile-action", ctx,
       [] (gpointer p) { delete static_cast<TileActionCtx *> (p); });
+  g_object_set_data (G_OBJECT (btn), "winome-running-dot", dot);
   g_signal_connect (btn, "clicked", G_CALLBACK (on_tile_clicked), ctx);
+
+  GtkGesture *mclick = gtk_gesture_click_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (mclick),
+                                 GDK_BUTTON_MIDDLE);
+  g_signal_connect (mclick, "pressed", G_CALLBACK (on_tile_middle_click), ctx);
+  gtk_widget_add_controller (btn, GTK_EVENT_CONTROLLER (mclick));
 
   GtkGesture *rclick = gtk_gesture_click_new ();
   gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (rclick),
@@ -319,61 +606,134 @@ build_app_tile (WinomeAppGrid *self, const AppEntry &entry, int icon_size,
   g_signal_connect (rclick, "pressed", G_CALLBACK (on_tile_right_click), ctx);
   gtk_widget_add_controller (btn, GTK_EVENT_CONTROLLER (rclick));
 
+  GtkEventController *keys = gtk_event_controller_key_new ();
+  g_signal_connect (keys, "key-pressed", G_CALLBACK (on_tile_key_pressed), ctx);
+  gtk_widget_add_controller (btn, keys);
+
   return btn;
 }
 
 void
-rebuild_page_contents (WinomeAppGrid *self)
+update_running_dots_in_place (WinomeAppGrid *self)
+{
+  if (self == nullptr || self->pages_stack == nullptr)
+    return;
+  self->running_windows = app_index_enumerate_running_windows ();
+  for (GtkWidget *page_w = gtk_widget_get_first_child (self->pages_stack);
+       page_w != nullptr; page_w = gtk_widget_get_next_sibling (page_w)) {
+    for (GtkWidget *tile = gtk_widget_get_first_child (page_w); tile != nullptr;
+         tile = gtk_widget_get_next_sibling (tile)) {
+      auto *ctx = static_cast<TileActionCtx *> (
+          g_object_get_data (G_OBJECT (tile), "winome-tile-action"));
+      auto *dot = GTK_WIDGET (
+          g_object_get_data (G_OBJECT (tile), "winome-running-dot"));
+      if (ctx != nullptr && dot != nullptr) {
+        bool running = !match_entry_running_windows (
+                            ctx->entry, self->running_windows)
+                            .empty ();
+        gtk_widget_set_visible (dot, running);
+      }
+    }
+  }
+}
+
+void
+rebuild_all_pages (WinomeAppGrid *self)
 {
   app_grid_close_menu (GTK_WIDGET (self));
-  clear_grid_children (self->grid);
+  clear_stack_children (self->pages_stack);
   clear_box_children (self->indicators_box);
+  self->page_dots.clear ();
+
+  self->running_windows = app_index_enumerate_running_windows ();
 
   AppGridDimensions dim =
       compute_app_grid_dimensions (self->avail_w, self->avail_h);
-  AppGridSlice slice = compute_app_grid_slice ((int)self->filtered.size (),
-                                                self->page, dim.page_size);
-  self->page = slice.page;
+  self->total_pages =
+      compute_app_grid_page_count ((int)self->filtered.size (), dim.page_size);
+  self->page = std::clamp (self->page, 0, self->total_pages - 1);
 
   bool empty = self->filtered.empty ();
   gtk_widget_set_visible (self->empty_label, empty);
-  gtk_widget_set_visible (self->grid, !empty);
+  gtk_widget_set_visible (self->pages_stack, !empty);
 
   if (empty) {
     gtk_label_set_text (GTK_LABEL (self->empty_label),
                         tr ("No results.", "未找到匹配的应用"));
   } else {
-    // Keep tile bounding box proportional to available grid width cleanly.
-    int grid_w = std::max (self->avail_w - 160, 480);
-    int tile_w = std::clamp ((grid_w - (dim.cols - 1) * 18) / dim.cols, 112, 152);
-    int tile_h = dim.icon_size + 60;
-
-    int idx = 0;
-    for (int i = slice.begin; i < slice.end; ++i) {
-      int r = idx / dim.cols;
-      int c = idx % dim.cols;
-      GtkWidget *tile =
-          build_app_tile (self, self->filtered[i], dim.icon_size, tile_w, tile_h);
-      gtk_grid_attach (GTK_GRID (self->grid), tile, c, r, 1, 1);
-      ++idx;
+    int base_col_gap = 12;
+    int base_row_gap = 12;
+    int max_col_gap = 36;
+    int max_row_gap = 36;
+    if (StEngine *e = StEngine::get ()) {
+      StEngine::Node grid_node (*e, nullptr, "", "icon-grid", "");
+      double v = 0.0;
+      if (grid_node.lookup_length ("column-spacing", &v) && v > 0.0)
+        base_col_gap = (int)(v + 0.5);
+      if (grid_node.lookup_length ("row-spacing", &v) && v > 0.0)
+        base_row_gap = (int)(v + 0.5);
+      if (grid_node.lookup_length ("max-column-spacing", &v) && v > 0.0)
+        max_col_gap = (int)(v + 0.5);
+      if (grid_node.lookup_length ("max-row-spacing", &v) && v > 0.0)
+        max_row_gap = (int)(v + 0.5);
     }
+
+    int inner_w = std::max (self->avail_w - 144, 360);
+    int inner_h = std::max (self->avail_h - 36, 220);
+    int tile_w = std::clamp (
+        (inner_w - (dim.cols - 1) * base_col_gap) / dim.cols, 108, 168);
+    int tile_h = dim.icon_size + 72;
+    int col_spacing =
+        dim.cols > 1
+            ? std::clamp ((inner_w - dim.cols * tile_w) / (dim.cols - 1),
+                          base_col_gap, std::max (base_col_gap, max_col_gap))
+            : base_col_gap;
+    int row_spacing =
+        dim.rows > 1
+            ? std::clamp ((inner_h - dim.rows * tile_h) / (dim.rows - 1),
+                          base_row_gap, std::max (base_row_gap, max_row_gap))
+            : base_row_gap;
+    int label_spacing = lookup_icon_label_spacing ();
+
+    for (int p = 0; p < self->total_pages; ++p) {
+      AppGridSlice slice = compute_app_grid_slice ((int)self->filtered.size (),
+                                                   p, dim.page_size);
+      GtkWidget *page_grid = gtk_grid_new ();
+      gtk_widget_add_css_class (page_grid, "icon-grid");
+      gtk_grid_set_column_spacing (GTK_GRID (page_grid), col_spacing);
+      gtk_grid_set_row_spacing (GTK_GRID (page_grid), row_spacing);
+      gtk_grid_set_column_homogeneous (GTK_GRID (page_grid), TRUE);
+      gtk_grid_set_row_homogeneous (GTK_GRID (page_grid), TRUE);
+      gtk_widget_set_halign (page_grid, GTK_ALIGN_CENTER);
+      gtk_widget_set_valign (page_grid, GTK_ALIGN_CENTER);
+
+      int idx = 0;
+      for (int i = slice.begin; i < slice.end; ++i) {
+        int r = idx / dim.cols;
+        int c = idx % dim.cols;
+        bool running =
+            !match_entry_running_windows (self->filtered[i],
+                                          self->running_windows)
+                 .empty ();
+        GtkWidget *tile = build_app_tile (self, self->filtered[i],
+                                          dim.icon_size, tile_w, tile_h,
+                                          label_spacing, running);
+        gtk_grid_attach (GTK_GRID (page_grid), tile, c, r, 1, 1);
+        ++idx;
+      }
+
+      std::string page_name = "page-" + std::to_string (p);
+      gtk_stack_add_named (GTK_STACK (self->pages_stack), page_grid,
+                           page_name.c_str ());
+    }
+
+    std::string active_name = "page-" + std::to_string (self->page);
+    gtk_stack_set_visible_child_full (GTK_STACK (self->pages_stack),
+                                      active_name.c_str (),
+                                      GTK_STACK_TRANSITION_TYPE_NONE);
   }
 
-  // Page navigation arrows & dots.
-  bool multi_page = slice.total_pages > 1;
-  bool has_prev = slice.page > 0;
-  bool has_next = slice.page + 1 < slice.total_pages;
-  gtk_widget_set_visible (self->prev_btn, multi_page);
-  gtk_widget_set_visible (self->next_btn, multi_page);
-  gtk_widget_set_sensitive (self->prev_btn, has_prev);
-  gtk_widget_set_can_target (self->prev_btn, has_prev);
-  gtk_widget_set_opacity (self->prev_btn, has_prev ? 1.0 : 0.0);
-  gtk_widget_set_sensitive (self->next_btn, has_next);
-  gtk_widget_set_can_target (self->next_btn, has_next);
-  gtk_widget_set_opacity (self->next_btn, has_next ? 1.0 : 0.0);
-  gtk_widget_set_visible (self->indicators_box, multi_page);
-
-  if (multi_page) {
+  if (self->total_pages > 1) {
     int dot_size = 10;
     if (StEngine *e = StEngine::get ()) {
       StEngine::Node ind (*e, nullptr, "", "page-indicator", "");
@@ -382,16 +742,13 @@ rebuild_page_contents (WinomeAppGrid *self)
       if (icon.lookup_length ("width", &v) && v > 0.0)
         dot_size = (int)(v + 0.5);
     }
-    for (int p = 0; p < slice.total_pages; ++p) {
+    for (int p = 0; p < self->total_pages; ++p) {
       GtkWidget *dot_btn = gtk_button_new ();
       gtk_widget_set_name (dot_btn, "winome-page-dot");
       gtk_widget_add_css_class (dot_btn, "page-indicator");
-      if (p == slice.page)
-        gtk_widget_add_css_class (dot_btn, "active");
       GtkWidget *dot = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
       gtk_widget_add_css_class (dot, "page-indicator-icon");
       gtk_widget_set_size_request (dot, dot_size, dot_size);
-      gtk_widget_set_opacity (dot, (p == slice.page) ? 1.0 : 0.35);
       gtk_button_set_child (GTK_BUTTON (dot_btn), dot);
 
       auto *dctx = new PageDotCtx{self, p};
@@ -401,15 +758,27 @@ rebuild_page_contents (WinomeAppGrid *self)
       g_signal_connect (dot_btn, "clicked", G_CALLBACK (on_page_dot_clicked),
                         dctx);
       gtk_box_append (GTK_BOX (self->indicators_box), dot_btn);
+      self->page_dots.push_back (dot_btn);
     }
   }
+  update_page_controls (self);
 }
 
 void
 winome_app_grid_dispose (GObject *object)
 {
   WinomeAppGrid *self = WINOME_APP_GRID (object);
+  if (self->scroll_timer != 0) {
+    g_source_remove (self->scroll_timer);
+    self->scroll_timer = 0;
+  }
+  if (self->refresh_timer != 0) {
+    g_source_remove (self->refresh_timer);
+    self->refresh_timer = 0;
+  }
   app_grid_close_menu (GTK_WIDGET (self));
+  clear_menu_tile_highlight (self);
+  self->page_dots.clear ();
   G_OBJECT_CLASS (winome_app_grid_parent_class)->dispose (object);
 }
 
@@ -419,6 +788,10 @@ winome_app_grid_finalize (GObject *object)
   WinomeAppGrid *self = WINOME_APP_GRID (object);
   using StringT = std::string;
   using AppVecT = std::vector<AppEntry>;
+  using RunVecT = std::vector<RunningWindow>;
+  using DotVecT = std::vector<GtkWidget *>;
+  self->page_dots.~DotVecT ();
+  self->running_windows.~RunVecT ();
   self->filtered.~AppVecT ();
   self->all_apps.~AppVecT ();
   self->query_lower.~StringT ();
@@ -433,16 +806,28 @@ winome_app_grid_init (WinomeAppGrid *self)
   new (&self->query_lower) std::string ();
   new (&self->all_apps) std::vector<AppEntry> ();
   new (&self->filtered) std::vector<AppEntry> ();
+  new (&self->running_windows) std::vector<RunningWindow> ();
+  new (&self->page_dots) std::vector<GtkWidget *> ();
+  self->total_pages = 1;
   self->avail_w = 1000;
   self->avail_h = 560;
+  self->can_scroll = true;
 
   gtk_orientable_set_orientation (GTK_ORIENTABLE (self),
                                   GTK_ORIENTATION_VERTICAL);
-  gtk_box_set_spacing (GTK_BOX (self), 12);
+  gtk_box_set_spacing (GTK_BOX (self), 8);
   gtk_widget_set_halign (GTK_WIDGET (self), GTK_ALIGN_CENTER);
   gtk_widget_set_valign (GTK_WIDGET (self), GTK_ALIGN_CENTER);
 
-  self->body_row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
+  int arrow_size = 24;
+  if (StEngine *e = StEngine::get ()) {
+    StEngine::Node arrow (*e, nullptr, "", "page-navigation-arrow", "");
+    double v = 0.0;
+    if (arrow.lookup_length ("width", &v) && v > 0.0)
+      arrow_size = (int)(v + 0.5);
+  }
+
+  self->body_row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
   gtk_widget_set_halign (self->body_row, GTK_ALIGN_CENTER);
   gtk_widget_set_valign (self->body_row, GTK_ALIGN_CENTER);
   gtk_widget_set_vexpand (self->body_row, TRUE);
@@ -454,7 +839,7 @@ winome_app_grid_init (WinomeAppGrid *self)
   gtk_widget_set_valign (self->prev_btn, GTK_ALIGN_CENTER);
   GtkWidget *prev_img =
       gtk_image_new_from_icon_name ("carousel-arrow-previous-symbolic");
-  gtk_image_set_pixel_size (GTK_IMAGE (prev_img), 16);
+  gtk_image_set_pixel_size (GTK_IMAGE (prev_img), arrow_size);
   gtk_button_set_child (GTK_BUTTON (self->prev_btn), prev_img);
   g_signal_connect (self->prev_btn, "clicked", G_CALLBACK (on_prev_clicked),
                     self);
@@ -465,26 +850,15 @@ winome_app_grid_init (WinomeAppGrid *self)
   gtk_widget_set_valign (self->center_box, GTK_ALIGN_CENTER);
   gtk_widget_set_hexpand (self->center_box, TRUE);
 
-  int grid_col_spacing = 12;
-  int grid_row_spacing = 12;
-  if (StEngine *e = StEngine::get ()) {
-    StEngine::Node grid_node (*e, nullptr, "", "icon-grid", "");
-    double v = 0.0;
-    if (grid_node.lookup_length ("column-spacing", &v) && v > 0.0)
-      grid_col_spacing = (int)(v + 0.5);
-    if (grid_node.lookup_length ("row-spacing", &v) && v > 0.0)
-      grid_row_spacing = (int)(v + 0.5);
-  }
-
-  self->grid = gtk_grid_new ();
-  gtk_widget_add_css_class (self->grid, "icon-grid");
-  gtk_grid_set_column_spacing (GTK_GRID (self->grid), grid_col_spacing);
-  gtk_grid_set_row_spacing (GTK_GRID (self->grid), grid_row_spacing);
-  gtk_grid_set_column_homogeneous (GTK_GRID (self->grid), TRUE);
-  gtk_grid_set_row_homogeneous (GTK_GRID (self->grid), TRUE);
-  gtk_widget_set_halign (self->grid, GTK_ALIGN_CENTER);
-  gtk_widget_set_valign (self->grid, GTK_ALIGN_CENTER);
-  gtk_box_append (GTK_BOX (self->center_box), self->grid);
+  self->pages_stack = gtk_stack_new ();
+  gtk_stack_set_transition_type (GTK_STACK (self->pages_stack),
+                                 GTK_STACK_TRANSITION_TYPE_SLIDE_LEFT_RIGHT);
+  gtk_stack_set_transition_duration (GTK_STACK (self->pages_stack), 250);
+  gtk_stack_set_hhomogeneous (GTK_STACK (self->pages_stack), TRUE);
+  gtk_stack_set_vhomogeneous (GTK_STACK (self->pages_stack), TRUE);
+  gtk_widget_set_halign (self->pages_stack, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (self->pages_stack, GTK_ALIGN_CENTER);
+  gtk_box_append (GTK_BOX (self->center_box), self->pages_stack);
 
   self->empty_label = gtk_label_new ("");
   gtk_widget_add_css_class (self->empty_label, "search-statustext");
@@ -502,7 +876,7 @@ winome_app_grid_init (WinomeAppGrid *self)
   gtk_widget_set_valign (self->next_btn, GTK_ALIGN_CENTER);
   GtkWidget *next_img =
       gtk_image_new_from_icon_name ("carousel-arrow-next-symbolic");
-  gtk_image_set_pixel_size (GTK_IMAGE (next_img), 16);
+  gtk_image_set_pixel_size (GTK_IMAGE (next_img), arrow_size);
   gtk_button_set_child (GTK_BUTTON (self->next_btn), next_img);
   g_signal_connect (self->next_btn, "clicked", G_CALLBACK (on_next_clicked),
                     self);
@@ -510,13 +884,13 @@ winome_app_grid_init (WinomeAppGrid *self)
 
   gtk_box_append (GTK_BOX (self), self->body_row);
 
-  self->indicators_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 4);
+  self->indicators_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
   gtk_widget_add_css_class (self->indicators_box, "page-indicators");
   gtk_widget_set_halign (self->indicators_box, GTK_ALIGN_CENTER);
   gtk_box_append (GTK_BOX (self), self->indicators_box);
 
   GtkEventController *scroll = gtk_event_controller_scroll_new (
-      GTK_EVENT_CONTROLLER_SCROLL_VERTICAL);
+      GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
   g_signal_connect (scroll, "scroll", G_CALLBACK (on_grid_scroll), self);
   gtk_widget_add_controller (GTK_WIDGET (self), scroll);
 }
@@ -561,18 +935,37 @@ AppGridDimensions
 compute_app_grid_dimensions (int avail_w, int avail_h)
 {
   AppGridDimensions d;
-  if (avail_w >= 1150 && avail_h >= 580) {
+  int inner_w = std::max (avail_w - 144, 320);
+  int inner_h = std::max (avail_h - 36, 220);
+
+  if (avail_w < avail_h && inner_w < 700) {
+    d.cols = 4;
+    d.rows = (inner_h >= 580) ? 5 : 4;
+  } else if (inner_w >= 900 && inner_h >= 560) {
     d.cols = 6;
     d.rows = 4;
-    d.icon_size = 64;
-  } else if (avail_w >= 860 && avail_h >= 440) {
+  } else if (inner_w >= 960 && inner_h >= 400) {
+    d.cols = 6;
+    d.rows = 3;
+  } else if (inner_w >= 680 && inner_h >= 380) {
     d.cols = 5;
     d.rows = 3;
-    d.icon_size = 56;
   } else {
     d.cols = 4;
     d.rows = 3;
-    d.icon_size = 48;
+  }
+
+  constexpr int kMinGap = 12;
+  int max_cell_w = (inner_w - (d.cols - 1) * kMinGap) / d.cols;
+  int max_cell_h = (inner_h - (d.rows - 1) * kMinGap) / d.rows;
+
+  constexpr int kCandidates[] = {96, 80, 72, 64, 56, 48};
+  d.icon_size = 48;
+  for (int sz : kCandidates) {
+    if (sz + 24 <= max_cell_w && sz + 72 <= max_cell_h) {
+      d.icon_size = sz;
+      break;
+    }
   }
   d.page_size = d.cols * d.rows;
   return d;
@@ -604,7 +997,7 @@ app_grid_set_query (GtkWidget *grid, const std::string &query_lower)
     self->index_loaded = true;
   }
   self->filtered = filter_and_sort_apps (self->all_apps, self->query_lower);
-  rebuild_page_contents (self);
+  rebuild_all_pages (self);
 }
 
 void
@@ -616,18 +1009,14 @@ app_grid_rebuild (GtkWidget *grid, int avail_w, int avail_h)
   self->all_apps = app_index_get_all ();
   self->index_loaded = true;
   self->filtered = filter_and_sort_apps (self->all_apps, self->query_lower);
-  rebuild_page_contents (self);
+  rebuild_all_pages (self);
 }
 
 void
 app_grid_next_page (GtkWidget *grid)
 {
   WinomeAppGrid *self = WINOME_APP_GRID (grid);
-  AppGridDimensions dim =
-      compute_app_grid_dimensions (self->avail_w, self->avail_h);
-  int pages = compute_app_grid_page_count ((int)self->filtered.size (),
-                                           dim.page_size);
-  if (self->page + 1 < pages)
+  if (self->page + 1 < self->total_pages)
     switch_to_page (self, self->page + 1);
 }
 
@@ -640,17 +1029,39 @@ app_grid_prev_page (GtkWidget *grid)
 }
 
 void
+app_grid_first_page (GtkWidget *grid)
+{
+  WinomeAppGrid *self = WINOME_APP_GRID (grid);
+  switch_to_page (self, 0);
+}
+
+void
+app_grid_last_page (GtkWidget *grid)
+{
+  WinomeAppGrid *self = WINOME_APP_GRID (grid);
+  switch_to_page (self, std::max (self->total_pages - 1, 0));
+}
+
+void
 app_grid_reset_page (GtkWidget *grid)
 {
   WinomeAppGrid *self = WINOME_APP_GRID (grid);
-  if (self->grid != nullptr) {
-    tween_opacity (self->grid, 1.0, 1.0, 0, Ease::linear);
-    gtk_widget_set_opacity (self->grid, 1.0);
-  }
   if (self->page != 0) {
     self->page = 0;
-    rebuild_page_contents (self);
+    if (self->pages_stack != nullptr) {
+      gtk_stack_set_visible_child_full (GTK_STACK (self->pages_stack), "page-0",
+                                        GTK_STACK_TRANSITION_TYPE_NONE);
+    }
+    update_page_controls (self);
   }
+}
+
+void
+app_grid_refresh_running (GtkWidget *grid)
+{
+  if (grid == nullptr)
+    return;
+  update_running_dots_in_place (WINOME_APP_GRID (grid));
 }
 
 bool
@@ -659,7 +1070,7 @@ app_grid_launch_first (GtkWidget *grid)
   WinomeAppGrid *self = WINOME_APP_GRID (grid);
   if (self->filtered.empty ())
     return false;
-  return app_index_launch (self->filtered[0], false);
+  return activate_or_launch_entry (self->filtered[0], false);
 }
 
 void
@@ -668,6 +1079,7 @@ app_grid_close_menu (GtkWidget *grid)
   if (grid == nullptr)
     return;
   WinomeAppGrid *self = WINOME_APP_GRID (grid);
+  clear_menu_tile_highlight (self);
   if (self->active_menu != nullptr) {
     GtkWidget *m = self->active_menu;
     self->active_menu = nullptr;

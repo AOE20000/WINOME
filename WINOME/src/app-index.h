@@ -63,6 +63,24 @@ bool app_index_launch_id (const std::string &id_or_aumid,
 bool app_index_open_location (const AppEntry &entry);
 bool app_index_launch_best_match (const std::string &query_lower);
 
+// Running-window inspection & activation shared between App Grid and Dash.
+struct RunningWindow {
+  HWND hwnd = nullptr;
+  std::string title;
+  std::string canonical_id;
+  std::string aumid_norm;
+  std::string exe_norm;
+  std::string exe_base_lower;
+};
+
+std::vector<RunningWindow> match_entry_running_windows (
+    const AppEntry &entry, const std::vector<RunningWindow> &windows);
+std::vector<RunningWindow> app_index_enumerate_running_windows (void);
+std::vector<RunningWindow> app_index_running_windows_for_entry (
+    const AppEntry &entry);
+bool app_index_activate_hwnd (HWND hwnd);
+void app_index_close_windows (const std::vector<HWND> &hwnds);
+
 // GdkTexture conversion & bounded LRU icon cache.
 GdkTexture *hicon_to_texture (HICON icon);
 GdkTexture *texture_from_hbitmap (HBITMAP bmp);

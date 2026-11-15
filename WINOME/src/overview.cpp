@@ -149,6 +149,7 @@ constexpr double kThumbnailsAdjustBottom = 0.4;  // THUMBNAILS_SPACING_ADJ_
                                                   // USTMENT_BOTTOM
 constexpr double kMaxThumbnailScale = 0.05;      // MAX_THUMBNAIL_SCALE
 constexpr double kDashMaxHeightRatio = 0.16;
+constexpr double kSmallWorkspaceRatio = 0.15;    // SMALL_WORKSPACE_RATIO
 
 // Overview.ANIMATION_TIME: opening EASE_OUT_SINE, closing EASE_OUT_QUAD.
 constexpr guint kOpenMs = 250;
@@ -1577,6 +1578,10 @@ on_root_motion (GtkEventControllerMotion *motion, double x, double y,
   (void)user_data;
   if (g_window == nullptr)
     return;
+  if (g_app_grid_mode) {
+    set_hover (-1, true);
+    return;
+  }
 
   int scale = gtk_widget_get_scale_factor (g_window);
   int px = (int)(x * scale);
@@ -1768,6 +1773,7 @@ struct PlacedGeometry {
   int thumbs_x, thumbs_y;      // logical
   int thumbs_h;                // physical (0 = hidden)
   RECT ws_box;                 // physical workspace box (slots + background)
+  RECT app_grid_box;           // physical App Grid container box
 };
 
 bool
@@ -1833,18 +1839,34 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
   box.right = mw;
   box.bottom = panel_height + wa_h - dash_h - spacing;
 
-  // Workspace box: as tall as the container box, width preserving the
-  // workarea aspect ratio, centered (WorkspacesView
-  // _getFirstFitSingleWorkspaceBox + WorkspaceLayout.vfunc_get_preferred_
-  // width/height). Window slots and the background live inside it.
+  // Workspace box & App Grid box (ControlsManagerLayout):
+  // - WINDOW_PICKER: thumbnails row sits between search and ws_box.
+  // - APP_GRID: workspace box shrinks to SMALL_WORKSPACE_RATIO (0.15) under
+  //   search, and AppGrid occupies the vertical band between ws_box and dash.
   double wa_aspect = (double)mw / (double)wa_h;
-  int ws_h = box.bottom - box.top;
-  int ws_w = (int)(ws_h * wa_aspect + 0.5);
-  ws_w = std::min (ws_w, mw);
-  int ws_x = (mw - ws_w) / 2;
-  RECT ws_box = {ws_x, box.top, ws_x + ws_w, box.top + ws_h};
+  RECT ws_box{};
+  RECT app_grid_box{};
+  if (g_app_grid_mode) {
+    int ws_top = panel_height + search_total + spacing;
+    int avail_bottom = panel_height + wa_h - dash_h - spacing;
+    int max_ws_h = std::max (72, avail_bottom - ws_top - spacing - 320);
+    int ws_h = std::clamp ((int)(wa_h * kSmallWorkspaceRatio + 0.5), 72,
+                           max_ws_h);
+    int ws_w = std::min ((int)(ws_h * wa_aspect + 0.5), mw);
+    int ws_x = (mw - ws_w) / 2;
+    ws_box = {ws_x, ws_top, ws_x + ws_w, ws_top + ws_h};
+    app_grid_box = {0, ws_box.bottom + spacing, mw, avail_bottom};
+  } else {
+    int ws_h = box.bottom - box.top;
+    int ws_w = (int)(ws_h * wa_aspect + 0.5);
+    ws_w = std::min (ws_w, mw);
+    int ws_x = (mw - ws_w) / 2;
+    ws_box = {ws_x, box.top, ws_x + ws_w, box.top + ws_h};
+    app_grid_box = {0, box.bottom, mw, box.bottom};
+  }
 
   out->ws_box = ws_box;
+  out->app_grid_box = app_grid_box;
   out->search_w = search_w;
   out->search_h = search_h;
   out->search_x = (mw / scale - search_w) / 2;
@@ -1867,13 +1889,18 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
   g_bg_full = RECT{0, panel_height, mw, mh};
   g_bg_final = ws_box;
 
-  // .workspace-background border-radius.
+  // .workspace-background border-radius (proportionally scaled in APP_GRID).
   g_bg_radius_target = kWorkspaceRadiusFallback;
   if (engine != nullptr) {
     StEngine::Node node (*engine, nullptr, "", "workspace-background", "");
     double v = 0;
     if (node.lookup_length ("border-radius", &v) && v > 0)
       g_bg_radius_target = v;
+  }
+  if (g_app_grid_mode && wa_h > 0) {
+    double ratio = (double)(ws_box.bottom - ws_box.top) / (double)wa_h;
+    g_bg_radius_target =
+        std::clamp (g_bg_radius_target * ratio * 1.8, 10.0, 16.0);
   }
   return true;
 }
@@ -2028,11 +2055,44 @@ place_overview_locked (bool opening)
     set_hover (-1, true);
     destroy_previews ();
     destroy_mini_previews ();
+    if (g_ws_bg != nullptr)
+      gtk_widget_set_visible (g_ws_bg, TRUE);
+
+    // Keep shrunk live workspace window thumbnails inside the top bar
+    // (SMALL_WORKSPACE_RATIO = 0.15 in overviewControls.js).
+    std::vector<OvWindowInfo> small_windows;
+    EnumContext sctx{monitor, mi.rcMonitor, &small_windows, !g_desktops.empty (),
+                     false};
+    EnumWindows (collect_windows, reinterpret_cast<LPARAM> (&sctx));
+    RECT workarea = {0, panel_height, w, h};
     int scale = gtk_widget_get_scale_factor (g_window);
-    int grid_w = std::max (std::min (w / scale - 48, 1180), 400);
-    int grid_h = std::max ((int)(geo.ws_box.bottom - geo.ws_box.top) / scale, 320);
+    double small_gap = (window_picker_spacing () * kSmallWorkspaceRatio + 4.0) *
+                       scale;
+    std::vector<OvSlot> small_slots;
+    overview_compute_slots (small_windows, mi.rcMonitor, workarea, geo.ws_box,
+                            small_gap, small_gap, &small_slots);
+    g_slots.reserve (small_slots.size ());
+    for (const OvSlot &s : small_slots) {
+      SlotEntry e;
+      e.target = s.window.hwnd;
+      e.start = s.window.rect;
+      e.minimized = IsIconic (s.window.hwnd) != FALSE;
+      int sw = (int)((s.window.rect.right - s.window.rect.left) * s.scale);
+      int sh = (int)((s.window.rect.bottom - s.window.rect.top) * s.scale);
+      e.rect.left = (int)s.x;
+      e.rect.top = (int)s.y;
+      e.rect.right = e.rect.left + sw;
+      e.rect.bottom = e.rect.top + sh;
+      if (e.rect.right > e.rect.left && e.rect.bottom > e.rect.top)
+        g_slots.push_back (e);
+    }
+    create_previews (false);
+
+    int grid_w = std::max (std::min (w / scale - 48, 1320), 400);
+    int grid_h = std::max (
+        (int)(geo.app_grid_box.bottom - geo.app_grid_box.top) / scale, 260);
     int grid_x = (w / scale - grid_w) / 2;
-    int grid_y = (int)geo.ws_box.top / scale;
+    int grid_y = (int)geo.app_grid_box.top / scale;
     app_grid_set_query (g_app_grid, g_search_query);
     app_grid_rebuild (g_app_grid, grid_w, grid_h);
     gtk_widget_set_size_request (g_app_grid, grid_w, grid_h);
@@ -2723,6 +2783,14 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
   }
 
   if (g_app_grid_mode) {
+    POINT pt = {px, py};
+    if (pt.x >= g_ws_box.left && pt.x < g_ws_box.right &&
+        pt.y >= g_ws_box.top && pt.y < g_ws_box.bottom) {
+      g_print ("[ov] click (%d,%d) small workspace -> window picker\n", px,
+               py);
+      overview_toggle_app_grid ();
+      return;
+    }
     restack_locked ();
     return;
   }
@@ -2999,6 +3067,14 @@ on_overview_key_pressed (GtkEventControllerKey *controller G_GNUC_UNUSED,
   if ((state & GDK_CONTROL_MASK) && (state & GDK_SHIFT_MASK) &&
       (keyval == GDK_KEY_n || keyval == GDK_KEY_N)) {
     on_thumb_add_desktop (nullptr);
+    return GDK_EVENT_STOP;
+  }
+  if (g_app_grid_mode && g_app_grid != nullptr && g_search_query.empty () &&
+      (keyval == GDK_KEY_Home || keyval == GDK_KEY_End)) {
+    if (keyval == GDK_KEY_Home)
+      app_grid_first_page (g_app_grid);
+    else
+      app_grid_last_page (g_app_grid);
     return GDK_EVENT_STOP;
   }
   if (keyval == GDK_KEY_Page_Up || keyval == GDK_KEY_Page_Down) {

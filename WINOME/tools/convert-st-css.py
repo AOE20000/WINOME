@@ -521,21 +521,38 @@ window.winome-overview-chrome {
   box-shadow: none;
 }
 
-/* Page indicator buttons should stay transparent around the dot indicator. */
+/* Page indicator dots follow upstream PageIndicators: inactive 2/3 scale & ~50%
+   opacity, hover full opacity, active full scale & opacity, press 0.5 scale. */
 .page-indicator,
 .page-indicator:hover,
 .page-indicator:active {
   background-color: transparent;
   box-shadow: none;
-  padding: 6px;
-  min-width: 12px;
-  min-height: 12px;
+  padding: 6px 12px 0;
+  min-width: 0;
+  min-height: 0;
+}
+.page-indicator .page-indicator-icon {
+  min-width: 10px;
+  min-height: 10px;
+  border-radius: 999px;
+  background-color: #fafafb;
+  opacity: 0.502;
+  transform: scale(0.667);
+  transition-property: opacity, transform;
+  transition-duration: 300ms;
+  transition-timing-function: cubic-bezier(0.25, 0.46, 0.45, 0.94);
 }
 .page-indicator:hover .page-indicator-icon {
-  opacity: 0.7;
-}
-.page-indicator.active .page-indicator-icon {
   opacity: 1.0;
+}
+.page-indicator.active .page-indicator-icon,
+.page-indicator.active:hover .page-indicator-icon {
+  opacity: 1.0;
+  transform: scale(1.0);
+}
+.page-indicator:active .page-indicator-icon {
+  transform: scale(0.5);
 }
 
 /* Match GNOME St switch (.toggle-switch + .handle) on GTK4 GtkSwitch. */
@@ -684,6 +701,41 @@ separator.popup-separator-menu-item {
   background-color: rgba(255, 255, 255, 0.1);
   min-height: 1px;
   margin: 4px 2px;
+}
+
+/* App Menu non-interactive section headers (e.g. "Open Windows"). */
+label.popup-menu-item.popup-inactive-menu-item:disabled {
+  background-color: transparent;
+  background-image: none;
+  color: #9b9b9d;
+  font-size: 0.9em;
+  font-weight: 700;
+  padding: 4px 12px 2px 12px;
+}
+
+/* App Grid tiles & navigation arrows: forced highlight while AppMenu is open,
+   crisp 5px running dot, and circular hoverable page arrows. */
+.overview-tile.checked {
+  color: #fafafb;
+  background-color: #35353a;
+}
+.overview-tile.checked:hover {
+  background-color: #46464c;
+}
+.app-grid-running-dot {
+  min-width: 5px;
+  min-height: 5px;
+  border-radius: 999px;
+  background-color: #fafafb;
+}
+.page-navigation-arrow {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 18px;
+  margin: 6px;
+  border-radius: 999px;
+  transition-property: background-color, opacity;
+  transition-duration: 150ms;
 }
 
 /* Match upstream Message.expand()/unexpand() 180-degree chevron rotation. */

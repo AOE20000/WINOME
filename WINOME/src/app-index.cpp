@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstring>
 #include <cwctype>
 #include <list>
 #include <mutex>
@@ -194,6 +195,82 @@ scan_start_menu_sync ()
                               L"\\Microsoft\\Windows\\Start Menu\\Programs";
       collect_lnk_recursive (programs, 0, &raw);
     }
+  }
+
+  // Append Store / UWP / Windows inbox apps exposed via FOLDERID_AppsFolder
+  // (e.g. Settings, Calculator, Photos, Snipping Tool) when not already covered
+  // by a Start Menu .lnk entry.
+  constexpr GUID kFOLDERID_AppsFolder = {
+      0x1e87508d, 0x89c2, 0x42f0,
+      {0x8a, 0x7e, 0x64, 0x5a, 0x0f, 0x50, 0xca, 0x58}};
+  constexpr GUID kBHID_EnumItems = {
+      0x94f60519, 0x2850, 0x4924,
+      {0xaa, 0x5a, 0xd1, 0x5e, 0x84, 0x86, 0x80, 0x39}};
+
+  IShellItem *apps_folder = nullptr;
+  if (SUCCEEDED (SHGetKnownFolderItem (kFOLDERID_AppsFolder, KF_FLAG_DEFAULT,
+                                       nullptr, IID_PPV_ARGS (&apps_folder))) &&
+      apps_folder != nullptr) {
+    IEnumShellItems *enum_items = nullptr;
+    if (SUCCEEDED (apps_folder->BindToHandler (nullptr, kBHID_EnumItems,
+                                               IID_PPV_ARGS (&enum_items))) &&
+        enum_items != nullptr) {
+      std::unordered_map<std::string, bool> lnk_names;
+      std::unordered_map<std::string, bool> lnk_ids;
+      for (const AppEntry &e : raw) {
+        if (!e.id.empty ())
+          lnk_ids[e.id] = true;
+        if (!e.name_lower.empty ())
+          lnk_names[e.name_lower] = true;
+      }
+
+      IShellItem *child = nullptr;
+      while (enum_items->Next (1, &child, nullptr) == S_OK &&
+             child != nullptr) {
+        PWSTR disp = nullptr;
+        PWSTR parsing = nullptr;
+        if (SUCCEEDED (child->GetDisplayName (SIGDN_NORMALDISPLAY, &disp)) &&
+            disp != nullptr &&
+            SUCCEEDED (
+                child->GetDisplayName (SIGDN_PARENTRELATIVEPARSING, &parsing)) &&
+            parsing != nullptr) {
+          std::wstring app_id (parsing);
+          bool has_path_sep =
+              app_id.find (L'\\') != std::wstring::npos ||
+              app_id.find (L'/') != std::wstring::npos;
+          bool is_raw_guid =
+              app_id.size () >= 2 && app_id.front () == L'{' &&
+              app_id.back () == L'}';
+          if (!app_id.empty () && !has_path_sep && !is_raw_guid) {
+            std::string name = app_wide_to_utf8 (disp);
+            std::string name_lower = app_utf8_tolower (name);
+            std::string id = canonical_app_id (app_id, L"", L"");
+            if (!name.empty () && !is_ignored_shortcut_name (name_lower) &&
+                !id.empty () && lnk_ids.find (id) == lnk_ids.end () &&
+                lnk_names.find (name_lower) == lnk_names.end ()) {
+              AppEntry uwp;
+              uwp.id = std::move (id);
+              uwp.name = std::move (name);
+              uwp.name_lower = std::move (name_lower);
+              uwp.aumid = app_id;
+              uwp.launch_path = L"shell:AppsFolder\\" + app_id;
+              uwp.is_uwp = true;
+              lnk_ids[uwp.id] = true;
+              lnk_names[uwp.name_lower] = true;
+              raw.push_back (std::move (uwp));
+            }
+          }
+        }
+        if (disp != nullptr)
+          CoTaskMemFree (disp);
+        if (parsing != nullptr)
+          CoTaskMemFree (parsing);
+        child->Release ();
+        child = nullptr;
+      }
+      enum_items->Release ();
+    }
+    apps_folder->Release ();
   }
 
   if (did_co)
@@ -603,7 +680,7 @@ app_index_open_location (const AppEntry &entry)
 {
   std::wstring target =
       !entry.target_exe.empty () ? entry.target_exe : entry.launch_path;
-  if (target.empty ())
+  if (target.empty () || target.rfind (L"shell:", 0) == 0)
     return false;
   std::wstring arg = L"/select,\"" + target + L"\"";
   HINSTANCE res = ShellExecuteW (nullptr, L"open", L"explorer.exe", arg.c_str (),
@@ -884,6 +961,199 @@ app_icon_for_window (HWND hwnd, const std::wstring &exe, int size,
   if (!exe.empty ())
     texture = app_icon_for_path (exe, size, key);
   return texture;
+}
+
+namespace {
+
+bool
+is_running_alt_tab_window (HWND hwnd)
+{
+  if (!IsWindowVisible (hwnd))
+    return false;
+
+  DWORD pid = 0;
+  GetWindowThreadProcessId (hwnd, &pid);
+  if (pid == GetCurrentProcessId ())
+    return false;
+
+  HWND try_ = GetAncestor (hwnd, GA_ROOTOWNER);
+  HWND walk = nullptr;
+  while (try_ != walk) {
+    walk = try_;
+    try_ = GetLastActivePopup (walk);
+    if (IsWindowVisible (try_))
+      break;
+  }
+  if (walk != hwnd)
+    return false;
+
+  if (GetWindowLongPtrW (hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)
+    return false;
+
+  // Dynamic lookup avoids adding dwmapi link requirements to test binaries.
+  using DwmGetAttrFn = HRESULT (WINAPI *) (HWND, DWORD, PVOID, DWORD);
+  static DwmGetAttrFn fn = [] () -> DwmGetAttrFn {
+    HMODULE mod = GetModuleHandleW (L"dwmapi.dll");
+    if (mod == nullptr)
+      mod = LoadLibraryW (L"dwmapi.dll");
+    FARPROC proc =
+        mod != nullptr ? GetProcAddress (mod, "DwmGetWindowAttribute")
+                       : nullptr;
+    DwmGetAttrFn resolved = nullptr;
+    if (proc != nullptr)
+      std::memcpy (&resolved, &proc, sizeof (resolved));
+    return resolved;
+  }();
+  if (fn != nullptr) {
+    BOOL cloaked = FALSE;
+    constexpr DWORD kDwmwaCloaked = 14;
+    if (SUCCEEDED (fn (hwnd, kDwmwaCloaked, &cloaked, sizeof (cloaked))) &&
+        cloaked != FALSE) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::wstring
+running_window_aumid (HWND hwnd)
+{
+  std::wstring out;
+  IPropertyStore *store = nullptr;
+  struct WinomePropKey {
+    GUID fmtid;
+    DWORD pid;
+  };
+  WinomePropKey key{kPKEY_AppUserModel_ID_fmt, 5};
+  if (SUCCEEDED (SHGetPropertyStoreForWindow (hwnd, IID_PPV_ARGS (&store))) &&
+      store != nullptr) {
+    PROPVARIANT pv;
+    PropVariantInit (&pv);
+    if (SUCCEEDED (store->GetValue (*reinterpret_cast<PROPERTYKEY *> (&key),
+                                    &pv)) &&
+        pv.vt == VT_LPWSTR && pv.pwszVal != nullptr) {
+      out = pv.pwszVal;
+    }
+    PropVariantClear (&pv);
+    store->Release ();
+  }
+  return out;
+}
+
+std::wstring
+running_window_exe (HWND hwnd)
+{
+  DWORD pid = 0;
+  GetWindowThreadProcessId (hwnd, &pid);
+  if (pid == 0)
+    return {};
+  HANDLE proc = OpenProcess (PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (proc == nullptr)
+    return {};
+  wchar_t buf[MAX_PATH] = L"";
+  DWORD len = MAX_PATH;
+  std::wstring out;
+  if (QueryFullProcessImageNameW (proc, 0, buf, &len))
+    out.assign (buf, len);
+  CloseHandle (proc);
+  return out;
+}
+
+BOOL CALLBACK
+collect_running_window_cb (HWND hwnd, LPARAM lparam)
+{
+  auto *out = reinterpret_cast<std::vector<RunningWindow> *> (lparam);
+  if (!is_running_alt_tab_window (hwnd))
+    return TRUE;
+
+  std::wstring aumid = running_window_aumid (hwnd);
+  std::wstring exe = running_window_exe (hwnd);
+  if (aumid.empty () && exe.empty ())
+    return TRUE;
+
+  wchar_t wtitle[256] = L"";
+  GetWindowTextW (hwnd, wtitle, 256);
+
+  RunningWindow rw;
+  rw.hwnd = hwnd;
+  rw.title = app_wide_to_utf8 (wtitle);
+  rw.aumid_norm = normalize_app_id (app_wide_to_utf8 (aumid));
+  rw.exe_norm = normalize_app_id (app_wide_to_utf8 (exe));
+  size_t slash = rw.exe_norm.find_last_of ('\\');
+  rw.exe_base_lower =
+      (slash != std::string::npos) ? rw.exe_norm.substr (slash + 1) : rw.exe_norm;
+  rw.canonical_id = canonical_app_id (aumid, exe, L"");
+  out->push_back (std::move (rw));
+  return TRUE;
+}
+
+}  // namespace
+
+std::vector<RunningWindow>
+match_entry_running_windows (const AppEntry &entry,
+                             const std::vector<RunningWindow> &windows)
+{
+  std::string entry_aumid =
+      normalize_app_id (app_wide_to_utf8 (entry.aumid));
+  std::string entry_exe =
+      normalize_app_id (app_wide_to_utf8 (entry.target_exe));
+  bool is_frame_host =
+      entry_exe.find ("\\applicationframehost.exe") != std::string::npos;
+
+  std::vector<RunningWindow> matched;
+  for (const RunningWindow &w : windows) {
+    bool hit = false;
+    if (!entry_aumid.empty () && !w.aumid_norm.empty ()) {
+      hit = (entry_aumid == w.aumid_norm);
+    } else if (!entry.id.empty () && !w.canonical_id.empty () &&
+               entry.id == w.canonical_id) {
+      hit = true;
+    } else if (!entry_aumid.empty () && w.canonical_id == entry_aumid) {
+      hit = true;
+    } else if (!entry_exe.empty () && !is_frame_host &&
+               w.exe_base_lower != "applicationframehost.exe" &&
+               !w.exe_norm.empty () && entry_exe == w.exe_norm &&
+               (w.aumid_norm.empty () || entry_aumid.empty ())) {
+      hit = true;
+    }
+    if (hit)
+      matched.push_back (w);
+  }
+  return matched;
+}
+
+std::vector<RunningWindow>
+app_index_enumerate_running_windows (void)
+{
+  std::vector<RunningWindow> out;
+  EnumWindows (collect_running_window_cb, reinterpret_cast<LPARAM> (&out));
+  return out;
+}
+
+std::vector<RunningWindow>
+app_index_running_windows_for_entry (const AppEntry &entry)
+{
+  std::vector<RunningWindow> all = app_index_enumerate_running_windows ();
+  return match_entry_running_windows (entry, all);
+}
+
+bool
+app_index_activate_hwnd (HWND hwnd)
+{
+  if (hwnd == nullptr || !IsWindow (hwnd))
+    return false;
+  if (IsIconic (hwnd))
+    ShowWindow (hwnd, SW_RESTORE);
+  return SetForegroundWindow (hwnd) != FALSE;
+}
+
+void
+app_index_close_windows (const std::vector<HWND> &hwnds)
+{
+  for (HWND hwnd : hwnds) {
+    if (hwnd != nullptr && IsWindow (hwnd))
+      PostMessageW (hwnd, WM_CLOSE, 0, 0);
+  }
 }
 
 }  // namespace winome
