@@ -54,6 +54,7 @@
 #include "overview.h"
 #include "app-grid.h"
 #include "app-index.h"
+#include "easing.h"
 #include "i18n.h"
 #include "overview-layout.h"
 #include "overview-dash.h"
@@ -938,9 +939,8 @@ chrome_hide (void)
 }
 
 void
-on_chrome_click (GtkGestureClick *gesture G_GNUC_UNUSED,
-                 int n_press G_GNUC_UNUSED, double x G_GNUC_UNUSED,
-                 double y G_GNUC_UNUSED, gpointer user_data G_GNUC_UNUSED)
+on_chrome_clicked (GtkButton *btn G_GNUC_UNUSED,
+                   gpointer user_data G_GNUC_UNUSED)
 {
   if (g_chrome_target != nullptr && IsWindow (g_chrome_target)) {
     PostMessageW (g_chrome_target, WM_CLOSE, 0, 0);
@@ -980,8 +980,9 @@ chrome_init (void)
     }
   }
 
-  g_chrome_button = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  g_chrome_button = gtk_button_new ();
   gtk_widget_add_css_class (g_chrome_button, "window-close");
+  gtk_widget_set_focus_on_click (g_chrome_button, FALSE);
   gtk_widget_set_halign (g_chrome_button, GTK_ALIGN_CENTER);
   gtk_widget_set_valign (g_chrome_button, GTK_ALIGN_CENTER);
   gtk_widget_set_margin_start (g_chrome_button, kCloseShadowPad);
@@ -993,17 +994,14 @@ chrome_init (void)
   gtk_image_set_pixel_size (GTK_IMAGE (icon), close_icon_size ());
   gtk_widget_set_halign (icon, GTK_ALIGN_CENTER);
   gtk_widget_set_valign (icon, GTK_ALIGN_CENTER);
-  gtk_widget_set_hexpand (icon, TRUE);
-  gtk_widget_set_vexpand (icon, TRUE);
-  gtk_box_append (GTK_BOX (g_chrome_button), icon);
+  gtk_button_set_child (GTK_BUTTON (g_chrome_button), icon);
 
   GtkWidget *wrap = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
   gtk_box_append (GTK_BOX (wrap), g_chrome_button);
   gtk_window_set_child (GTK_WINDOW (g_chrome_window), wrap);
 
-  GtkGesture *click = gtk_gesture_click_new ();
-  g_signal_connect (click, "released", G_CALLBACK (on_chrome_click), nullptr);
-  gtk_widget_add_controller (g_chrome_button, GTK_EVENT_CONTROLLER (click));
+  g_signal_connect (g_chrome_button, "clicked",
+                    G_CALLBACK (on_chrome_clicked), nullptr);
 
   attach_chrome_hover_motion (g_chrome_button);
 }
@@ -1085,13 +1083,16 @@ on_icon_click (GtkGestureClick *gesture G_GNUC_UNUSED,
   activate_slot_and_close (index, "ov-click-icon");
 }
 
+constexpr int kIconShadowPad = 6; // Room for .icon-dropshadow blur/offset
+
 void
 icon_chrome_init (void)
 {
   g_icon_window = make_chrome_toplevel (&g_icon_hooks);
 
   // The 64px application icon straddling the preview's bottom edge
-  // (ICON_SIZE / ICON_OVERLAP), letterboxed inside its square.
+  // (ICON_SIZE / ICON_OVERLAP), letterboxed inside its square and padded for
+  // its CSS drop shadow.
   g_icon_picture = gtk_picture_new ();
   gtk_widget_add_css_class (g_icon_picture, "window-icon");
   gtk_widget_add_css_class (g_icon_picture, "icon-dropshadow");
@@ -1099,9 +1100,17 @@ icon_chrome_init (void)
                                GTK_CONTENT_FIT_CONTAIN);
   gtk_widget_set_size_request (g_icon_picture, kWindowIconSize,
                                kWindowIconSize);
-  gtk_window_set_child (GTK_WINDOW (g_icon_window), g_icon_picture);
-  gtk_window_set_default_size (GTK_WINDOW (g_icon_window), kWindowIconSize,
-                               kWindowIconSize);
+  gtk_widget_set_margin_start (g_icon_picture, kIconShadowPad);
+  gtk_widget_set_margin_end (g_icon_picture, kIconShadowPad);
+  gtk_widget_set_margin_top (g_icon_picture, kIconShadowPad);
+  gtk_widget_set_margin_bottom (g_icon_picture, kIconShadowPad);
+
+  GtkWidget *wrap = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_box_append (GTK_BOX (wrap), g_icon_picture);
+  gtk_window_set_child (GTK_WINDOW (g_icon_window), wrap);
+  gtk_window_set_default_size (GTK_WINDOW (g_icon_window),
+                               kWindowIconSize + 2 * kIconShadowPad,
+                               kWindowIconSize + 2 * kIconShadowPad);
 
   GtkGesture *click = gtk_gesture_click_new ();
   g_signal_connect (click, "released", G_CALLBACK (on_icon_click), nullptr);
@@ -1123,14 +1132,15 @@ icon_show_at (const RECT &preview_rect, HWND target)
   GetMonitorInfoW (monitor, &mi);
 
   int size = kWindowIconSize * scale;
+  int pad = kIconShadowPad * scale;
   double cx = (preview_rect.left + preview_rect.right) / 2.0;
   // ICON_OVERLAP: 70% of the icon overlaps the preview's bottom edge.
   double top = preview_rect.bottom - kIconOverlap * size;
 
-  g_icon_want.left = mi.rcMonitor.left + (LONG)(cx - size / 2.0);
-  g_icon_want.top = mi.rcMonitor.top + (LONG)top;
-  g_icon_want.right = g_icon_want.left + size;
-  g_icon_want.bottom = g_icon_want.top + size;
+  g_icon_want.left = mi.rcMonitor.left + (LONG)(cx - size / 2.0) - pad;
+  g_icon_want.top = mi.rcMonitor.top + (LONG)top - pad;
+  g_icon_want.right = g_icon_want.left + size + 2 * pad;
+  g_icon_want.bottom = g_icon_want.top + size + 2 * pad;
 
   // Icon at >= 64 physical px (WM_GETICON / shell item factory); cached per
   // target — the lookup is far too slow for the per-frame hover animation.
@@ -2479,6 +2489,8 @@ finish_hide (void)
   if (g_app_grid != nullptr) {
     app_grid_close_menu (g_app_grid);
     app_grid_reset_page (g_app_grid);
+    tween_opacity (g_app_grid, 1.0, 1.0, 0, Ease::linear);
+    gtk_widget_set_opacity (g_app_grid, 1.0);
     gtk_widget_set_visible (g_app_grid, FALSE);
   }
   g_app_grid_mode = false;
@@ -3247,6 +3259,15 @@ overview_toggle_app_grid (void)
   if (g_app_grid_mode && g_app_grid != nullptr)
     app_grid_reset_page (g_app_grid);
   place_overview_locked (false);
+  if (g_app_grid != nullptr) {
+    if (g_app_grid_mode) {
+      gtk_widget_set_opacity (g_app_grid, 0.0);
+      tween_opacity (g_app_grid, 0.0, 1.0, 220, Ease::ease_out_cubic);
+    } else {
+      tween_opacity (g_app_grid, 1.0, 1.0, 0, Ease::linear);
+      gtk_widget_set_opacity (g_app_grid, 1.0);
+    }
+  }
 }
 
 }  // namespace winome

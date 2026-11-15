@@ -31,6 +31,7 @@ ACCENT_VARS = {
 RENAME = {
     'height': 'min-height',
     'width': 'min-width',
+    'icon-shadow': 'filter',
 }
 
 # -natural-hpadding: X -> padding-left/right: X (expanded to two decls).
@@ -44,7 +45,7 @@ DROP = set([
     '-minimum-hpadding', 'icon-size', 'spacing', 'spacing-rows',
     'spacing-columns', 'row-spacing', 'column-spacing', 'max-row-spacing',
     'max-column-spacing', 'page-padding-top', 'page-padding-right',
-    'page-padding-bottom', 'page-padding-left', 'text-align', 'icon-shadow',
+    'page-padding-bottom', 'page-padding-left', 'text-align',
     'link-color', 'selected-color', 'selection-background-color',
     'warning-color', 'success-color', 'error-color', 'caret-color',
     'caret-size', 'visible-width', 'offset-y', '-arrow-background-color',
@@ -599,7 +600,9 @@ window.winome-overview scrollbar slider:active {
   background-color: #868689;
 }
 
-/* Overview context GtkPopovers delegate frame styling to .popup-menu-content. */
+/* Overview context GtkPopovers render a unified .popup-menu-content surface
+   directly on > contents so > arrow connects seamlessly without a gap, while
+   keeping fallback popovers transparent around nested .popup-menu-content. */
 window.winome-overview popover.background > contents {
   background: transparent;
   background-color: transparent;
@@ -613,11 +616,95 @@ window.winome-overview popover.background > arrow {
   border: none;
   box-shadow: none;
 }
+window.winome-overview popover.background.winome-context-popover > contents {
+  background-color: #36363a;
+  color: #ffffff;
+  border-radius: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  box-shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.2);
+  padding: 6px;
+  margin: 0;
+}
+window.winome-overview popover.background.winome-context-popover > arrow {
+  background-color: #36363a;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  box-shadow: none;
+}
 
-/* Floating notification toast toplevel keeps a transparent frame around cards. */
+/* Floating notification toast toplevel keeps a transparent frame around cards
+   with Cantarell typography and margin cushion so drop shadows do not clip. */
 window#winomeToastWindow {
   background-color: transparent;
   box-shadow: none;
+  font: 11pt "Cantarell";
+}
+window#winomeToastWindow .notification-banner {
+  margin: 8px 10px 12px 10px;
+}
+
+/* Tray popover matches upstream .popup-menu-content 20px radius on its outer
+   card without nesting a second bordered card inside it. */
+.quick-settings-popover-card.tray-popover-card {
+  border-radius: 20px;
+}
+.tray-menu-box {
+  padding: 14px;
+}
+.tray-menu-title {
+  font-weight: 700;
+}
+.tray-header-button {
+  background-image: none;
+  border-image: none;
+  border-style: none;
+  border-radius: 999px;
+  background-color: rgba(255, 255, 255, 0.08);
+  color: #ffffff;
+  padding: 4px 10px;
+  min-height: 28px;
+  transition-property: background-color, color;
+  transition-duration: 100ms;
+}
+.tray-header-button.icon-button {
+  padding: 6px;
+  min-width: 28px;
+}
+.tray-header-button:hover {
+  background-color: rgba(255, 255, 255, 0.14);
+}
+.tray-header-button:active {
+  background-color: rgba(255, 255, 255, 0.20);
+}
+.tray-header-button:focus:not(:focus-visible) {
+  outline-style: none;
+  outline-width: 0;
+  box-shadow: none;
+}
+separator.popup-separator-menu-item {
+  background-color: rgba(255, 255, 255, 0.1);
+  min-height: 1px;
+  margin: 4px 2px;
+}
+
+/* Match upstream Message.expand()/unexpand() 180-degree chevron rotation. */
+.message .message-header .message-expand-button image {
+  transition-property: transform;
+  transition-duration: 200ms;
+  transition-timing-function: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+}
+.message .message-header .message-expand-button.expanded image {
+  transform: rotate(180deg);
+}
+
+/* Activities workspace dot transitions for multi-desktop state sync. */
+#panel .panel-button#panelActivities .workspace-dot {
+  transition-property: min-width, min-height, opacity, transform;
+  transition-duration: 180ms;
+  transition-timing-function: cubic-bezier(0.215, 0.61, 0.355, 1.0);
+}
+#panel .panel-button#panelActivities .workspace-dot.inactive {
+  opacity: 0.5;
+  transform: scale(0.75);
 }
 
 /* Floating modal dialogs keep a transparent frame around rounded .modal-dialog. */
@@ -805,6 +892,18 @@ def process_declaration(prop, value):
         m = re.match(r'^inset 0 0 0 100px (.+)$', value)
         if m:
             return [('background-color', m.group(1))]
+
+    if prop == 'icon-shadow':
+        return [('filter', f'drop-shadow({eval_color_value(value)})')]
+
+    if prop == 'background-image':
+        value = value.replace(
+            'resource:///org/gnome/shell/theme/calendar-today.svg',
+            'resource:///org/winome/theme/calendar-today.svg',
+        ).replace(
+            'resource:///org/gnome/shell/theme/workspace-placeholder.svg',
+            'resource:///org/winome/theme/workspace-placeholder.svg',
+        )
 
     if prop in DROP:
         return None

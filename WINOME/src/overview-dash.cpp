@@ -11,6 +11,7 @@
 #include "overview-dash.h"
 #include "app-index.h"
 #include "config.h"
+#include "easing.h"
 #include "i18n.h"
 #include "overview-trigger.h"
 #include "st-engine.h"
@@ -46,6 +47,8 @@ constexpr int kItemGap = 4;           // margin 0 2px on both neighbours
 constexpr int kSeparatorGap = 9;      // .dash-separator (1px + 4px margin * 2)
 constexpr int kDotSize = 5;
 constexpr int kLabelHoverTimeoutMs = 300; // DASH_ITEM_HOVER_TIMEOUT
+constexpr int kLabelShowMs = 150;         // DASH_ITEM_LABEL_SHOW_TIME
+constexpr int kLabelHideMs = 100;         // dash.js label hideFade
 constexpr int kLabelOffset = 8;           // .dash-label -y-offset
 
 // PKEY_AppUserModel_ID (propsys), defined locally to avoid header churn.
@@ -72,6 +75,7 @@ struct WinomeDash {
   GtkWidget *root_fixed;  // overview root (owns the hover label)
   GtkWidget *label;       // .dash-label GtkLabel
   guint label_timeout;    // hover delay source
+  uint64_t label_anim_gen = 0;
   GtkWidget *active_menu; // right-click GtkPopover
 
   std::vector<DashApp> apps;
@@ -392,12 +396,26 @@ place_label (WinomeDash *self, int index)
     double cx = dst_pt.x + tile_cx;
     double top = dst_pt.y + tile_top;
     double x = cx - natural.width / 2.0;
-    double y = top - natural.height - kLabelOffset;
+    int root_w = gtk_widget_get_width (self->root_fixed);
+    if (root_w > 0) {
+      double max_x = std::max (8.0, (double)root_w - natural.width - 8.0);
+      x = std::clamp (x, 8.0, max_x);
+    }
+    double y = std::max (8.0, top - natural.height - kLabelOffset);
     gtk_fixed_move (GTK_FIXED (self->root_fixed), self->label,
                     (int)x, (int)y);
   }
 
+  uint64_t gen = ++self->label_anim_gen;
+  g_object_set_data (G_OBJECT (self->label), "dash-fade-gen",
+                     GUINT_TO_POINTER ((guint)gen));
+  double start_opacity = gtk_widget_get_visible (self->label)
+                             ? gtk_widget_get_opacity (self->label)
+                             : 0.0;
+  gtk_widget_set_opacity (self->label, start_opacity);
   gtk_widget_set_visible (self->label, TRUE);
+  tween_opacity (self->label, start_opacity, 1.0, kLabelShowMs,
+                 Ease::ease_out_quad);
 }
 
 void
@@ -407,7 +425,20 @@ hide_label (WinomeDash *self)
     g_source_remove (self->label_timeout);
     self->label_timeout = 0;
   }
-  gtk_widget_set_visible (self->label, FALSE);
+  if (self->label == nullptr || !gtk_widget_get_visible (self->label))
+    return;
+
+  GtkWidget *lbl = self->label;
+  uint64_t gen = ++self->label_anim_gen;
+  g_object_set_data (G_OBJECT (lbl), "dash-fade-gen",
+                     GUINT_TO_POINTER ((guint)gen));
+  tween_opacity (lbl, gtk_widget_get_opacity (lbl), 0.0, kLabelHideMs,
+                 Ease::ease_out_quad, [lbl, gen] {
+                   if (GPOINTER_TO_UINT (g_object_get_data (
+                           G_OBJECT (lbl), "dash-fade-gen")) == (guint)gen) {
+                     gtk_widget_set_visible (lbl, FALSE);
+                   }
+                 });
 }
 
 gboolean
@@ -572,6 +603,7 @@ show_dash_context_menu (WinomeDash *self, int index)
   const DashTileRect &r = self->tile_rects[index];
 
   GtkWidget *popover = gtk_popover_new ();
+  gtk_widget_add_css_class (popover, "winome-context-popover");
   gtk_widget_set_parent (popover, GTK_WIDGET (self));
   gtk_popover_set_has_arrow (GTK_POPOVER (popover), TRUE);
   gtk_popover_set_position (GTK_POPOVER (popover), GTK_POS_TOP);
@@ -580,7 +612,6 @@ show_dash_context_menu (WinomeDash *self, int index)
   gtk_popover_set_pointing_to (GTK_POPOVER (popover), &target);
 
   GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
-  gtk_widget_add_css_class (box, "popup-menu-content");
 
   auto *ctx = new DashMenuCtx{self, app.id, app.exe_path, app.windows, index};
   g_object_set_data_full (
@@ -652,7 +683,7 @@ on_dash_motion_enter (GtkEventControllerMotion *motion, double x, double y,
       self->label_timeout =
           g_timeout_add (kLabelHoverTimeoutMs, label_timeout_cb, self);
     else
-      gtk_widget_set_visible (self->label, FALSE);
+      hide_label (self);
   }
 }
 
@@ -846,8 +877,13 @@ winome_dash_dispose (GObject *object)
 {
   WinomeDash *self = WINOME_DASH (object);
   overview_dash_close_menu (GTK_WIDGET (self));
-  hide_label (self);
+  if (self->label_timeout != 0) {
+    g_source_remove (self->label_timeout);
+    self->label_timeout = 0;
+  }
+  ++self->label_anim_gen;
   if (self->label != nullptr) {
+    gtk_widget_set_visible (self->label, FALSE);
     gtk_fixed_remove (GTK_FIXED (self->root_fixed), self->label);
     self->label = nullptr;
   }

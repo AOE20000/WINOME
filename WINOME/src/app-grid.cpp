@@ -4,6 +4,7 @@
 #include "app-grid.h"
 #include "app-index.h"
 #include "config.h"
+#include "easing.h"
 #include "i18n.h"
 #include "st-engine.h"
 
@@ -139,12 +140,12 @@ show_tile_context_menu (GtkWidget *tile, WinomeAppGrid *self,
   app_grid_close_menu (GTK_WIDGET (self));
 
   GtkWidget *popover = gtk_popover_new ();
+  gtk_widget_add_css_class (popover, "winome-context-popover");
   gtk_widget_set_parent (popover, tile);
   gtk_popover_set_has_arrow (GTK_POPOVER (popover), FALSE);
   gtk_popover_set_autohide (GTK_POPOVER (popover), TRUE);
 
   GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
-  gtk_widget_add_css_class (box, "popup-menu-content");
 
   auto *ctx = new TileActionCtx{self, entry};
   g_object_set_data_full (
@@ -223,13 +224,23 @@ struct PageDotCtx {
 };
 
 void
+switch_to_page (WinomeAppGrid *self, int target_page)
+{
+  if (self == nullptr || target_page == self->page)
+    return;
+  self->page = target_page;
+  rebuild_page_contents (self);
+  if (self->grid != nullptr) {
+    gtk_widget_set_opacity (self->grid, 0.0);
+    tween_opacity (self->grid, 0.0, 1.0, 200, Ease::ease_out_cubic);
+  }
+}
+
+void
 on_page_dot_clicked (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 {
   auto *ctx = static_cast<PageDotCtx *> (user_data);
-  if (ctx->self->page != ctx->page) {
-    ctx->self->page = ctx->page;
-    rebuild_page_contents (ctx->self);
-  }
+  switch_to_page (ctx->self, ctx->page);
 }
 
 gboolean
@@ -344,13 +355,16 @@ rebuild_page_contents (WinomeAppGrid *self)
 
   // Page navigation arrows & dots.
   bool multi_page = slice.total_pages > 1;
+  bool has_prev = slice.page > 0;
+  bool has_next = slice.page + 1 < slice.total_pages;
   gtk_widget_set_visible (self->prev_btn, multi_page);
   gtk_widget_set_visible (self->next_btn, multi_page);
-  gtk_widget_set_sensitive (self->prev_btn, slice.page > 0);
-  gtk_widget_set_opacity (self->prev_btn, slice.page > 0 ? 1.0 : 0.28);
-  gtk_widget_set_sensitive (self->next_btn, slice.page + 1 < slice.total_pages);
-  gtk_widget_set_opacity (self->next_btn,
-                          slice.page + 1 < slice.total_pages ? 1.0 : 0.28);
+  gtk_widget_set_sensitive (self->prev_btn, has_prev);
+  gtk_widget_set_can_target (self->prev_btn, has_prev);
+  gtk_widget_set_opacity (self->prev_btn, has_prev ? 1.0 : 0.0);
+  gtk_widget_set_sensitive (self->next_btn, has_next);
+  gtk_widget_set_can_target (self->next_btn, has_next);
+  gtk_widget_set_opacity (self->next_btn, has_next ? 1.0 : 0.0);
   gtk_widget_set_visible (self->indicators_box, multi_page);
 
   if (multi_page) {
@@ -410,9 +424,11 @@ winome_app_grid_init (WinomeAppGrid *self)
   self->prev_btn = gtk_button_new ();
   gtk_widget_set_name (self->prev_btn, "winome-app-nav-arrow");
   gtk_widget_add_css_class (self->prev_btn, "page-navigation-arrow");
+  gtk_widget_set_focus_on_click (self->prev_btn, FALSE);
   gtk_widget_set_valign (self->prev_btn, GTK_ALIGN_CENTER);
-  GtkWidget *prev_img = gtk_image_new_from_icon_name ("go-previous-symbolic");
-  gtk_image_set_pixel_size (GTK_IMAGE (prev_img), 24);
+  GtkWidget *prev_img =
+      gtk_image_new_from_icon_name ("carousel-arrow-previous-symbolic");
+  gtk_image_set_pixel_size (GTK_IMAGE (prev_img), 16);
   gtk_button_set_child (GTK_BUTTON (self->prev_btn), prev_img);
   g_signal_connect (self->prev_btn, "clicked", G_CALLBACK (on_prev_clicked),
                     self);
@@ -456,9 +472,11 @@ winome_app_grid_init (WinomeAppGrid *self)
   self->next_btn = gtk_button_new ();
   gtk_widget_set_name (self->next_btn, "winome-app-nav-arrow");
   gtk_widget_add_css_class (self->next_btn, "page-navigation-arrow");
+  gtk_widget_set_focus_on_click (self->next_btn, FALSE);
   gtk_widget_set_valign (self->next_btn, GTK_ALIGN_CENTER);
-  GtkWidget *next_img = gtk_image_new_from_icon_name ("go-next-symbolic");
-  gtk_image_set_pixel_size (GTK_IMAGE (next_img), 24);
+  GtkWidget *next_img =
+      gtk_image_new_from_icon_name ("carousel-arrow-next-symbolic");
+  gtk_image_set_pixel_size (GTK_IMAGE (next_img), 16);
   gtk_button_set_child (GTK_BUTTON (self->next_btn), next_img);
   g_signal_connect (self->next_btn, "clicked", G_CALLBACK (on_next_clicked),
                     self);
@@ -581,26 +599,26 @@ app_grid_next_page (GtkWidget *grid)
       compute_app_grid_dimensions (self->avail_w, self->avail_h);
   int pages = compute_app_grid_page_count ((int)self->filtered.size (),
                                            dim.page_size);
-  if (self->page + 1 < pages) {
-    ++self->page;
-    rebuild_page_contents (self);
-  }
+  if (self->page + 1 < pages)
+    switch_to_page (self, self->page + 1);
 }
 
 void
 app_grid_prev_page (GtkWidget *grid)
 {
   WinomeAppGrid *self = WINOME_APP_GRID (grid);
-  if (self->page > 0) {
-    --self->page;
-    rebuild_page_contents (self);
-  }
+  if (self->page > 0)
+    switch_to_page (self, self->page - 1);
 }
 
 void
 app_grid_reset_page (GtkWidget *grid)
 {
   WinomeAppGrid *self = WINOME_APP_GRID (grid);
+  if (self->grid != nullptr) {
+    tween_opacity (self->grid, 1.0, 1.0, 0, Ease::linear);
+    gtk_widget_set_opacity (self->grid, 1.0);
+  }
   if (self->page != 0) {
     self->page = 0;
     rebuild_page_contents (self);

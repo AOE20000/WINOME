@@ -682,7 +682,7 @@ GtkWidget* build_about_page() {
   gtk_widget_set_name(page, "winomeSettingsPage");
 
   GtkWidget* header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 14);
-  GtkWidget* logo = gtk_image_new_from_icon_name("desktop-symbolic");
+  GtkWidget* logo = gtk_image_new_from_icon_name("computer-symbolic");
   gtk_image_set_pixel_size(GTK_IMAGE(logo), 48);
 
   GtkWidget* titles = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);

@@ -193,6 +193,11 @@ def verify_full_theme_with_gtk4(converter):
             '.calendar:hover',
             '.message-list',
             '.quick-settings-grid > .quick-toggle-has-menu',
+            'filter: drop-shadow(',
+            '.tray-popover-card',
+            '.message-expand-button.expanded image',
+            'popover.background.winome-context-popover > arrow',
+            'resource:///org/winome/theme/calendar-today.svg',
         ):
             assert expected_rule in full_text, (
                 f'missing GTK4 override rule: {expected_rule}')
@@ -245,6 +250,19 @@ def verify_full_theme_with_gtk4(converter):
                 'go-next-symbolic',
                 'preferences-system-symbolic',
                 'video-display-symbolic',
+                'computer-symbolic',
+                'pan-start-symbolic',
+                'pan-end-symbolic',
+                'pan-down-symbolic',
+                'view-refresh-symbolic',
+                'audio-x-generic-symbolic',
+                'media-skip-backward-symbolic',
+                'media-playback-pause-symbolic',
+                'media-playback-start-symbolic',
+                'media-skip-forward-symbolic',
+                'dialog-information-symbolic',
+                'window-close-symbolic',
+                'edit-find-symbolic',
             ]
             for icon_name in bundled_icons + required_stock_icons:
                 assert gtk.gtk_icon_theme_has_icon(

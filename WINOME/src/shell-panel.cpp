@@ -17,9 +17,11 @@
 
 #include "shell-panel.h"
 #include "config.h"
+#include "easing.h"
 #include "i18n.h"
 #include "st-engine.h"
 #include "system-status.h"
+#include "virtual-desktop.h"
 #include "wifi-networks.h"
 #include "quick-settings.h"
 #include "notifications.h"
@@ -161,6 +163,7 @@ create_workspace_dot (void)
 {
   GtkWidget *dot = GTK_WIDGET (g_object_new (winome_dot_get_type (), NULL));
   gtk_widget_add_css_class (dot, "workspace-dot");
+  gtk_widget_set_valign (dot, GTK_ALIGN_CENTER);
 
   int size = workspace_dot_size ();
   // width-multiplier for a single workspace (nIndicators <= 2 -> 3.625).
@@ -180,7 +183,7 @@ on_activities_clicked (GtkButton *button G_GNUC_UNUSED,
 }
 
 static GtkWidget *
-create_activities_button (void)
+create_activities_button (GtkWidget **out_indicators)
 {
   GtkWidget *button;
   GtkWidget *indicators;
@@ -201,6 +204,9 @@ create_activities_button (void)
   gtk_widget_set_valign (indicators, GTK_ALIGN_CENTER);
   dot = create_workspace_dot ();
   gtk_box_append (GTK_BOX (indicators), dot);
+
+  if (out_indicators != nullptr)
+    *out_indicators = indicators;
 
   gtk_button_set_child (GTK_BUTTON (button), indicators);
 
@@ -433,6 +439,7 @@ typedef struct {
   int win_x;               // last positioned left edge in physical px
   gint raise_attempts;     // post-map re-assert counter (GDK re-lates late)
   guint raise_source_id;   // pending g_idle/g_timeout id for popover_raise_idle
+  uint64_t anim_gen;       // invalidates stale open/close fade callbacks
 } PanelPopover;
 
 static GList *g_open_popovers = NULL;
@@ -702,26 +709,35 @@ panel_popover_geometry (PanelPopover *pp, int width, int height,
 }
 
 static void
-panel_popover_close (PanelPopover *pp, const char *reason)
+panel_popover_hide_now (PanelPopover *pp)
 {
-  if (!pp->open)
+  gtk_widget_set_visible (pp->window, FALSE);
+  HWND hwnd = panel_popover_hwnd (pp);
+  if (hwnd != nullptr)
+    SetWindowPos (hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                  SWP_NOMOVE | SWP_NOSIZE);
+}
+
+static void
+panel_popover_close_ex (PanelPopover *pp, const char *reason, gboolean immediate)
+{
+  if (!pp->open) {
+    if (immediate) {
+      ++pp->anim_gen;
+      if (pp->window != nullptr && gtk_widget_get_visible (pp->window))
+        panel_popover_hide_now (pp);
+    }
     return;
+  }
 
   g_print ("[pop] close (%s)\n", reason);
   pp->open = FALSE;
+  const uint64_t gen = ++pp->anim_gen;
   panel_popover_cancel_raise (pp);
   gtk_widget_remove_css_class (pp->button, "open");
 
   if (pp->child != NULL)
     winome_quick_settings_close_menu (pp->child, FALSE);
-
-  gtk_widget_set_visible (pp->window, FALSE);
-
-  // Stop floating above everything once closed.
-  HWND hwnd = panel_popover_hwnd (pp);
-  if (hwnd != nullptr)
-    SetWindowPos (hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
-                  SWP_NOMOVE | SWP_NOSIZE);
 
   g_open_popovers = g_list_remove (g_open_popovers, pp);
 
@@ -734,6 +750,26 @@ panel_popover_close (PanelPopover *pp, const char *reason)
   }
   g_timeout_add_full (G_PRIORITY_DEFAULT, 200, clear_stale_hover,
                       g_object_ref (pp->button), g_object_unref);
+
+  const double cur_op = pp->wrap != nullptr ? gtk_widget_get_opacity (pp->wrap) : 0.0;
+  if (immediate || pp->wrap == nullptr || cur_op <= 0.01) {
+    panel_popover_hide_now (pp);
+    return;
+  }
+
+  winome::tween_opacity (
+      pp->wrap, cur_op, 0.0, winome::BOXPOPOVER_ANIMATION_TIME,
+      winome::Ease::ease_out_quad, [pp, gen] () {
+        if (pp->open || pp->anim_gen != gen)
+          return;
+        panel_popover_hide_now (pp);
+      });
+}
+
+static void
+panel_popover_close (PanelPopover *pp, const char *reason)
+{
+  panel_popover_close_ex (pp, reason, FALSE);
 }
 
 // After GTK maps the popover, re-assert the shell-chrome ex styles, the
@@ -823,8 +859,18 @@ panel_popover_open (PanelPopover *pp)
   if (pp->open)
     return;
 
+  // Match upstream PanelMenu: opening one panel menu closes any sibling menu.
+  GList *siblings = g_list_copy (g_open_popovers);
+  for (GList *l = siblings; l != nullptr; l = l->next) {
+    PanelPopover *other = static_cast<PanelPopover *> (l->data);
+    if (other != pp && g_list_find (g_open_popovers, other) != nullptr)
+      panel_popover_close_ex (other, "switch", TRUE);
+  }
+  g_list_free (siblings);
+
   g_print ("[pop] open\n");
   pp->open = TRUE;
+  ++pp->anim_gen;
   pp->raise_attempts = 0;
   gtk_widget_add_css_class (pp->button, "open");
 
@@ -877,7 +923,17 @@ panel_popover_open (PanelPopover *pp)
     }
   }
 
-  gtk_widget_set_visible (pp->window, TRUE);
+  if (pp->wrap != nullptr) {
+    const double start_op =
+        gtk_widget_get_visible (pp->window) ? gtk_widget_get_opacity (pp->wrap) : 0.0;
+    gtk_widget_set_opacity (pp->wrap, start_op);
+    gtk_widget_set_visible (pp->window, TRUE);
+    winome::tween_opacity (pp->wrap, start_op, 1.0,
+                           winome::BOXPOPOVER_ANIMATION_TIME,
+                           winome::Ease::ease_out_quad);
+  } else {
+    gtk_widget_set_visible (pp->window, TRUE);
+  }
 
   // Re-assert the topmost placement after GTK's map completes (see
   // popover_raise_idle): the first map demotes the window out of the
@@ -1081,6 +1137,9 @@ make_panel_popover (GtkWidget *button, GtkWidget *child, gboolean centered)
   gtk_widget_add_css_class (pp->card, "quick-settings-popover-card");
   if (centered)
     gtk_widget_add_css_class (pp->card, "datemenu-card");
+  else if (child != nullptr &&
+           g_object_get_data (G_OBJECT (child), "tray-popover") != nullptr)
+    gtk_widget_add_css_class (pp->card, "tray-popover-card");
   pp->child = child;
   gtk_box_append (GTK_BOX (pp->card), child);
   gtk_box_append (GTK_BOX (wrap), pp->card);
@@ -1117,6 +1176,10 @@ typedef struct PanelStatus {
   bool is_primary;
   guint status_timer_id;
   guint clock_timer_id;
+  guint vd_timer_id;
+  GtkWidget *activities_indicators;
+  int desktop_count;
+  int active_desktop;
   GtkWidget *clock_label;
   GtkWidget *messages_indicator;
   GtkWidget *messages_indicator_pad;
@@ -1133,6 +1196,61 @@ typedef struct PanelStatus {
   GtkWidget *tray_list_box;
   GtkWidget *tray_empty_label;
 } PanelStatus;
+
+// Sync Activities workspace dots with active Windows virtual desktops
+// (upstream panel.js WorkspaceIndicators).
+static void
+sync_activities_dots (PanelStatus *st)
+{
+  if (st == nullptr || st->activities_indicators == nullptr)
+    return;
+
+  int count = std::max (1, winome::vd::count ());
+  int active = count > 1 ? winome::vd::current_index () : 0;
+  if (active < 0 || active >= count)
+    active = 0;
+
+  if (st->desktop_count == count && st->active_desktop == active)
+    return;
+
+  const bool count_changed = st->desktop_count != count;
+  st->desktop_count = count;
+  st->active_desktop = active;
+
+  if (count_changed) {
+    GtkWidget *child = gtk_widget_get_first_child (st->activities_indicators);
+    while (child != nullptr) {
+      GtkWidget *next = gtk_widget_get_next_sibling (child);
+      gtk_box_remove (GTK_BOX (st->activities_indicators), child);
+      child = next;
+    }
+    for (int i = 0; i < count; ++i)
+      gtk_box_append (GTK_BOX (st->activities_indicators), create_workspace_dot ());
+  }
+
+  const int size = workspace_dot_size ();
+  const double mult = (count <= 2) ? 3.625 : (count <= 5) ? 3.25 : 2.75;
+  int idx = 0;
+  for (GtkWidget *dot = gtk_widget_get_first_child (st->activities_indicators);
+       dot != nullptr;
+       dot = gtk_widget_get_next_sibling (dot), ++idx) {
+    const bool is_active = (idx == active);
+    if (is_active) {
+      gtk_widget_remove_css_class (dot, "inactive");
+      gtk_widget_set_size_request (dot, (int)(size * mult + 0.5), size);
+    } else {
+      gtk_widget_add_css_class (dot, "inactive");
+      gtk_widget_set_size_request (dot, size, size);
+    }
+  }
+}
+
+static gboolean
+sync_activities_timer_cb (gpointer data)
+{
+  sync_activities_dots (static_cast<PanelStatus *> (data));
+  return G_SOURCE_CONTINUE;
+}
 
 // In GNOME the hover/active highlight lives on the .clock child (an St.Widget).
 // GtkLabel does not paint its CSS background in GTK4, so the .clock "label" is
@@ -1380,6 +1498,7 @@ refresh_status (gpointer data)
 
   if (st->clock_label != nullptr)
     update_clock (st->clock_label);
+  sync_activities_dots (st);
   update_messages_indicator (st);
   if (st->network_icon != nullptr)
     update_network_icon (st->network_icon);
@@ -1573,16 +1692,19 @@ create_tray_button (PanelStatus *st)
   gtk_button_set_child (GTK_BUTTON (button), st->tray_inline_box);
 
   st->tray_menu = gtk_box_new (GTK_ORIENTATION_VERTICAL, 8);
-  gtk_widget_add_css_class (st->tray_menu, "popup-menu-content");
+  gtk_widget_add_css_class (st->tray_menu, "tray-menu-box");
+  g_object_set_data (G_OBJECT (st->tray_menu), "tray-popover",
+                     GINT_TO_POINTER (1));
   gtk_widget_set_size_request (st->tray_menu, 280, -1);
 
   GtkWidget *header = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
   GtkWidget *title = gtk_label_new (winome::tr ("System Tray", "系统托盘"));
+  gtk_widget_add_css_class (title, "tray-menu-title");
   gtk_label_set_xalign (GTK_LABEL (title), 0.0f);
   gtk_widget_set_hexpand (title, TRUE);
 
   GtkWidget *refresh_btn = gtk_button_new_from_icon_name ("view-refresh-symbolic");
-  gtk_widget_add_css_class (refresh_btn, "button");
+  gtk_widget_add_css_class (refresh_btn, "tray-header-button");
   gtk_widget_add_css_class (refresh_btn, "icon-button");
   gtk_widget_set_focus_on_click (refresh_btn, FALSE);
   gtk_widget_set_tooltip_text (refresh_btn, winome::tr ("Refresh", "刷新"));
@@ -1591,7 +1713,7 @@ create_tray_button (PanelStatus *st)
 
   GtkWidget *overflow_btn =
       gtk_button_new_with_label (winome::tr ("Windows Tray", "原生托盘"));
-  gtk_widget_add_css_class (overflow_btn, "button");
+  gtk_widget_add_css_class (overflow_btn, "tray-header-button");
   gtk_widget_set_focus_on_click (overflow_btn, FALSE);
   gtk_widget_set_tooltip_text (
       overflow_btn, winome::tr ("Open Windows system tray overflow", "打开 Windows 系统托盘溢出区"));
@@ -1604,6 +1726,7 @@ create_tray_button (PanelStatus *st)
   gtk_box_append (GTK_BOX (st->tray_menu), header);
 
   GtkWidget *sep = gtk_separator_new (GTK_ORIENTATION_HORIZONTAL);
+  gtk_widget_add_css_class (sep, "popup-separator-menu-item");
   gtk_box_append (GTK_BOX (st->tray_menu), sep);
 
   st->tray_empty_label = gtk_label_new (
@@ -1757,6 +1880,8 @@ on_panel_destroy (GtkWidget *panel, gpointer user_data)
       g_source_remove (st->status_timer_id);
     if (st->clock_timer_id != 0)
       g_source_remove (st->clock_timer_id);
+    if (st->vd_timer_id != 0)
+      g_source_remove (st->vd_timer_id);
     winome::remove_config_listener (on_panel_config_changed, st);
     winome::notifications_remove_listener (on_panel_status_event, st);
     if (st->is_primary) {
@@ -1798,7 +1923,12 @@ build_shell_panel (bool primary)
 
   status = g_new0 (PanelStatus, 1);
   status->is_primary = primary;
-  gtk_box_append (GTK_BOX (left_box), create_activities_button ());
+  status->desktop_count = -1;
+  status->active_desktop = -1;
+  gtk_box_append (GTK_BOX (left_box),
+                  create_activities_button (&status->activities_indicators));
+  sync_activities_dots (status);
+  status->vd_timer_id = g_timeout_add (350, sync_activities_timer_cb, status);
   gtk_box_append (GTK_BOX (center_box), create_clock_button (status, primary));
   if (primary) {
     gtk_box_append (GTK_BOX (right_box), create_tray_button (status));

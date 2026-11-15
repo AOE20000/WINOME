@@ -461,7 +461,9 @@ create_notification_card (const winome::ShellNotification &notif,
 
   const bool needs_expand =
       body != nullptr &&
-      (notif.body.size () > 110 || notif.body.find ('\n') != std::string::npos);
+      (g_utf8_strlen (notif.body.c_str (), -1) > 70 ||
+       notif.body.size () > 110 ||
+       notif.body.find ('\n') != std::string::npos);
   if (needs_expand) {
     GtkWidget *expand_btn = create_icon_button (
         "notification-expand-symbolic", 16,

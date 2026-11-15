@@ -49,6 +49,9 @@ std::atomic<bool> g_running{false};
 std::atomic<bool> g_poll_in_flight{false};
 guint g_poll_timer_id = 0;
 
+constexpr int kBannerAnimMs = 200; // messageTray.js ANIMATION_TIME
+constexpr int kBannerTimeoutMs = 4500;
+
 GtkWidget* g_banner_window = nullptr;
 GtkWidget* g_banner_wrap = nullptr;
 GtkWidget* g_banner_app_label = nullptr;
@@ -56,6 +59,15 @@ GtkWidget* g_banner_title_label = nullptr;
 GtkWidget* g_banner_body_label = nullptr;
 guint g_banner_hide_timer = 0;
 uint64_t g_banner_current_key = 0;
+uint64_t g_banner_anim_gen = 0;
+bool g_banner_hovered = false;
+
+void cancel_banner_hide_timer() {
+  if (g_banner_hide_timer != 0) {
+    g_source_remove(g_banner_hide_timer);
+    g_banner_hide_timer = 0;
+  }
+}
 
 void notify_listeners_main() {
   std::vector<ListenerEntry> snap;
@@ -70,10 +82,9 @@ void notify_listeners_main() {
 }
 
 void dismiss_banner_immediately() {
-  if (g_banner_hide_timer != 0) {
-    g_source_remove(g_banner_hide_timer);
-    g_banner_hide_timer = 0;
-  }
+  ++g_banner_anim_gen;
+  cancel_banner_hide_timer();
+  g_banner_hovered = false;
   if (g_banner_window != nullptr)
     gtk_widget_set_visible(g_banner_window, FALSE);
   g_banner_current_key = 0;
@@ -83,15 +94,45 @@ gboolean on_banner_timeout(gpointer G_GNUC_UNUSED data) {
   g_banner_hide_timer = 0;
   if (g_banner_window == nullptr || g_banner_wrap == nullptr)
     return G_SOURCE_REMOVE;
+  if (g_banner_hovered)
+    return G_SOURCE_REMOVE;
 
+  const uint64_t gen = ++g_banner_anim_gen;
   gtk_widget_set_sensitive(g_banner_wrap, FALSE);
   tween_opacity(g_banner_wrap, gtk_widget_get_opacity(g_banner_wrap), 0.0,
-                BOXPOPOVER_ANIMATION_TIME, Ease::ease_out_quad, [] {
+                kBannerAnimMs, Ease::ease_out_quad, [gen] {
+                  if (gen != g_banner_anim_gen)
+                    return;
                   if (g_banner_window != nullptr)
                     gtk_widget_set_visible(g_banner_window, FALSE);
                   g_banner_current_key = 0;
                 });
   return G_SOURCE_REMOVE;
+}
+
+void schedule_banner_hide() {
+  cancel_banner_hide_timer();
+  if (!g_banner_hovered)
+    g_banner_hide_timer = g_timeout_add(kBannerTimeoutMs, on_banner_timeout,
+                                        nullptr);
+}
+
+void on_banner_motion_enter(GtkEventControllerMotion* ctrl G_GNUC_UNUSED,
+                            double x G_GNUC_UNUSED,
+                            double y G_GNUC_UNUSED,
+                            gpointer user_data G_GNUC_UNUSED) {
+  g_banner_hovered = true;
+  cancel_banner_hide_timer();
+}
+
+void on_banner_motion_leave(GtkEventControllerMotion* ctrl G_GNUC_UNUSED,
+                            gpointer user_data G_GNUC_UNUSED) {
+  g_banner_hovered = false;
+  if (g_banner_window != nullptr && gtk_widget_get_visible(g_banner_window) &&
+      g_banner_wrap != nullptr && gtk_widget_get_sensitive(g_banner_wrap) &&
+      g_banner_current_key != 0) {
+    schedule_banner_hide();
+  }
 }
 
 void on_banner_close_clicked(GtkButton* btn G_GNUC_UNUSED,
@@ -191,12 +232,14 @@ void position_banner_window(GtkWidget* window) {
   mi.cbSize = sizeof(mi);
   GetMonitorInfoW(mon, &mi);
 
-  int top_y = mi.rcMonitor.top + 40;
+  // Offset .notification-banner's 8px top shadow margin so the visible card
+  // sits cleanly below the top panel (or 40px below monitor top).
+  int top_y = mi.rcMonitor.top + 32;
   HWND panel_hwnd = FindWindowW(nullptr, L"WINOME Shell");
   if (panel_hwnd != nullptr) {
     RECT pr{};
     if (GetWindowRect(panel_hwnd, &pr) && pr.bottom > mi.rcMonitor.top)
-      top_y = pr.bottom + 8;
+      top_y = pr.bottom;
   }
 
   int x = mi.rcMonitor.left + (mi.rcMonitor.right - mi.rcMonitor.left - w) / 2;
@@ -218,6 +261,11 @@ void ensure_banner_window() {
   g_banner_wrap = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
   gtk_widget_add_css_class(g_banner_wrap, "notification-banner");
   gtk_widget_add_css_class(g_banner_wrap, "message");
+
+  GtkEventController* motion = gtk_event_controller_motion_new();
+  g_signal_connect(motion, "enter", G_CALLBACK(on_banner_motion_enter), nullptr);
+  g_signal_connect(motion, "leave", G_CALLBACK(on_banner_motion_leave), nullptr);
+  gtk_widget_add_controller(g_banner_wrap, motion);
 
   GtkWidget* header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, banner_header_spacing());
   gtk_widget_add_css_class(header, "message-header");
@@ -303,19 +351,16 @@ void show_banner_main(const ShellNotification& notif) {
   gtk_label_set_text(GTK_LABEL(g_banner_body_label), notif.body.c_str());
   gtk_widget_set_visible(g_banner_body_label, !notif.body.empty());
 
-  if (g_banner_hide_timer != 0) {
-    g_source_remove(g_banner_hide_timer);
-    g_banner_hide_timer = 0;
-  }
+  cancel_banner_hide_timer();
+  ++g_banner_anim_gen;
 
   gtk_widget_set_sensitive(g_banner_wrap, TRUE);
   gtk_widget_set_opacity(g_banner_wrap, 0.0);
   gtk_widget_set_visible(g_banner_window, TRUE);
   position_banner_window(g_banner_window);
 
-  tween_opacity(g_banner_wrap, 0.0, 1.0, BOXPOPOVER_ANIMATION_TIME,
-                Ease::ease_out_quad);
-  g_banner_hide_timer = g_timeout_add(4500, on_banner_timeout, nullptr);
+  tween_opacity(g_banner_wrap, 0.0, 1.0, kBannerAnimMs, Ease::ease_out_quad);
+  schedule_banner_hide();
 }
 
 struct PollApplyData {
