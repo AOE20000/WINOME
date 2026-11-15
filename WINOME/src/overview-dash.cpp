@@ -533,6 +533,7 @@ make_dash_menu_btn (const char *text, GCallback cb, DashMenuCtx *ctx)
   GtkWidget *btn = gtk_button_new_with_label (text);
   gtk_widget_set_name (btn, "winome-dash-ctx-item");
   gtk_widget_add_css_class (btn, "popup-menu-item");
+  gtk_widget_set_focus_on_click (btn, FALSE);
   GtkWidget *lbl = gtk_button_get_child (GTK_BUTTON (btn));
   if (GTK_IS_LABEL (lbl))
     gtk_label_set_xalign (GTK_LABEL (lbl), 0.0f);
@@ -684,6 +685,7 @@ show_dash_context_menu (WinomeDash *self, int index)
       GtkWidget *wbtn = gtk_button_new_with_label (title.c_str ());
       gtk_widget_set_name (wbtn, "winome-dash-ctx-item");
       gtk_widget_add_css_class (wbtn, "popup-menu-item");
+      gtk_widget_set_focus_on_click (wbtn, FALSE);
       GtkWidget *lbl = gtk_button_get_child (GTK_BUTTON (wbtn));
       if (GTK_IS_LABEL (lbl)) {
         gtk_label_set_xalign (GTK_LABEL (lbl), 0.0f);
@@ -907,7 +909,9 @@ winome_dash_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
       double dw = tw * scale, dh = th * scale;
       graphene_rect_init (&icon_rect, r.x + kTilePad + (self->icon_size - dw) / 2,
                           r.y + kTilePad + (self->icon_size - dh) / 2, dw, dh);
-      gtk_snapshot_append_texture (snapshot, texture, &icon_rect);
+      gtk_snapshot_append_scaled_texture (snapshot, texture,
+                                          GSK_SCALING_FILTER_TRILINEAR,
+                                          &icon_rect);
     } else if (i == (int)self->apps.size ()) {
       // Show Apps: view-app-grid-symbolic as a crisp 3x3 dot grid.
       double pad = self->icon_size * 0.16;
@@ -1158,7 +1162,8 @@ overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
     if (kBaseIconSizes[i] <= avail)
       self->icon_size = kBaseIconSizes[i];
   }
-  int icon_px = (int)(self->icon_size * scale + 0.5);
+  int super_scale = std::max ((int)(scale + 0.5), 2);
+  int icon_px = std::clamp (self->icon_size * super_scale, 96, 256);
 
   // Enumerate windows top-down and group into running applications.
   std::vector<HWND> windows;

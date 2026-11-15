@@ -4,6 +4,8 @@
 #include "app-index.h"
 #include "config.h"
 
+#include <commctrl.h>
+#include <commoncontrols.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -11,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdint>
 #include <cstring>
 #include <cwctype>
 #include <list>
@@ -22,15 +25,17 @@ namespace winome {
 
 namespace {
 
-constexpr size_t kMaxIconCacheEntries = 96;
+constexpr size_t kMaxIconCacheEntries = 1024;
+constexpr int kShilJumbo = 4;
+constexpr UINT kIldTransparent = 0x00000001u;
 
 constexpr GUID kPKEY_AppUserModel_ID_fmt = {
     0x9F4C2855, 0x9F79, 0x4B39,
     {0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3}};
 
-constexpr GUID kBHID_SFUIObject = {
-    0x3981e225, 0xf559, 0x11d3,
-    {0x8e, 0x3a, 0x00, 0xc0, 0x4f, 0x68, 0x37, 0xd5}};
+constexpr GUID kIID_IImageList = {
+    0x46eb5926, 0x582e, 0x4017,
+    {0x9f, 0xdf, 0xe8, 0x99, 0x8d, 0xaa, 0x09, 0x50}};
 
 struct CacheItem {
   std::string key;
@@ -45,6 +50,7 @@ std::mutex g_index_mu;
 std::vector<AppEntry> g_entries;
 bool g_index_populated = false;
 std::atomic<bool> g_refresh_running{false};
+std::atomic<uint64_t> g_index_revision{0};
 
 std::string
 make_sized_key (const std::string &key, int size)
@@ -324,31 +330,183 @@ dispatch_ready_idle (gpointer user_data)
   return G_SOURCE_REMOVE;
 }
 
-GdkTexture *
-load_shell_image_for_path (const std::wstring &path, int size)
+bool
+extract_hbitmap_raw (HBITMAP bmp, RawDecodedIcon *out)
 {
-  if (path.empty ())
-    return nullptr;
+  if (bmp == nullptr || out == nullptr)
+    return false;
+
+  BITMAP bm{};
+  if (GetObjectW (bmp, sizeof (bm), &bm) == 0 || bm.bmWidth <= 0 ||
+      bm.bmHeight <= 0)
+    return false;
+
+  int w = bm.bmWidth;
+  int h = bm.bmHeight;
+  size_t byte_len = (size_t)w * (size_t)h * 4;
+  auto *buf = static_cast<uint8_t *> (g_malloc (byte_len));
+
+  BITMAPINFO bi{};
+  bi.bmiHeader.biSize = sizeof (BITMAPINFOHEADER);
+  bi.bmiHeader.biWidth = w;
+  bi.bmiHeader.biHeight = -h;
+  bi.bmiHeader.biPlanes = 1;
+  bi.bmiHeader.biBitCount = 32;
+  bi.bmiHeader.biCompression = BI_RGB;
+
+  HDC screen = GetDC (nullptr);
+  int lines = GetDIBits (screen, bmp, 0, (UINT)h, buf, &bi, DIB_RGB_COLORS);
+  ReleaseDC (nullptr, screen);
+  if (lines <= 0) {
+    g_free (buf);
+    return false;
+  }
+
+  // IShellItemImageFactory::GetImage frequently outputs straight (unpremultiplied)
+  // BGRA where color channels exceed alpha; opaque 32-bpp HBITMAPs can also
+  // leave all alpha bytes at 0 despite non-zero RGB.
+  bool any_nonzero_alpha = false;
+  bool any_nonzero_rgb = false;
+  bool has_rgb_gt_a = false;
+  for (size_t i = 0; i < byte_len; i += 4) {
+    uint8_t b = buf[i + 0];
+    uint8_t g = buf[i + 1];
+    uint8_t r = buf[i + 2];
+    uint8_t a = buf[i + 3];
+    if (a != 0)
+      any_nonzero_alpha = true;
+    if (r != 0 || g != 0 || b != 0)
+      any_nonzero_rgb = true;
+    if (r > a || g > a || b > a)
+      has_rgb_gt_a = true;
+  }
+  if (!any_nonzero_alpha && any_nonzero_rgb) {
+    for (size_t i = 0; i < byte_len; i += 4)
+      buf[i + 3] = 0xff;
+    has_rgb_gt_a = true;
+  }
+
+  out->width = w;
+  out->height = h;
+  out->unpremultiplied = has_rgb_gt_a;
+  if (out->bytes != nullptr)
+    g_bytes_unref (out->bytes);
+  out->bytes = g_bytes_new_take (buf, (gsize)byte_len);
+  return true;
+}
+
+bool
+extract_hicon_raw (HICON icon, RawDecodedIcon *out)
+{
+  if (icon == nullptr || out == nullptr)
+    return false;
+
+  ICONINFO info{};
+  if (!GetIconInfo (icon, &info))
+    return false;
+
+  int w = 0;
+  int h = 0;
+  if (info.hbmColor != nullptr) {
+    BITMAP bm{};
+    GetObjectW (info.hbmColor, sizeof (bm), &bm);
+    w = bm.bmWidth;
+    h = bm.bmHeight;
+  } else if (info.hbmMask != nullptr) {
+    BITMAP bm{};
+    GetObjectW (info.hbmMask, sizeof (bm), &bm);
+    w = bm.bmWidth;
+    h = bm.bmHeight / 2;
+  }
+  if (w <= 0 || h <= 0) {
+    if (info.hbmColor != nullptr)
+      DeleteObject (info.hbmColor);
+    if (info.hbmMask != nullptr)
+      DeleteObject (info.hbmMask);
+    return false;
+  }
+
+  BITMAPINFO bi{};
+  bi.bmiHeader.biSize = sizeof (BITMAPINFOHEADER);
+  bi.bmiHeader.biWidth = w;
+  bi.bmiHeader.biHeight = -h;
+  bi.bmiHeader.biPlanes = 1;
+  bi.bmiHeader.biBitCount = 32;
+  bi.bmiHeader.biCompression = BI_RGB;
+
+  HDC screen = GetDC (nullptr);
+  void *bits = nullptr;
+  HBITMAP dib =
+      CreateDIBSection (screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+  bool ok = false;
+  if (dib != nullptr && bits != nullptr) {
+    HDC mem = CreateCompatibleDC (screen);
+    HGDIOBJ old = SelectObject (mem, dib);
+    BOOL drawn = DrawIconEx (mem, 0, 0, icon, w, h, 0, nullptr, DI_NORMAL);
+    SelectObject (mem, old);
+    DeleteDC (mem);
+    if (drawn) {
+      size_t byte_len = (size_t)w * (size_t)h * 4;
+      const auto *src = static_cast<const uint8_t *> (bits);
+      bool any_nonzero_alpha = false;
+      bool has_rgb_gt_a = false;
+      for (size_t i = 0; i < byte_len; i += 4) {
+        uint8_t a = src[i + 3];
+        if (a != 0)
+          any_nonzero_alpha = true;
+        if (src[i + 0] > a || src[i + 1] > a || src[i + 2] > a)
+          has_rgb_gt_a = true;
+      }
+      out->width = w;
+      out->height = h;
+      out->unpremultiplied = any_nonzero_alpha && has_rgb_gt_a;
+      if (out->bytes != nullptr)
+        g_bytes_unref (out->bytes);
+      out->bytes = g_bytes_new (bits, (gsize)byte_len);
+      ok = true;
+    }
+  }
+  if (dib != nullptr)
+    DeleteObject (dib);
+  ReleaseDC (nullptr, screen);
+
+  if (info.hbmColor != nullptr)
+    DeleteObject (info.hbmColor);
+  if (info.hbmMask != nullptr)
+    DeleteObject (info.hbmMask);
+  return ok;
+}
+
+bool
+load_shell_image_raw_for_path (const std::wstring &path, int size,
+                               RawDecodedIcon *out)
+{
+  if (path.empty () || size <= 0 || out == nullptr)
+    return false;
 
   HRESULT hr = CoInitializeEx (
       nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
   bool did_co = SUCCEEDED (hr);
 
-  GdkTexture *texture = nullptr;
+  bool ok = false;
   IShellItem *item = nullptr;
   if (SUCCEEDED (SHCreateItemFromParsingName (path.c_str (), nullptr,
                                               IID_PPV_ARGS (&item))) &&
       item != nullptr) {
     IShellItemImageFactory *factory = nullptr;
-    if (SUCCEEDED (item->BindToHandler (nullptr, kBHID_SFUIObject,
-                                        IID_PPV_ARGS (&factory))) &&
+    if (SUCCEEDED (item->QueryInterface (IID_PPV_ARGS (&factory))) &&
         factory != nullptr) {
       HBITMAP bmp = nullptr;
       if (SUCCEEDED (factory->GetImage (SIZE{size, size},
                                         SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
                                         &bmp)) &&
           bmp != nullptr) {
-        texture = texture_from_hbitmap (bmp);
+        ok = extract_hbitmap_raw (bmp, out);
+        DeleteObject (bmp);
+      } else if (SUCCEEDED (factory->GetImage (SIZE{size, size},
+                                               SIIGBF_BIGGERSIZEOK, &bmp)) &&
+                 bmp != nullptr) {
+        ok = extract_hbitmap_raw (bmp, out);
         DeleteObject (bmp);
       }
       factory->Release ();
@@ -356,20 +514,50 @@ load_shell_image_for_path (const std::wstring &path, int size)
     item->Release ();
   }
 
+  if (!ok) {
+    SHFILEINFOW sfi{};
+    if (SHGetFileInfoW (path.c_str (), 0, &sfi, sizeof (sfi),
+                        SHGFI_SYSICONINDEX)) {
+      IImageList *iml = nullptr;
+      if (SUCCEEDED (SHGetImageList (kShilJumbo, kIID_IImageList,
+                                     reinterpret_cast<void **> (&iml))) &&
+          iml != nullptr) {
+        HICON hi = nullptr;
+        if (SUCCEEDED (iml->GetIcon (sfi.iIcon, kIldTransparent, &hi)) &&
+            hi != nullptr) {
+          ok = extract_hicon_raw (hi, out);
+          DestroyIcon (hi);
+        }
+        iml->Release ();
+      }
+    }
+  }
+
   if (did_co)
     CoUninitialize ();
 
-  if (texture != nullptr)
-    return texture;
+  if (ok)
+    return true;
 
   SHFILEINFOW sfi{};
   if (SHGetFileInfoW (path.c_str (), 0, &sfi, sizeof (sfi),
                       SHGFI_ICON | SHGFI_LARGEICON) &&
       sfi.hIcon != nullptr) {
-    texture = hicon_to_texture (sfi.hIcon);
+    ok = extract_hicon_raw (sfi.hIcon, out);
     DestroyIcon (sfi.hIcon);
   }
-  return texture;
+  return ok;
+}
+
+GdkTexture *
+load_shell_image_for_path (const std::wstring &path, int size)
+{
+  RawDecodedIcon raw;
+  if (!load_shell_image_raw_for_path (path, size, &raw))
+    return nullptr;
+  GdkTexture *tex = app_icon_texture_from_raw (raw);
+  app_icon_raw_clear (raw);
+  return tex;
 }
 
 }  // namespace
@@ -536,6 +724,7 @@ app_index_refresh_async (void (*on_ready) (void *), void *user_data)
       std::lock_guard<std::mutex> lock (g_index_mu);
       g_entries = std::move (fresh);
       g_index_populated = true;
+      g_index_revision.fetch_add (1, std::memory_order_release);
     }
     g_refresh_running.store (false);
     if (on_ready != nullptr) {
@@ -559,9 +748,16 @@ app_index_get_all (void)
     if (!g_index_populated) {
       g_entries = fresh;
       g_index_populated = true;
+      g_index_revision.fetch_add (1, std::memory_order_release);
     }
     return g_entries;
   }
+}
+
+uint64_t
+app_index_revision (void)
+{
+  return g_index_revision.load (std::memory_order_acquire);
 }
 
 bool
@@ -701,119 +897,88 @@ app_index_launch_best_match (const std::string &query_lower)
   return app_index_launch (matches[0], false);
 }
 
+void
+app_icon_raw_clear (RawDecodedIcon &raw)
+{
+  if (raw.bytes != nullptr) {
+    g_bytes_unref (raw.bytes);
+    raw.bytes = nullptr;
+  }
+  raw.width = 0;
+  raw.height = 0;
+  raw.unpremultiplied = false;
+}
+
+GdkTexture *
+app_icon_texture_from_raw (const RawDecodedIcon &raw)
+{
+  if (raw.bytes == nullptr || raw.width <= 0 || raw.height <= 0)
+    return nullptr;
+  GdkMemoryFormat fmt = raw.unpremultiplied
+                            ? GDK_MEMORY_B8G8R8A8
+                            : GDK_MEMORY_B8G8R8A8_PREMULTIPLIED;
+  return gdk_memory_texture_new (raw.width, raw.height, fmt, raw.bytes,
+                                 (gsize)raw.width * 4);
+}
+
+RawDecodedIcon
+app_icon_decode_entry_raw (const AppEntry &entry, int size)
+{
+  RawDecodedIcon raw;
+  raw.id = entry.id;
+  raw.size = size;
+  if (size <= 0)
+    return raw;
+
+  bool ok = false;
+  if (!entry.launch_path.empty ())
+    ok = load_shell_image_raw_for_path (entry.launch_path, size, &raw);
+  if (!ok && !entry.target_exe.empty ())
+    ok = load_shell_image_raw_for_path (entry.target_exe, size, &raw);
+  if (!ok && !entry.icon_path.empty ()) {
+    HICON hi = nullptr;
+    UINT icon_id = 0;
+    UINT extracted = PrivateExtractIconsW (
+        entry.icon_path.c_str (), entry.icon_index, size, size, &hi, &icon_id,
+        1, 0);
+    if (extracted > 0 && extracted != 0xFFFFFFFFu && hi != nullptr) {
+      ok = extract_hicon_raw (hi, &raw);
+      DestroyIcon (hi);
+    }
+    if (!ok) {
+      HICON fallback = nullptr;
+      if (ExtractIconExW (entry.icon_path.c_str (), entry.icon_index, &fallback,
+                          nullptr, 1) > 0 &&
+          fallback != nullptr) {
+        ok = extract_hicon_raw (fallback, &raw);
+        DestroyIcon (fallback);
+      }
+    }
+  }
+  if (!ok)
+    app_icon_raw_clear (raw);
+  return raw;
+}
+
 GdkTexture *
 hicon_to_texture (HICON icon)
 {
-  if (icon == nullptr)
+  RawDecodedIcon raw;
+  if (!extract_hicon_raw (icon, &raw))
     return nullptr;
-
-  ICONINFO info{};
-  if (!GetIconInfo (icon, &info))
-    return nullptr;
-
-  int w = 0;
-  int h = 0;
-  if (info.hbmColor != nullptr) {
-    BITMAP bm{};
-    GetObjectW (info.hbmColor, sizeof (bm), &bm);
-    w = bm.bmWidth;
-    h = bm.bmHeight;
-  } else if (info.hbmMask != nullptr) {
-    BITMAP bm{};
-    GetObjectW (info.hbmMask, sizeof (bm), &bm);
-    w = bm.bmWidth;
-    h = bm.bmHeight / 2;
-  }
-  if (w <= 0 || h <= 0) {
-    if (info.hbmColor != nullptr)
-      DeleteObject (info.hbmColor);
-    if (info.hbmMask != nullptr)
-      DeleteObject (info.hbmMask);
-    return nullptr;
-  }
-
-  BITMAPINFO bi{};
-  bi.bmiHeader.biSize = sizeof (BITMAPINFOHEADER);
-  bi.bmiHeader.biWidth = w;
-  bi.bmiHeader.biHeight = -h;
-  bi.bmiHeader.biPlanes = 1;
-  bi.bmiHeader.biBitCount = 32;
-  bi.bmiHeader.biCompression = BI_RGB;
-
-  HDC screen = GetDC (nullptr);
-  void *bits = nullptr;
-  HBITMAP dib =
-      CreateDIBSection (screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-  GdkTexture *texture = nullptr;
-  if (dib != nullptr && bits != nullptr) {
-    HDC mem = CreateCompatibleDC (screen);
-    HGDIOBJ old = SelectObject (mem, dib);
-    BOOL ok = DrawIconEx (mem, 0, 0, icon, w, h, 0, nullptr, DI_NORMAL);
-    SelectObject (mem, old);
-    DeleteDC (mem);
-    if (ok) {
-      GBytes *bytes = g_bytes_new (bits, (gsize)w * h * 4);
-      texture = gdk_memory_texture_new (w, h, GDK_MEMORY_B8G8R8A8_PREMULTIPLIED,
-                                        bytes, (gsize)w * 4);
-      g_bytes_unref (bytes);
-    }
-  }
-  if (dib != nullptr)
-    DeleteObject (dib);
-  ReleaseDC (nullptr, screen);
-
-  if (info.hbmColor != nullptr)
-    DeleteObject (info.hbmColor);
-  if (info.hbmMask != nullptr)
-    DeleteObject (info.hbmMask);
+  GdkTexture *texture = app_icon_texture_from_raw (raw);
+  app_icon_raw_clear (raw);
   return texture;
 }
 
 GdkTexture *
 texture_from_hbitmap (HBITMAP bmp)
 {
-  if (bmp == nullptr)
+  RawDecodedIcon raw;
+  if (!extract_hbitmap_raw (bmp, &raw))
     return nullptr;
-
-  BITMAP bm{};
-  GetObjectW (bmp, sizeof (bm), &bm);
-  if (bm.bmWidth <= 0 || bm.bmHeight <= 0)
-    return nullptr;
-
-  BITMAPINFO bi{};
-  bi.bmiHeader.biSize = sizeof (BITMAPINFOHEADER);
-  bi.bmiHeader.biWidth = bm.bmWidth;
-  bi.bmiHeader.biHeight = -bm.bmHeight;
-  bi.bmiHeader.biPlanes = 1;
-  bi.bmiHeader.biBitCount = 32;
-  bi.bmiHeader.biCompression = BI_RGB;
-
-  HDC screen = GetDC (nullptr);
-  void *bits = nullptr;
-  HBITMAP dib =
-      CreateDIBSection (screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-  GdkTexture *texture = nullptr;
-  if (dib != nullptr && bits != nullptr) {
-    HDC src = CreateCompatibleDC (screen);
-    HDC dst = CreateCompatibleDC (screen);
-    HGDIOBJ old_src = SelectObject (src, bmp);
-    HGDIOBJ old_dst = SelectObject (dst, dib);
-    if (BitBlt (dst, 0, 0, bm.bmWidth, bm.bmHeight, src, 0, 0, SRCCOPY)) {
-      GBytes *bytes =
-          g_bytes_new (bits, (gsize)bm.bmWidth * bm.bmHeight * 4);
-      texture = gdk_memory_texture_new (
-          bm.bmWidth, bm.bmHeight, GDK_MEMORY_B8G8R8A8_PREMULTIPLIED, bytes,
-          (gsize)bm.bmWidth * 4);
-      g_bytes_unref (bytes);
-    }
-    SelectObject (src, old_src);
-    SelectObject (dst, old_dst);
-    DeleteDC (src);
-    DeleteDC (dst);
-  }
-  if (dib != nullptr)
-    DeleteObject (dib);
-  ReleaseDC (nullptr, screen);
+  GdkTexture *texture = app_icon_texture_from_raw (raw);
+  app_icon_raw_clear (raw);
   return texture;
 }
 
@@ -909,20 +1074,9 @@ app_icon_for_entry (const AppEntry &entry, int size)
   if (GdkTexture *cached = app_icon_cache_lookup (entry.id, size))
     return cached;
 
-  GdkTexture *tex = nullptr;
-  if (!entry.launch_path.empty ())
-    tex = load_shell_image_for_path (entry.launch_path, size);
-  if (tex == nullptr && !entry.target_exe.empty ())
-    tex = load_shell_image_for_path (entry.target_exe, size);
-  if (tex == nullptr && !entry.icon_path.empty ()) {
-    HICON hi = nullptr;
-    if (ExtractIconExW (entry.icon_path.c_str (), entry.icon_index, &hi,
-                        nullptr, 1) > 0 &&
-        hi != nullptr) {
-      tex = hicon_to_texture (hi);
-      DestroyIcon (hi);
-    }
-  }
+  RawDecodedIcon raw = app_icon_decode_entry_raw (entry, size);
+  GdkTexture *tex = app_icon_texture_from_raw (raw);
+  app_icon_raw_clear (raw);
   if (tex != nullptr)
     app_icon_cache_store (entry.id, size, tex);
   return tex;

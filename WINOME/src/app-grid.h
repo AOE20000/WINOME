@@ -42,6 +42,7 @@ void app_grid_first_page (GtkWidget *grid);
 void app_grid_last_page (GtkWidget *grid);
 void app_grid_reset_page (GtkWidget *grid);
 void app_grid_refresh_running (GtkWidget *grid);
+void app_grid_prewarm (GtkWidget *grid, int avail_w, int avail_h);
 bool app_grid_launch_first (GtkWidget *grid);
 void app_grid_close_menu (GtkWidget *grid);
 

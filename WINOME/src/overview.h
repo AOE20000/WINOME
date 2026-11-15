@@ -49,4 +49,9 @@ void overview_reposition();
 // Toggle in-host paginated App Grid view inside the open overview.
 void overview_toggle_app_grid();
 
+// Thread-safe double-Win progression: interrupt/advance an opening or open
+// WINDOW_PICKER overview into the APP_GRID state.
+void overview_shift_to_app_grid_async();
+bool overview_can_shift_to_app_grid();
+
 }  // namespace winome

@@ -511,6 +511,7 @@ window.winome-overview-chrome {
 }
 
 .popup-menu-item {
+  color: #ffffff;
   background-image: none;
   border-image: none;
   border-style: none;
@@ -647,6 +648,40 @@ window.winome-overview popover.background.winome-context-popover > arrow {
   border: 1px solid rgba(255, 255, 255, 0.07);
   box-shadow: none;
 }
+window.winome-overview popover.winome-context-popover button.popup-menu-item,
+window.winome-overview popover.winome-context-popover button.popup-menu-item label {
+  color: #ffffff;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  text-shadow: none;
+  font-weight: 400;
+}
+window.winome-overview popover.winome-context-popover button.popup-menu-item {
+  border-radius: 10px;
+  padding: 6px 12px;
+  min-height: 28px;
+}
+window.winome-overview popover.winome-context-popover button.popup-menu-item:hover,
+window.winome-overview popover.winome-context-popover button.popup-menu-item:focus-visible {
+  background-color: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+}
+window.winome-overview popover.winome-context-popover button.popup-menu-item:hover label,
+window.winome-overview popover.winome-context-popover button.popup-menu-item:focus-visible label {
+  color: #ffffff;
+}
+window.winome-overview popover.winome-context-popover button.popup-menu-item:active,
+window.winome-overview popover.winome-context-popover button.popup-menu-item:active:hover {
+  background-color: rgba(255, 255, 255, 0.18);
+  color: #ffffff;
+}
+window.winome-overview popover.winome-context-popover button.popup-menu-item:disabled,
+window.winome-overview popover.winome-context-popover button.popup-menu-item:disabled label {
+  background-color: transparent;
+  color: rgba(255, 255, 255, 0.45);
+}
 
 /* Floating notification toast toplevel keeps a transparent frame around cards
    with Cantarell typography and margin cushion so drop shadows do not clip. */
@@ -707,7 +742,8 @@ separator.popup-separator-menu-item {
 label.popup-menu-item.popup-inactive-menu-item:disabled {
   background-color: transparent;
   background-image: none;
-  color: #9b9b9d;
+  color: #b5b5b7;
+  opacity: 1.0;
   font-size: 0.9em;
   font-weight: 700;
   padding: 4px 12px 2px 12px;

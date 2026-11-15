@@ -448,6 +448,7 @@ void test_app_index_and_lru_cache() {
                                            bytes, 4);
   g_bytes_unref(bytes);
   size_t cap = winome::app_icon_cache_capacity();
+  CHECK(cap >= 512);
   for (size_t i = 0; i < cap + 5; ++i)
     winome::app_icon_cache_store("app-" + std::to_string(i), 64, tex);
   g_object_unref(tex);
@@ -462,6 +463,30 @@ void test_app_index_and_lru_cache() {
     g_object_unref(kept);
   winome::app_icon_cache_clear();
   CHECK(winome::app_icon_cache_count() == 0);
+
+  // Straight vs premultiplied RawDecodedIcon materialization + revision tracking.
+  uint32_t raw_px[4] = {0x80FFFFFFu, 0x800000FFu, 0xFF00FF00u, 0x00000000u};
+  for (bool unpremul : {true, false}) {
+    winome::RawDecodedIcon raw;
+    raw.id = "raw.test";
+    raw.size = 96;
+    raw.width = 2;
+    raw.height = 2;
+    raw.unpremultiplied = unpremul;
+    raw.bytes = g_bytes_new(raw_px, sizeof(raw_px));
+    GdkTexture *t = winome::app_icon_texture_from_raw(raw);
+    CHECK(t != nullptr);
+    if (t != nullptr) {
+      CHECK(gdk_texture_get_width(t) == 2);
+      CHECK(gdk_texture_get_height(t) == 2);
+      g_object_unref(t);
+    }
+    winome::app_icon_raw_clear(raw);
+    CHECK(raw.bytes == nullptr);
+    CHECK(winome::app_icon_texture_from_raw(raw) == nullptr);
+  }
+  (void)winome::app_index_get_all();
+  CHECK(winome::app_index_revision() >= 1);
 }
 
 void test_app_grid_and_running_window_matching() {
@@ -591,6 +616,8 @@ void test_app_grid_pagination() {
     winome::app_grid_set_query(grid, "");
     winome::app_grid_set_query(grid, "win");
     winome::app_grid_set_query(grid, "");
+    winome::app_grid_rebuild(grid, 1000, 560);
+    // Repeated unchanged rebuild must hit structure cache cleanly.
     winome::app_grid_rebuild(grid, 1000, 560);
     winome::app_grid_next_page(grid);
     winome::app_grid_prev_page(grid);

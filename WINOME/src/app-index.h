@@ -10,6 +10,8 @@
 #include <windows.h>
 
 #include <cstddef>
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -49,6 +51,7 @@ void app_index_refresh_async (void (*on_ready) (void *) = nullptr,
                               void *user_data = nullptr);
 std::vector<AppEntry> app_index_get_all (void);
 bool app_index_find_by_id (const std::string &id_or_aumid, AppEntry *out);
+uint64_t app_index_revision (void);
 
 // Pin helpers shared between Dash and App Grid (backed by WinomeConfig).
 bool is_app_id_pinned (const std::vector<std::string> &pinned_apps,
@@ -80,6 +83,21 @@ std::vector<RunningWindow> app_index_running_windows_for_entry (
     const AppEntry &entry);
 bool app_index_activate_hwnd (HWND hwnd);
 void app_index_close_windows (const std::vector<HWND> &hwnds);
+
+// Thread-safe decoded BGRA pixel buffer ready to materialize into a GdkTexture
+// on the GTK main thread.
+struct RawDecodedIcon {
+  std::string id;
+  int size = 0;
+  int width = 0;
+  int height = 0;
+  bool unpremultiplied = false;
+  GBytes *bytes = nullptr;
+};
+
+void app_icon_raw_clear (RawDecodedIcon &raw);
+GdkTexture *app_icon_texture_from_raw (const RawDecodedIcon &raw);
+RawDecodedIcon app_icon_decode_entry_raw (const AppEntry &entry, int size);
 
 // GdkTexture conversion & bounded LRU icon cache.
 GdkTexture *hicon_to_texture (HICON icon);

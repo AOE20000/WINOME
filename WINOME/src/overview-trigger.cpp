@@ -39,6 +39,7 @@ BOOL g_win_down = FALSE;
 BOOL g_win_alone = FALSE;
 BOOL g_win_injected = FALSE;
 HHOOK g_keyboard_hook = nullptr;
+std::atomic<gint64> g_last_win_press_us{0};
 
 // State-change callback, marshaled to the main thread.
 OverviewStateCallback g_state_cb = nullptr;
@@ -158,11 +159,24 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
           g_win_injected = FALSE;
         }
         if (bare) {
-          // A bare Win press opens/closes the Activities overview.
-          if (!g_running)
+          // A bare Win press opens the Activities overview; a rapid second Win
+          // press (within 550ms while opening or in WINDOW_PICKER) interrupts
+          // smoothly into the App Grid like GNOME Shell's overlay-key flow.
+          gint64 now = g_get_monotonic_time();
+          if (!g_running) {
+            g_last_win_press_us.store(now, std::memory_order_release);
             open_overview("win-key");
-          else
-            close_overview("win-key");
+          } else {
+            gint64 prev =
+                g_last_win_press_us.exchange(0, std::memory_order_acq_rel);
+            if (prev > 0 && (now - prev) <= 550000 &&
+                overview_can_shift_to_app_grid()) {
+              g_print("[trig] double win-key -> app-grid\n");
+              overview_shift_to_app_grid_async();
+            } else {
+              close_overview("win-key");
+            }
+          }
         }
         return 1;
       }
@@ -220,6 +234,7 @@ void close_overview(const char *source) {
   if (!g_running)
     return;
   g_print ("[trig] close_overview (%s)\n", source != nullptr ? source : "?");
+  g_last_win_press_us.store(0, std::memory_order_release);
   g_running = FALSE;
   overview_hide_async();
   notify_overview_state(FALSE);
