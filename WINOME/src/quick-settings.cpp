@@ -1063,8 +1063,9 @@ on_lock_clicked (GtkButton *button G_GNUC_UNUSED, gpointer G_GNUC_UNUSED user_da
 // widget. GtkGrid would work, but it distributes surplus height to rows that
 // report expand and misaligns the toggle capsules; the native layout sizes
 // each row to its natural height and gives each child exactly its share, while
-// expanding any active QuickToggleMenu inline in a GtkRevealer directly under
-// its trigger row.
+// expanding any active QuickToggleMenu inline directly under its trigger row
+// using upstream's two-phase choreography (height first while card is hidden,
+// then opacity fade in place; opacity fade out first on close, then height).
 //
 // Layout (nColumns=2, row/column spacing 12px):
 //   - Invisible children (e.g. missing brightness, Bluetooth, keyboard) are
@@ -1073,6 +1074,15 @@ on_lock_clicked (GtkButton *button G_GNUC_UNUSED, gpointer G_GNUC_UNUSED user_da
 //     theme `max-width` (12em) resolved through StEngine.
 //   - childWidth = floor((width - columnSpacing) / 2); a spanned child gets
 //     childWidth * span + columnSpacing * (span - 1).
+
+enum class DrawerPhase {
+  Closed,
+  OpeningHeight,
+  OpeningFade,
+  Open,
+  ClosingFade,
+  ClosingHeight,
+};
 
 static int
 qs_toggle_max_width (void)
@@ -1095,8 +1105,18 @@ typedef struct {
 typedef struct {
   GtkWidget parent_instance;
   GPtrArray *children;
-  GtkWidget *drawer_revealer;
+  GtkWidget *drawer_child;
   GtkWidget *drawer_anchor;
+  GtkWidget *pending_child;
+  GtkWidget *pending_anchor;
+  DrawerPhase drawer_phase;
+  guint anim_tick_id;
+  gint64 anim_start_us;
+  int anim_duration_us;
+  double anim_from;
+  double anim_to;
+  double drawer_slot_h;
+  double drawer_opacity;
   int row_spacing;
   int column_spacing;
   int toggle_max_width;
@@ -1112,26 +1132,77 @@ typedef struct {
 
 G_DEFINE_TYPE (WinomeQuickSettingsGrid, winome_quick_settings_grid, GTK_TYPE_WIDGET)
 
+static void grid_start_anim (WinomeQuickSettingsGrid *self, DrawerPhase phase,
+                             double from, double to, int duration_ms);
+
 static gboolean
-grid_is_drawer_active (WinomeQuickSettingsGrid *self)
+grid_is_opening_or_open (WinomeQuickSettingsGrid *self)
 {
-  if (self->drawer_revealer == NULL || self->drawer_anchor == NULL)
-    return FALSE;
-  GtkRevealer *rev = GTK_REVEALER (self->drawer_revealer);
-  return gtk_revealer_get_child (rev) != NULL &&
-         (gtk_revealer_get_reveal_child (rev) ||
-          gtk_revealer_get_child_revealed (rev));
+  return self->drawer_phase == DrawerPhase::OpeningHeight ||
+         self->drawer_phase == DrawerPhase::OpeningFade ||
+         self->drawer_phase == DrawerPhase::Open;
 }
 
-static int
-grid_measure_drawer (WinomeQuickSettingsGrid *self, int for_width)
+static void
+grid_stop_anim (WinomeQuickSettingsGrid *self)
 {
-  if (!grid_is_drawer_active (self))
+  if (self->anim_tick_id != 0) {
+    gtk_widget_remove_tick_callback (GTK_WIDGET (self), self->anim_tick_id);
+    self->anim_tick_id = 0;
+  }
+}
+
+static void
+grid_clear_pending (WinomeQuickSettingsGrid *self)
+{
+  g_clear_object (&self->pending_child);
+  self->pending_anchor = NULL;
+}
+
+static void
+grid_detach_drawer (WinomeQuickSettingsGrid *self)
+{
+  if (self->drawer_child != NULL) {
+    gtk_widget_unparent (self->drawer_child);
+    self->drawer_child = NULL;
+  }
+  self->drawer_anchor = NULL;
+}
+
+// Measure natural height of the inline QuickToggleMenu card at @for_width.
+static int
+measure_drawer_content_height (WinomeQuickSettingsGrid *self, int for_width)
+{
+  if (self->drawer_child == NULL ||
+      !gtk_widget_get_visible (self->drawer_child))
     return 0;
-  int m = 0, n = 0;
-  gtk_widget_measure (self->drawer_revealer, GTK_ORIENTATION_VERTICAL,
-                      for_width, &m, &n, NULL, NULL);
-  return n;
+  int min_h = 0, nat_h = 0;
+  gtk_widget_measure (self->drawer_child, GTK_ORIENTATION_VERTICAL,
+                      for_width, &min_h, &nat_h, NULL, NULL);
+  return MAX (min_h, nat_h);
+}
+
+// Extra grid height consumed by the inline drawer slot (top gap + menu height).
+static int
+grid_current_slot_height (WinomeQuickSettingsGrid *self, int for_width,
+                          int anchor_row)
+{
+  if (anchor_row < 0 || self->drawer_child == NULL ||
+      self->drawer_phase == DrawerPhase::Closed)
+    return 0;
+
+  if (self->drawer_phase == DrawerPhase::Open ||
+      self->drawer_phase == DrawerPhase::OpeningFade ||
+      self->drawer_phase == DrawerPhase::ClosingFade) {
+    int menu_h = measure_drawer_content_height (self, for_width);
+    if (menu_h <= 0)
+      return 0;
+    int target = self->row_spacing + menu_h;
+    self->drawer_slot_h = (double)target;
+    return target;
+  }
+
+  return (int)(self->drawer_slot_h + 0.5);
 }
 
 static void
@@ -1144,21 +1215,6 @@ grid_set_dimmed (WinomeQuickSettingsGrid *self, GtkWidget *keep_clear)
       gtk_widget_add_css_class (c->widget, "quick-settings-dimmed");
     else
       gtk_widget_remove_css_class (c->widget, "quick-settings-dimmed");
-  }
-}
-
-static void
-on_drawer_child_revealed (GObject *object,
-                          GParamSpec *pspec G_GNUC_UNUSED,
-                          gpointer user_data)
-{
-  GtkRevealer *rev = GTK_REVEALER (object);
-  WinomeQuickSettingsGrid *self = WINOME_QUICK_SETTINGS_GRID (user_data);
-  if (!gtk_revealer_get_reveal_child (rev) &&
-      !gtk_revealer_get_child_revealed (rev)) {
-    gtk_revealer_set_child (rev, NULL);
-    self->drawer_anchor = NULL;
-    gtk_widget_queue_resize (GTK_WIDGET (self));
   }
 }
 
@@ -1214,6 +1270,190 @@ compute_rows (WinomeQuickSettingsGrid *self, int n_columns,
     *anchor_row_out = anchor_row;
 
   return rows;
+}
+
+// Return the packed row index of @target inside the grid, or -1.
+static int
+grid_find_row_for (WinomeQuickSettingsGrid *self, GtkWidget *target)
+{
+  if (target == NULL)
+    return -1;
+  int n_rows = 0;
+  GList **rows = compute_rows (self, 2, &n_rows, NULL);
+  int found = -1;
+  for (int r = 0; r < n_rows; r++) {
+    for (GList *l = rows[r]; l != NULL; l = l->next) {
+      QuickGridChild *c = static_cast<QuickGridChild *> (l->data);
+      if (c->widget == target)
+        found = r;
+    }
+    g_list_free (rows[r]);
+  }
+  g_free (rows);
+  return found;
+}
+
+// Compute full target slot height (top spacing + menu card) at current grid width.
+static int
+grid_target_slot_height (WinomeQuickSettingsGrid *self)
+{
+  int w = gtk_widget_get_width (GTK_WIDGET (self));
+  int menu_h = measure_drawer_content_height (self, w > 0 ? w : -1);
+  return menu_h > 0 ? (self->row_spacing + menu_h) : 0;
+}
+
+// Attach @menu under @anchor with opacity 0 and start Phase 1 (height expansion).
+static void
+grid_open_drawer_now (WinomeQuickSettingsGrid *self, GtkWidget *anchor,
+                      GtkWidget *menu, double from_slot_h)
+{
+  grid_stop_anim (self);
+  grid_detach_drawer (self);
+
+  self->drawer_anchor = anchor;
+  self->drawer_child = menu;
+  gtk_widget_set_opacity (menu, 0.0);
+  gtk_widget_set_can_target (menu, FALSE);
+  gtk_widget_set_parent (menu, GTK_WIDGET (self));
+
+  self->drawer_opacity = 0.0;
+  self->drawer_slot_h = MAX (0.0, from_slot_h);
+  grid_set_dimmed (self, anchor);
+
+  int target_h = grid_target_slot_height (self);
+  const int base_ms = winome::QUICK_SETTINGS_ANIMATION_TIME / 2;
+  int dur_ms = base_ms;
+  if (target_h > 0 && from_slot_h > 0.0) {
+    double ratio = fabs ((double)target_h - from_slot_h) /
+                   MAX ((double)target_h, from_slot_h);
+    dur_ms = MAX (80, (int)(base_ms * ratio + 0.5));
+  }
+  grid_start_anim (self, DrawerPhase::OpeningHeight, self->drawer_slot_h,
+                   (double)target_h, dur_ms);
+}
+
+static void
+grid_promote_pending (WinomeQuickSettingsGrid *self, double from_slot_h)
+{
+  GtkWidget *anchor = self->pending_anchor;
+  GtkWidget *menu = self->pending_child;
+  self->pending_anchor = NULL;
+  self->pending_child = NULL;
+  if (anchor == NULL || menu == NULL) {
+    g_clear_object (&menu);
+    return;
+  }
+  // grid_open_drawer_now parents @menu and sinks/uses the ref we transfer.
+  GtkWidget *menu_unowned = menu;
+  grid_open_drawer_now (self, anchor, menu_unowned, from_slot_h);
+  g_object_unref (menu_unowned);
+}
+
+static gboolean
+grid_on_anim_tick (GtkWidget *widget, GdkFrameClock *clock,
+                   gpointer user_data G_GNUC_UNUSED)
+{
+  WinomeQuickSettingsGrid *self = WINOME_QUICK_SETTINGS_GRID (widget);
+  const gint64 now = clock != NULL ? gdk_frame_clock_get_frame_time (clock)
+                                   : g_get_monotonic_time ();
+  if (self->anim_start_us == 0)
+    self->anim_start_us = now;
+
+  double t = 1.0;
+  if (self->anim_duration_us > 0)
+    t = (double)MAX ((gint64)0, now - self->anim_start_us) /
+        (double)self->anim_duration_us;
+  if (t >= 1.0)
+    t = 1.0;
+
+  const double e = winome::ease_sample (winome::Ease::ease_out_quad, t);
+  const double val = self->anim_from + (self->anim_to - self->anim_from) * e;
+
+  switch (self->drawer_phase) {
+  case DrawerPhase::OpeningHeight:
+  case DrawerPhase::ClosingHeight:
+    self->drawer_slot_h = val;
+    if (self->drawer_child != NULL)
+      gtk_widget_set_opacity (self->drawer_child, 0.0);
+    gtk_widget_queue_resize (widget);
+    break;
+  case DrawerPhase::OpeningFade:
+  case DrawerPhase::ClosingFade:
+    self->drawer_opacity = CLAMP (val, 0.0, 1.0);
+    if (self->drawer_child != NULL)
+      gtk_widget_set_opacity (self->drawer_child, self->drawer_opacity);
+    break;
+  case DrawerPhase::Closed:
+  case DrawerPhase::Open:
+    self->anim_tick_id = 0;
+    return G_SOURCE_REMOVE;
+  }
+
+  if (t < 1.0)
+    return G_SOURCE_CONTINUE;
+
+  const DrawerPhase finished_phase = self->drawer_phase;
+  self->anim_tick_id = 0;
+
+  if (finished_phase == DrawerPhase::OpeningHeight) {
+    self->drawer_slot_h = self->anim_to;
+    self->drawer_opacity = 0.0;
+    if (self->drawer_child != NULL)
+      gtk_widget_set_can_target (self->drawer_child, TRUE);
+    gtk_widget_queue_resize (widget);
+    grid_start_anim (self, DrawerPhase::OpeningFade, 0.0, 1.0,
+                     winome::QUICK_SETTINGS_ANIMATION_TIME / 2);
+  } else if (finished_phase == DrawerPhase::OpeningFade) {
+    self->drawer_phase = DrawerPhase::Open;
+    self->drawer_opacity = 1.0;
+    if (self->drawer_child != NULL) {
+      gtk_widget_set_opacity (self->drawer_child, 1.0);
+      gtk_widget_set_can_target (self->drawer_child, TRUE);
+    }
+  } else if (finished_phase == DrawerPhase::ClosingFade) {
+    self->drawer_opacity = 0.0;
+    if (self->drawer_child != NULL) {
+      gtk_widget_set_opacity (self->drawer_child, 0.0);
+      gtk_widget_set_can_target (self->drawer_child, FALSE);
+    }
+    if (self->pending_anchor != NULL && self->pending_child != NULL &&
+        grid_find_row_for (self, self->pending_anchor) ==
+            grid_find_row_for (self, self->drawer_anchor)) {
+      grid_promote_pending (self, self->drawer_slot_h);
+    } else {
+      const int base_ms = winome::QUICK_SETTINGS_ANIMATION_TIME / 2;
+      int close_ms = self->pending_child != NULL ? MIN (140, base_ms) : base_ms;
+      grid_start_anim (self, DrawerPhase::ClosingHeight, self->drawer_slot_h,
+                       0.0, close_ms);
+    }
+  } else if (finished_phase == DrawerPhase::ClosingHeight) {
+    grid_detach_drawer (self);
+    self->drawer_slot_h = 0.0;
+    self->drawer_opacity = 0.0;
+    self->drawer_phase = DrawerPhase::Closed;
+    gtk_widget_queue_resize (widget);
+    if (self->pending_anchor != NULL && self->pending_child != NULL)
+      grid_promote_pending (self, 0.0);
+  }
+
+  return G_SOURCE_REMOVE;
+}
+
+static void
+grid_start_anim (WinomeQuickSettingsGrid *self, DrawerPhase phase,
+                 double from, double to, int duration_ms)
+{
+  grid_stop_anim (self);
+  self->drawer_phase = phase;
+  self->anim_from = from;
+  self->anim_to = to;
+  GdkFrameClock *fc = gtk_widget_get_frame_clock (GTK_WIDGET (self));
+  self->anim_start_us = fc != NULL ? gdk_frame_clock_get_frame_time (fc)
+                                   : g_get_monotonic_time ();
+  self->anim_duration_us = MAX (1, duration_ms) * 1000;
+  self->anim_tick_id =
+      gtk_widget_add_tick_callback (GTK_WIDGET (self), grid_on_anim_tick,
+                                    NULL, NULL);
 }
 
 static int
@@ -1285,11 +1525,7 @@ winome_quick_settings_grid_measure (GtkWidget *widget,
     if (n_rows > 1)
       total_h += (n_rows - 1) * self->row_spacing;
 
-    if (anchor_row >= 0) {
-      int drawer_h = grid_measure_drawer (self, for_size);
-      if (drawer_h > 0)
-        total_h += drawer_h + MIN (self->row_spacing, drawer_h);
-    }
+    total_h += grid_current_slot_height (self, for_size, anchor_row);
 
     *minimum = total_h;
     *natural = total_h;
@@ -1331,17 +1567,22 @@ winome_quick_settings_grid_size_allocate (GtkWidget *widget,
     y += row_height;
     g_list_free (row);
 
-    int drawer_h = (r == anchor_row) ? grid_measure_drawer (self, width) : 0;
-    if (drawer_h > 0) {
-      int top_gap = (r + 1 < n_rows) ? self->row_spacing
-                                     : MIN (self->row_spacing, drawer_h);
-      GtkAllocation drawer_alloc = {0, y + top_gap, width, drawer_h};
-      gtk_widget_size_allocate (self->drawer_revealer, &drawer_alloc, -1);
-      y += top_gap + drawer_h;
-      if (r + 1 < n_rows)
-        y += MIN (self->row_spacing, drawer_h);
-    } else if (r + 1 < n_rows) {
-      y += self->row_spacing;
+    int base_gap = (r + 1 < n_rows) ? self->row_spacing : 0;
+    int slot_h = (r == anchor_row)
+                     ? grid_current_slot_height (self, width, anchor_row)
+                     : 0;
+    if (r == anchor_row && self->drawer_child != NULL &&
+        self->drawer_phase != DrawerPhase::Closed) {
+      int menu_h = measure_drawer_content_height (self, width);
+      if (menu_h > 0) {
+        // Keep the card allocated at full natural height so internal text and
+        // scrollviews never reflow during Phase 1 height expansion.
+        GtkAllocation drawer_alloc = {0, y + self->row_spacing, width, menu_h};
+        gtk_widget_size_allocate (self->drawer_child, &drawer_alloc, -1);
+      }
+      y += base_gap + slot_h;
+    } else {
+      y += base_gap;
     }
   }
   g_free (rows);
@@ -1354,30 +1595,16 @@ winome_quick_settings_grid_init (WinomeQuickSettingsGrid *self)
   self->row_spacing = qs_grid_spacing ("spacing-rows", 12);
   self->column_spacing = qs_grid_spacing ("spacing-columns", 12);
   self->toggle_max_width = qs_toggle_max_width ();
-
-  self->drawer_revealer = gtk_revealer_new ();
-  gtk_revealer_set_transition_type (GTK_REVEALER (self->drawer_revealer),
-                                    GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
-  gtk_revealer_set_transition_duration (
-      GTK_REVEALER (self->drawer_revealer),
-      winome::QUICK_SETTINGS_ANIMATION_TIME / 2);
-  gtk_revealer_set_reveal_child (GTK_REVEALER (self->drawer_revealer), FALSE);
-  gtk_widget_set_hexpand (self->drawer_revealer, TRUE);
-  gtk_widget_set_parent (self->drawer_revealer, GTK_WIDGET (self));
-
-  g_signal_connect (self->drawer_revealer, "notify::child-revealed",
-                    G_CALLBACK (on_drawer_child_revealed), self);
+  self->drawer_phase = DrawerPhase::Closed;
 }
 
 static void
 winome_quick_settings_grid_finalize (GObject *object)
 {
   WinomeQuickSettingsGrid *self = WINOME_QUICK_SETTINGS_GRID (object);
-  self->drawer_anchor = NULL;
-  if (self->drawer_revealer != NULL) {
-    gtk_widget_unparent (self->drawer_revealer);
-    self->drawer_revealer = NULL;
-  }
+  grid_stop_anim (self);
+  grid_clear_pending (self);
+  grid_detach_drawer (self);
   for (guint i = 0; i < self->children->len; i++) {
     QuickGridChild *c =
         static_cast<QuickGridChild *> (g_ptr_array_index (self->children, i));
@@ -1444,10 +1671,9 @@ static gboolean
 quick_settings_is_menu_open_for (GtkWidget *quick_settings, GtkWidget *anchor)
 {
   WinomeQuickSettingsGrid *grid = get_qs_grid (quick_settings);
-  if (grid == NULL || anchor == NULL || grid->drawer_revealer == NULL)
+  if (grid == NULL || anchor == NULL)
     return FALSE;
-  return grid->drawer_anchor == anchor &&
-         gtk_revealer_get_reveal_child (GTK_REVEALER (grid->drawer_revealer));
+  return grid->drawer_anchor == anchor && grid_is_opening_or_open (grid);
 }
 
 static void
@@ -1459,40 +1685,88 @@ quick_settings_toggle_inline_menu (GtkWidget *quick_settings,
     return;
 
   if (quick_settings_is_menu_open_for (quick_settings, anchor)) {
+    g_object_ref_sink (menu);
+    g_object_unref (menu);
     winome_quick_settings_close_menu (quick_settings, TRUE);
     return;
   }
 
-  GtkRevealer *rev = GTK_REVEALER (grid->drawer_revealer);
-  grid->drawer_anchor = anchor;
-  gtk_revealer_set_transition_duration (
-      rev, winome::QUICK_SETTINGS_ANIMATION_TIME / 2);
-  gtk_revealer_set_child (rev, menu);
-  grid_set_dimmed (grid, anchor);
-  gtk_revealer_set_reveal_child (rev, TRUE);
-  gtk_widget_queue_resize (GTK_WIDGET (grid));
+  // Re-opening the same drawer mid-close cleanly reverses the active tween.
+  if (grid->drawer_anchor == anchor && grid->drawer_child != NULL) {
+    g_object_ref_sink (menu);
+    g_object_unref (menu);
+    grid_clear_pending (grid);
+    grid_set_dimmed (grid, anchor);
+    const int base_ms = winome::QUICK_SETTINGS_ANIMATION_TIME / 2;
+    if (grid->drawer_phase == DrawerPhase::ClosingFade) {
+      gtk_widget_set_can_target (grid->drawer_child, TRUE);
+      int ms = MAX (60, (int)(base_ms * (1.0 - grid->drawer_opacity) + 0.5));
+      grid_start_anim (grid, DrawerPhase::OpeningFade, grid->drawer_opacity,
+                       1.0, ms);
+    } else if (grid->drawer_phase == DrawerPhase::ClosingHeight) {
+      int target_h = grid_target_slot_height (grid);
+      int ms = target_h > 0
+                   ? MAX (80, (int)(base_ms *
+                                    MAX (0.0, (target_h - grid->drawer_slot_h) /
+                                                  (double)target_h) +
+                                    0.5))
+                   : base_ms;
+      grid_start_anim (grid, DrawerPhase::OpeningHeight, grid->drawer_slot_h,
+                       (double)target_h, ms);
+    }
+    return;
+  }
+
+  if (grid->drawer_phase == DrawerPhase::Closed || grid->drawer_child == NULL) {
+    grid_clear_pending (grid);
+    grid_open_drawer_now (grid, anchor, menu, 0.0);
+    return;
+  }
+
+  // Another menu is currently open or closing: queue @menu after fade-out.
+  grid_clear_pending (grid);
+  grid->pending_anchor = anchor;
+  grid->pending_child = GTK_WIDGET (g_object_ref_sink (menu));
+  if (grid->drawer_phase == DrawerPhase::Open ||
+      grid->drawer_phase == DrawerPhase::OpeningFade) {
+    gtk_widget_set_can_target (grid->drawer_child, FALSE);
+    const int base_ms = winome::QUICK_SETTINGS_ANIMATION_TIME / 2;
+    int fade_ms = MAX (60, (int)(MIN (140, base_ms) * grid->drawer_opacity + 0.5));
+    grid_start_anim (grid, DrawerPhase::ClosingFade, grid->drawer_opacity,
+                     0.0, fade_ms);
+  } else if (grid->drawer_phase == DrawerPhase::OpeningHeight) {
+    if (grid_find_row_for (grid, anchor) ==
+        grid_find_row_for (grid, grid->drawer_anchor)) {
+      grid_promote_pending (grid, grid->drawer_slot_h);
+    } else {
+      grid_start_anim (grid, DrawerPhase::ClosingHeight, grid->drawer_slot_h,
+                       0.0, 120);
+    }
+  }
 }
 
 gboolean
 winome_quick_settings_close_menu (GtkWidget *quick_settings, gboolean animate)
 {
   WinomeQuickSettingsGrid *grid = get_qs_grid (quick_settings);
-  if (grid == NULL || grid->drawer_revealer == NULL)
+  if (grid == NULL)
     return FALSE;
 
-  GtkRevealer *rev = GTK_REVEALER (grid->drawer_revealer);
-  gboolean open_now = gtk_revealer_get_reveal_child (rev) != FALSE;
-  gboolean active_now = open_now || gtk_revealer_get_child_revealed (rev);
+  gboolean open_now = grid_is_opening_or_open (grid);
+  gboolean active_now =
+      grid->drawer_phase != DrawerPhase::Closed || grid->drawer_child != NULL;
   if (!active_now && grid->drawer_anchor == NULL)
     return FALSE;
 
+  grid_clear_pending (grid);
   grid_set_dimmed (grid, NULL);
 
   if (!animate) {
-    gtk_revealer_set_transition_duration (rev, 0);
-    gtk_revealer_set_reveal_child (rev, FALSE);
-    gtk_revealer_set_child (rev, NULL);
-    grid->drawer_anchor = NULL;
+    grid_stop_anim (grid);
+    grid_detach_drawer (grid);
+    grid->drawer_slot_h = 0.0;
+    grid->drawer_opacity = 0.0;
+    grid->drawer_phase = DrawerPhase::Closed;
     gtk_widget_queue_resize (GTK_WIDGET (grid));
     return open_now;
   }
@@ -1500,9 +1774,19 @@ winome_quick_settings_close_menu (GtkWidget *quick_settings, gboolean animate)
   if (!open_now)
     return FALSE;
 
-  gtk_revealer_set_transition_duration (
-      rev, winome::QUICK_SETTINGS_ANIMATION_TIME / 2);
-  gtk_revealer_set_reveal_child (rev, FALSE);
+  const int base_ms = winome::QUICK_SETTINGS_ANIMATION_TIME / 2;
+  if (grid->drawer_phase == DrawerPhase::OpeningHeight) {
+    double target = MAX (1.0, grid->anim_to);
+    int ms = MAX (80, (int)(base_ms * (grid->drawer_slot_h / target) + 0.5));
+    grid_start_anim (grid, DrawerPhase::ClosingHeight, grid->drawer_slot_h,
+                     0.0, ms);
+  } else {
+    if (grid->drawer_child != NULL)
+      gtk_widget_set_can_target (grid->drawer_child, FALSE);
+    int ms = MAX (60, (int)(base_ms * grid->drawer_opacity + 0.5));
+    grid_start_anim (grid, DrawerPhase::ClosingFade, grid->drawer_opacity,
+                     0.0, ms);
+  }
   return TRUE;
 }
 
@@ -1512,15 +1796,15 @@ on_grid_capture_pressed (GtkGestureClick *gesture, int n_press G_GNUC_UNUSED,
 {
   GtkWidget *qs = GTK_WIDGET (user_data);
   WinomeQuickSettingsGrid *grid = get_qs_grid (qs);
-  if (grid == NULL || grid->drawer_revealer == NULL ||
-      !gtk_revealer_get_reveal_child (GTK_REVEALER (grid->drawer_revealer)))
+  if (grid == NULL || grid->drawer_child == NULL ||
+      !grid_is_opening_or_open (grid))
     return;
 
   GtkWidget *picked =
       gtk_widget_pick (GTK_WIDGET (grid), x, y, GTK_PICK_DEFAULT);
-  if (picked == grid->drawer_revealer ||
+  if (picked == grid->drawer_child ||
       (picked != NULL &&
-       gtk_widget_is_ancestor (picked, grid->drawer_revealer)))
+       gtk_widget_is_ancestor (picked, grid->drawer_child)))
     return;
 
   if (winome_quick_settings_close_menu (qs, TRUE))

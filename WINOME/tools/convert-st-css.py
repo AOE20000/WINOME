@@ -327,12 +327,19 @@ GTK4_BUTTON_OVERRIDE = """
   box-shadow: none;
   outline: none;
 }
-/* Non-active grid rows dim softly while an inline QuickToggleMenu drawer is open. */
+/* Non-active grid rows dim softly while an inline QuickToggleMenu drawer is open.
+   Give the grid children an opacity transition on their resting selector too
+   so un-dimming smoothly reverses instead of snapping back to 1.0 on close. */
+.quick-settings-grid > .quick-settings-system-item,
+.quick-settings-grid > .quick-slider,
+.quick-settings-grid > .quick-toggle,
+.quick-settings-grid > .quick-toggle-has-menu {
+  transition-property: background-color, color, border-color, box-shadow, opacity;
+  transition-duration: 200ms;
+  transition-timing-function: ease-out;
+}
 .quick-settings-grid .quick-settings-dimmed {
   opacity: 0.4;
-  transition-property: opacity;
-  transition-duration: 150ms;
-  transition-timing-function: ease-out;
 }
 
 /* Quick slider: rendered by the custom WinomeQuickSlider widget (GNOME

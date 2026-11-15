@@ -763,21 +763,27 @@ popover_raise_idle (gpointer data)
     BOOL cloaked = FALSE;
     DwmGetWindowAttribute (hwnd, DWMWA_CLOAKED, &cloaked, sizeof (cloaked));
 
-    // Recompute the position from the anchor; keep the current size (GTK
-    // has negotiated it by now).
-    int w = before.right - before.left;
-    int h = before.bottom - before.top;
-    int x = before.left, y = before.top;
-    if (pp->raise_attempts < 3)
+    if (pp->raise_attempts == 0) {
+      // Recompute the position from the anchor; keep the current size (GTK
+      // has negotiated it by now).
+      int w = before.right - before.left;
+      int h = before.bottom - before.top;
+      int x = before.left, y = before.top;
       g_print ("[pop] raise#%d rect=%ld,%ld %dx%d vis=%d cloak=%d\n",
                pp->raise_attempts, before.left, before.top, w, h,
                (int)IsWindowVisible (hwnd), (int)cloaked);
-    if (w > 0 && h > 0 && panel_popover_geometry (pp, w, h, &x, &y)) {
-      pp->win_x = x;
-      if (pp->arrow_area != nullptr)
-        gtk_widget_queue_draw (pp->arrow_area);
-      SetWindowPos (hwnd, HWND_TOPMOST, x, y, w, h,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+      if (w > 0 && h > 0 && panel_popover_geometry (pp, w, h, &x, &y)) {
+        pp->win_x = x;
+        if (pp->arrow_area != nullptr)
+          gtk_widget_queue_draw (pp->arrow_area);
+        SetWindowPos (hwnd, HWND_TOPMOST, x, y, w, h,
+                      SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+      }
+    } else {
+      // Subsequent follow-up passes only re-assert HWND_TOPMOST without
+      // touching size/frame so inline drawer animations resize smoothly.
+      SetWindowPos (hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
   }
 

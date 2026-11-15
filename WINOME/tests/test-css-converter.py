@@ -192,6 +192,7 @@ def verify_full_theme_with_gtk4(converter):
             '.page-indicator.active .page-indicator-icon',
             '.calendar:hover',
             '.message-list',
+            '.quick-settings-grid > .quick-toggle-has-menu',
         ):
             assert expected_rule in full_text, (
                 f'missing GTK4 override rule: {expected_rule}')
