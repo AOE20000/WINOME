@@ -950,23 +950,17 @@ void test_ipc_dispatch_and_named_pipe_roundtrip() {
   CHECK(winome::ipc_dispatch_request_json("{\"cmd\":\"nonexistent\"}", cbs)
             .find("\"unknown command\"") != std::string::npos);
 
-  // Exercise live Named Pipe server + client roundtrip.
+  // Exercise live Named Pipe server + rapid back-to-back client roundtrips.
   CHECK(winome::ipc_server_start(cbs));
   std::string pipe_reply;
-  bool connected = false;
-  for (int attempt = 0; attempt < 25; ++attempt) {
-    if (winome::ipc_query_running_shell("{\"cmd\":\"ping\"}", &pipe_reply, 500)) {
-      connected = true;
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(15));
-  }
-  CHECK(connected);
+  CHECK(winome::ipc_query_running_shell("{\"cmd\":\"ping\"}", &pipe_reply, 1000));
   CHECK(pipe_reply.find("\"pong\":true") != std::string::npos);
 
-  std::string pipe_status;
-  CHECK(winome::ipc_query_running_shell("{\"cmd\":\"status\"}", &pipe_status, 1000));
-  CHECK(pipe_status.find("\"capabilities\":[") != std::string::npos);
+  for (int i = 0; i < 5; ++i) {
+    std::string pipe_status;
+    CHECK(winome::ipc_query_running_shell("{\"cmd\":\"status\"}", &pipe_status, 1000));
+    CHECK(pipe_status.find("\"capabilities\":[") != std::string::npos);
+  }
   winome::ipc_server_stop();
 }
 

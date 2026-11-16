@@ -292,6 +292,7 @@ struct ServerState {
   IpcCallbacks cbs;
   std::thread thread;
   HANDLE stop_event = nullptr;
+  HANDLE ready_event = nullptr;
   std::atomic<bool> running{false};
 };
 
@@ -372,77 +373,166 @@ void write_pipe_reply(HANDLE pipe, const std::string& payload) {
   FlushFileBuffers(pipe);
 }
 
+HANDLE create_pipe_instance() {
+  return CreateNamedPipeW(
+      kShellPipeName,
+      PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+      PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+      4,
+      kMaxIpcPayloadBytes,
+      kMaxIpcPayloadBytes,
+      1000,
+      nullptr);
+}
+
+bool start_connect(HANDLE pipe, HANDLE ev, OVERLAPPED* ov, bool* out_pending) {
+  ResetEvent(ev);
+  *ov = OVERLAPPED{};
+  ov->hEvent = ev;
+  BOOL connected = ConnectNamedPipe(pipe, ov);
+  if (connected) {
+    *out_pending = false;
+    return true;
+  }
+  const DWORD err = GetLastError();
+  if (err == ERROR_IO_PENDING) {
+    *out_pending = true;
+    return true;
+  }
+  if (err == ERROR_PIPE_CONNECTED) {
+    *out_pending = false;
+    return true;
+  }
+  *out_pending = false;
+  return false;
+}
+
+struct PipeSlot {
+  HANDLE pipe = INVALID_HANDLE_VALUE;
+  HANDLE ev = nullptr;
+  OVERLAPPED ov{};
+  bool armed = false;
+  bool pending = false;
+};
+
 void server_thread_main() {
-  HANDLE connect_ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  if (connect_ev == nullptr) {
+  PipeSlot slots[2]{};
+  slots[0].ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  slots[1].ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (slots[0].ev == nullptr || slots[1].ev == nullptr) {
+    if (slots[0].ev != nullptr)
+      CloseHandle(slots[0].ev);
+    if (slots[1].ev != nullptr)
+      CloseHandle(slots[1].ev);
     capability_set(SubsystemId::IpcServer, CapabilityState::Tripped,
                    "Failed to create IPC overlapped event");
+    if (g_ipc.ready_event != nullptr)
+      SetEvent(g_ipc.ready_event);
     return;
   }
 
-  for (;;) {
-    HANDLE pipe = CreateNamedPipeW(
-        kShellPipeName,
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-        4,
-        kMaxIpcPayloadBytes,
-        kMaxIpcPayloadBytes,
-        1000,
-        nullptr);
-    if (pipe == INVALID_HANDLE_VALUE) {
-      capability_record_failure(SubsystemId::IpcServer,
-                                "CreateNamedPipeW failed");
-      if (WaitForSingleObject(g_ipc.stop_event, 500) == WAIT_OBJECT_0)
-        break;
-      continue;
-    }
+  int cur_idx = 0;
+  bool signaled_ready = false;
 
-    capability_set(SubsystemId::IpcServer, CapabilityState::Active);
+  while (g_ipc.running.load(std::memory_order_acquire)) {
+    PipeSlot& s = slots[cur_idx];
+    PipeSlot& next = slots[1 - cur_idx];
 
-    ResetEvent(connect_ev);
-    OVERLAPPED ov{};
-    ov.hEvent = connect_ev;
-    BOOL connected = ConnectNamedPipe(pipe, &ov);
-    if (!connected) {
-      DWORD err = GetLastError();
-      if (err == ERROR_IO_PENDING) {
-        HANDLE waits[2] = {connect_ev, g_ipc.stop_event};
-        DWORD w = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-        if (w != WAIT_OBJECT_0) {
-          CancelIo(pipe);
-          CloseHandle(pipe);
-          break;
-        }
-      } else if (err != ERROR_PIPE_CONNECTED) {
-        CloseHandle(pipe);
-        if (WaitForSingleObject(g_ipc.stop_event, 50) == WAIT_OBJECT_0)
+    if (s.pipe == INVALID_HANDLE_VALUE) {
+      s.pipe = create_pipe_instance();
+      s.armed = false;
+      s.pending = false;
+      if (s.pipe == INVALID_HANDLE_VALUE) {
+        capability_record_failure(SubsystemId::IpcServer,
+                                  "CreateNamedPipeW failed");
+        if (WaitForSingleObject(g_ipc.stop_event, 500) == WAIT_OBJECT_0)
           break;
         continue;
       }
     }
 
-    if (!g_ipc.running.load(std::memory_order_acquire)) {
-      DisconnectNamedPipe(pipe);
-      CloseHandle(pipe);
+    if (!s.armed) {
+      if (!start_connect(s.pipe, s.ev, &s.ov, &s.pending)) {
+        CloseHandle(s.pipe);
+        s.pipe = INVALID_HANDLE_VALUE;
+        if (WaitForSingleObject(g_ipc.stop_event, 50) == WAIT_OBJECT_0)
+          break;
+        continue;
+      }
+      s.armed = true;
+    }
+
+    capability_set(SubsystemId::IpcServer, CapabilityState::Active);
+    if (!signaled_ready) {
+      signaled_ready = true;
+      if (g_ipc.ready_event != nullptr)
+        SetEvent(g_ipc.ready_event);
+    }
+
+    if (s.pending) {
+      HANDLE waits[2] = {s.ev, g_ipc.stop_event};
+      DWORD w = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+      if (w != WAIT_OBJECT_0)
+        break;
+      DWORD dummy = 0;
+      if (!GetOverlappedResult(s.pipe, &s.ov, &dummy, FALSE)) {
+        CancelIo(s.pipe);
+        CloseHandle(s.pipe);
+        s.pipe = INVALID_HANDLE_VALUE;
+        s.armed = false;
+        s.pending = false;
+        continue;
+      }
+    }
+
+    if (!g_ipc.running.load(std::memory_order_acquire))
       break;
+
+    // Pre-create and arm the standby listening instance at a stable OVERLAPPED
+    // address BEFORE replying and disconnecting s.pipe, eliminating gaps.
+    if (next.pipe == INVALID_HANDLE_VALUE) {
+      next.pipe = create_pipe_instance();
+      next.armed = false;
+      next.pending = false;
+      if (next.pipe != INVALID_HANDLE_VALUE) {
+        if (start_connect(next.pipe, next.ev, &next.ov, &next.pending)) {
+          next.armed = true;
+        } else {
+          CloseHandle(next.pipe);
+          next.pipe = INVALID_HANDLE_VALUE;
+        }
+      }
     }
 
     std::string req;
-    if (read_pipe_message(pipe, g_ipc.stop_event, &req)) {
+    if (read_pipe_message(s.pipe, g_ipc.stop_event, &req)) {
       IpcCallbacks cbs_copy;
       {
         std::lock_guard<std::mutex> lock(g_ipc.mu);
         cbs_copy = g_ipc.cbs;
       }
       const std::string reply = ipc_dispatch_request_json(req, cbs_copy);
-      write_pipe_reply(pipe, reply);
+      write_pipe_reply(s.pipe, reply);
     }
-    DisconnectNamedPipe(pipe);
-    CloseHandle(pipe);
+    DisconnectNamedPipe(s.pipe);
+    CloseHandle(s.pipe);
+    s.pipe = INVALID_HANDLE_VALUE;
+    s.armed = false;
+    s.pending = false;
+
+    cur_idx = 1 - cur_idx;
   }
 
-  CloseHandle(connect_ev);
+  for (PipeSlot& slot : slots) {
+    if (slot.pipe != INVALID_HANDLE_VALUE) {
+      CancelIo(slot.pipe);
+      DisconnectNamedPipe(slot.pipe);
+      CloseHandle(slot.pipe);
+      slot.pipe = INVALID_HANDLE_VALUE;
+    }
+    if (slot.ev != nullptr)
+      CloseHandle(slot.ev);
+  }
 }
 
 }  // namespace
@@ -542,24 +632,40 @@ std::string ipc_dispatch_request_json(const std::string& req_json,
 }
 
 bool ipc_server_start(const IpcCallbacks& cbs) {
-  std::lock_guard<std::mutex> lock(g_ipc.mu);
-  if (g_ipc.running.load(std::memory_order_acquire))
-    return true;
-  g_ipc.cbs = cbs;
-  g_ipc.stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  if (g_ipc.stop_event == nullptr) {
-    capability_set(SubsystemId::IpcServer, CapabilityState::Tripped,
-                   "CreateEventW failed for IPC stop event");
-    return false;
+  HANDLE ready_ev = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_ipc.mu);
+    if (g_ipc.running.load(std::memory_order_acquire))
+      return true;
+    g_ipc.cbs = cbs;
+    g_ipc.stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_ipc.ready_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (g_ipc.stop_event == nullptr || g_ipc.ready_event == nullptr) {
+      if (g_ipc.stop_event != nullptr) {
+        CloseHandle(g_ipc.stop_event);
+        g_ipc.stop_event = nullptr;
+      }
+      if (g_ipc.ready_event != nullptr) {
+        CloseHandle(g_ipc.ready_event);
+        g_ipc.ready_event = nullptr;
+      }
+      capability_set(SubsystemId::IpcServer, CapabilityState::Tripped,
+                     "CreateEventW failed for IPC stop/ready event");
+      return false;
+    }
+    ready_ev = g_ipc.ready_event;
+    g_ipc.running.store(true, std::memory_order_release);
+    g_ipc.thread = std::thread(server_thread_main);
   }
-  g_ipc.running.store(true, std::memory_order_release);
-  g_ipc.thread = std::thread(server_thread_main);
+  if (ready_ev != nullptr)
+    WaitForSingleObject(ready_ev, 1000);
   return true;
 }
 
 void ipc_server_stop() {
   std::thread to_join;
   HANDLE stop_ev = nullptr;
+  HANDLE ready_ev = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_ipc.mu);
     if (!g_ipc.running.exchange(false, std::memory_order_acq_rel))
@@ -567,6 +673,8 @@ void ipc_server_stop() {
     to_join = std::move(g_ipc.thread);
     stop_ev = g_ipc.stop_event;
     g_ipc.stop_event = nullptr;
+    ready_ev = g_ipc.ready_event;
+    g_ipc.ready_event = nullptr;
   }
   if (stop_ev != nullptr)
     SetEvent(stop_ev);
@@ -574,6 +682,8 @@ void ipc_server_stop() {
     to_join.join();
   if (stop_ev != nullptr)
     CloseHandle(stop_ev);
+  if (ready_ev != nullptr)
+    CloseHandle(ready_ev);
 }
 
 bool ipc_query_running_shell(const std::string& req_json,
@@ -583,13 +693,25 @@ bool ipc_query_running_shell(const std::string& req_json,
     return false;
   out_resp->clear();
 
-  if (!WaitNamedPipeW(kShellPipeName, static_cast<DWORD>(std::max(100, timeout_ms))))
-    return false;
+  const DWORD total_wait = static_cast<DWORD>(std::max(100, timeout_ms));
+  const ULONGLONG deadline = GetTickCount64() + total_wait;
+  HANDLE pipe = INVALID_HANDLE_VALUE;
+  for (;;) {
+    pipe = CreateFileW(kShellPipeName, GENERIC_READ | GENERIC_WRITE,
+                       0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (pipe != INVALID_HANDLE_VALUE)
+      break;
 
-  HANDLE pipe = CreateFileW(kShellPipeName, GENERIC_READ | GENERIC_WRITE,
-                            0, nullptr, OPEN_EXISTING, 0, nullptr);
-  if (pipe == INVALID_HANDLE_VALUE)
-    return false;
+    const DWORD err = GetLastError();
+    if (err != ERROR_PIPE_BUSY)
+      return false;
+
+    const ULONGLONG now = GetTickCount64();
+    if (now >= deadline)
+      return false;
+    const DWORD rem = static_cast<DWORD>(deadline - now);
+    WaitNamedPipeW(kShellPipeName, std::min<DWORD>(rem, 100));
+  }
 
   std::string framed = req_json;
   if (framed.empty() || framed.back() != '\n')
