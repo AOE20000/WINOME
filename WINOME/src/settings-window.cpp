@@ -7,6 +7,7 @@
 #include "config.h"
 #include "fonts.h"
 #include "i18n.h"
+#include "looking-glass.h"
 #include "perf-metrics.h"
 #include "virtual-desktop.h"
 #include "window-theming.h"
@@ -42,7 +43,10 @@ struct SettingsUi {
   GtkWidget* hot_corner_switch = nullptr;
   GtkWidget* hot_cooldown_spin = nullptr;
   GtkWidget* win_key_switch = nullptr;
+  GtkWidget* overview_blacklist_switch = nullptr;
   GtkWidget* end_session_confirm_switch = nullptr;
+  GtkWidget* dev_mode_switch = nullptr;
+  GtkWidget* dev_console_btn = nullptr;
 
   // Diagnostics readout container
   GtkWidget* diag_box = nullptr;
@@ -393,9 +397,21 @@ void sync_ui_from_config() {
     gtk_switch_set_active(GTK_SWITCH(g_ui.win_key_switch),
                           cfg.win_key_overview ? TRUE : FALSE);
   }
+  if (g_ui.overview_blacklist_switch != nullptr) {
+    gtk_switch_set_active(GTK_SWITCH(g_ui.overview_blacklist_switch),
+                          cfg.overview_window_blacklist ? TRUE : FALSE);
+  }
   if (g_ui.end_session_confirm_switch != nullptr) {
     gtk_switch_set_active(GTK_SWITCH(g_ui.end_session_confirm_switch),
                           cfg.end_session_confirm ? TRUE : FALSE);
+  }
+  if (g_ui.dev_mode_switch != nullptr) {
+    gtk_switch_set_active(GTK_SWITCH(g_ui.dev_mode_switch),
+                          cfg.developer_mode ? TRUE : FALSE);
+  }
+  if (g_ui.dev_console_btn != nullptr) {
+    gtk_widget_set_sensitive(g_ui.dev_console_btn,
+                             cfg.developer_mode ? TRUE : FALSE);
   }
 
   g_ui.syncing = false;
@@ -492,6 +508,17 @@ gboolean on_win_key_set(GtkSwitch* sw G_GNUC_UNUSED, gboolean state, gpointer ud
   return FALSE;
 }
 
+gboolean on_overview_blacklist_set(GtkSwitch* sw G_GNUC_UNUSED,
+                                   gboolean state,
+                                   gpointer ud G_GNUC_UNUSED) {
+  if (g_ui.syncing)
+    return FALSE;
+  WinomeConfig cfg = get_config();
+  cfg.overview_window_blacklist = state != FALSE;
+  update_config(cfg);
+  return FALSE;
+}
+
 gboolean on_dark_titlebars_set(GtkSwitch* sw G_GNUC_UNUSED, gboolean state, gpointer ud G_GNUC_UNUSED) {
   if (g_ui.syncing)
     return FALSE;
@@ -521,6 +548,25 @@ gboolean on_end_session_confirm_set(GtkSwitch* sw G_GNUC_UNUSED, gboolean state,
   return FALSE;
 }
 
+gboolean on_dev_mode_set(GtkSwitch* sw G_GNUC_UNUSED, gboolean state, gpointer ud G_GNUC_UNUSED) {
+  if (g_ui.syncing)
+    return FALSE;
+  WinomeConfig cfg = get_config();
+  cfg.developer_mode = state != FALSE;
+  update_config(cfg);
+  if (!cfg.developer_mode)
+    close_looking_glass();
+  if (g_ui.dev_console_btn != nullptr) {
+    gtk_widget_set_sensitive(g_ui.dev_console_btn,
+                             cfg.developer_mode ? TRUE : FALSE);
+  }
+  return FALSE;
+}
+
+void on_open_dev_console(GtkButton* btn G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
+  open_looking_glass();
+}
+
 void populate_diagnostics_box() {
   if (g_ui.diag_box == nullptr)
     return;
@@ -542,6 +588,16 @@ void populate_diagnostics_box() {
   GtkWidget* perf_card = make_card();
   char buf[256];
 
+  if (is_safe_mode()) {
+    append_row_to_card(
+        perf_card,
+        make_row(tr("Runtime Mode: SAFE MODE (--safe-mode)", "运行模式：安全模式（--safe-mode）"),
+                 tr("Third-party plugins and opt-in DWM theming are temporarily disabled",
+                    "第三方外部插件与实验性 DWM 窗口外观统一已临时停用"),
+                 nullptr),
+        false);
+  }
+
   char ws_buf[64];
   char priv_buf[64];
   format_mib(tel.working_set_bytes, ws_buf, sizeof(ws_buf));
@@ -553,7 +609,7 @@ void populate_diagnostics_box() {
   append_row_to_card(
       perf_card,
       make_row(tr("Memory & Win32 Handles", "内存与句柄占用"), buf, nullptr),
-      false);
+      is_safe_mode());
 
   std::snprintf(buf, sizeof(buf),
                 "Total %.1f ms | Fontconfig %.1f ms (%d files / %d fontset) | "
@@ -656,7 +712,10 @@ void on_window_destroy(GtkWidget* widget G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSE
   g_ui.hot_corner_switch = nullptr;
   g_ui.hot_cooldown_spin = nullptr;
   g_ui.win_key_switch = nullptr;
+  g_ui.overview_blacklist_switch = nullptr;
   g_ui.end_session_confirm_switch = nullptr;
+  g_ui.dev_mode_switch = nullptr;
+  g_ui.dev_console_btn = nullptr;
   g_ui.diag_box = nullptr;
 }
 
@@ -807,6 +866,17 @@ GtkWidget* build_behavior_page() {
                g_ui.win_key_switch),
       true);
 
+  g_ui.overview_blacklist_switch = gtk_switch_new();
+  g_signal_connect(g_ui.overview_blacklist_switch, "state-set",
+                   G_CALLBACK(on_overview_blacklist_set), nullptr);
+  append_row_to_card(
+      trig_card,
+      make_row(tr("Overview System Blacklist", "概览默认黑名单"),
+               tr("Exclude \"Windows Input Experience\" and nameless blank Explorer windows from Overview",
+                  "默认在概览中过滤“Windows输入体验”及资源管理器的无名无画面窗口"),
+               g_ui.overview_blacklist_switch),
+      true);
+
   g_ui.end_session_confirm_switch = gtk_switch_new();
   g_signal_connect(g_ui.end_session_confirm_switch, "state-set",
                    G_CALLBACK(on_end_session_confirm_set), nullptr);
@@ -842,6 +912,13 @@ GtkWidget* build_behavior_page() {
       make_row("Win + Shift + PageUp / PageDown",
                tr("Move active foreground window to adjacent workspace and follow it",
                   "将当前活动窗口移动到相邻工作区并跟随切换"),
+               nullptr),
+      true);
+  append_row_to_card(
+      keys_card,
+      make_row("Alt + F2",
+               tr("Open GNOME Run Dialog (commands, URLs, or Dev Mode lg/rt/r)",
+                  "打开 GNOME 运行命令弹窗（程序/网址，开发者模式下支持 lg/rt/r）"),
                nullptr),
       true);
   append_row_to_card(
@@ -895,6 +972,37 @@ GtkWidget* build_behavior_page() {
       true);
 
   gtk_box_append(GTK_BOX(page), sys_card);
+
+  gtk_box_append(GTK_BOX(page),
+                 make_section_label(tr("Developer Mode & Runtime Debugging",
+                                       "开发者模式与运行时调试")));
+  GtkWidget* dev_card = make_card();
+
+  g_ui.dev_mode_switch = gtk_switch_new();
+  g_signal_connect(g_ui.dev_mode_switch, "state-set",
+                   G_CALLBACK(on_dev_mode_set), nullptr);
+  append_row_to_card(
+      dev_card,
+      make_row(tr("Developer Mode", "开发者模式"),
+               tr("Unlock in-host Looking Glass console, internal Run commands (lg/rt/r), and user-debug.css",
+                  "开启后可在当前界面直接打开 Looking Glass 运行时控制台、启用 Alt+F2 内部指令 (lg/rt/r) 与 user-debug.css 覆盖"),
+               g_ui.dev_mode_switch),
+      false);
+
+  g_ui.dev_console_btn =
+      gtk_button_new_with_label(tr("Open Console", "打开控制台"));
+  gtk_widget_set_name(g_ui.dev_console_btn, "winomeSettingsButton");
+  g_signal_connect(g_ui.dev_console_btn, "clicked",
+                   G_CALLBACK(on_open_dev_console), nullptr);
+  append_row_to_card(
+      dev_card,
+      make_row(tr("Runtime Developer Console (Looking Glass)", "Looking Glass 运行时控制台"),
+               tr("Execute IPC commands, stream live logs, inspect Z-order/CSS, and control plugins & circuit breakers",
+                  "直接执行运行时指令、订阅实时日志、检测控件 CSS 与窗口 Z-Order、管理插件与故障注入（无需全局快捷键）"),
+               g_ui.dev_console_btn),
+      true);
+
+  gtk_box_append(GTK_BOX(page), dev_card);
   return page;
 }
 
@@ -1050,9 +1158,11 @@ void open_settings_window() {
 void open_settings_window_page(const char* page_name) {
   open_settings_window();
   if (g_ui.stack != nullptr && page_name != nullptr && page_name[0] != '\0') {
-    if (gtk_stack_get_child_by_name(GTK_STACK(g_ui.stack), page_name) != nullptr) {
-      gtk_stack_set_visible_child_name(GTK_STACK(g_ui.stack), page_name);
-      if (std::string(page_name) == "diagnostics")
+    const std::string target =
+        (std::string(page_name) == "developer") ? "behavior" : std::string(page_name);
+    if (gtk_stack_get_child_by_name(GTK_STACK(g_ui.stack), target.c_str()) != nullptr) {
+      gtk_stack_set_visible_child_name(GTK_STACK(g_ui.stack), target.c_str());
+      if (target == "diagnostics")
         populate_diagnostics_box();
     }
   }

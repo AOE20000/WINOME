@@ -20,7 +20,9 @@
 
 #include "overview-trigger.h"
 #include "config.h"
+#include "debug-runtime.h"
 #include "overview.h"
+#include "run-dialog.h"
 #include "virtual-desktop.h"
 
 #include <windows.h>
@@ -46,10 +48,12 @@ namespace {
 // are passed through to the system instead of being re-processed by the hook.
 constexpr ULONG_PTR kSyntheticWinExtra = 0x574E4F31;  // "WNO1"
 
-BOOL g_running = FALSE;
+std::atomic<bool> g_running{false};
+std::atomic<uint64_t> g_state_seq{0};
 BOOL g_win_down = FALSE;
 BOOL g_win_alone = FALSE;
 BOOL g_win_injected = FALSE;
+BOOL g_alt_f2_down = FALSE;
 HHOOK g_keyboard_hook = nullptr;
 std::atomic<gint64> g_last_win_press_us{0};
 
@@ -59,14 +63,17 @@ void *g_state_cb_data = nullptr;
 
 struct OverviewStateData {
   gboolean active;
+  uint64_t seq;
 };
 
 static gboolean
 emit_overview_state (gpointer data)
 {
   OverviewStateData *d = static_cast<OverviewStateData *> (data);
-  if (g_state_cb != nullptr)
+  if (d->seq == g_state_seq.load (std::memory_order_acquire) &&
+      g_state_cb != nullptr) {
     g_state_cb (d->active != FALSE, g_state_cb_data);
+  }
   g_free (d);
   return G_SOURCE_REMOVE;
 }
@@ -74,12 +81,13 @@ emit_overview_state (gpointer data)
 // Notify the state-change callback on the main thread. start_overview /
 // close_overview can be called from the hook thread (Win key) or the main
 // thread (Activities button, overview clicks), so always marshal through the
-// default context.
+// default context and drop out-of-order stale notifications by sequence id.
 static void
-notify_overview_state (bool active)
+notify_overview_state (bool active, uint64_t seq)
 {
   OverviewStateData *d = g_new (OverviewStateData, 1);
   d->active = active;
+  d->seq = seq;
   g_main_context_invoke (nullptr, emit_overview_state, d);
 }
 
@@ -279,7 +287,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
           // press (within 550ms while opening or in WINDOW_PICKER) interrupts
           // smoothly into the App Grid like GNOME Shell's overlay-key flow.
           gint64 now = g_get_monotonic_time();
-          if (!g_running) {
+          if (!g_running.load(std::memory_order_acquire)) {
             g_last_win_press_us.store(now, std::memory_order_release);
             open_overview("win-key");
           } else {
@@ -340,13 +348,32 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         inject_win_key(false);
         g_win_injected = TRUE;
       }
+    } else if (state->vkCode == VK_F2) {
+      if (up) {
+        g_alt_f2_down = FALSE;
+      } else if (down && !g_win_down) {
+        const bool alt_held =
+            (wParam == WM_SYSKEYDOWN) ||
+            ((GetAsyncKeyState(VK_MENU) & 0x8000) != 0);
+        const bool ctrl_held = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool shift_held = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (alt_held && !ctrl_held && !shift_held) {
+          if (!g_alt_f2_down) {
+            g_alt_f2_down = TRUE;
+            if (debug_get_flags().hotkey_trace)
+              debug_append_log("trig", "[trig] Alt+F2 -> toggle RunDialog");
+            run_dialog_toggle_async();
+          }
+          return 1;
+        }
+      }
     } else if (up && state->vkCode == VK_ESCAPE && g_running) {
       close_overview("esc");
     }
   }
   // Everything else (Alt+Tab, Ctrl+Esc, print-screen, ...) is passed through
   // untouched: the hook only ever consumes Win, Win+Tab, Win(+Shift)+PageUp/Dn,
-  // and Esc-while-open.
+  // Alt+F2, and Esc-while-open.
   return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
 
@@ -366,33 +393,39 @@ void stop_overview_trigger() {
 }
 
 void open_overview(const char *source) {
-  if (g_running)
+  bool expected = false;
+  if (!g_running.compare_exchange_strong(expected, true,
+                                        std::memory_order_acq_rel)) {
     return;
+  }
+  const uint64_t seq = g_state_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
   g_print ("[trig] open_overview (%s)\n", source != nullptr ? source : "?");
-  g_running = TRUE;
   overview_show_async();
-  notify_overview_state(TRUE);
+  notify_overview_state(TRUE, seq);
 }
 
 void close_overview(const char *source) {
-  if (!g_running)
+  bool expected = true;
+  if (!g_running.compare_exchange_strong(expected, false,
+                                        std::memory_order_acq_rel)) {
     return;
+  }
+  const uint64_t seq = g_state_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
   g_print ("[trig] close_overview (%s)\n", source != nullptr ? source : "?");
   g_last_win_press_us.store(0, std::memory_order_release);
-  g_running = FALSE;
   overview_hide_async();
-  notify_overview_state(FALSE);
+  notify_overview_state(FALSE, seq);
 }
 
 void toggle_overview(const char *source) {
-  if (!g_running)
+  if (!g_running.load(std::memory_order_acquire))
     open_overview(source);
   else
     close_overview(source);
 }
 
 bool overview_active() {
-  return g_running != FALSE;
+  return g_running.load(std::memory_order_acquire);
 }
 
 void set_overview_change_callback(OverviewStateCallback callback,

@@ -18,6 +18,7 @@
 #include "shell-panel.h"
 #include "config.h"
 #include "easing.h"
+#include "host-utils.h"
 #include "i18n.h"
 #include "st-engine.h"
 #include "system-status.h"
@@ -38,6 +39,7 @@
 #include <math.h>
 #include <algorithm>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <windows.h>
@@ -1128,7 +1130,6 @@ make_panel_popover (GtkWidget *button, GtkWidget *child, gboolean centered)
   gtk_drawing_area_set_content_height (
       GTK_DRAWING_AREA (pp->arrow_area),
       (int)(boxpointer_theme ().arrow_rise + 0.5));
-  gtk_widget_set_margin_bottom (pp->arrow_area, -1);
   gtk_drawing_area_set_draw_func (GTK_DRAWING_AREA (pp->arrow_area),
                                   draw_popover_arrow, pp, nullptr);
   gtk_box_append (GTK_BOX (wrap), pp->arrow_area);
@@ -1164,13 +1165,25 @@ make_panel_popover (GtkWidget *button, GtkWidget *child, gboolean centered)
   return pp->window;
 }
 
-void
-winome_shell_panel_close_popovers (void)
+static void
+close_all_open_popovers (gboolean immediate)
 {
   while (g_open_popovers != nullptr) {
     PanelPopover *pp = static_cast<PanelPopover *> (g_open_popovers->data);
-    panel_popover_close (pp, "dismiss");
+    panel_popover_close_ex (pp, "dismiss", immediate);
   }
+}
+
+void
+winome_shell_panel_close_popovers (void)
+{
+  close_all_open_popovers (FALSE);
+}
+
+void
+winome_shell_panel_close_popovers_immediate (void)
+{
+  close_all_open_popovers (TRUE);
 }
 typedef struct PanelStatus {
   bool is_primary;
@@ -1191,6 +1204,7 @@ typedef struct PanelStatus {
   GtkWidget *quick_settings;
   GtkWidget *date_menu;
   GtkWidget *tray_inline_box;
+  GtkWidget *plugin_box;
   GtkWidget *tray_menu;
   GtkWidget *tray_list_box;
   GtkWidget *tray_empty_label;
@@ -1565,7 +1579,8 @@ on_tray_item_clicked (GtkButton *button, gpointer G_GNUC_UNUSED data)
       g_object_get_data (G_OBJECT (button), "tray-payload"));
   if (payload == nullptr)
     return;
-  winome_shell_panel_close_popovers ();
+  winome_shell_panel_close_popovers_immediate ();
+  AllowSetForegroundWindow (ASFW_ANY);
   POINT pt{};
   GetCursorPos (&pt);
   winome::systray_activate_item (payload->id, false, pt.x, pt.y);
@@ -1583,7 +1598,8 @@ on_tray_item_right_click (GtkGestureClick *gesture G_GNUC_UNUSED,
       g_object_get_data (G_OBJECT (button), "tray-payload"));
   if (payload == nullptr)
     return;
-  winome_shell_panel_close_popovers ();
+  winome_shell_panel_close_popovers_immediate ();
+  AllowSetForegroundWindow (ASFW_ANY);
   POINT pt{};
   GetCursorPos (&pt);
   winome::systray_activate_item (payload->id, true, pt.x, pt.y);
@@ -1672,7 +1688,8 @@ static void
 on_tray_native_overflow_clicked (GtkButton *button G_GNUC_UNUSED,
                                  gpointer G_GNUC_UNUSED data)
 {
-  winome_shell_panel_close_popovers ();
+  winome_shell_panel_close_popovers_immediate ();
+  AllowSetForegroundWindow (ASFW_ANY);
   winome::systray_toggle_native_overflow ();
 }
 
@@ -1680,7 +1697,7 @@ static void
 on_tray_popover_map (GtkWidget *win G_GNUC_UNUSED, gpointer data)
 {
   PanelStatus *st = static_cast<PanelStatus *> (data);
-  winome::systray_refresh_async (true);
+  winome::systray_refresh_async (false);
   rebuild_tray_views (st);
 }
 
@@ -1813,27 +1830,92 @@ create_quick_settings (PanelStatus *st)
 
 // --- CSS --------------------------------------------------------------------
 
+static GtkCssProvider *g_theme_provider = nullptr;
+static GtkCssProvider *g_dev_css_provider = nullptr;
+
+static void
+load_optional_dev_css (GtkCssProvider *provider)
+{
+  if (provider == nullptr)
+    return;
+  if (!winome::get_config ().developer_mode || winome::is_safe_mode ()) {
+    gtk_css_provider_load_from_string (provider, "");
+    return;
+  }
+  const std::wstring dir = winome::app_data_dir ();
+  if (dir.empty ()) {
+    gtk_css_provider_load_from_string (provider, "");
+    return;
+  }
+  const std::wstring css_path = dir + L"\\user-debug.css";
+  HANDLE f = CreateFileW (css_path.c_str (), GENERIC_READ, FILE_SHARE_READ,
+                          nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (f == INVALID_HANDLE_VALUE) {
+    gtk_css_provider_load_from_string (provider, "");
+    return;
+  }
+  LARGE_INTEGER sz {};
+  std::string content;
+  if (GetFileSizeEx (f, &sz) && sz.QuadPart > 0 && sz.QuadPart <= 1048576) {
+    content.resize (static_cast<size_t> (sz.QuadPart));
+    DWORD got = 0;
+    if (ReadFile (f, content.data (), static_cast<DWORD> (sz.QuadPart),
+                  &got, nullptr)) {
+      content.resize (got);
+    } else {
+      content.clear ();
+    }
+  }
+  CloseHandle (f);
+  gtk_css_provider_load_from_string (provider, content.c_str ());
+}
+
 static void
 load_css (GtkWidget *panel G_GNUC_UNUSED)
 {
-  GtkCssProvider *provider = gtk_css_provider_new ();
-
-  gtk_css_provider_load_from_resource (provider,
-                                       "/org/winome/theme/gnome-shell-gtk4.css");
-
-  // Register custom GNOME Shell symbolic icons bundled in GResource alongside CSS.
   GdkDisplay *display = gdk_display_get_default ();
-  gtk_icon_theme_add_resource_path (gtk_icon_theme_get_for_display (display),
-                                    "/org/winome/theme/icons");
 
-  // Load at display scope so descendant selectors (#panel .panel-button,
-  // #panel .panel-button.clock-display .clock, etc.) match all child widgets.
-  gtk_style_context_add_provider_for_display (
-    display,
-    GTK_STYLE_PROVIDER (provider),
-    GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+  if (g_theme_provider == nullptr) {
+    g_theme_provider = gtk_css_provider_new ();
+    gtk_css_provider_load_from_resource (g_theme_provider,
+                                         "/org/winome/theme/gnome-shell-gtk4.css");
 
-  g_object_unref (provider);
+    // Register custom GNOME Shell symbolic icons bundled in GResource alongside CSS.
+    gtk_icon_theme_add_resource_path (gtk_icon_theme_get_for_display (display),
+                                      "/org/winome/theme/icons");
+
+    // Load at display scope so descendant selectors (#panel .panel-button,
+    // #panel .panel-button.clock-display .clock, etc.) match all child widgets.
+    gtk_style_context_add_provider_for_display (
+      display,
+      GTK_STYLE_PROVIDER (g_theme_provider),
+      GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+  }
+
+  if (g_dev_css_provider == nullptr) {
+    g_dev_css_provider = gtk_css_provider_new ();
+    load_optional_dev_css (g_dev_css_provider);
+    gtk_style_context_add_provider_for_display (
+      display,
+      GTK_STYLE_PROVIDER (g_dev_css_provider),
+      GTK_STYLE_PROVIDER_PRIORITY_USER);
+  }
+}
+
+bool
+winome_shell_reload_theme (void)
+{
+  if (g_theme_provider != nullptr) {
+    gtk_css_provider_load_from_resource (g_theme_provider,
+                                         "/org/winome/theme/gnome-shell-gtk4.css");
+  }
+  if (g_dev_css_provider != nullptr)
+    load_optional_dev_css (g_dev_css_provider);
+  bool st_ok = true;
+  if (winome::StEngine *eng = winome::StEngine::get ())
+    st_ok = eng->load_stylesheet_resource ("resource:///org/winome/theme/gnome-shell-dark.css");
+  g_print ("[theme] theme reloaded (st_ok=%d)\n", st_ok ? 1 : 0);
+  return st_ok;
 }
 
 // HWND of the topmost open popover, or NULL. The list is prepended on open,
@@ -1873,6 +1955,126 @@ on_panel_status_event (void *data)
   refresh_status (data);
 }
 
+struct PanelPluginSlotSpec {
+  std::string key;
+  std::string plugin_id;
+  std::string slot;
+  std::string icon_name;
+  std::string text;
+  std::string tooltip;
+};
+
+struct PanelPluginClickData {
+  std::string plugin_id;
+  std::string slot;
+};
+
+static std::vector<PanelPluginSlotSpec> g_panel_plugin_slots;
+static GtkWidget *g_primary_plugin_box = nullptr;
+static WinomePluginTopBarClickCb g_panel_plugin_click_cb = nullptr;
+
+static void
+on_panel_plugin_btn_clicked (GtkButton *button, gpointer G_GNUC_UNUSED data)
+{
+  auto *payload = static_cast<PanelPluginClickData *> (
+      g_object_get_data (G_OBJECT (button), "winome-plugin-click"));
+  if (payload != nullptr && g_panel_plugin_click_cb != nullptr)
+    g_panel_plugin_click_cb (payload->plugin_id.c_str (), payload->slot.c_str ());
+}
+
+static void
+rebuild_panel_plugin_slots (void)
+{
+  if (g_primary_plugin_box == nullptr)
+    return;
+  clear_box_children (g_primary_plugin_box);
+  gtk_widget_set_visible (g_primary_plugin_box,
+                          g_panel_plugin_slots.empty () ? FALSE : TRUE);
+
+  for (const auto &s : g_panel_plugin_slots) {
+    GtkWidget *btn = gtk_button_new ();
+    gtk_widget_add_css_class (btn, "panel-button");
+    gtk_widget_set_focus_on_click (btn, FALSE);
+    gtk_widget_set_vexpand (btn, TRUE);
+    if (!s.tooltip.empty ())
+      gtk_widget_set_tooltip_text (btn, s.tooltip.c_str ());
+
+    GtkWidget *box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_widget_add_css_class (box, "panel-status-indicators-box");
+    gtk_widget_set_valign (box, GTK_ALIGN_CENTER);
+
+    if (!s.icon_name.empty ())
+      gtk_box_append (GTK_BOX (box), create_status_icon (s.icon_name.c_str ()));
+    if (!s.text.empty ()) {
+      GtkWidget *lbl = gtk_label_new (s.text.c_str ());
+      gtk_label_set_single_line_mode (GTK_LABEL (lbl), TRUE);
+      gtk_box_append (GTK_BOX (box), lbl);
+    }
+
+    gtk_button_set_child (GTK_BUTTON (btn), box);
+
+    auto *click_data = new PanelPluginClickData{s.plugin_id, s.slot};
+    g_object_set_data_full (
+        G_OBJECT (btn), "winome-plugin-click", click_data,
+        +[](gpointer p) { delete static_cast<PanelPluginClickData *>(p); });
+    g_signal_connect (btn, "clicked",
+                      G_CALLBACK (on_panel_plugin_btn_clicked), nullptr);
+    gtk_box_append (GTK_BOX (g_primary_plugin_box), btn);
+  }
+}
+
+void
+winome_shell_panel_set_plugin_click_cb (WinomePluginTopBarClickCb cb)
+{
+  g_panel_plugin_click_cb = cb;
+}
+
+void
+winome_shell_panel_plugin_upsert (const char *key,
+                                  const char *plugin_id,
+                                  const char *slot,
+                                  const char *icon_name,
+                                  const char *text,
+                                  const char *tooltip)
+{
+  if (key == nullptr || plugin_id == nullptr)
+    return;
+  PanelPluginSlotSpec spec;
+  spec.key = key;
+  spec.plugin_id = plugin_id;
+  spec.slot = slot ? slot : "";
+  spec.icon_name = icon_name ? icon_name : "";
+  spec.text = text ? text : "";
+  spec.tooltip = tooltip ? tooltip : "";
+
+  bool updated = false;
+  for (auto &existing : g_panel_plugin_slots) {
+    if (existing.key == spec.key) {
+      existing = spec;
+      updated = true;
+      break;
+    }
+  }
+  if (!updated)
+    g_panel_plugin_slots.push_back (std::move (spec));
+
+  rebuild_panel_plugin_slots ();
+}
+
+void
+winome_shell_panel_plugin_remove (const char *key)
+{
+  if (key == nullptr)
+    return;
+  const size_t before = g_panel_plugin_slots.size ();
+  g_panel_plugin_slots.erase (
+      std::remove_if (g_panel_plugin_slots.begin (), g_panel_plugin_slots.end (),
+                      [key](const PanelPluginSlotSpec &s) { return s.key == key; }),
+      g_panel_plugin_slots.end ());
+  if (g_panel_plugin_slots.size () != before)
+    rebuild_panel_plugin_slots ();
+}
+
 static void
 on_panel_destroy (GtkWidget *panel, gpointer user_data)
 {
@@ -1883,6 +2085,8 @@ on_panel_destroy (GtkWidget *panel, gpointer user_data)
       g_registered_panels.end ());
 
   if (st != nullptr) {
+    if (st->plugin_box != nullptr && st->plugin_box == g_primary_plugin_box)
+      g_primary_plugin_box = nullptr;
     if (st->status_timer_id != 0)
       g_source_remove (st->status_timer_id);
     if (st->clock_timer_id != 0)
@@ -1937,6 +2141,13 @@ build_shell_panel (bool primary)
   winome::vd::add_change_listener (on_panel_desktop_changed, status);
   gtk_box_append (GTK_BOX (center_box), create_clock_button (status, primary));
   if (primary) {
+    status->plugin_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 2);
+    gtk_widget_set_name (status->plugin_box, "panelPlugins");
+    gtk_widget_set_visible (status->plugin_box, FALSE);
+    gtk_box_append (GTK_BOX (right_box), status->plugin_box);
+    g_primary_plugin_box = status->plugin_box;
+    rebuild_panel_plugin_slots ();
+
     gtk_box_append (GTK_BOX (right_box), create_tray_button (status));
     gtk_box_append (GTK_BOX (right_box), create_quick_settings (status));
   }

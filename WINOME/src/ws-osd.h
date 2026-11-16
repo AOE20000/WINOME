@@ -16,5 +16,6 @@ namespace winome {
 
 // Create the (hidden) OSD window and start the desktop-switch poll.
 void ws_osd_init();
+void ws_osd_shutdown();
 
 }  // namespace winome

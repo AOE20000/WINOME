@@ -17,12 +17,21 @@ struct WinomeConfig {
   bool hot_corner_enabled = true;
   int hot_corner_cooldown_ms = 500;
   bool win_key_overview = true;
+  bool overview_window_blacklist = true;
   bool multi_monitor_panels = true;
   bool end_session_confirm = true;
   bool unify_dark_titlebars = false;
   bool unify_rounded_corners = false;
+  bool developer_mode = false;
   std::vector<std::string> pinned_apps;
+  std::vector<std::string> disabled_plugins;
 };
+
+// Runtime-only Safe Mode flag (enabled via --safe-mode; disables third-party
+// plugins and opt-in DWM window theming for emergency recovery without
+// overwriting user preferences in config.json).
+bool is_safe_mode();
+void set_safe_mode(bool safe);
 
 using ConfigListener = void (*)(void* user_data);
 

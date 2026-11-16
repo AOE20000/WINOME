@@ -5,8 +5,12 @@
 #include "app-grid.h"
 #include "app-index.h"
 #include "config.h"
+#include "crash-dialog.h"
+#include "debug-runtime.h"
 #include "end-session-dialog.h"
+#include "../ctl/ctl-protocol.h"
 #include "fonts.h"
+#include "host-utils.h"
 #include "hot-corner.h"
 #include "i18n.h"
 #include "monitor-manager.h"
@@ -15,6 +19,8 @@
 #include "overview-layout.h"
 #include "overview-thumbs.h"
 #include "perf-metrics.h"
+#include "plugin-host.h"
+#include "run-dialog.h"
 #include "shell-ipc.h"
 #include "st-engine.h"
 #include "systray.h"
@@ -25,6 +31,7 @@
 #include <cmath>
 
 #include <windows.h>
+#include <glib.h>
 #include <pango/pangocairo.h>
 
 #include <algorithm>
@@ -85,6 +92,7 @@ struct ScopedTempConfigDir {
 void test_config_roundtrip() {
   winome::WinomeConfig def;
   CHECK(def.end_session_confirm == true);
+  CHECK(def.overview_window_blacklist == true);
   CHECK(def.unify_dark_titlebars == false);
   CHECK(def.unify_rounded_corners == false);
 
@@ -96,6 +104,7 @@ void test_config_roundtrip() {
   src.hot_corner_enabled = false;
   src.hot_corner_cooldown_ms = 1250;
   src.win_key_overview = false;
+  src.overview_window_blacklist = false;
   src.multi_monitor_panels = false;
   src.end_session_confirm = false;
   src.unify_dark_titlebars = true;
@@ -116,6 +125,7 @@ void test_config_roundtrip() {
   CHECK(dst.hot_corner_enabled == src.hot_corner_enabled);
   CHECK(dst.hot_corner_cooldown_ms == src.hot_corner_cooldown_ms);
   CHECK(dst.win_key_overview == src.win_key_overview);
+  CHECK(dst.overview_window_blacklist == src.overview_window_blacklist);
   CHECK(dst.multi_monitor_panels == src.multi_monitor_panels);
   CHECK(dst.end_session_confirm == src.end_session_confirm);
   CHECK(dst.unify_dark_titlebars == src.unify_dark_titlebars);
@@ -126,6 +136,7 @@ void test_config_roundtrip() {
   winome::WinomeConfig legacy;
   CHECK(winome::parse_config("{\"language\":\"en\"}", &legacy));
   CHECK(legacy.end_session_confirm == true);
+  CHECK(legacy.overview_window_blacklist == true);
   CHECK(legacy.unify_dark_titlebars == false);
   CHECK(legacy.unify_rounded_corners == false);
 }
@@ -920,6 +931,7 @@ void test_ipc_dispatch_and_named_pipe_roundtrip() {
   const std::string cfg_get = winome::ipc_dispatch_request_json("{\"cmd\":\"config.get\"}", cbs);
   CHECK(cfg_get.find("\"ok\":true") != std::string::npos);
   CHECK(cfg_get.find("\"end_session_confirm\"") != std::string::npos);
+  CHECK(cfg_get.find("\"overview_window_blacklist\"") != std::string::npos);
   CHECK(winome::ipc_dispatch_request_json("{\"cmd\":\"config.reload\"}", cbs)
             .find("\"ok\":true") != std::string::npos);
   CHECK(g_ipc_sink.cfg_reload == 1);
@@ -987,6 +999,795 @@ void test_vd_vtable_profiles_and_cache_trim() {
   winome::app_icon_cache_clear();
 }
 
+void test_crash_recovery_snapshot_and_state() {
+  // Config safe mode + developer_mode + disabled_plugins serialization check.
+  CHECK(!winome::is_safe_mode());
+  winome::set_safe_mode(true);
+  CHECK(winome::is_safe_mode());
+  winome::set_safe_mode(false);
+  CHECK(!winome::is_safe_mode());
+
+  winome::WinomeConfig cfg;
+  cfg.developer_mode = true;
+  cfg.disabled_plugins = {"com.example.cpu", "sample-weather"};
+  const std::string cjson = winome::serialize_config(cfg);
+  winome::WinomeConfig cback;
+  CHECK(winome::parse_config(cjson, &cback));
+  CHECK(cback.developer_mode == true);
+  CHECK(cback.disabled_plugins == cfg.disabled_plugins);
+
+  // Versioned JSON recovery snapshot roundtrip.
+  winome::RecoverySnapshot snap;
+  snap.valid = true;
+  snap.taskbar_state = 1;  // ABS_AUTOHIDE
+  snap.primary_work = RECT{0, 0, 2560, 1400};
+  const std::string sraw = winome::serialize_recovery_snapshot(snap);
+  winome::RecoverySnapshot sout;
+  CHECK(winome::parse_recovery_snapshot(sraw, &sout));
+  CHECK(sout.valid);
+  CHECK(sout.taskbar_state == 1);
+  CHECK(sout.primary_work.right == 2560 && sout.primary_work.bottom == 1400);
+
+  // Legacy raw 16-byte RECT backward compatibility.
+  RECT legacy_rc{10, 20, 1920, 1040};
+  std::string legacy_raw(reinterpret_cast<const char*>(&legacy_rc),
+                         sizeof(legacy_rc));
+  winome::RecoverySnapshot lout;
+  CHECK(winome::parse_recovery_snapshot(legacy_raw, &lout));
+  CHECK(lout.valid);
+  CHECK(lout.primary_work.left == 10 && lout.primary_work.bottom == 1040);
+
+  // Invalid recovery payload cleanly rejected.
+  winome::RecoverySnapshot bad_snap;
+  CHECK(!winome::parse_recovery_snapshot("corrupt", &bad_snap));
+
+  // CrashState roundtrip & emergency raw writer + log tail reader.
+  winome::CrashState cs;
+  cs.reason = "CRT Fatal Signal (22)";
+  cs.exit_code = 150;
+  cs.pid = 4321;
+  cs.timestamp_utc = "2026-11-16T13:10:00Z";
+  cs.minidump_path = "C:\\Users\\Test\\crashes\\dump.dmp";
+  cs.log_tail = "line1\nline2\n";
+  cs.taskbar_restored = true;
+  cs.safe_mode = true;
+  const std::string cs_json = winome::serialize_crash_state(cs);
+  winome::CrashState cs_out;
+  CHECK(winome::parse_crash_state(cs_json, &cs_out));
+  CHECK(cs_out.reason == cs.reason);
+  CHECK(cs_out.exit_code == 150);
+  CHECK(cs_out.pid == 4321);
+  CHECK(cs_out.taskbar_restored);
+  CHECK(cs_out.safe_mode);
+
+  wchar_t tmp_dir[MAX_PATH] = {};
+  if (GetTempPathW(MAX_PATH, tmp_dir) > 0) {
+    const std::wstring crash_file = std::wstring(tmp_dir) + L"winome_test_crash.json";
+    winome::write_crash_state_emergency_file(
+        crash_file.c_str(), "Win32 Unhandled Exception \"0xC0000005\"",
+        0xC0000005u, 9999u, "C:\\dumps\\test.dmp", true);
+    HANDLE h = CreateFileW(crash_file.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(h != INVALID_HANDLE_VALUE);
+    if (h != INVALID_HANDLE_VALUE) {
+      char buf[2048] = {};
+      DWORD got = 0;
+      CHECK(ReadFile(h, buf, sizeof(buf) - 1, &got, nullptr));
+      CloseHandle(h);
+      winome::CrashState em;
+      CHECK(winome::parse_crash_state(std::string(buf, got), &em));
+      CHECK(em.exit_code == 0xC0000005u);
+      CHECK(em.pid == 9999u);
+      CHECK(em.safe_mode);
+      CHECK(em.minidump_path == "C:\\dumps\\test.dmp");
+    }
+    DeleteFileW(crash_file.c_str());
+
+    const std::wstring log_file = std::wstring(tmp_dir) + L"winome_test_tail.log";
+    HANDLE lf = CreateFileW(log_file.c_str(), GENERIC_WRITE, 0, nullptr,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (lf != INVALID_HANDLE_VALUE) {
+      std::string lines;
+      for (int i = 0; i < 40; ++i)
+        lines += "entry line " + std::to_string(i) + "\n";
+      DWORD w = 0;
+      WriteFile(lf, lines.data(), static_cast<DWORD>(lines.size()), &w, nullptr);
+      CloseHandle(lf);
+      const std::string tail = winome::read_log_tail_utf8(log_file, 120);
+      CHECK(!tail.empty());
+      CHECK(tail.find("entry line 39") != std::string::npos);
+      CHECK(tail.find("entry line 0\n") == std::string::npos);
+      DeleteFileW(log_file.c_str());
+    }
+  }
+}
+
+void test_debug_runtime_ipc_sddl_and_ctl() {
+  // Verify log ring buffer capture, filtering, and seq monotonicity.
+  winome::debug_clear_logs();
+  const uint64_t base_seq = winome::debug_latest_log_seq();
+  winome::debug_append_log(nullptr, "[vd] snapshot changed count=3");
+  winome::debug_append_log("perf", "frame time 4.2ms");
+  winome::debug_append_log("ipc", "ping handled");
+  CHECK(winome::debug_latest_log_seq() == base_seq + 3);
+  CHECK(winome::debug_extract_log_tag("[vd] hello") == "vd");
+  CHECK(winome::debug_extract_log_tag("plain message") == "misc");
+
+  const auto vd_logs = winome::debug_get_logs_since(base_seq, "vd", 10);
+  CHECK(vd_logs.size() == 1);
+  CHECK(vd_logs[0].tag == "vd");
+  const auto all_logs = winome::debug_get_logs_since(base_seq, "all", 10);
+  CHECK(all_logs.size() == 3);
+
+  // Verify debug flags and IPC commands for runtime control & fault injection.
+  CHECK(winome::debug_set_flag_by_name("ipc_trace", true));
+  CHECK(!winome::debug_set_flag_by_name("nonexistent_flag", true));
+  CHECK(winome::debug_get_flags().ipc_trace);
+  winome::debug_set_flag_by_name("ipc_trace", false);
+
+  winome::IpcCallbacks cbs{};
+  CHECK(winome::ipc_dispatch_request_json("{\"cmd\":\"debug.flags.get\"}", cbs)
+            .find("\"zorder_trace\"") != std::string::npos);
+  CHECK(winome::ipc_dispatch_request_json(
+            "{\"cmd\":\"debug.flags.set\",\"name\":\"zorder_trace\",\"value\":true}", cbs)
+            .find("\"zorder_trace\":true") != std::string::npos);
+  CHECK(winome::debug_get_flags().zorder_trace);
+  winome::debug_set_flag_by_name("zorder_trace", false);
+
+  const std::string tail_resp = winome::ipc_dispatch_request_json(
+      "{\"cmd\":\"logs.tail\",\"tag\":\"perf\",\"count\":5}", cbs);
+  CHECK(tail_resp.find("frame time 4.2ms") != std::string::npos);
+  CHECK(tail_resp.find("snapshot changed") == std::string::npos);
+
+  const std::string trip_resp = winome::ipc_dispatch_request_json(
+      "{\"cmd\":\"subsystem.trip\",\"name\":\"SysTray\"}", cbs);
+  CHECK(trip_resp.find("\"state\":\"tripped\"") != std::string::npos);
+  const std::string rec_resp = winome::ipc_dispatch_request_json(
+      "{\"cmd\":\"subsystem.recover\",\"name\":\"SysTray\"}", cbs);
+  CHECK(rec_resp.find("\"state\":\"active\"") != std::string::npos);
+
+  CHECK(winome::ipc_dispatch_request_json(
+            "{\"cmd\":\"config.set\",\"name\":\"developer_mode\",\"value\":true}", cbs)
+            .find("\"ok\":true") != std::string::npos);
+  CHECK(winome::get_config().developer_mode);
+
+  // When developer_mode == false and no callback overrides, looking_glass.open refuses cleanly.
+  CHECK(winome::ipc_dispatch_request_json(
+            "{\"cmd\":\"looking_glass.open\"}", cbs)
+            .find("\"ok\":false") != std::string::npos);
+
+  // Verify SDDL string for current-user + Medium IL pipe access.
+  const std::wstring sddl = winome::ipc_build_user_pipe_sddl(L"S-1-5-21-1000-2000-3000-1001");
+  CHECK(sddl.find(L"(A;;GA;;;S-1-5-21-1000-2000-3000-1001)") != std::wstring::npos);
+  CHECK(sddl.find(L"S:(ML;;NW;;;ME)") != std::wstring::npos);
+
+  // Verify winome-ctl CLI-to-JSON translation.
+  std::string req;
+  std::string err;
+  CHECK(winome::ctl::ctl_build_request_json({"ping"}, &req, &err));
+  CHECK(req == "{\"cmd\":\"ping\"}");
+  CHECK(winome::ctl::ctl_build_request_json({"overview", "grid"}, &req, &err));
+  CHECK(req == "{\"cmd\":\"overview.app_grid\"}");
+  CHECK(winome::ctl::ctl_build_request_json({"desktop", "switch", "2"}, &req, &err));
+  CHECK(req.find("\"desktop.switch\"") != std::string::npos &&
+        req.find("\"index\":2") != std::string::npos);
+  CHECK(winome::ctl::ctl_build_request_json({"flags", "set", "ipc_trace", "on"}, &req, &err));
+  CHECK(req.find("\"debug.flags.set\"") != std::string::npos &&
+        req.find("\"value\":true") != std::string::npos);
+  CHECK(winome::ctl::ctl_build_request_json({"subsystem", "trip", "Wlan"}, &req, &err));
+  CHECK(req.find("\"subsystem.trip\"") != std::string::npos);
+  CHECK(winome::ctl::ctl_build_request_json({"plugins", "restart", "demo"}, &req, &err));
+  CHECK(req.find("\"plugin.restart\"") != std::string::npos);
+  CHECK(winome::ctl::ctl_build_request_json({"run", "notepad.exe", "a.txt"}, &req, &err));
+  CHECK(req.find("\"run.exec\"") != std::string::npos &&
+        req.find("notepad.exe a.txt") != std::string::npos);
+  CHECK(!winome::ctl::ctl_build_request_json({"nonexistent"}, &req, &err));
+}
+
+void test_run_dialog_helpers() {
+  winome::RunCommandParts parts;
+  CHECK(winome::split_run_command("notepad.exe C:\\temp\\foo.txt", &parts));
+  CHECK(parts.executable == "notepad.exe");
+  CHECK(parts.arguments == "C:\\temp\\foo.txt");
+
+  CHECK(winome::split_run_command(
+      "  \"C:\\Program Files\\My App\\app.exe\" --arg 1  ", &parts));
+  CHECK(parts.executable == "C:\\Program Files\\My App\\app.exe");
+  CHECK(parts.arguments == "--arg 1");
+
+  CHECK(winome::split_run_command("ms-settings:display", &parts));
+  CHECK(parts.executable == "ms-settings:display");
+  CHECK(parts.arguments.empty());
+  CHECK(!winome::split_run_command("   ", &parts));
+
+  // Internal commands must only trigger when developer_mode == true.
+  CHECK(winome::classify_run_internal_command("lg", false) ==
+        winome::RunInternalAction::None);
+  CHECK(winome::classify_run_internal_command("rt", false) ==
+        winome::RunInternalAction::None);
+  CHECK(winome::classify_run_internal_command("r", false) ==
+        winome::RunInternalAction::None);
+
+  CHECK(winome::classify_run_internal_command("lg", true) ==
+        winome::RunInternalAction::OpenLookingGlass);
+  CHECK(winome::classify_run_internal_command("rt", true) ==
+        winome::RunInternalAction::ReloadTheme);
+  CHECK(winome::classify_run_internal_command("r", true) ==
+        winome::RunInternalAction::RestartShell);
+  CHECK(winome::classify_run_internal_command("debugexit", true) ==
+        winome::RunInternalAction::DebugExit);
+
+  // History deduplication & max cap.
+  std::vector<std::string> hist;
+  hist = winome::run_history_add_item(std::move(hist), "cmd", 3);
+  hist = winome::run_history_add_item(std::move(hist), "notepad", 3);
+  hist = winome::run_history_add_item(std::move(hist), "calc", 3);
+  hist = winome::run_history_add_item(std::move(hist), "cmd", 3);
+  CHECK(hist.size() == 3);
+  CHECK(hist[0] == "notepad" && hist[2] == "cmd");
+  hist = winome::run_history_add_item(std::move(hist), "mspaint", 3);
+  CHECK(hist.size() == 3);
+  CHECK(hist[0] == "calc" && hist[2] == "mspaint");
+
+  // Prefix common completion.
+  CHECK(winome::run_complete_prefix(
+            "note", {"notepad.exe", "notepad++.exe"}) == "pad");
+  CHECK(winome::run_complete_prefix(
+            "calc", {"notepad.exe", "calc.exe"}) == ".exe");
+  CHECK(winome::run_complete_prefix("zzz", {"notepad.exe"}).empty());
+
+  // Internal command dispatch executes clean callback when developer_mode == true.
+  winome::WinomeConfig prev_cfg = winome::get_config();
+  winome::WinomeConfig dev_cfg = prev_cfg;
+  dev_cfg.developer_mode = true;
+  winome::update_config(dev_cfg);
+
+  static bool s_lg_opened = false;
+  static bool s_theme_reloaded = false;
+  s_lg_opened = false;
+  s_theme_reloaded = false;
+  winome::RunDialogCallbacks rcbs{};
+  rcbs.open_looking_glass = +[]() {
+    s_lg_opened = true;
+    return true;
+  };
+  rcbs.reload_theme = +[]() {
+    s_theme_reloaded = true;
+    return true;
+  };
+  std::string err;
+  CHECK(winome::execute_run_command_string("lg", false, rcbs, &err));
+  CHECK(s_lg_opened);
+  CHECK(winome::execute_run_command_string("rt", false, rcbs, &err));
+  CHECK(s_theme_reloaded);
+
+  winome::update_config(prev_cfg);
+}
+
+void test_plugin_host_and_real_child_process() {
+  // 1. Manifest parsing & capability validation.
+  {
+    winome::PluginManifest m;
+    std::string err;
+    const std::string valid_json =
+        "{\"id\":\"sysmon\",\"name\":\"Sys \\u4e2d\","
+        "\"version\":\"1.2.3\",\"exec\":\"python.exe\","
+        "\"args\":[\"-u\",\"run.py\"],"
+        "\"capabilities\":[\"topbar\",\"desktop.read\"],"
+        "\"max_memory_mb\":2048,\"enabled\":true}";
+    CHECK(winome::parse_plugin_manifest(valid_json, L"C:\\plugins\\sysmon", &m, &err));
+    CHECK(m.id == "sysmon");
+    CHECK(m.name == "Sys \xE4\xB8\xAD");
+    CHECK(m.version == "1.2.3");
+    CHECK(m.exec == "python.exe");
+    CHECK(m.args.size() == 2 && m.args[0] == "-u" && m.args[1] == "run.py");
+    CHECK(m.max_memory_mb == 1024);  // clamped [8, 1024]
+    CHECK(winome::plugin_has_capability(m, "topbar"));
+    CHECK(winome::plugin_has_capability(m, "desktop.read"));
+    CHECK(!winome::plugin_has_capability(m, "notify"));
+
+    winome::PluginManifest bad;
+    CHECK(!winome::parse_plugin_manifest("{\"id\":\"../evil\",\"exec\":\"a.exe\"}",
+                                         L"C:\\p", &bad, &err));
+    CHECK(!winome::parse_plugin_manifest("{\"id\":\"ok\",\"exec\":\"..\\\\evil.exe\"}",
+                                         L"C:\\p", &bad, &err));
+  }
+
+  // 2. Rate limiter & crash-loop circuit breaker.
+  {
+    winome::PluginRateLimiter rl(30, 1000);
+    for (int i = 0; i < 30; ++i)
+      CHECK(rl.allow(1000 + i));
+    CHECK(!rl.allow(1500));
+    CHECK(rl.dropped_count() == 1);
+    CHECK(rl.allow(2000));
+
+    winome::PluginCrashTracker ct(3, 60000);
+    CHECK(!ct.record_crash(1000));
+    CHECK(!ct.record_crash(2000));
+    // First two expired outside 60s window at t=70000.
+    CHECK(!ct.record_crash(70000));
+    CHECK(!ct.record_crash(71000));
+    CHECK(ct.record_crash(72000));
+  }
+
+  // 3. Real child-process lifecycle, Win32 Job Object, JSON stdio, ACL & breaker.
+  wchar_t mod_buf[MAX_PATH] = {};
+  DWORD mod_len = GetModuleFileNameW(nullptr, mod_buf, MAX_PATH);
+  CHECK(mod_len > 0 && mod_len < MAX_PATH);
+  std::wstring exe_dir(mod_buf);
+  size_t slash = exe_dir.find_last_of(L"\\/");
+  exe_dir = (slash == std::wstring::npos) ? L"." : exe_dir.substr(0, slash);
+  const std::wstring mock_exe = exe_dir + L"\\winome-mock-plugin.exe";
+  CHECK(GetFileAttributesW(mock_exe.c_str()) != INVALID_FILE_ATTRIBUTES);
+
+  int u8_len = WideCharToMultiByte(CP_UTF8, 0, mock_exe.c_str(), -1,
+                                   nullptr, 0, nullptr, nullptr);
+  std::string mock_utf8(static_cast<size_t>(std::max(0, u8_len - 1)), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, mock_exe.c_str(), -1,
+                      &mock_utf8[0], u8_len, nullptr, nullptr);
+  std::string mock_json_path;
+  for (char c : mock_utf8) {
+    if (c == '\\') mock_json_path += "\\\\";
+    else mock_json_path.push_back(c);
+  }
+
+  wchar_t tmp[MAX_PATH] = {};
+  GetTempPathW(MAX_PATH, tmp);
+  const std::wstring pdir =
+      std::wstring(tmp) + L"winome_plugins_test_" + std::to_wstring(GetCurrentProcessId());
+  const std::wstring good_dir = pdir + L"\\good";
+  const std::wstring crash_dir = pdir + L"\\crasher";
+  CreateDirectoryW(pdir.c_str(), nullptr);
+  CreateDirectoryW(good_dir.c_str(), nullptr);
+  CreateDirectoryW(crash_dir.c_str(), nullptr);
+
+  auto write_text_file = [](const std::wstring& path, const std::string& content) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+      DWORD wr = 0;
+      WriteFile(f, content.data(), static_cast<DWORD>(content.size()), &wr, nullptr);
+      CloseHandle(f);
+    }
+  };
+
+  // Note: "good" intentionally lacks "notify" capability.
+  write_text_file(
+      good_dir + L"\\manifest.json",
+      "{\"id\":\"good\",\"name\":\"Good Plugin\",\"version\":\"1.0.0\","
+      "\"exec\":\"" + mock_json_path + "\",\"args\":[\"normal\"],"
+      "\"capabilities\":[\"topbar\",\"quicksettings\",\"desktop.read\"],"
+      "\"max_memory_mb\":64,\"enabled\":true}");
+  write_text_file(
+      crash_dir + L"\\manifest.json",
+      "{\"id\":\"crasher\",\"name\":\"Crasher Plugin\",\"version\":\"0.1.0\","
+      "\"exec\":\"" + mock_json_path + "\",\"args\":[\"crash\"],"
+      "\"capabilities\":[\"topbar\"],\"max_memory_mb\":64,\"enabled\":true}");
+
+  SetEnvironmentVariableW(L"WINOME_PLUGINS_DIR", pdir.c_str());
+
+  static std::string s_tb_text;
+  static int s_tb_removed = 0;
+  static std::string s_qs_sub;
+  static bool s_qs_active = false;
+  static int s_qs_removed = 0;
+  static std::vector<std::string> s_notify_titles;
+  s_tb_text.clear();
+  s_tb_removed = 0;
+  s_qs_sub.clear();
+  s_qs_active = false;
+  s_qs_removed = 0;
+  s_notify_titles.clear();
+
+  winome::debug_clear_logs();
+  winome::PluginHostCallbacks cbs{};
+  cbs.topbar_upsert = +[](const winome::PluginTopBarSpec& spec) {
+    if (spec.key == "good:cpu")
+      s_tb_text = spec.text;
+  };
+  cbs.topbar_remove = +[](const std::string& pid, const std::string& key) {
+    if (pid == "good" && key == "good:cpu")
+      ++s_tb_removed;
+  };
+  cbs.quicktoggle_upsert = +[](const winome::PluginQuickToggleSpec& spec) {
+    if (spec.key == "good:turbo") {
+      s_qs_sub = spec.subtitle;
+      s_qs_active = spec.active;
+    }
+  };
+  cbs.quicktoggle_remove = +[](const std::string& pid, const std::string& key) {
+    if (pid == "good" && key == "good:turbo")
+      ++s_qs_removed;
+  };
+  cbs.notify = +[](const std::string& title, const std::string&, const std::string&) {
+    s_notify_titles.push_back(title);
+  };
+
+  auto pump_until = [](auto pred, int max_ms) -> bool {
+    const ULONGLONG t0 = GetTickCount64();
+    while (!pred()) {
+      while (g_main_context_pending(nullptr))
+        g_main_context_iteration(nullptr, FALSE);
+      if (pred())
+        return true;
+      if (GetTickCount64() - t0 >= static_cast<ULONGLONG>(max_ms))
+        return false;
+      Sleep(15);
+    }
+    return true;
+  };
+
+  winome::plugin_host_init(cbs);
+
+  // Wait for good plugin startup & UI slots (\u4e2d decoded to UTF-8).
+  CHECK(pump_until([&]() {
+    return s_tb_text == "42%\xE4\xB8\xAD" && s_qs_active && s_qs_sub == "On";
+  }, 3000));
+
+  // Wait briefly for crasher to hit 3 crashes in 60s -> Tripped circuit breaker & idle notify.
+  CHECK(pump_until([&]() {
+    const std::string lj = winome::plugin_host_list_json();
+    return lj.find("\"id\":\"crasher\"") != std::string::npos &&
+           lj.find("\"state\":\"Tripped\"") != std::string::npos &&
+           !s_notify_titles.empty();
+  }, 6000));
+
+  // Capability denial: "Denied" from good MUST NOT trigger notify callback, while
+  // breaker tripped notification SHOULD appear.
+  bool saw_denied = false;
+  bool saw_tripped_notify = false;
+  for (const auto& t : s_notify_titles) {
+    if (t == "Denied") saw_denied = true;
+    if (t.find("Tripped") != std::string::npos ||
+        t.find("\xE7\x86\x94\xE6\x96\xAD") != std::string::npos) {
+      saw_tripped_notify = true;
+    }
+  }
+  CHECK(!saw_denied);
+  CHECK(saw_tripped_notify);
+
+  // Bidirectional events: click TopBar, toggle QuickSettings, notify desktop change.
+  winome::plugin_host_emit_topbar_click("good", "cpu");
+  CHECK(pump_until([&]() { return s_tb_text == "CLICKED"; }, 2000));
+
+  winome::plugin_host_emit_quicktoggle("good", "turbo", false);
+  CHECK(pump_until([&]() { return !s_qs_active && s_qs_sub == "Off"; }, 2000));
+
+  winome::plugin_host_emit_desktop_changed(3, 1);
+  CHECK(pump_until([&]() {
+    for (const auto& e : winome::debug_get_logs_since(0, "plugin:good", 200)) {
+      if (e.tag == "plugin:good" &&
+          e.text.find("mock saw desktop.changed") != std::string::npos) {
+        return true;
+      }
+    }
+    return false;
+  }, 2000));
+
+  std::string err;
+  CHECK(winome::plugin_host_action("ping", "good", &err));
+
+  // Verify stderr forwarding and capability denial logged under plugin:good.
+  bool saw_stderr = false;
+  bool saw_cap_log = false;
+  for (const auto& e : winome::debug_get_logs_since(0, "plugin:good", 200)) {
+    if (e.tag == "plugin:good") {
+      if (e.text.find("mock stderr hello") != std::string::npos) saw_stderr = true;
+      if (e.text.find("capability denied") != std::string::npos) saw_cap_log = true;
+    }
+  }
+  CHECK(saw_stderr);
+  CHECK(saw_cap_log);
+
+  // Verify disable clears UI slots and persists disabled_plugins, enable restores.
+  CHECK(winome::plugin_host_action("disable", "good", &err));
+  CHECK(pump_until([&]() { return s_tb_removed >= 1 && s_qs_removed >= 1; }, 2000));
+  const auto dis_list = winome::get_config().disabled_plugins;
+  CHECK(std::find(dis_list.begin(), dis_list.end(), "good") != dis_list.end());
+
+  s_tb_text.clear();
+  CHECK(winome::plugin_host_action("enable", "good", &err));
+  CHECK(pump_until([&]() { return s_tb_text == "42%\xE4\xB8\xAD"; }, 3000));
+
+  winome::plugin_host_shutdown();
+
+  // Cleanup temp manifests & restore clean config state.
+  winome::WinomeConfig clean_cfg = winome::get_config();
+  clean_cfg.disabled_plugins.clear();
+  winome::update_config(clean_cfg);
+  SetEnvironmentVariableW(L"WINOME_PLUGINS_DIR", nullptr);
+  DeleteFileW((good_dir + L"\\manifest.json").c_str());
+  DeleteFileW((crash_dir + L"\\manifest.json").c_str());
+  RemoveDirectoryW(good_dir.c_str());
+  RemoveDirectoryW(crash_dir.c_str());
+  RemoveDirectoryW(pdir.c_str());
+}
+
+void test_vd_async_and_breaker_recovery() {
+  winome::vd::pin_window_async(nullptr);
+  winome::capability_set(winome::SubsystemId::VirtualDesktop,
+                         winome::CapabilityState::Tripped, "simulated stall");
+  winome::vd::reset_circuit_breaker();
+  const auto snap = winome::capability_snapshot_all();
+  bool found_active = false;
+  for (const auto& c : snap) {
+    if (c.id == winome::SubsystemId::VirtualDesktop &&
+        c.state == winome::CapabilityState::Active) {
+      found_active = true;
+    }
+  }
+  CHECK(found_active);
+}
+
+void test_start_menu_pinned_layout_and_folder_sync() {
+  // Decrypted start2.bin schema (`pinType: 2`, `name`, `items`, `W~`, `P~`).
+  const std::string start2_json =
+      R"({"pinnedList":[)"
+      R"({"id":"W~Chrome","pinnedBy":32},)"
+      R"({"id":"{b9bc0040-0cf1-40c0-8484-db793af3f4cf}","pinnedBy":4,"pinType":2,"name":"\u7231","items":[{"id":"P~Microsoft.WindowsCalculator_8wekyb3d8bbwe!App","pinnedBy":4},{"id":"W~steam://rungameid/1279610","pinnedBy":4}]},)"
+      R"({"id":"W~C:\\Tools\\Clip.exe","pinnedBy":4}"
+      R"(]})";
+  const auto s2_pins = winome::parse_windows_start_layout_json(start2_json);
+  CHECK(s2_pins.size() == 3);
+  CHECK(s2_pins[0].kind == winome::StartMenuPinnedItem::Kind::DesktopAppId);
+  CHECK(s2_pins[0].value == "Chrome");
+  CHECK(s2_pins[1].kind == winome::StartMenuPinnedItem::Kind::Folder);
+  CHECK(s2_pins[1].value == "\xE7\x88\xB1");
+  CHECK(s2_pins[1].children.size() == 2);
+  CHECK(s2_pins[1].children[0].kind == winome::StartMenuPinnedItem::Kind::PackagedApp);
+  CHECK(s2_pins[1].children[1].value == "steam://rungameid/1279610");
+
+  winome::AppEntry chrome;
+  chrome.id = "chrome.exe";
+  chrome.name = "Google Chrome";
+  chrome.name_lower = "google chrome";
+  chrome.aumid = L"Chrome";
+
+  winome::AppEntry uwp_calc;
+  uwp_calc.id = "microsoft.windowscalculator_8wekyb3d8bbwe!app";
+  uwp_calc.name = "Calculator";
+  uwp_calc.name_lower = "calculator";
+  uwp_calc.aumid = L"Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
+  uwp_calc.is_uwp = true;
+
+  winome::AppEntry wallpaper;
+  wallpaper.id = "wallpaper.url";
+  wallpaper.name = "Wallpaper Engine";
+  wallpaper.name_lower = "wallpaper engine";
+  wallpaper.launch_url = "steam://rungameid/1279610";
+  wallpaper.folder_name = "Steam";
+
+  winome::AppEntry clip_exe;
+  clip_exe.id = "clip-id";
+  clip_exe.name = "Clip";
+  clip_exe.name_lower = "clip";
+  clip_exe.target_exe = L"C:\\Tools\\Clip.exe";
+
+  const auto s2_grid = winome::build_app_grid_items(
+      {chrome, uwp_calc, wallpaper, clip_exe}, s2_pins, "");
+  CHECK(s2_grid.size() == 3);
+  CHECK(s2_grid[0].kind == winome::AppGridItemKind::App);
+  CHECK(s2_grid[0].id == "chrome.exe");
+  CHECK(s2_grid[1].kind == winome::AppGridItemKind::Folder);
+  CHECK(s2_grid[1].title == "\xE7\x88\xB1");
+  CHECK(s2_grid[1].children.size() == 2);
+  CHECK(s2_grid[2].id == "clip-id");
+
+  // Binary header prefix + escaped UTF-8/Unicode JSON payload + Win11 folder.
+  const std::string sample =
+      std::string("\x01\x02\x00\x00", 4) +
+      R"({"pinnedList":[)"
+      R"({"desktopAppLink":"%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\VSCode.lnk"},)"
+      R"({"folderName":"\u5de5\u5177","folderItems":[{"packagedAppId":"Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"},{"desktopAppLink":"%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Sub\\Clip.lnk"}]},)"
+      R"({"secondaryTile":{"appUserModelId":"Custom.SecTile!App"}})"
+      R"(]})";
+
+  const auto pins = winome::parse_windows_start_layout_json(sample);
+  CHECK(pins.size() == 3);
+  CHECK(pins[0].kind == winome::StartMenuPinnedItem::Kind::DesktopLink);
+  CHECK(pins[0].value.find("VSCode.lnk") != std::string::npos);
+  CHECK(pins[1].kind == winome::StartMenuPinnedItem::Kind::Folder);
+  CHECK(pins[1].value == "\xE5\xB7\xA5\xE5\x85\xB7");
+  CHECK(pins[1].children.size() == 2);
+  CHECK(pins[2].kind == winome::StartMenuPinnedItem::Kind::PackagedApp);
+  CHECK(pins[2].value == "Custom.SecTile!App");
+
+  // Resolve real expanded APPDATA path to match desktopAppLink accurately.
+  wchar_t appdata[MAX_PATH] = L"";
+  GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
+  const std::wstring prefix =
+      std::wstring(appdata) + L"\\Microsoft\\Windows\\Start Menu\\Programs\\";
+
+  winome::AppEntry vscode;
+  vscode.id = "vscode.exe";
+  vscode.name = "VSCode";
+  vscode.name_lower = "vscode";
+  vscode.launch_path = prefix + L"VSCode.lnk";
+  vscode.from_user_programs = true;
+
+  winome::AppEntry calc;
+  calc.id = "microsoft.windowscalculator_8wekyb3d8bbwe!app";
+  calc.name = "Calculator";
+  calc.name_lower = "calculator";
+  calc.aumid = L"Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
+  calc.is_uwp = true;
+
+  winome::AppEntry clip;
+  clip.id = "clip.exe";
+  clip.name = "Clip";
+  clip.name_lower = "clip";
+  clip.launch_path = prefix + L"Sub\\Clip.lnk";
+  clip.folder_name = "Sub";
+  clip.folder_order = 0;
+  clip.from_user_programs = true;
+
+  winome::AppEntry msys_bash;
+  msys_bash.id = "msys2-bash";
+  msys_bash.name = "MSYS2 Bash";
+  msys_bash.name_lower = "msys2 bash";
+  msys_bash.folder_name = "MSYS2";
+  msys_bash.folder_order = 1;
+  msys_bash.item_order = 10;
+  msys_bash.from_user_programs = true;
+
+  winome::AppEntry msys_mingw;
+  msys_mingw.id = "msys2-ucrt64";
+  msys_mingw.name = "MSYS2 UCRT64";
+  msys_mingw.name_lower = "msys2 ucrt64";
+  msys_mingw.folder_name = "MSYS2";
+  msys_mingw.folder_order = 1;
+  msys_mingw.item_order = 5;
+  msys_mingw.from_user_programs = true;
+
+  winome::AppEntry common_tool;
+  common_tool.id = "common-tool";
+  common_tool.name = "Common Tool";
+  common_tool.name_lower = "common tool";
+  common_tool.folder_name = "CommonSuite";
+  common_tool.folder_order = 0;
+  common_tool.item_order = 2;
+  common_tool.from_user_programs = false;
+
+  winome::AppEntry root_extra;
+  root_extra.id = "root-extra";
+  root_extra.name = "Root Extra";
+  root_extra.name_lower = "root extra";
+  root_extra.from_user_programs = true;
+  root_extra.item_order = 12;
+
+  const std::vector<winome::AppEntry> all{
+      vscode, calc, clip, msys_bash, msys_mingw, common_tool, root_extra};
+  const auto grid_items = winome::build_app_grid_items(all, pins, "");
+
+  // Expected order:
+  // 0: VSCode (pinned app)
+  // 1: 工具 (pinned folder: Calculator + Clip)
+  // 2: MSYS2 (unpinned user folder, children sorted by item_order: UCRT64 then Bash)
+  // 3: CommonSuite (unpinned common folder)
+  // 4: Root Extra (unpinned root app)
+  CHECK(grid_items.size() == 5);
+  CHECK(grid_items[0].kind == winome::AppGridItemKind::App);
+  CHECK(grid_items[0].id == "vscode.exe");
+  CHECK(grid_items[1].kind == winome::AppGridItemKind::Folder);
+  CHECK(grid_items[1].children.size() == 2);
+  CHECK(grid_items[2].kind == winome::AppGridItemKind::Folder);
+  CHECK(grid_items[2].title == "MSYS2");
+  CHECK(grid_items[2].children.size() == 2);
+  CHECK(grid_items[2].children[0].id == "msys2-ucrt64");
+  CHECK(grid_items[2].children[1].id == "msys2-bash");
+  CHECK(grid_items[3].kind == winome::AppGridItemKind::Folder);
+  CHECK(grid_items[3].title == "CommonSuite");
+  CHECK(grid_items[4].kind == winome::AppGridItemKind::App);
+  CHECK(grid_items[4].id == "root-extra");
+
+  // Search query must flatten apps across folders.
+  const auto search_items = winome::build_app_grid_items(all, pins, "ucrt64");
+  CHECK(search_items.size() == 1);
+  CHECK(search_items[0].kind == winome::AppGridItemKind::App);
+  CHECK(search_items[0].id == "msys2-ucrt64");
+}
+
+void test_systray_v4_and_uia_candidates() {
+  const auto v4_right = winome::build_tray_click_messages(
+      WM_APP + 5, 77, 4, true, 123, 456);
+  CHECK(v4_right.size() == 3);
+  CHECK(v4_right[0].msg == WM_APP + 5);
+  CHECK(v4_right[0].wparam == static_cast<uintptr_t>(MAKEWPARAM(123, 456)));
+  CHECK(LOWORD(v4_right[0].lparam) == WM_RBUTTONDOWN);
+  CHECK(HIWORD(v4_right[0].lparam) == 77);
+  CHECK(LOWORD(v4_right[2].lparam) == WM_CONTEXTMENU);
+  CHECK(HIWORD(v4_right[2].lparam) == 77);
+
+  const auto v4_left = winome::build_tray_click_messages(
+      WM_APP + 5, 42, 4, false, 10, 20);
+  CHECK(v4_left.size() == 3);
+  CHECK(LOWORD(v4_left[2].lparam) == (WM_USER + 0));
+  CHECK(HIWORD(v4_left[2].lparam) == 42);
+
+  const auto v3_right = winome::build_tray_click_messages(
+      WM_APP + 1, 9, 3, true, 0, 0);
+  CHECK(v3_right.size() == 3);
+  CHECK(v3_right[0].wparam == 9);
+  CHECK(v3_right[0].lparam == static_cast<intptr_t>(WM_RBUTTONDOWN));
+
+  CHECK(winome::is_uia_tray_candidate("Steam", "", true));
+  CHECK(!winome::is_uia_tray_candidate("Steam", "", false));
+  CHECK(winome::is_uia_tray_candidate("FlClash", "NotifyItemIcon", false));
+  CHECK(winome::is_uia_tray_candidate(" \xE6\x89\x93\xE5\xBC\x80 Chrome \xE4\xB8\xAD\xE7\x9A\x84 Gemini",
+                                      "NotifyItemIcon", false));
+  CHECK(!winome::is_uia_tray_candidate("\xE7\xBD\x91\xE7\xBB\x9C MISAKA_00002\nInternet \xE8\xAE\xBF\xE9\x97\xAE",
+                                       "SystemTrayIcon", false));
+  CHECK(!winome::is_uia_tray_candidate("\xE9\x9F\xB3\xE9\x87\x8F \xE5\x96\x87\xE5\x8F\xAD: 44%",
+                                       "SystemTrayIcon", false));
+  CHECK(!winome::is_uia_tray_candidate("\xE7\x94\xB5\xE6\xBA\x90 \xE7\x94\xB5\xE6\xB1\xA0\xE7\x8A\xB6\xE6\x80\x81: 0%",
+                                       "SystemTrayIcon", false));
+  CHECK(!winome::is_uia_tray_candidate("\xE9\x80\x9A\xE7\x9F\xA5 \xE6\xB2\xA1\xE6\x9C\x89\xE6\x96\xB0\xE9\x80\x9A\xE7\x9F\xA5",
+                                       "SystemTrayIcon", false));
+  CHECK(!winome::is_uia_tray_candidate("\xE8\xA7\xA6\xE6\x91\xB8\xE9\x94\xAE\xE7\x9B\x98",
+                                       "SystemTrayIcon", false));
+  CHECK(!winome::is_uia_tray_candidate("\xE6\x89\x98\xE7\x9B\x98\xE8\xBE\x93\xE5\x85\xA5\xE6\x8C\x87\xE7\xA4\xBA\xE5\x99\xA8 \xE4\xB8\xAD\xE6\x96\x87\xE6\xA8\xA1\xE5\xBC\x8F",
+                                       "SystemTrayIcon", false));
+  CHECK(winome::is_uia_tray_candidate("Clash Verge", "NotifyItemIcon_1", false));
+  CHECK(!winome::is_uia_tray_candidate("Show Hidden Icons", "OverflowButton", true));
+
+  const std::string tray_json = winome::systray_debug_inspect_json();
+  CHECK(tray_json.find("\"items_count\"") != std::string::npos);
+  CHECK(tray_json.find("\"stats\"") != std::string::npos);
+  CHECK(tray_json.find("\"inspect_ms\"") != std::string::npos);
+}
+
+void test_overview_window_blacklist() {
+  // "Windows 输入体验" / "Windows Input Experience" (TextInputHost).
+  CHECK(winome::is_overview_default_blacklisted_window_info(
+      "Windows.UI.Core.CoreWindow",
+      "C:\\Windows\\SystemApps\\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\\TextInputHost.exe",
+      "Windows \xE8\xBE\x93\xE5\x85\xA5\xE4\xBD\x93\xE9\xAA\x8C",
+      true));
+  CHECK(winome::is_overview_default_blacklisted_window_info(
+      "Windows.UI.Core.CoreWindow",
+      "",
+      "Windows\xE8\xBE\x93\xE5\x85\xA5\xE4\xBD\x93\xE9\xAA\x8C",
+      false));
+  CHECK(winome::is_overview_default_blacklisted_window_info(
+      "Windows.UI.Core.CoreWindow",
+      "TextInputHost.exe",
+      "Windows Input Experience",
+      true));
+
+  // Explorer's nameless, blank/ghost windows.
+  CHECK(winome::is_overview_default_blacklisted_window_info(
+      "ApplicationFrameWindow",
+      "C:\\Windows\\explorer.exe",
+      "",
+      true));
+  CHECK(winome::is_overview_default_blacklisted_window_info(
+      "WorkerW",
+      "explorer.exe",
+      "   ",
+      false));
+
+  // Legitimate Explorer folders, UWP Settings, and regular user windows remain untouched.
+  CHECK(!winome::is_overview_default_blacklisted_window_info(
+      "CabinetWClass",
+      "C:\\Windows\\explorer.exe",
+      "WINOME-portable - \xE6\x96\x87\xE4\xBB\xB6\xE8\xB5\x84\xE6\xBA\x90\xE7\xAE\xA1\xE7\x90\x86\xE5\x99\xA8",
+      false));
+  CHECK(!winome::is_overview_default_blacklisted_window_info(
+      "ApplicationFrameWindow",
+      "C:\\Windows\\System32\\ApplicationFrameHost.exe",
+      "\xE8\xAE\xBE\xE7\xBD\xAE",
+      true));
+  CHECK(!winome::is_overview_default_blacklisted_window_info(
+      "Chrome_WidgetWin_1",
+      "chrome.exe",
+      "Google Chrome",
+      false));
+  CHECK(!winome::is_overview_default_blacklisted_hwnd(nullptr, true));
+  // Disabled setting must bypass filtering.
+  CHECK(!winome::is_overview_default_blacklisted_hwnd(nullptr, false));
+}
+
 }  // namespace
 
 int main() {
@@ -1013,6 +1814,14 @@ int main() {
   test_window_theming_hwnd_filter();
   test_ipc_dispatch_and_named_pipe_roundtrip();
   test_vd_vtable_profiles_and_cache_trim();
+  test_crash_recovery_snapshot_and_state();
+  test_debug_runtime_ipc_sddl_and_ctl();
+  test_run_dialog_helpers();
+  test_plugin_host_and_real_child_process();
+  test_vd_async_and_breaker_recovery();
+  test_start_menu_pinned_layout_and_folder_sync();
+  test_systray_v4_and_uia_candidates();
+  test_overview_window_blacklist();
 
   if (g_failures == 0)
     std::printf("ALL WINOME UNIT TESTS PASSED\n");

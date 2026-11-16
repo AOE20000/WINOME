@@ -30,3 +30,19 @@ int winome_shell_panel_popover_just_closed (void);
 
 // Close all open panel popovers.
 void winome_shell_panel_close_popovers (void);
+void winome_shell_panel_close_popovers_immediate (void);
+
+// Reload GNOME theme stylesheet, optional developer user-debug.css, and StEngine.
+bool winome_shell_reload_theme (void);
+
+// Declarative TopBar plugin UI slots (host updates only on GTK main thread).
+typedef void (*WinomePluginTopBarClickCb) (const char *plugin_id,
+                                           const char *slot);
+void winome_shell_panel_set_plugin_click_cb (WinomePluginTopBarClickCb cb);
+void winome_shell_panel_plugin_upsert (const char *key,
+                                       const char *plugin_id,
+                                       const char *slot,
+                                       const char *icon_name,
+                                       const char *text,
+                                       const char *tooltip);
+void winome_shell_panel_plugin_remove (const char *key);

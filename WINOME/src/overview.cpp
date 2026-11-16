@@ -54,7 +54,9 @@
 #include "overview.h"
 #include "app-grid.h"
 #include "app-index.h"
+#include "config.h"
 #include "easing.h"
+#include "host-utils.h"
 #include "i18n.h"
 #include "perf-metrics.h"
 #include "overview-layout.h"
@@ -627,6 +629,7 @@ struct EnumContext {
   // Include cloaked windows (every desktop): used for the thumbnail
   // mini-previews, which bucket windows by their desktop GUID afterwards.
   bool include_cloaked = false;
+  bool use_blacklist = true;
 };
 
 BOOL CALLBACK
@@ -635,6 +638,9 @@ collect_windows (HWND hwnd, LPARAM lparam)
   EnumContext *ctx = reinterpret_cast<EnumContext *> (lparam);
 
   if (is_our_process (hwnd) || !is_alt_tab_window (hwnd))
+    return TRUE;
+
+  if (is_overview_default_blacklisted_hwnd (hwnd, ctx->use_blacklist))
     return TRUE;
 
   if (ctx->vd_filter) {
@@ -1792,7 +1798,8 @@ create_mini_previews (HMONITOR monitor, const RECT &monitor_rect,
   // Every alt-tab window on the monitor, cloaked ones included; bucketed
   // by desktop afterwards.
   std::vector<OvWindowInfo> all;
-  EnumContext ctx{monitor, monitor_rect, &all, false, true};
+  EnumContext ctx{monitor, monitor_rect, &all, false, true,
+                  winome::get_config ().overview_window_blacklist};
   EnumWindows (collect_windows, reinterpret_cast<LPARAM> (&ctx));
 
   // Pre-resolve each window's desktop once.
@@ -2188,7 +2195,7 @@ place_overview_locked (bool opening)
   // require zero window re-enumeration or DWM thumbnail teardown.
   std::vector<OvWindowInfo> windows;
   EnumContext ctx{monitor, mi.rcMonitor, &windows, !g_desktops.empty (),
-                  false};
+                  false, winome::get_config ().overview_window_blacklist};
   EnumWindows (collect_windows, reinterpret_cast<LPARAM> (&ctx));
 
   RECT workarea = {0, panel_height, w, h};
@@ -2270,7 +2277,6 @@ place_overview_locked (bool opening)
   create_mini_previews (monitor, mi.rcMonitor, geo.thumbs_x, geo.thumbs_y,
                         (opening || g_app_grid_mode) ? 0 : 255);
 
-  g_desktop_active = g_desktops.empty () ? -1 : vd::current_index ();
   g_placed = true;
   g_print ("[ov] placed %dx%d slots=%zu ws=%ldx%ld dash=%d\n", w, h,
            g_slots.size (), (long)(g_ws_box.right - g_ws_box.left),
@@ -2432,20 +2438,28 @@ restack_locked (void)
                          SWP_FRAMECHANGED))
     g_print ("[restack] panel failed gle=%lu\n", GetLastError ());
 
-  // The chrome windows sit directly below the panel (above the overview,
-  // hence above the DWM thumbnails): close button, app icon, caption pill.
+  // Place the owner (overview) directly below the panel first, THEN insert
+  // visible owned chrome windows between panel and overview with SWP_NOOWNERZORDER.
+  // Moving the owner AFTER its owned children would violate Win32 owner-child
+  // z-order rules and kick the panel below the overview group.
+  if (is_visible_hwnd (g_overview_hwnd)) {
+    ensure_hwnd_topmost (g_overview_hwnd);
+    if (!SetWindowPos (g_overview_hwnd, g_panel_hwnd, 0, 0, 0, 0,
+                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                           SWP_NOOWNERZORDER | SWP_FRAMECHANGED)) {
+      g_print ("[restack] overview failed gle=%lu\n", GetLastError ());
+    }
+  }
+
   HWND below_panel = g_panel_hwnd;
-  HWND layers[] = {g_chrome_hwnd, g_icon_hwnd, g_caption_hwnd, g_overview_hwnd};
-  for (HWND h : layers) {
+  HWND chrome_layers[] = {g_chrome_hwnd, g_icon_hwnd, g_caption_hwnd};
+  for (HWND h : chrome_layers) {
     if (!is_visible_hwnd (h))
       continue;
     ensure_hwnd_topmost (h);
-    if (!SetWindowPos (h, below_panel, 0, 0, 0, 0,
-                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
-                           SWP_FRAMECHANGED)) {
-      if (h == g_overview_hwnd)
-        g_print ("[restack] overview failed gle=%lu\n", GetLastError ());
-    }
+    SetWindowPos (h, below_panel, 0, 0, 0, 0,
+                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                      SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
     below_panel = h;
   }
 }
@@ -2815,6 +2829,7 @@ finish_hide (void)
     overview_dash_set_apps_active (g_dash, false);
   }
   if (g_app_grid != nullptr) {
+    app_grid_close_open_folder (g_app_grid);
     app_grid_close_menu (g_app_grid);
     app_grid_reset_page (g_app_grid);
     gtk_widget_set_opacity (g_app_grid, 1.0);
@@ -2859,7 +2874,8 @@ on_drag_begin (GtkGestureDrag *drag, double x, double y,
   g_drag_active = false;
   g_drag_thumbs_revealed = false;
 
-  if (g_app_grid_mode || g_desktops.empty () || g_window == nullptr) {
+  if (g_app_grid_mode || g_desktops.empty () || g_window == nullptr ||
+      g_target_state == ControlsState::HIDDEN || !overview_active ()) {
     gtk_gesture_set_state (GTK_GESTURE (drag), GTK_EVENT_SEQUENCE_DENIED);
     return;
   }
@@ -3044,6 +3060,9 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
 
   // A click that just dismissed a panel popover floating above the overview
   // is consumed by GNOME's menu grab: close the menu only.
+  if (g_target_state == ControlsState::HIDDEN || !overview_active ())
+    return;
+
   if (winome_shell_panel_popover_just_closed ()) {
     g_print ("[ov] click (%d,%d) swallowed (popover dismiss)\n", px, py);
     return;
@@ -3293,7 +3312,8 @@ gboolean
 show_idle (gpointer user_data)
 {
   (void)user_data;
-  overview_show ();
+  if (overview_active ())
+    overview_show ();
   return G_SOURCE_REMOVE;
 }
 
@@ -3301,7 +3321,8 @@ gboolean
 hide_idle (gpointer user_data)
 {
   (void)user_data;
-  overview_hide ();
+  if (!overview_active ())
+    overview_hide ();
   return G_SOURCE_REMOVE;
 }
 
@@ -3309,8 +3330,11 @@ gboolean
 shift_app_grid_idle (gpointer user_data)
 {
   (void)user_data;
-  if (g_window == nullptr || !gtk_widget_get_visible (g_window))
+  if (!overview_active () || g_window == nullptr ||
+      !gtk_widget_get_visible (g_window) ||
+      g_target_state == ControlsState::HIDDEN) {
     return G_SOURCE_REMOVE;
+  }
   if (!g_placed) {
     g_pending_show_state = ControlsState::APP_GRID;
     g_atomic_can_shift_app_grid.store (false, std::memory_order_release);
@@ -3390,6 +3414,8 @@ on_overview_key_pressed (GtkEventControllerKey *controller G_GNUC_UNUSED,
       return GDK_EVENT_STOP;
     }
     if (g_app_grid_mode) {
+      if (g_app_grid != nullptr && app_grid_close_open_folder (g_app_grid))
+        return GDK_EVENT_STOP;
       overview_toggle_app_grid ();
       return GDK_EVENT_STOP;
     }
@@ -3678,8 +3704,10 @@ overview_reposition (void)
 void
 overview_toggle_app_grid (void)
 {
-  if (g_window == nullptr || !gtk_widget_get_visible (g_window))
+  if (g_window == nullptr || !gtk_widget_get_visible (g_window) ||
+      g_target_state == ControlsState::HIDDEN || !overview_active ()) {
     return;
+  }
   if (!g_placed) {
     g_pending_show_state =
         (g_pending_show_state == ControlsState::APP_GRID)

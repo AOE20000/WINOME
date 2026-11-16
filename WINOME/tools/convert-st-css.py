@@ -847,6 +847,26 @@ window#winomeModalDialogWindow {
   border-bottom-width: 0;
   border-left-width: 0;
 }
+
+/* Let App Grid folder dialog size to available viewport height instead of fixed 720px. */
+.app-folder-dialog {
+  min-width: 0;
+  min-height: 0;
+  border-radius: 32px;
+}
+#winome-folder-scrim {
+  background-color: rgba(0, 0, 0, 0.35);
+  border-radius: 16px;
+}
+.overview-tile.app-folder {
+  background-color: rgba(250, 250, 251, 0.08);
+}
+.overview-tile.app-folder:hover {
+  background-color: rgba(250, 250, 251, 0.14);
+}
+.overview-tile.app-folder:active {
+  background-color: rgba(250, 250, 251, 0.20);
+}
 """
 
 # em values in the stylesheet resolve against the St theme context font

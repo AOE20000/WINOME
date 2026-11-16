@@ -3,7 +3,9 @@
 
 #include "app-index.h"
 #include "config.h"
+#include "host-utils.h"
 
+#include <bcrypt.h>
 #include <commctrl.h>
 #include <commoncontrols.h>
 #include <shellapi.h>
@@ -18,6 +20,7 @@
 #include <cwctype>
 #include <list>
 #include <mutex>
+#include <random>
 #include <thread>
 #include <unordered_map>
 
@@ -48,9 +51,83 @@ std::unordered_map<std::string, std::list<CacheItem>::iterator> g_cache_map;
 
 std::mutex g_index_mu;
 std::vector<AppEntry> g_entries;
+std::vector<StartMenuPinnedItem> g_pinned_layout;
 bool g_index_populated = false;
 std::atomic<bool> g_refresh_running{false};
 std::atomic<uint64_t> g_index_revision{0};
+
+std::mutex g_watch_mu;
+std::thread g_watch_thread;
+HANDLE g_watch_stop_event = nullptr;
+bool g_watch_running = false;
+
+std::wstring
+wide_from_utf8_local (const std::string &s)
+{
+  if (s.empty ())
+    return {};
+  int need = MultiByteToWideChar (CP_UTF8, 0, s.c_str (), -1, nullptr, 0);
+  if (need <= 1)
+    return {};
+  std::wstring out (static_cast<size_t> (need - 1), L'\0');
+  MultiByteToWideChar (CP_UTF8, 0, s.c_str (), -1, out.data (), need);
+  return out;
+}
+
+std::wstring
+expand_env_wide_local (const std::wstring &raw)
+{
+  if (raw.empty ())
+    return {};
+  DWORD need = ExpandEnvironmentStringsW (raw.c_str (), nullptr, 0);
+  if (need == 0 || need > 4096)
+    return raw;
+  std::wstring out (need, L'\0');
+  DWORD wrote = ExpandEnvironmentStringsW (raw.c_str (), out.data (), need);
+  if (wrote == 0 || wrote > need)
+    return raw;
+  if (!out.empty () && out.back () == L'\0')
+    out.pop_back ();
+  return out;
+}
+
+std::string
+normalize_win_path_lower (const std::wstring &raw)
+{
+  if (raw.empty ())
+    return {};
+  std::wstring exp = expand_env_wide_local (raw);
+  std::string utf8 = app_wide_to_utf8 (exp);
+  std::string lower = app_utf8_tolower (utf8);
+  std::string out;
+  out.reserve (lower.size ());
+  char prev = '\0';
+  for (char ch : lower) {
+    if (ch == '/')
+      ch = '\\';
+    if (ch == '\\' && prev == '\\')
+      continue;
+    out.push_back (ch);
+    prev = ch;
+  }
+  while (out.size () > 3 && out.back () == '\\')
+    out.pop_back ();
+  return out;
+}
+
+bool
+natural_name_less (const std::wstring &a, const std::wstring &b)
+{
+  int cmp = CompareStringEx (
+      LOCALE_NAME_USER_DEFAULT,
+      SORT_DIGITSASNUMBERS | LINGUISTIC_IGNORECASE,
+      a.c_str (), static_cast<int> (a.size ()),
+      b.c_str (), static_cast<int> (b.size ()),
+      nullptr, nullptr, 0);
+  if (cmp != 0)
+    return cmp == CSTR_LESS_THAN;
+  return _wcsicmp (a.c_str (), b.c_str ()) < 0;
+}
 
 std::string
 make_sized_key (const std::string &key, int size)
@@ -135,8 +212,39 @@ resolve_shortcut_info (const std::wstring &lnk_path, AppEntry *entry)
 }
 
 void
-collect_lnk_recursive (const std::wstring &dir, int depth,
-                       std::vector<AppEntry> *out)
+resolve_url_shortcut_info (const std::wstring &url_path, AppEntry *entry)
+{
+  if (entry == nullptr || url_path.empty ())
+    return;
+  wchar_t url_buf[1024] = L"";
+  if (GetPrivateProfileStringW (L"InternetShortcut", L"URL", L"", url_buf,
+                              1024, url_path.c_str ()) > 0 &&
+      url_buf[0] != L'\0') {
+    entry->launch_url = app_utf8_tolower (app_wide_to_utf8 (url_buf));
+  }
+  wchar_t icon_buf[MAX_PATH] = L"";
+  if (GetPrivateProfileStringW (L"InternetShortcut", L"IconFile", L"", icon_buf,
+                              MAX_PATH, url_path.c_str ()) > 0 &&
+      icon_buf[0] != L'\0') {
+    entry->icon_path = expand_env_wide_local (icon_buf);
+    entry->icon_index = static_cast<int> (
+        GetPrivateProfileIntW (L"InternetShortcut", L"IconIndex", 0,
+                               url_path.c_str ()));
+  }
+}
+
+bool
+is_start_menu_shortcut_ext (const wchar_t *name, size_t len)
+{
+  return len > 4 && (_wcsicmp (name + len - 4, L".lnk") == 0 ||
+                     _wcsicmp (name + len - 4, L".url") == 0);
+}
+
+void
+collect_start_menu_dir (const std::wstring &dir, int depth, bool is_user,
+                        const std::string &top_folder_name,
+                        int top_folder_order, int *next_folder_order,
+                        int *next_item_order, std::vector<AppEntry> *out)
 {
   if (depth > 5 || out == nullptr)
     return;
@@ -147,21 +255,29 @@ collect_lnk_recursive (const std::wstring &dir, int depth,
   if (h == INVALID_HANDLE_VALUE)
     return;
 
+  std::vector<std::wstring> subdirs;
+  std::vector<std::wstring> files;
   do {
     if (wcscmp (ffd.cFileName, L".") == 0 || wcscmp (ffd.cFileName, L"..") == 0)
       continue;
-
-    std::wstring full = dir + L"\\" + ffd.cFileName;
     if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-      collect_lnk_recursive (full, depth + 1, out);
-      continue;
+      subdirs.emplace_back (ffd.cFileName);
+    } else {
+      size_t flen = wcslen (ffd.cFileName);
+      if (is_start_menu_shortcut_ext (ffd.cFileName, flen))
+        files.emplace_back (ffd.cFileName);
     }
+  } while (FindNextFileW (h, &ffd));
+  FindClose (h);
 
-    size_t flen = wcslen (ffd.cFileName);
-    if (flen <= 4 || _wcsicmp (ffd.cFileName + flen - 4, L".lnk") != 0)
-      continue;
+  std::sort (subdirs.begin (), subdirs.end (), natural_name_less);
+  std::sort (files.begin (), files.end (), natural_name_less);
 
-    std::wstring stem (ffd.cFileName, flen - 4);
+  // Process files in this directory first (preserving root entries before subfolders
+  // or per-folder child order).
+  for (const std::wstring &fname : files) {
+    size_t flen = fname.size ();
+    std::wstring stem (fname.c_str (), flen - 4);
     std::string name = app_wide_to_utf8 (stem);
     if (name.empty ())
       continue;
@@ -169,20 +285,40 @@ collect_lnk_recursive (const std::wstring &dir, int depth,
     if (is_ignored_shortcut_name (name_lower))
       continue;
 
+    std::wstring full = dir + L"\\" + fname;
     AppEntry entry;
     entry.name = std::move (name);
     entry.name_lower = std::move (name_lower);
     entry.launch_path = full;
-    resolve_shortcut_info (full, &entry);
+    if (flen > 4 && _wcsicmp (fname.c_str () + flen - 4, L".url") == 0)
+      resolve_url_shortcut_info (full, &entry);
+    else
+      resolve_shortcut_info (full, &entry);
     entry.id = canonical_app_id (entry.aumid, entry.target_exe, entry.launch_path);
     if (!entry.target_exe.empty ()) {
       entry.target_lower =
           app_utf8_tolower (app_wide_to_utf8 (basename_lower (entry.target_exe)));
     }
+    entry.folder_name = top_folder_name;
+    entry.folder_order = top_folder_order;
+    entry.item_order = next_item_order != nullptr ? (*next_item_order)++ : 0;
+    entry.from_user_programs = is_user;
     out->push_back (std::move (entry));
-  } while (FindNextFileW (h, &ffd));
+  }
 
-  FindClose (h);
+  for (const std::wstring &sub : subdirs) {
+    std::wstring full = dir + L"\\" + sub;
+    std::string folder_name = top_folder_name;
+    int folder_order = top_folder_order;
+    if (depth == 0) {
+      folder_name = app_wide_to_utf8 (sub);
+      // Skip autostart-only folder if empty or standard Windows Startup utilities?
+      // Still collect non-ignored shortcuts if user placed any in Startup.
+      folder_order = next_folder_order != nullptr ? (*next_folder_order)++ : 0;
+    }
+    collect_start_menu_dir (full, depth + 1, is_user, folder_name, folder_order,
+                            next_folder_order, next_item_order, out);
+  }
 }
 
 std::vector<AppEntry>
@@ -193,13 +329,20 @@ scan_start_menu_sync ()
   bool did_co = SUCCEEDED (co_hr);
 
   std::vector<AppEntry> raw;
+  int user_folder_order = 0;
+  int common_folder_order = 0;
+  int next_item_order = 0;
   const wchar_t *vars[] = {L"APPDATA", L"ProgramData"};
   for (const wchar_t *var : vars) {
     wchar_t base[MAX_PATH] = L"";
     if (GetEnvironmentVariableW (var, base, MAX_PATH) > 0) {
+      bool is_user = (wcscmp (var, L"APPDATA") == 0);
       std::wstring programs = std::wstring (base) +
                               L"\\Microsoft\\Windows\\Start Menu\\Programs";
-      collect_lnk_recursive (programs, 0, &raw);
+      collect_start_menu_dir (
+          programs, 0, is_user, "", -1,
+          is_user ? &user_folder_order : &common_folder_order,
+          &next_item_order, &raw);
     }
   }
 
@@ -221,13 +364,14 @@ scan_start_menu_sync ()
     if (SUCCEEDED (apps_folder->BindToHandler (nullptr, kBHID_EnumItems,
                                                IID_PPV_ARGS (&enum_items))) &&
         enum_items != nullptr) {
-      std::unordered_map<std::string, bool> lnk_names;
+      std::unordered_map<std::string, std::vector<size_t>> lnk_names;
       std::unordered_map<std::string, bool> lnk_ids;
-      for (const AppEntry &e : raw) {
+      for (size_t i = 0; i < raw.size (); ++i) {
+        const AppEntry &e = raw[i];
         if (!e.id.empty ())
           lnk_ids[e.id] = true;
         if (!e.name_lower.empty ())
-          lnk_names[e.name_lower] = true;
+          lnk_names[e.name_lower].push_back (i);
       }
 
       IShellItem *child = nullptr;
@@ -252,18 +396,27 @@ scan_start_menu_sync ()
             std::string name_lower = app_utf8_tolower (name);
             std::string id = canonical_app_id (app_id, L"", L"");
             if (!name.empty () && !is_ignored_shortcut_name (name_lower) &&
-                !id.empty () && lnk_ids.find (id) == lnk_ids.end () &&
-                lnk_names.find (name_lower) == lnk_names.end ()) {
-              AppEntry uwp;
-              uwp.id = std::move (id);
-              uwp.name = std::move (name);
-              uwp.name_lower = std::move (name_lower);
-              uwp.aumid = app_id;
-              uwp.launch_path = L"shell:AppsFolder\\" + app_id;
-              uwp.is_uwp = true;
-              lnk_ids[uwp.id] = true;
-              lnk_names[uwp.name_lower] = true;
-              raw.push_back (std::move (uwp));
+                !id.empty ()) {
+              auto nit = lnk_names.find (name_lower);
+              if (nit != lnk_names.end ()) {
+                // Attach Windows AppsFolder AUMID onto matching .lnk / .url
+                // shortcuts so start2.bin W~<AUMID> pins match cleanly.
+                for (size_t idx : nit->second) {
+                  if (raw[idx].aumid.empty ())
+                    raw[idx].aumid = app_id;
+                }
+              } else if (lnk_ids.find (id) == lnk_ids.end ()) {
+                AppEntry uwp;
+                uwp.id = std::move (id);
+                uwp.name = std::move (name);
+                uwp.name_lower = std::move (name_lower);
+                uwp.aumid = app_id;
+                uwp.launch_path = L"shell:AppsFolder\\" + app_id;
+                uwp.is_uwp = true;
+                lnk_ids[uwp.id] = true;
+                lnk_names[uwp.name_lower].push_back (raw.size ());
+                raw.push_back (std::move (uwp));
+              }
             }
           }
         }
@@ -703,9 +856,1205 @@ filter_and_sort_apps (const std::vector<AppEntry> &entries,
   return out;
 }
 
+namespace {
+
+bool
+get_file_write_stamp (const std::wstring &path, std::string *out_stamp)
+{
+  if (path.empty () || out_stamp == nullptr)
+    return false;
+  WIN32_FILE_ATTRIBUTE_DATA fad{};
+  if (!GetFileAttributesExW (path.c_str (), GetFileExInfoStandard, &fad))
+    return false;
+  *out_stamp = std::to_string (fad.ftLastWriteTime.dwHighDateTime) + ":" +
+               std::to_string (fad.ftLastWriteTime.dwLowDateTime) + ":" +
+               std::to_string (fad.nFileSizeHigh) + ":" +
+               std::to_string (fad.nFileSizeLow);
+  return true;
+}
+
+bool
+write_file_bytes_local (const std::wstring &path, const std::string &data)
+{
+  if (path.empty ())
+    return false;
+  size_t slash = path.find_last_of (L"\\/");
+  if (slash != std::wstring::npos) {
+    std::wstring dir = path.substr (0, slash);
+    CreateDirectoryW (dir.c_str (), nullptr);
+  }
+  HANDLE hf = CreateFileW (path.c_str (), GENERIC_WRITE, FILE_SHARE_READ,
+                           nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+  if (hf == INVALID_HANDLE_VALUE)
+    return false;
+  DWORD wrote = 0;
+  BOOL ok = WriteFile (hf, data.data (), static_cast<DWORD> (data.size ()),
+                       &wrote, nullptr);
+  CloseHandle (hf);
+  return ok != FALSE && wrote == data.size ();
+}
+
+void
+skip_json_ws (const std::string &s, size_t *pos)
+{
+  while (*pos < s.size ()) {
+    unsigned char c = static_cast<unsigned char> (s[*pos]);
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+      ++(*pos);
+    else
+      break;
+  }
+}
+
+void
+append_codepoint_utf8 (uint32_t cp, std::string *out)
+{
+  if (cp <= 0x7F) {
+    out->push_back (static_cast<char> (cp));
+  } else if (cp <= 0x7FF) {
+    out->push_back (static_cast<char> (0xC0 | (cp >> 6)));
+    out->push_back (static_cast<char> (0x80 | (cp & 0x3F)));
+  } else if (cp <= 0xFFFF) {
+    out->push_back (static_cast<char> (0xE0 | (cp >> 12)));
+    out->push_back (static_cast<char> (0x80 | ((cp >> 6) & 0x3F)));
+    out->push_back (static_cast<char> (0x80 | (cp & 0x3F)));
+  } else {
+    out->push_back (static_cast<char> (0xF0 | (cp >> 18)));
+    out->push_back (static_cast<char> (0x80 | ((cp >> 12) & 0x3F)));
+    out->push_back (static_cast<char> (0x80 | ((cp >> 6) & 0x3F)));
+    out->push_back (static_cast<char> (0x80 | (cp & 0x3F)));
+  }
+}
+
+bool
+parse_hex4 (const std::string &s, size_t pos, uint32_t *out)
+{
+  if (pos + 4 > s.size ())
+    return false;
+  uint32_t v = 0;
+  for (size_t i = 0; i < 4; ++i) {
+    char c = s[pos + i];
+    uint32_t d = 0;
+    if (c >= '0' && c <= '9')
+      d = static_cast<uint32_t> (c - '0');
+    else if (c >= 'a' && c <= 'f')
+      d = 10u + static_cast<uint32_t> (c - 'a');
+    else if (c >= 'A' && c <= 'F')
+      d = 10u + static_cast<uint32_t> (c - 'A');
+    else
+      return false;
+    v = (v << 4) | d;
+  }
+  *out = v;
+  return true;
+}
+
+bool
+parse_json_string_local (const std::string &s, size_t *pos, std::string *out)
+{
+  skip_json_ws (s, pos);
+  if (*pos >= s.size () || s[*pos] != '"')
+    return false;
+  ++(*pos);
+  std::string buf;
+  while (*pos < s.size ()) {
+    char c = s[*pos];
+    ++(*pos);
+    if (c == '"') {
+      *out = std::move (buf);
+      return true;
+    }
+    if (c == '\\') {
+      if (*pos >= s.size ())
+        return false;
+      char esc = s[*pos];
+      ++(*pos);
+      switch (esc) {
+        case '"': buf.push_back ('"'); break;
+        case '\\': buf.push_back ('\\'); break;
+        case '/': buf.push_back ('/'); break;
+        case 'b': buf.push_back ('\b'); break;
+        case 'f': buf.push_back ('\f'); break;
+        case 'n': buf.push_back ('\n'); break;
+        case 'r': buf.push_back ('\r'); break;
+        case 't': buf.push_back ('\t'); break;
+        case 'u': {
+          uint32_t cp = 0;
+          if (!parse_hex4 (s, *pos, &cp))
+            return false;
+          *pos += 4;
+          if (cp >= 0xD800 && cp <= 0xDBFF && *pos + 6 <= s.size () &&
+              s[*pos] == '\\' && s[*pos + 1] == 'u') {
+            uint32_t lo = 0;
+            if (parse_hex4 (s, *pos + 2, &lo) && lo >= 0xDC00 && lo <= 0xDFFF) {
+              *pos += 6;
+              cp = 0x10000 + (((cp - 0xD800) << 10) | (lo - 0xDC00));
+            }
+          }
+          append_codepoint_utf8 (cp, &buf);
+          break;
+        }
+        default:
+          buf.push_back (esc);
+          break;
+      }
+    } else {
+      buf.push_back (c);
+    }
+  }
+  return false;
+}
+
+bool skip_json_value_local (const std::string &s, size_t *pos, int depth);
+
+bool
+skip_json_array_or_obj_local (const std::string &s, size_t *pos,
+                              char open_ch, char close_ch, int depth)
+{
+  if (depth > 32 || *pos >= s.size () || s[*pos] != open_ch)
+    return false;
+  ++(*pos);
+  skip_json_ws (s, pos);
+  if (*pos < s.size () && s[*pos] == close_ch) {
+    ++(*pos);
+    return true;
+  }
+  while (*pos < s.size ()) {
+    if (open_ch == '{') {
+      std::string k;
+      if (!parse_json_string_local (s, pos, &k))
+        return false;
+      skip_json_ws (s, pos);
+      if (*pos >= s.size () || s[*pos] != ':')
+        return false;
+      ++(*pos);
+    }
+    if (!skip_json_value_local (s, pos, depth + 1))
+      return false;
+    skip_json_ws (s, pos);
+    if (*pos >= s.size ())
+      return false;
+    if (s[*pos] == ',') {
+      ++(*pos);
+      continue;
+    }
+    if (s[*pos] == close_ch) {
+      ++(*pos);
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+bool
+skip_json_value_local (const std::string &s, size_t *pos, int depth)
+{
+  if (depth > 32)
+    return false;
+  skip_json_ws (s, pos);
+  if (*pos >= s.size ())
+    return false;
+  char c = s[*pos];
+  if (c == '"') {
+    std::string dummy;
+    return parse_json_string_local (s, pos, &dummy);
+  }
+  if (c == '{')
+    return skip_json_array_or_obj_local (s, pos, '{', '}', depth);
+  if (c == '[')
+    return skip_json_array_or_obj_local (s, pos, '[', ']', depth);
+  while (*pos < s.size ()) {
+    char ch = s[*pos];
+    if (ch == ',' || ch == '}' || ch == ']' || ch == ' ' || ch == '\t' ||
+        ch == '\r' || ch == '\n') {
+      return true;
+    }
+    ++(*pos);
+  }
+  return true;
+}
+
+bool
+parse_secondary_tile_id (const std::string &s, size_t *pos, std::string *out_id)
+{
+  skip_json_ws (s, pos);
+  if (*pos >= s.size () || s[*pos] != '{')
+    return skip_json_value_local (s, pos, 0);
+  ++(*pos);
+  skip_json_ws (s, pos);
+  if (*pos < s.size () && s[*pos] == '}') {
+    ++(*pos);
+    return true;
+  }
+  while (*pos < s.size ()) {
+    std::string key;
+    if (!parse_json_string_local (s, pos, &key))
+      return false;
+    skip_json_ws (s, pos);
+    if (*pos >= s.size () || s[*pos] != ':')
+      return false;
+    ++(*pos);
+    skip_json_ws (s, pos);
+    if (*pos < s.size () && s[*pos] == '"' &&
+        (key == "appUserModelId" || key == "packageFamilyName" ||
+         key == "packagedAppId")) {
+      std::string v;
+      if (!parse_json_string_local (s, pos, &v))
+        return false;
+      if (out_id != nullptr && out_id->empty () && !v.empty ())
+        *out_id = std::move (v);
+    } else {
+      if (!skip_json_value_local (s, pos, 1))
+        return false;
+    }
+    skip_json_ws (s, pos);
+    if (*pos < s.size () && s[*pos] == ',') {
+      ++(*pos);
+      continue;
+    }
+    if (*pos < s.size () && s[*pos] == '}') {
+      ++(*pos);
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+bool parse_pinned_array (const std::string &s, size_t *pos, int depth,
+                         std::vector<StartMenuPinnedItem> *out);
+
+bool
+parse_pinned_object (const std::string &s, size_t *pos, int depth,
+                     StartMenuPinnedItem *out_item, bool *has_item)
+{
+  if (depth > 16)
+    return false;
+  skip_json_ws (s, pos);
+  if (*pos >= s.size () || s[*pos] != '{')
+    return false;
+  ++(*pos);
+  skip_json_ws (s, pos);
+  if (*pos < s.size () && s[*pos] == '}') {
+    ++(*pos);
+    *has_item = false;
+    return true;
+  }
+
+  std::string link_val;
+  std::string uwp_val;
+  std::string appid_val;
+  std::string sec_val;
+  std::string start2_id;
+  std::string folder_name;
+  std::vector<StartMenuPinnedItem> folder_children;
+  bool has_folder_items = false;
+
+  while (*pos < s.size ()) {
+    std::string key;
+    if (!parse_json_string_local (s, pos, &key))
+      return false;
+    skip_json_ws (s, pos);
+    if (*pos >= s.size () || s[*pos] != ':')
+      return false;
+    ++(*pos);
+    skip_json_ws (s, pos);
+
+    if (key == "id" && *pos < s.size () && s[*pos] == '"') {
+      if (!parse_json_string_local (s, pos, &start2_id))
+        return false;
+    } else if (key == "desktopAppLink" && *pos < s.size () && s[*pos] == '"') {
+      if (!parse_json_string_local (s, pos, &link_val))
+        return false;
+    } else if (key == "packagedAppId" && *pos < s.size () && s[*pos] == '"') {
+      if (!parse_json_string_local (s, pos, &uwp_val))
+        return false;
+    } else if (key == "desktopAppId" && *pos < s.size () && s[*pos] == '"') {
+      if (!parse_json_string_local (s, pos, &appid_val))
+        return false;
+    } else if (key == "secondaryTile") {
+      if (!parse_secondary_tile_id (s, pos, &sec_val))
+        return false;
+    } else if ((key == "folderName" || key == "name" || key == "title") &&
+               *pos < s.size () && s[*pos] == '"') {
+      if (!parse_json_string_local (s, pos, &folder_name))
+        return false;
+    } else if ((key == "folderItems" || key == "items") &&
+               *pos < s.size () && s[*pos] == '[') {
+      if (!parse_pinned_array (s, pos, depth + 1, &folder_children))
+        return false;
+      has_folder_items = true;
+    } else {
+      if (!skip_json_value_local (s, pos, depth + 1))
+        return false;
+    }
+
+    skip_json_ws (s, pos);
+    if (*pos < s.size () && s[*pos] == ',') {
+      ++(*pos);
+      continue;
+    }
+    if (*pos < s.size () && s[*pos] == '}') {
+      ++(*pos);
+      break;
+    }
+    return false;
+  }
+
+  *has_item = false;
+  if (has_folder_items && !folder_children.empty ()) {
+    out_item->kind = StartMenuPinnedItem::Kind::Folder;
+    out_item->value = std::move (folder_name);
+    out_item->children = std::move (folder_children);
+    *has_item = true;
+  } else if (start2_id.rfind ("P~", 0) == 0 && start2_id.size () > 2) {
+    out_item->kind = StartMenuPinnedItem::Kind::PackagedApp;
+    out_item->value = start2_id.substr (2);
+    *has_item = true;
+  } else if (start2_id.rfind ("W~", 0) == 0 && start2_id.size () > 2) {
+    out_item->kind = StartMenuPinnedItem::Kind::DesktopAppId;
+    out_item->value = start2_id.substr (2);
+    *has_item = true;
+  } else if (!link_val.empty ()) {
+    out_item->kind = StartMenuPinnedItem::Kind::DesktopLink;
+    out_item->value = std::move (link_val);
+    *has_item = true;
+  } else if (!uwp_val.empty ()) {
+    out_item->kind = StartMenuPinnedItem::Kind::PackagedApp;
+    out_item->value = std::move (uwp_val);
+    *has_item = true;
+  } else if (!appid_val.empty ()) {
+    out_item->kind = StartMenuPinnedItem::Kind::DesktopAppId;
+    out_item->value = std::move (appid_val);
+    *has_item = true;
+  } else if (!sec_val.empty ()) {
+    out_item->kind = StartMenuPinnedItem::Kind::PackagedApp;
+    out_item->value = std::move (sec_val);
+    *has_item = true;
+  }
+  return true;
+}
+
+bool
+parse_pinned_array (const std::string &s, size_t *pos, int depth,
+                    std::vector<StartMenuPinnedItem> *out)
+{
+  if (depth > 16)
+    return false;
+  skip_json_ws (s, pos);
+  if (*pos >= s.size () || s[*pos] != '[')
+    return false;
+  ++(*pos);
+  skip_json_ws (s, pos);
+  if (*pos < s.size () && s[*pos] == ']') {
+    ++(*pos);
+    return true;
+  }
+  while (*pos < s.size ()) {
+    skip_json_ws (s, pos);
+    if (*pos < s.size () && s[*pos] == '{') {
+      StartMenuPinnedItem item;
+      bool has_item = false;
+      if (!parse_pinned_object (s, pos, depth + 1, &item, &has_item))
+        return false;
+      if (has_item)
+        out->push_back (std::move (item));
+    } else {
+      if (!skip_json_value_local (s, pos, depth + 1))
+        return false;
+    }
+    skip_json_ws (s, pos);
+    if (*pos < s.size () && s[*pos] == ',') {
+      ++(*pos);
+      continue;
+    }
+    if (*pos < s.size () && s[*pos] == ']') {
+      ++(*pos);
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+std::string
+read_file_bytes_local (const std::wstring &path)
+{
+  if (path.empty ())
+    return {};
+  HANDLE hf = CreateFileW (path.c_str (), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+  if (hf == INVALID_HANDLE_VALUE)
+    return {};
+  LARGE_INTEGER sz{};
+  std::string out;
+  if (GetFileSizeEx (hf, &sz) && sz.QuadPart > 0 && sz.QuadPart <= 4 * 1024 * 1024) {
+    out.resize (static_cast<size_t> (sz.QuadPart));
+    DWORD read_bytes = 0;
+    if (!ReadFile (hf, out.data (), static_cast<DWORD> (sz.QuadPart), &read_bytes,
+                   nullptr)) {
+      out.clear ();
+    } else {
+      out.resize (read_bytes);
+    }
+  }
+  CloseHandle (hf);
+  return out;
+}
+
+void
+watch_thread_proc ()
+{
+  std::vector<HANDLE> handles;
+  if (g_watch_stop_event != nullptr)
+    handles.push_back (g_watch_stop_event);
+
+  auto add_dir_watch = [&handles] (const std::wstring &dir) {
+    if (dir.empty () || GetFileAttributesW (dir.c_str ()) == INVALID_FILE_ATTRIBUTES)
+      return;
+    HANDLE h = FindFirstChangeNotificationW (
+        dir.c_str (), TRUE,
+        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+            FILE_NOTIFY_CHANGE_LAST_WRITE);
+    if (h != nullptr && h != INVALID_HANDLE_VALUE)
+      handles.push_back (h);
+  };
+
+  wchar_t buf[MAX_PATH] = L"";
+  if (GetEnvironmentVariableW (L"APPDATA", buf, MAX_PATH) > 0) {
+    add_dir_watch (std::wstring (buf) +
+                   L"\\Microsoft\\Windows\\Start Menu\\Programs");
+  }
+  if (GetEnvironmentVariableW (L"ProgramData", buf, MAX_PATH) > 0) {
+    add_dir_watch (std::wstring (buf) +
+                   L"\\Microsoft\\Windows\\Start Menu\\Programs");
+  }
+  if (GetEnvironmentVariableW (L"LOCALAPPDATA", buf, MAX_PATH) > 0) {
+    add_dir_watch (std::wstring (buf) +
+                   L"\\Packages\\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\\LocalState");
+  }
+
+  if (handles.size () <= 1)
+    return;
+
+  for (;;) {
+    DWORD wait = WaitForMultipleObjects (
+        static_cast<DWORD> (handles.size ()), handles.data (), FALSE, INFINITE);
+    if (wait == WAIT_OBJECT_0 || wait == WAIT_FAILED)
+      break;
+    DWORD idx = wait - WAIT_OBJECT_0;
+    if (idx < handles.size ())
+      FindNextChangeNotification (handles[idx]);
+
+    // Coalesce burst file writes (shortcut installers / Start Menu saves).
+    if (WaitForSingleObject (handles[0], 500) == WAIT_OBJECT_0)
+      break;
+    for (size_t i = 1; i < handles.size (); ++i) {
+      while (WaitForSingleObject (handles[i], 0) == WAIT_OBJECT_0)
+        FindNextChangeNotification (handles[i]);
+    }
+    app_index_refresh_async (nullptr, nullptr);
+  }
+
+  for (size_t i = 1; i < handles.size (); ++i)
+    FindCloseChangeNotification (handles[i]);
+}
+
+}  // namespace
+
+std::vector<StartMenuPinnedItem>
+parse_windows_start_layout_json (const std::string &json_text)
+{
+  std::vector<StartMenuPinnedItem> result;
+  size_t pos = 0;
+  // Strip UTF-8 BOM if present, or scan to first '{' (handles binary headers).
+  if (json_text.size () >= 3 &&
+      static_cast<unsigned char> (json_text[0]) == 0xEF &&
+      static_cast<unsigned char> (json_text[1]) == 0xBB &&
+      static_cast<unsigned char> (json_text[2]) == 0xBF) {
+    pos = 3;
+  }
+  size_t brace = json_text.find ("{\"pinnedList\"", pos);
+  if (brace == std::string::npos)
+    brace = json_text.find ('{', pos);
+  if (brace == std::string::npos)
+    return result;
+  pos = brace + 1;
+  skip_json_ws (json_text, &pos);
+  if (pos < json_text.size () && json_text[pos] == '}')
+    return result;
+
+  while (pos < json_text.size ()) {
+    std::string key;
+    if (!parse_json_string_local (json_text, &pos, &key))
+      break;
+    skip_json_ws (json_text, &pos);
+    if (pos >= json_text.size () || json_text[pos] != ':')
+      break;
+    ++pos;
+    skip_json_ws (json_text, &pos);
+    if (key == "pinnedList" && pos < json_text.size () &&
+        json_text[pos] == '[') {
+      parse_pinned_array (json_text, &pos, 0, &result);
+      break;
+    }
+    if (!skip_json_value_local (json_text, &pos, 0))
+      break;
+    skip_json_ws (json_text, &pos);
+    if (pos < json_text.size () && json_text[pos] == ',') {
+      ++pos;
+      continue;
+    }
+    break;
+  }
+  return result;
+}
+
+bool
+decrypt_start2_bin_bytes (const std::string &raw_bytes, std::string *out_json)
+{
+  if (out_json == nullptr)
+    return false;
+  out_json->clear ();
+
+  // Minimal 44-byte header + 512-byte random padding split + AES ciphertext.
+  if (raw_bytes.size () <= 44u + 512u)
+    return false;
+
+  auto read_u32_le = [&raw_bytes] (size_t off) -> uint32_t {
+    const auto *p = reinterpret_cast<const uint8_t *> (raw_bytes.data () + off);
+    return static_cast<uint32_t> (p[0]) |
+           (static_cast<uint32_t> (p[1]) << 8) |
+           (static_cast<uint32_t> (p[2]) << 16) |
+           (static_cast<uint32_t> (p[3]) << 24);
+  };
+
+  const uint32_t ft_low = read_u32_le (0x20);
+  const uint32_t ft_high = read_u32_le (0x24);
+  const uint32_t total_len = read_u32_le (0x28);
+  if (total_len <= 0x200u ||
+      44u + static_cast<size_t> (total_len) > raw_bytes.size ()) {
+    return false;
+  }
+
+  const uint32_t ct_len = total_len - 0x200u;
+  if ((ct_len % 16u) != 0u)
+    return false;
+
+  auto mt_uniform = [] (std::mt19937 &mt, uint32_t r) -> uint32_t {
+    if (r == 0u)
+      return 0u;
+    if (r == 0xFFFFFFFFu)
+      return mt ();
+    const uint32_t b = r + 1u;
+    const uint32_t limit_q = 0xFFFFFFFFu / b;
+    const uint32_t rem = 0xFFFFFFFFu % b;
+    for (;;) {
+      const uint32_t v = mt ();
+      if (!(limit_q <= (v / b) && rem != r))
+        return v % b;
+    }
+  };
+
+  auto alpha_numeric = [] (uint32_t seed, size_t len) -> std::vector<uint8_t> {
+    std::mt19937 mt (seed);
+    uint32_t v = 0;
+    do {
+      v = mt ();
+    } while ((v / 0x3E9u) > 0x417873u);
+    mt.discard (v % 0x3E9u);
+    std::vector<uint8_t> out (len);
+    for (size_t i = 0; i < len; ++i) {
+      do {
+        v = mt ();
+      } while ((v / 0x60u) > 0x2AAAAA9u);
+      out[i] = static_cast<uint8_t> ((v % 0x60u) + 0x20u);
+    }
+    return out;
+  };
+
+  std::mt19937 pad_mt (0x00AF4D97u ^ ft_low);
+  const uint32_t pre_pad = pad_mt () & 0x1FFu;
+  const size_t ct_off = 0x2Cu + static_cast<size_t> (pre_pad);
+  if (ct_off + ct_len > raw_bytes.size ())
+    return false;
+
+  std::mt19937 sym_mt (ft_high ^ ft_low ^ 0x3B21D91Eu);
+  const uint32_t key_seed = sym_mt ();
+  const uint32_t key_len = 64u + mt_uniform (sym_mt, 64u);
+  const uint32_t iv_seed = sym_mt ();
+
+  std::vector<uint8_t> key = alpha_numeric (key_seed, key_len);
+  std::vector<uint8_t> iv = alpha_numeric (iv_seed, 16u);
+  if (key.size () < 32u || iv.size () != 16u)
+    return false;
+
+  BCRYPT_ALG_HANDLE alg = nullptr;
+  BCRYPT_KEY_HANDLE hkey = nullptr;
+  bool ok = false;
+  if (BCryptOpenAlgorithmProvider (&alg, BCRYPT_AES_ALGORITHM, nullptr, 0) >= 0) {
+    if (BCryptSetProperty (
+            alg, BCRYPT_CHAINING_MODE,
+            reinterpret_cast<PUCHAR> (const_cast<wchar_t *> (BCRYPT_CHAIN_MODE_CBC)),
+            sizeof (BCRYPT_CHAIN_MODE_CBC), 0) >= 0 &&
+        BCryptGenerateSymmetricKey (alg, &hkey, nullptr, 0, key.data (), 32u, 0) >=
+            0) {
+      std::vector<uint8_t> ct_buf (
+          reinterpret_cast<const uint8_t *> (raw_bytes.data () + ct_off),
+          reinterpret_cast<const uint8_t *> (raw_bytes.data () + ct_off + ct_len));
+      std::vector<uint8_t> iv_work = iv;
+      std::string plain (ct_len, '\0');
+      ULONG plain_len = 0;
+      LONG st = BCryptDecrypt (
+          hkey, ct_buf.data (), ct_len, nullptr, iv_work.data (),
+          static_cast<ULONG> (iv_work.size ()),
+          reinterpret_cast<PUCHAR> (plain.data ()), ct_len, &plain_len,
+          BCRYPT_BLOCK_PADDING);
+      if (st >= 0 && plain_len <= ct_len) {
+        plain.resize (plain_len);
+        *out_json = std::move (plain);
+        ok = true;
+      }
+      BCryptDestroyKey (hkey);
+    }
+    BCryptCloseAlgorithmProvider (alg, 0);
+  }
+  return ok;
+}
+
+std::vector<StartMenuPinnedItem>
+load_windows_start_menu_pinned ()
+{
+  wchar_t override_path[MAX_PATH] = L"";
+  if (GetEnvironmentVariableW (L"WINOME_START_LAYOUT_JSON", override_path,
+                             MAX_PATH) > 0 &&
+      override_path[0] != L'\0') {
+    std::string raw = read_file_bytes_local (override_path);
+    if (!raw.empty ())
+      return parse_windows_start_layout_json (raw);
+  }
+
+  wchar_t local_app[MAX_PATH] = L"";
+  std::wstring start_dir;
+  std::wstring start2_path;
+  std::wstring cache_json_path;
+  std::wstring cache_meta_path;
+  std::string current_stamp;
+  if (GetEnvironmentVariableW (L"LOCALAPPDATA", local_app, MAX_PATH) > 0) {
+    start_dir =
+        std::wstring (local_app) +
+        L"\\Packages\\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\\LocalState\\";
+    start2_path = start_dir + L"start2.bin";
+    if (!get_file_write_stamp (start2_path, &current_stamp))
+      get_file_write_stamp (start_dir + L"start.bin", &current_stamp);
+
+    // Primary path on Windows 11: directly decrypt live start2.bin / start.bin
+    // so manually pinned items AND Start Menu folder groups (`pinType: 2`)
+    // remain 100% intact.
+    for (const wchar_t *fname : {L"start2.bin", L"start.bin"}) {
+      std::string raw = read_file_bytes_local (start_dir + fname);
+      if (raw.empty ())
+        continue;
+      std::string decrypted;
+      if (decrypt_start2_bin_bytes (raw, &decrypted)) {
+        auto parsed = parse_windows_start_layout_json (decrypted);
+        if (!parsed.empty ())
+          return parsed;
+      }
+      auto plain_parsed = parse_windows_start_layout_json (raw);
+      if (!plain_parsed.empty ())
+        return plain_parsed;
+    }
+
+    std::wstring winome_dir = std::wstring (local_app) + L"\\winome";
+    CreateDirectoryW (winome_dir.c_str (), nullptr);
+    cache_json_path = winome_dir + L"\\start-layout-cache.json";
+    cache_meta_path = winome_dir + L"\\start-layout-cache.meta";
+
+    if (!current_stamp.empty ()) {
+      std::string saved_stamp = read_file_bytes_local (cache_meta_path);
+      if (saved_stamp == current_stamp) {
+        std::string cached = read_file_bytes_local (cache_json_path);
+        if (!cached.empty ())
+          return parse_windows_start_layout_json (cached);
+      }
+    }
+  }
+
+  // Fallback for builds where start2.bin encryption differs: invoke Windows
+  // `Export-StartLayout` cmdlet quietly and cache by start2.bin timestamp.
+  std::string json_raw;
+  wchar_t tmp_dir[MAX_PATH] = L"";
+  if (GetTempPathW (MAX_PATH, tmp_dir) > 0) {
+    std::wstring tmp_file =
+        std::wstring (tmp_dir) + L"winome-startlayout-" +
+        std::to_wstring (GetCurrentProcessId ()) + L"-" +
+        std::to_wstring (GetCurrentThreadId ()) + L".json";
+    std::wstring ps_cmd =
+        L"powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden "
+        L"-ExecutionPolicy Bypass -Command \"Export-StartLayout -Path '";
+    for (wchar_t ch : tmp_file) {
+      if (ch == L'\'')
+        ps_cmd += L"''";
+      else
+        ps_cmd.push_back (ch);
+    }
+    ps_cmd += L"'\"";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof (si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW (nullptr, ps_cmd.data (), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+      DWORD wait = WaitForSingleObject (pi.hProcess, 5000);
+      if (wait == WAIT_OBJECT_0) {
+        DWORD code = 1;
+        if (GetExitCodeProcess (pi.hProcess, &code) && code == 0)
+          json_raw = read_file_bytes_local (tmp_file);
+      } else {
+        TerminateProcess (pi.hProcess, 1);
+      }
+      CloseHandle (pi.hThread);
+      CloseHandle (pi.hProcess);
+    }
+    DeleteFileW (tmp_file.c_str ());
+  }
+
+  if (!json_raw.empty ()) {
+    auto parsed = parse_windows_start_layout_json (json_raw);
+    if (!parsed.empty () && !cache_json_path.empty () &&
+        !current_stamp.empty ()) {
+      write_file_bytes_local (cache_json_path, json_raw);
+      write_file_bytes_local (cache_meta_path, current_stamp);
+    }
+    if (!parsed.empty ())
+      return parsed;
+  }
+  return {};
+}
+
+namespace {
+
+std::wstring
+expand_known_folder_and_env_wide (const std::wstring &raw)
+{
+  std::wstring s = expand_env_wide_local (raw);
+  if (s.size () >= 38 && s[0] == L'{' && s[37] == L'}') {
+    std::wstring guid_str = s.substr (0, 38);
+    GUID kf_id{};
+    if (SUCCEEDED (CLSIDFromString (guid_str.c_str (), &kf_id))) {
+      PWSTR kf_path = nullptr;
+      if (SUCCEEDED (SHGetKnownFolderPath (kf_id, KF_FLAG_DEFAULT, nullptr,
+                                           &kf_path)) &&
+          kf_path != nullptr) {
+        std::wstring expanded (kf_path);
+        CoTaskMemFree (kf_path);
+        return expanded + s.substr (38);
+      }
+    }
+  }
+  return s;
+}
+
+}  // namespace
+
+std::vector<AppGridItem>
+build_app_grid_items (const std::vector<AppEntry> &apps,
+                      const std::vector<StartMenuPinnedItem> &pinned_items,
+                      const std::string &query_lower)
+{
+  std::vector<AppGridItem> items;
+  if (!query_lower.empty ()) {
+    std::vector<AppEntry> matched = filter_and_sort_apps (apps, query_lower);
+    items.reserve (matched.size ());
+    for (AppEntry &e : matched) {
+      AppGridItem gi;
+      gi.kind = AppGridItemKind::App;
+      gi.id = e.id;
+      gi.title = e.name;
+      gi.app = std::move (e);
+      items.push_back (std::move (gi));
+    }
+    return items;
+  }
+
+  std::unordered_map<std::string, size_t> by_launch;
+  std::unordered_map<std::string, size_t> by_target;
+  std::unordered_map<std::string, size_t> by_url;
+  std::unordered_map<std::string, size_t> by_aumid;
+  std::unordered_map<std::string, size_t> by_id;
+  for (size_t i = 0; i < apps.size (); ++i) {
+    if (!apps[i].launch_path.empty ()) {
+      std::string lp = normalize_win_path_lower (apps[i].launch_path);
+      if (!lp.empty () && by_launch.find (lp) == by_launch.end ())
+        by_launch[lp] = i;
+    }
+    if (!apps[i].target_exe.empty ()) {
+      std::string tp = normalize_win_path_lower (apps[i].target_exe);
+      if (!tp.empty () && by_target.find (tp) == by_target.end ())
+        by_target[tp] = i;
+    }
+    if (!apps[i].launch_url.empty ()) {
+      if (by_url.find (apps[i].launch_url) == by_url.end ())
+        by_url[apps[i].launch_url] = i;
+    }
+    if (!apps[i].aumid.empty ()) {
+      std::string au = normalize_app_id (app_wide_to_utf8 (apps[i].aumid));
+      if (!au.empty () && by_aumid.find (au) == by_aumid.end ())
+        by_aumid[au] = i;
+    }
+    if (!apps[i].id.empty ()) {
+      std::string id = normalize_app_id (apps[i].id);
+      if (!id.empty () && by_id.find (id) == by_id.end ())
+        by_id[id] = i;
+    }
+  }
+
+  std::vector<bool> used (apps.size (), false);
+  std::unordered_map<std::string, bool> placed_ids;
+
+  auto synthesize_disk_entry = [&] (const std::wstring &wval,
+                                    AppEntry *out_entry) -> bool {
+    DWORD attrs = wval.empty () ? INVALID_FILE_ATTRIBUTES
+                                : GetFileAttributesW (wval.c_str ());
+    if (attrs == INVALID_FILE_ATTRIBUTES)
+      return false;
+
+    std::wstring clean_path = wval;
+    while (clean_path.size () > 3 &&
+           (clean_path.back () == L'\\' || clean_path.back () == L'/')) {
+      clean_path.pop_back ();
+    }
+    size_t slash = clean_path.find_last_of (L"\\/");
+    std::wstring fname = slash != std::wstring::npos
+                             ? clean_path.substr (slash + 1)
+                             : clean_path;
+    bool is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    std::wstring stem = fname;
+    if (!is_dir) {
+      size_t dot = fname.find_last_of (L'.');
+      if (dot != std::wstring::npos) {
+        std::wstring ext = fname.substr (dot);
+        if (_wcsicmp (ext.c_str (), L".lnk") == 0 ||
+            _wcsicmp (ext.c_str (), L".url") == 0 ||
+            _wcsicmp (ext.c_str (), L".exe") == 0) {
+          stem = fname.substr (0, dot);
+        }
+      }
+    }
+    std::string name = app_wide_to_utf8 (stem);
+    if (name.empty ())
+      return false;
+
+    AppEntry e;
+    e.name = std::move (name);
+    e.name_lower = app_utf8_tolower (e.name);
+    e.launch_path = clean_path;
+    if (!is_dir) {
+      size_t dot = fname.find_last_of (L'.');
+      if (dot != std::wstring::npos &&
+          _wcsicmp (fname.c_str () + dot, L".url") == 0) {
+        resolve_url_shortcut_info (clean_path, &e);
+      } else if (dot != std::wstring::npos &&
+                 _wcsicmp (fname.c_str () + dot, L".lnk") == 0) {
+        resolve_shortcut_info (clean_path, &e);
+      } else {
+        e.target_exe = clean_path;
+      }
+    }
+    e.id = canonical_app_id (e.aumid, e.target_exe, e.launch_path);
+    if (!e.target_exe.empty ()) {
+      e.target_lower = app_utf8_tolower (
+          app_wide_to_utf8 (basename_lower (e.target_exe)));
+    }
+    if (e.id.empty () || placed_ids[e.id])
+      return false;
+    placed_ids[e.id] = true;
+    *out_entry = std::move (e);
+    return true;
+  };
+
+  auto claim_index = [&] (size_t idx, AppEntry *out_entry) -> bool {
+    used[idx] = true;
+    if (placed_ids[apps[idx].id])
+      return false;
+    placed_ids[apps[idx].id] = true;
+    *out_entry = apps[idx];
+    return true;
+  };
+
+  auto resolve_pin_entry = [&] (const StartMenuPinnedItem &pin,
+                                AppEntry *out_entry) -> bool {
+    std::wstring wval =
+        expand_known_folder_and_env_wide (wide_from_utf8_local (pin.value));
+    std::string lp = normalize_win_path_lower (wval);
+
+    if (pin.kind == StartMenuPinnedItem::Kind::DesktopLink) {
+      if (auto li = by_launch.find (lp); li != by_launch.end ())
+        return claim_index (li->second, out_entry);
+      if (auto ti = by_target.find (lp); ti != by_target.end ())
+        return claim_index (ti->second, out_entry);
+      return synthesize_disk_entry (wval, out_entry);
+    }
+
+    if (auto li = by_launch.find (lp); li != by_launch.end ())
+      return claim_index (li->second, out_entry);
+    if (auto ti = by_target.find (lp); ti != by_target.end ())
+      return claim_index (ti->second, out_entry);
+
+    std::string raw_low = app_utf8_tolower (pin.value);
+    if (auto ui = by_url.find (raw_low); ui != by_url.end ())
+      return claim_index (ui->second, out_entry);
+
+    std::string norm = normalize_app_id (pin.value);
+    if (!norm.empty ()) {
+      if (auto ai = by_aumid.find (norm); ai != by_aumid.end ())
+        return claim_index (ai->second, out_entry);
+      if (auto ii = by_id.find (norm); ii != by_id.end ())
+        return claim_index (ii->second, out_entry);
+    }
+
+    return synthesize_disk_entry (wval, out_entry);
+  };
+
+  // Tier 1: Manually pinned Windows Start Menu items & folders in exact order.
+  int pinned_folder_seq = 0;
+  for (const StartMenuPinnedItem &pin : pinned_items) {
+    if (pin.kind == StartMenuPinnedItem::Kind::Folder) {
+      std::vector<AppEntry> children;
+      for (const StartMenuPinnedItem &child : pin.children) {
+        AppEntry ce;
+        if (resolve_pin_entry (child, &ce))
+          children.push_back (std::move (ce));
+      }
+      if (!children.empty ()) {
+        AppGridItem fi;
+        fi.kind = AppGridItemKind::Folder;
+        fi.id = "pinned-folder:" + std::to_string (pinned_folder_seq++);
+        fi.title = pin.value.empty () ? "Folder" : pin.value;
+        fi.children = std::move (children);
+        items.push_back (std::move (fi));
+      }
+    } else {
+      AppEntry ae;
+      if (resolve_pin_entry (pin, &ae)) {
+        AppGridItem ai;
+        ai.kind = AppGridItemKind::App;
+        ai.id = ae.id;
+        ai.title = ae.name;
+        ai.app = std::move (ae);
+        items.push_back (std::move (ai));
+      }
+    }
+  }
+
+  // Tier 2: One-way sync grouping for remaining unpinned apps following Windows
+  // Start Menu\Programs folder directory order.
+  struct FolderGroup {
+    std::string key;
+    std::string display_name;
+    bool from_user = false;
+    int folder_order = 0x7fffffff;
+    std::vector<AppEntry> children;
+  };
+  std::unordered_map<std::string, size_t> group_idx;
+  std::vector<FolderGroup> groups;
+  std::vector<AppEntry> ungrouped;
+
+  for (size_t i = 0; i < apps.size (); ++i) {
+    if (used[i] || placed_ids[apps[i].id])
+      continue;
+    placed_ids[apps[i].id] = true;
+    if (!apps[i].folder_name.empty ()) {
+      std::string fkey = app_utf8_tolower (apps[i].folder_name);
+      auto git = group_idx.find (fkey);
+      if (git == group_idx.end ()) {
+        size_t idx = groups.size ();
+        group_idx[fkey] = idx;
+        FolderGroup fg;
+        fg.key = fkey;
+        fg.display_name = apps[i].folder_name;
+        fg.from_user = apps[i].from_user_programs;
+        fg.folder_order =
+            apps[i].folder_order >= 0 ? apps[i].folder_order : 0x7fffffff;
+        fg.children.push_back (apps[i]);
+        groups.push_back (std::move (fg));
+      } else {
+        FolderGroup &fg = groups[git->second];
+        if (apps[i].from_user_programs && !fg.from_user) {
+          fg.from_user = true;
+          fg.display_name = apps[i].folder_name;
+          if (apps[i].folder_order >= 0)
+            fg.folder_order = apps[i].folder_order;
+        } else if (apps[i].from_user_programs == fg.from_user &&
+                   apps[i].folder_order >= 0) {
+          fg.folder_order = std::min (fg.folder_order, apps[i].folder_order);
+        }
+        fg.children.push_back (apps[i]);
+      }
+    } else {
+      ungrouped.push_back (apps[i]);
+    }
+  }
+
+  std::sort (groups.begin (), groups.end (),
+             [] (const FolderGroup &a, const FolderGroup &b) {
+               if (a.from_user != b.from_user)
+                 return a.from_user > b.from_user;
+               if (a.folder_order != b.folder_order)
+                 return a.folder_order < b.folder_order;
+               return a.key < b.key;
+             });
+
+  for (FolderGroup &fg : groups) {
+    std::sort (fg.children.begin (), fg.children.end (),
+               [] (const AppEntry &a, const AppEntry &b) {
+                 if (a.from_user_programs != b.from_user_programs)
+                   return a.from_user_programs > b.from_user_programs;
+                 if (a.item_order != b.item_order)
+                   return a.item_order < b.item_order;
+                 return a.name_lower < b.name_lower;
+               });
+    AppGridItem fi;
+    fi.kind = AppGridItemKind::Folder;
+    fi.id = "folder:" + fg.key;
+    fi.title = std::move (fg.display_name);
+    fi.children = std::move (fg.children);
+    items.push_back (std::move (fi));
+  }
+
+  std::sort (ungrouped.begin (), ungrouped.end (),
+             [] (const AppEntry &a, const AppEntry &b) {
+               if (a.from_user_programs != b.from_user_programs)
+                 return a.from_user_programs > b.from_user_programs;
+               bool a_uwp = a.is_uwp && a.launch_path.empty ();
+               bool b_uwp = b.is_uwp && b.launch_path.empty ();
+               if (a_uwp != b_uwp)
+                 return !a_uwp;
+               if (a.item_order != b.item_order)
+                 return a.item_order < b.item_order;
+               return a.name_lower < b.name_lower;
+             });
+
+  for (AppEntry &e : ungrouped) {
+    AppGridItem ai;
+    ai.kind = AppGridItemKind::App;
+    ai.id = e.id;
+    ai.title = e.name;
+    ai.app = std::move (e);
+    items.push_back (std::move (ai));
+  }
+
+  return items;
+}
+
+void
+app_index_start_watch ()
+{
+  std::lock_guard<std::mutex> lock (g_watch_mu);
+  if (g_watch_running)
+    return;
+  g_watch_stop_event = CreateEventW (nullptr, TRUE, FALSE, nullptr);
+  if (g_watch_stop_event == nullptr)
+    return;
+  g_watch_running = true;
+  g_watch_thread = std::thread (watch_thread_proc);
+}
+
+void
+app_index_stop_watch ()
+{
+  std::thread to_join;
+  HANDLE ev = nullptr;
+  {
+    std::lock_guard<std::mutex> lock (g_watch_mu);
+    if (!g_watch_running)
+      return;
+    g_watch_running = false;
+    ev = g_watch_stop_event;
+    if (ev != nullptr)
+      SetEvent (ev);
+    to_join = std::move (g_watch_thread);
+  }
+  if (to_join.joinable ())
+    to_join.join ();
+  std::lock_guard<std::mutex> lock (g_watch_mu);
+  if (g_watch_stop_event != nullptr) {
+    CloseHandle (g_watch_stop_event);
+    g_watch_stop_event = nullptr;
+  }
+}
+
+std::string
+app_index_debug_dump_json ()
+{
+  const std::vector<AppEntry> apps = app_index_get_all ();
+  const std::vector<StartMenuPinnedItem> pins = app_index_get_pinned_layout ();
+  const std::vector<AppGridItem> items = build_app_grid_items (apps, pins, "");
+
+  auto escape_json = [] (const std::string &s, std::string *out) {
+    out->push_back ('"');
+    for (unsigned char c : s) {
+      if (c == '"')
+        *out += "\\\"";
+      else if (c == '\\')
+        *out += "\\\\";
+      else if (c < 0x20) {
+        char buf[8];
+        std::snprintf (buf, sizeof (buf), "\\u%04x", c);
+        *out += buf;
+      } else {
+        out->push_back (static_cast<char> (c));
+      }
+    }
+    out->push_back ('"');
+  };
+
+  size_t pin_folders = 0;
+  for (const auto &p : pins) {
+    if (p.kind == StartMenuPinnedItem::Kind::Folder)
+      ++pin_folders;
+  }
+  size_t grid_folders = 0;
+  for (const auto &g : items) {
+    if (g.kind == AppGridItemKind::Folder)
+      ++grid_folders;
+  }
+
+  std::string out = "{";
+  out += "\"apps_total\":" + std::to_string (apps.size ());
+  out += ",\"pinned_top_count\":" + std::to_string (pins.size ());
+  out += ",\"pinned_folder_count\":" + std::to_string (pin_folders);
+  out += ",\"grid_items_total\":" + std::to_string (items.size ());
+  out += ",\"grid_folders_total\":" + std::to_string (grid_folders);
+  out += ",\"items\":[";
+  size_t limit = std::min<size_t> (items.size (), 60);
+  for (size_t i = 0; i < limit; ++i) {
+    if (i > 0)
+      out.push_back (',');
+    out += "{\"kind\":";
+    out += (items[i].kind == AppGridItemKind::Folder ? "\"folder\"" : "\"app\"");
+    out += ",\"title\":";
+    escape_json (items[i].title, &out);
+    if (items[i].kind == AppGridItemKind::Folder) {
+      out += ",\"children_count\":" + std::to_string (items[i].children.size ());
+    }
+    out.push_back ('}');
+  }
+  out += "]}";
+  return out;
+}
+
 void
 app_index_refresh_async (void (*on_ready) (void *), void *user_data)
 {
+  app_index_start_watch ();
   bool expected = false;
   if (!g_refresh_running.compare_exchange_strong (expected, true)) {
     if (on_ready != nullptr) {
@@ -720,9 +2069,12 @@ app_index_refresh_async (void (*on_ready) (void *), void *user_data)
 
   std::thread ([on_ready, user_data] () {
     std::vector<AppEntry> fresh = scan_start_menu_sync ();
+    std::vector<StartMenuPinnedItem> fresh_pinned =
+        load_windows_start_menu_pinned ();
     {
       std::lock_guard<std::mutex> lock (g_index_mu);
       g_entries = std::move (fresh);
+      g_pinned_layout = std::move (fresh_pinned);
       g_index_populated = true;
       g_index_revision.fetch_add (1, std::memory_order_release);
     }
@@ -743,15 +2095,31 @@ app_index_get_all (void)
       return g_entries;
   }
   std::vector<AppEntry> fresh = scan_start_menu_sync ();
+  std::vector<StartMenuPinnedItem> fresh_pinned =
+      load_windows_start_menu_pinned ();
   {
     std::lock_guard<std::mutex> lock (g_index_mu);
     if (!g_index_populated) {
-      g_entries = fresh;
+      g_entries = std::move (fresh);
+      g_pinned_layout = std::move (fresh_pinned);
       g_index_populated = true;
       g_index_revision.fetch_add (1, std::memory_order_release);
     }
     return g_entries;
   }
+}
+
+std::vector<StartMenuPinnedItem>
+app_index_get_pinned_layout ()
+{
+  {
+    std::lock_guard<std::mutex> lock (g_index_mu);
+    if (g_index_populated)
+      return g_pinned_layout;
+  }
+  app_index_get_all ();
+  std::lock_guard<std::mutex> lock (g_index_mu);
+  return g_pinned_layout;
 }
 
 uint64_t
@@ -833,6 +2201,30 @@ toggle_app_id_pinned (const std::string &id_or_aumid)
   return now_pinned;
 }
 
+namespace {
+
+void
+shell_execute_async (std::wstring verb, std::wstring file, std::wstring params)
+{
+  std::thread ([v = std::move (verb), f = std::move (file),
+                p = std::move (params)] () {
+    HRESULT hr = CoInitializeEx (
+        nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    SHELLEXECUTEINFOW sei {};
+    sei.cbSize = sizeof (sei);
+    sei.fMask = SEE_MASK_FLAG_NO_UI;
+    sei.lpVerb = v.empty () ? L"open" : v.c_str ();
+    sei.lpFile = f.c_str ();
+    sei.lpParameters = p.empty () ? nullptr : p.c_str ();
+    sei.nShow = SW_SHOWNORMAL;
+    ShellExecuteExW (&sei);
+    if (SUCCEEDED (hr))
+      CoUninitialize ();
+  }).detach ();
+}
+
+}  // namespace
+
 bool
 app_index_launch (const AppEntry &entry, bool as_admin)
 {
@@ -840,10 +2232,8 @@ app_index_launch (const AppEntry &entry, bool as_admin)
       !entry.launch_path.empty () ? entry.launch_path : entry.target_exe;
   if (target.empty ())
     return false;
-  const wchar_t *verb = as_admin ? L"runas" : L"open";
-  HINSTANCE res = ShellExecuteW (nullptr, verb, target.c_str (), nullptr,
-                                 nullptr, SW_SHOWNORMAL);
-  return reinterpret_cast<INT_PTR> (res) > 32;
+  shell_execute_async (as_admin ? L"runas" : L"open", target, L"");
+  return true;
 }
 
 bool
@@ -857,16 +2247,12 @@ app_index_launch_id (const std::string &id_or_aumid, bool as_admin)
   if (wide.empty ())
     return false;
   if (GetFileAttributesW (wide.c_str ()) != INVALID_FILE_ATTRIBUTES) {
-    const wchar_t *verb = as_admin ? L"runas" : L"open";
-    HINSTANCE res = ShellExecuteW (nullptr, verb, wide.c_str (), nullptr,
-                                   nullptr, SW_SHOWNORMAL);
-    return reinterpret_cast<INT_PTR> (res) > 32;
+    shell_execute_async (as_admin ? L"runas" : L"open", wide, L"");
+    return true;
   }
   if (id_or_aumid.find ('!') != std::string::npos) {
-    std::wstring uri = L"shell:AppsFolder\\" + wide;
-    HINSTANCE res = ShellExecuteW (nullptr, L"open", uri.c_str (), nullptr,
-                                   nullptr, SW_SHOWNORMAL);
-    return reinterpret_cast<INT_PTR> (res) > 32;
+    shell_execute_async (L"open", L"shell:AppsFolder\\" + wide, L"");
+    return true;
   }
   return false;
 }
@@ -878,10 +2264,8 @@ app_index_open_location (const AppEntry &entry)
       !entry.target_exe.empty () ? entry.target_exe : entry.launch_path;
   if (target.empty () || target.rfind (L"shell:", 0) == 0)
     return false;
-  std::wstring arg = L"/select,\"" + target + L"\"";
-  HINSTANCE res = ShellExecuteW (nullptr, L"open", L"explorer.exe", arg.c_str (),
-                                 nullptr, SW_SHOWNORMAL);
-  return reinterpret_cast<INT_PTR> (res) > 32;
+  shell_execute_async (L"open", L"explorer.exe", L"/select,\"" + target + L"\"");
+  return true;
 }
 
 bool
@@ -1231,6 +2615,10 @@ collect_running_window_cb (HWND hwnd, LPARAM lparam)
   auto *out = reinterpret_cast<std::vector<RunningWindow> *> (lparam);
   if (!is_running_alt_tab_window (hwnd))
     return TRUE;
+  if (is_overview_default_blacklisted_hwnd (
+          hwnd, winome::get_config ().overview_window_blacklist)) {
+    return TRUE;
+  }
 
   std::wstring aumid = running_window_aumid (hwnd);
   std::wstring exe = running_window_exe (hwnd);

@@ -372,4 +372,24 @@ ws_osd_init ()
   vd::add_change_listener (on_ws_osd_desktop_changed, nullptr);
 }
 
+void
+ws_osd_shutdown ()
+{
+  vd::remove_change_listener (on_ws_osd_desktop_changed, nullptr);
+  if (g_timeout_id != 0) {
+    g_source_remove (g_timeout_id);
+    g_timeout_id = 0;
+  }
+  if (g_fade_source != 0 && g_window != nullptr) {
+    gtk_widget_remove_tick_callback (g_window, g_fade_source);
+    g_fade_source = 0;
+  }
+  if (g_window != nullptr) {
+    gtk_window_destroy (GTK_WINDOW (g_window));
+    g_window = nullptr;
+    g_area = nullptr;
+    g_hwnd = nullptr;
+  }
+}
+
 }  // namespace winome

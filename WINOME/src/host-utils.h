@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <windows.h>
+
 #include <string>
 
 namespace winome {
@@ -24,5 +26,15 @@ std::wstring app_data_dir();
 // path to app_data_dir() for libraries like fontconfig/FreeType that fail
 // on non-ASCII paths on Windows.
 std::string app_data_dir_ascii();
+
+// Pure & HWND helpers for the Overview default blacklist (filters system ghost
+// surfaces like "Windows Input Experience" / TextInputHost and nameless blank
+// explorer.exe windows when enabled in settings).
+bool is_overview_default_blacklisted_window_info(
+    const std::string& class_name_utf8,
+    const std::string& proc_name_utf8,
+    const std::string& title_utf8,
+    bool cloaked);
+bool is_overview_default_blacklisted_hwnd(HWND hwnd, bool enabled);
 
 }  // namespace winome

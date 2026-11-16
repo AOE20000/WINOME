@@ -57,12 +57,14 @@ ok()   { printf ' [OK] %s\n' "$*"; }
 fail() { printf ' [FAIL] %s\n' "$*" >&2; exit 1; }
 
 EXE_SRC="$PROJ/build-release/src/winome.exe"
+CTL_SRC="$PROJ/build-release/ctl/winome-ctl.exe"
 if [ "$NO_BUILD" -eq 0 ]; then
   info "Building release binary via build.sh..."
   "$ROOT/build.sh" release
 fi
 
 [ -f "$EXE_SRC" ] || fail "Release binary not found: $EXE_SRC (run ./build.sh release first)"
+[ -f "$CTL_SRC" ] || fail "Release CLI binary not found: $CTL_SRC (run ./build.sh release first)"
 
 UCRT_PREFIX="/ucrt64"
 [ -d "$UCRT_PREFIX/bin" ] || fail "MSYS2 UCRT64 toolchain directory not found: $UCRT_PREFIX"
@@ -75,8 +77,9 @@ info "Staging bundle in $BUNDLE_DIR..."
 rm -rf "$BUNDLE_DIR"
 mkdir -p "$BUNDLE_DIR"
 
-# 1. Main executable and GLib/GTK Windows helper binaries
+# 1. Main executable, winome-ctl.exe, and GLib/GTK Windows helper binaries
 cp -f "$EXE_SRC" "$BUNDLE_DIR/winome.exe"
+cp -f "$CTL_SRC" "$BUNDLE_DIR/winome-ctl.exe"
 for helper in gdbus.exe gspawn-win64-helper.exe gspawn-win64-helper-console.exe; do
   if [ -f "$UCRT_PREFIX/bin/$helper" ]; then
     cp -f "$UCRT_PREFIX/bin/$helper" "$BUNDLE_DIR/$helper"
@@ -192,9 +195,13 @@ if [ -d "$UCRT_PREFIX/etc/fonts" ]; then
   cp -r "$UCRT_PREFIX/etc/fonts" "$BUNDLE_DIR/etc/"
 fi
 
-# 7. License notices (GPL-2.0 binary distribution compliance)
+# 7. License notices & sample out-of-process stdio JSON plugin
 [ -f "$ROOT/LICENSE" ] && cp -f "$ROOT/LICENSE" "$BUNDLE_DIR/LICENSE"
 [ -f "$PROJ/THIRD-PARTY-NOTICES" ] && cp -f "$PROJ/THIRD-PARTY-NOTICES" "$BUNDLE_DIR/THIRD-PARTY-NOTICES"
+if [ -d "$PROJ/examples/plugins" ]; then
+  mkdir -p "$BUNDLE_DIR/examples"
+  cp -r "$PROJ/examples/plugins" "$BUNDLE_DIR/examples/"
+fi
 
 # 8. Helper scripts and portable usage note (CRLF line endings for cmd.exe/Notepad)
 printf '@echo off\r\n"%%~dp0winome.exe" --restore\r\n' > "$BUNDLE_DIR/restore-taskbar.bat"
@@ -213,13 +220,16 @@ text = (
     "3. Double-click open-settings.bat (or run 'winome.exe --settings') to configure WINOME.\r\n\r\n"
     "Recovery / CLI Commands:\r\n"
     "- restore-taskbar.bat        : Restore the native taskbar & work area (winome.exe --restore)\r\n"
+    "- winome.exe --safe-mode     : Start without window theming overrides or external plugins\r\n"
+    "- winome-ctl.exe status      : Un-elevated runtime control CLI (desktops, logs, plugins, themes)\r\n"
     "- winome.exe --show-overview : Toggle/show Activities Overview on the running instance\r\n"
     "- winome.exe --reload        : Reload config.json on the running instance\r\n"
     "- winome.exe --quit          : Gracefully exit WINOME and restore the taskbar\r\n\r\n"
-    "Logs & Config:\r\n"
-    "- Config: %LOCALAPPDATA%\\WINOME\\config.json\r\n"
-    "- Logs  : %LOCALAPPDATA%\\WINOME\\winome.log\r\n"
-    "- Dumps : %LOCALAPPDATA%\\WINOME\\crashes\\\r\n"
+    "Logs, Config & Plugins:\r\n"
+    "- Config : %LOCALAPPDATA%\\WINOME\\config.json\r\n"
+    "- Logs   : %LOCALAPPDATA%\\WINOME\\winome.log\r\n"
+    "- Plugins: %LOCALAPPDATA%\\WINOME\\plugins\\<id>\\manifest.json (sample in examples\\plugins)\r\n"
+    "- Dumps  : %LOCALAPPDATA%\\WINOME\\crashes\\\r\n"
 )
 pathlib.Path(sys.argv[1]).write_bytes(text.encode("utf-8"))
 PYEOF
@@ -227,6 +237,7 @@ PYEOF
 # 9. Verify critical bundle files before archiving
 for req in \
   "$BUNDLE_DIR/winome.exe" \
+  "$BUNDLE_DIR/winome-ctl.exe" \
   "$BUNDLE_DIR/libgtk-4-1.dll" \
   "$BUNDLE_DIR/libglib-2.0-0.dll" \
   "$BUNDLE_DIR/$PIXBUF_REL/loaders.cache" \

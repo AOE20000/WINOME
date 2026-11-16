@@ -68,6 +68,13 @@ bool switch_to (int index);
 // instead of sliding away with its owning desktop. FALSE when the pin
 // services are unreachable (older builds, explorer-side failure).
 bool pin_window (HWND hwnd);
+void pin_window_async (HWND hwnd);
+
+// Reset the transient stuck-COM breaker flag when Explorer recovers.
+void reset_circuit_breaker (void);
+
+// Stop background observer thread cleanly during shell shutdown.
+void shutdown (void);
 
 // Unpin @hwnd from all virtual desktops; FALSE on failure.
 bool unpin_window (HWND hwnd);

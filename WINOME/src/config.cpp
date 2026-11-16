@@ -8,6 +8,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <string>
@@ -25,6 +26,7 @@ struct ListenerEntry {
 WinomeConfig g_config;
 bool g_loaded = false;
 std::vector<ListenerEntry> g_listeners;
+std::atomic<bool> g_safe_mode{false};
 
 std::wstring config_file_path() {
   wchar_t override_dir[MAX_PATH] = {};
@@ -355,6 +357,8 @@ std::string serialize_config(const WinomeConfig& cfg) {
   out += std::to_string(cfg.hot_corner_cooldown_ms);
   out += ",\n  \"win_key_overview\": ";
   out += cfg.win_key_overview ? "true" : "false";
+  out += ",\n  \"overview_window_blacklist\": ";
+  out += cfg.overview_window_blacklist ? "true" : "false";
   out += ",\n  \"multi_monitor_panels\": ";
   out += cfg.multi_monitor_panels ? "true" : "false";
   out += ",\n  \"end_session_confirm\": ";
@@ -363,11 +367,19 @@ std::string serialize_config(const WinomeConfig& cfg) {
   out += cfg.unify_dark_titlebars ? "true" : "false";
   out += ",\n  \"unify_rounded_corners\": ";
   out += cfg.unify_rounded_corners ? "true" : "false";
+  out += ",\n  \"developer_mode\": ";
+  out += cfg.developer_mode ? "true" : "false";
   out += ",\n  \"pinned_apps\": [";
   for (size_t i = 0; i < cfg.pinned_apps.size(); ++i) {
     if (i > 0)
       out += ", ";
     append_escaped_json_string(cfg.pinned_apps[i], &out);
+  }
+  out += "],\n  \"disabled_plugins\": [";
+  for (size_t i = 0; i < cfg.disabled_plugins.size(); ++i) {
+    if (i > 0)
+      out += ", ";
+    append_escaped_json_string(cfg.disabled_plugins[i], &out);
   }
   out += "]\n}\n";
   return out;
@@ -413,6 +425,8 @@ bool parse_config(const std::string& json, WinomeConfig* out) {
       ok = parse_json_int(json, &pos, &cfg.hot_corner_cooldown_ms);
     else if (key == "win_key_overview")
       ok = parse_json_bool(json, &pos, &cfg.win_key_overview);
+    else if (key == "overview_window_blacklist")
+      ok = parse_json_bool(json, &pos, &cfg.overview_window_blacklist);
     else if (key == "multi_monitor_panels")
       ok = parse_json_bool(json, &pos, &cfg.multi_monitor_panels);
     else if (key == "end_session_confirm")
@@ -421,8 +435,12 @@ bool parse_config(const std::string& json, WinomeConfig* out) {
       ok = parse_json_bool(json, &pos, &cfg.unify_dark_titlebars);
     else if (key == "unify_rounded_corners")
       ok = parse_json_bool(json, &pos, &cfg.unify_rounded_corners);
+    else if (key == "developer_mode")
+      ok = parse_json_bool(json, &pos, &cfg.developer_mode);
     else if (key == "pinned_apps")
       ok = parse_json_string_array(json, &pos, &cfg.pinned_apps);
+    else if (key == "disabled_plugins")
+      ok = parse_json_string_array(json, &pos, &cfg.disabled_plugins);
     else
       ok = skip_json_value(json, &pos);
 
@@ -488,6 +506,14 @@ void remove_config_listener(ConfigListener listener, void* user_data) {
                        return e.fn == listener && e.user_data == user_data;
                      }),
       g_listeners.end());
+}
+
+bool is_safe_mode() {
+  return g_safe_mode.load(std::memory_order_acquire);
+}
+
+void set_safe_mode(bool safe) {
+  g_safe_mode.store(safe, std::memory_order_release);
 }
 
 }  // namespace winome

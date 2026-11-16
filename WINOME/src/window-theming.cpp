@@ -204,21 +204,24 @@ bool should_apply_dwm_theming_to_hwnd_info(const wchar_t* class_name,
 
 void window_theming_sync_all() {
   const WinomeConfig& cfg = get_config();
+  const bool allow_theming = !is_safe_mode();
+  const bool want_dark = allow_theming && cfg.unify_dark_titlebars;
+  const bool want_corners = allow_theming && cfg.unify_rounded_corners;
   bool reset_dark = false;
   bool reset_corners = false;
   {
     std::lock_guard<std::mutex> lock(g_theming.mu);
     g_theming.prev_dark_enabled = g_theming.dark_enabled;
     g_theming.prev_corners_enabled = g_theming.corners_enabled;
-    g_theming.dark_enabled = cfg.unify_dark_titlebars;
-    g_theming.corners_enabled = cfg.unify_rounded_corners;
+    g_theming.dark_enabled = want_dark;
+    g_theming.corners_enabled = want_corners;
     reset_dark = !g_theming.dark_enabled && g_theming.prev_dark_enabled;
     reset_corners = !g_theming.corners_enabled && g_theming.prev_corners_enabled;
   }
 
   ensure_hooks_for_state();
 
-  if (cfg.unify_dark_titlebars || cfg.unify_rounded_corners) {
+  if (want_dark || want_corners) {
     EnumWindows(enum_apply_proc, 0);
   } else if (reset_dark || reset_corners) {
     std::set<HWND> snapshot;

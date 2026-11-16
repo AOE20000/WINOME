@@ -257,8 +257,11 @@ bundled_font_map (void)
   }
 
   map = pango_cairo_font_map_new_for_font_type (CAIRO_FONT_TYPE_FT);
-  if (PANGO_IS_FC_FONT_MAP (map))
-    pango_fc_font_map_set_config (PANGO_FC_FONT_MAP (map), config);
+  if (map != NULL) {
+    if (PANGO_IS_FC_FONT_MAP (map))
+      pango_fc_font_map_set_config (PANGO_FC_FONT_MAP (map), config);
+    pango_cairo_font_map_set_default (PANGO_CAIRO_FONT_MAP (map));
+  }
 
   const int family_entries = count_config_families (config);
   if (owns_config)

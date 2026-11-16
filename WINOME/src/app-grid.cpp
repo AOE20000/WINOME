@@ -4,6 +4,7 @@
 #include "app-grid.h"
 #include "app-index.h"
 #include "config.h"
+#include "fonts.h"
 #include "i18n.h"
 #include "st-engine.h"
 
@@ -181,6 +182,8 @@ struct AppGridAsyncState {
 struct WinomeAppGrid {
   GtkBox parent_instance;
 
+  GtkWidget *root_overlay = nullptr;
+  GtkWidget *content_box = nullptr;
   GtkWidget *body_row = nullptr;
   GtkWidget *prev_btn = nullptr;
   GtkWidget *next_btn = nullptr;
@@ -190,10 +193,13 @@ struct WinomeAppGrid {
   GtkWidget *indicators_box = nullptr;
   GtkWidget *active_menu = nullptr;
   GtkWidget *menu_tile = nullptr;
+  GtkWidget *folder_backdrop = nullptr;
+  GtkWidget *folder_dialog_grid = nullptr;
 
   std::string query_lower;
   std::vector<AppEntry> all_apps;
-  std::vector<AppEntry> filtered;
+  std::vector<StartMenuPinnedItem> pinned_layout;
+  std::vector<AppGridItem> filtered;
   std::vector<RunningWindow> running_windows;
   std::vector<GtkWidget *> page_dots;
   AppGridAsyncState *async = nullptr;
@@ -225,8 +231,14 @@ struct TileActionCtx {
   AppEntry entry;
 };
 
+struct FolderTileCtx {
+  WinomeAppGrid *self = nullptr;
+  AppGridItem item;
+};
+
 void rebuild_all_pages (WinomeAppGrid *self);
 void update_running_dots_in_place (WinomeAppGrid *self);
+bool close_folder_dialog (WinomeAppGrid *self);
 
 void
 clear_box_children (GtkWidget *box)
@@ -404,6 +416,7 @@ show_tile_context_menu (GtkWidget *tile, WinomeAppGrid *self,
   app_grid_close_menu (GTK_WIDGET (self));
 
   GtkWidget *popover = gtk_popover_new ();
+  install_bundled_fonts (popover);
   gtk_widget_add_css_class (popover, "winome-context-popover");
   gtk_widget_set_parent (popover, tile);
   gtk_popover_set_has_arrow (GTK_POPOVER (popover), TRUE);
@@ -528,9 +541,10 @@ on_tile_clicked (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 {
   auto *ctx = static_cast<TileActionCtx *> (user_data);
   bool ctrl = (GetKeyState (VK_CONTROL) & 0x8000) != 0;
-  if (activate_or_launch_entry (ctx->entry, ctrl) &&
-      ctx->self->on_launch_done != nullptr) {
-    ctx->self->on_launch_done (ctx->self->user_data);
+  if (activate_or_launch_entry (ctx->entry, ctrl)) {
+    close_folder_dialog (ctx->self);
+    if (ctx->self->on_launch_done != nullptr)
+      ctx->self->on_launch_done (ctx->self->user_data);
   }
 }
 
@@ -540,9 +554,10 @@ on_tile_middle_click (GtkGestureClick *gesture G_GNUC_UNUSED,
                       double y G_GNUC_UNUSED, gpointer user_data)
 {
   auto *ctx = static_cast<TileActionCtx *> (user_data);
-  if (app_index_launch (ctx->entry, false) &&
-      ctx->self->on_launch_done != nullptr) {
-    ctx->self->on_launch_done (ctx->self->user_data);
+  if (app_index_launch (ctx->entry, false)) {
+    close_folder_dialog (ctx->self);
+    if (ctx->self->on_launch_done != nullptr)
+      ctx->self->on_launch_done (ctx->self->user_data);
   }
 }
 
@@ -923,6 +938,274 @@ build_app_tile (WinomeAppGrid *self, const AppEntry &entry, int icon_size,
   return btn;
 }
 
+bool
+close_folder_dialog (WinomeAppGrid *self)
+{
+  if (self == nullptr || self->folder_backdrop == nullptr)
+    return false;
+  app_grid_close_menu (GTK_WIDGET (self));
+  if (self->root_overlay != nullptr)
+    gtk_overlay_remove_overlay (GTK_OVERLAY (self->root_overlay),
+                                self->folder_backdrop);
+  self->folder_backdrop = nullptr;
+  self->folder_dialog_grid = nullptr;
+  return true;
+}
+
+void
+on_folder_backdrop_pressed (GtkGestureClick *gesture G_GNUC_UNUSED,
+                            int n_press G_GNUC_UNUSED, double x, double y,
+                            gpointer user_data)
+{
+  auto *self = WINOME_APP_GRID (user_data);
+  if (self->folder_backdrop == nullptr)
+    return;
+  GtkWidget *dialog = GTK_WIDGET (
+      g_object_get_data (G_OBJECT (self->folder_backdrop),
+                         "winome-folder-card"));
+  if (dialog != nullptr) {
+    graphene_rect_t bounds{};
+    if (gtk_widget_compute_bounds (dialog, self->folder_backdrop, &bounds) &&
+        x >= bounds.origin.x &&
+        x <= bounds.origin.x + bounds.size.width &&
+        y >= bounds.origin.y &&
+        y <= bounds.origin.y + bounds.size.height) {
+      return;
+    }
+  }
+  close_folder_dialog (self);
+}
+
+void
+open_folder_dialog (WinomeAppGrid *self, const AppGridItem &folder)
+{
+  if (self == nullptr || self->root_overlay == nullptr)
+    return;
+  close_folder_dialog (self);
+
+  GtkWidget *backdrop = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_set_name (backdrop, "winome-folder-scrim");
+  gtk_widget_set_hexpand (backdrop, TRUE);
+  gtk_widget_set_vexpand (backdrop, TRUE);
+  gtk_widget_set_halign (backdrop, GTK_ALIGN_FILL);
+  gtk_widget_set_valign (backdrop, GTK_ALIGN_FILL);
+
+  GtkGesture *outside_click = gtk_gesture_click_new ();
+  g_signal_connect (outside_click, "pressed",
+                    G_CALLBACK (on_folder_backdrop_pressed), self);
+  gtk_widget_add_controller (backdrop, GTK_EVENT_CONTROLLER (outside_click));
+
+  int dlg_w = std::clamp (self->avail_w - 80, 360, 680);
+  int dlg_h = std::clamp (self->avail_h - 12, 260, 560);
+
+  GtkWidget *card = gtk_box_new (GTK_ORIENTATION_VERTICAL, 12);
+  gtk_widget_add_css_class (card, "app-folder-dialog");
+  gtk_widget_set_size_request (card, dlg_w, dlg_h);
+  gtk_widget_set_halign (card, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (card, GTK_ALIGN_CENTER);
+  g_object_set_data (G_OBJECT (backdrop), "winome-folder-card", card);
+
+  GtkWidget *header = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_add_css_class (header, "folder-name-container");
+
+  GtkWidget *spacer = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_widget_set_size_request (spacer, 32, 32);
+  gtk_box_append (GTK_BOX (header), spacer);
+
+  GtkWidget *title_lbl = gtk_label_new (folder.title.c_str ());
+  gtk_widget_add_css_class (title_lbl, "folder-name-label");
+  gtk_widget_set_hexpand (title_lbl, TRUE);
+  gtk_widget_set_halign (title_lbl, GTK_ALIGN_CENTER);
+  gtk_label_set_ellipsize (GTK_LABEL (title_lbl), PANGO_ELLIPSIZE_END);
+  PangoAttrList *attrs = pango_attr_list_new ();
+  pango_attr_list_insert (attrs, pango_attr_weight_new (PANGO_WEIGHT_BOLD));
+  pango_attr_list_insert (attrs, pango_attr_scale_new (1.35));
+  gtk_label_set_attributes (GTK_LABEL (title_lbl), attrs);
+  pango_attr_list_unref (attrs);
+  gtk_box_append (GTK_BOX (header), title_lbl);
+
+  GtkWidget *close_btn = gtk_button_new_from_icon_name ("window-close-symbolic");
+  gtk_widget_add_css_class (close_btn, "icon-button");
+  gtk_widget_set_focus_on_click (close_btn, FALSE);
+  g_signal_connect (
+      close_btn, "clicked",
+      G_CALLBACK (+[] (GtkButton *b G_GNUC_UNUSED, gpointer d) {
+        close_folder_dialog (WINOME_APP_GRID (d));
+      }),
+      self);
+  gtk_box_append (GTK_BOX (header), close_btn);
+  gtk_box_append (GTK_BOX (card), header);
+
+  GtkWidget *scroll = gtk_scrolled_window_new ();
+  gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (scroll),
+                                  GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+  gtk_widget_set_vexpand (scroll, TRUE);
+  gtk_widget_set_hexpand (scroll, TRUE);
+  gtk_widget_set_margin_start (scroll, 24);
+  gtk_widget_set_margin_end (scroll, 24);
+  gtk_widget_set_margin_bottom (scroll, 24);
+
+  GtkWidget *grid = gtk_grid_new ();
+  gtk_widget_add_css_class (grid, "icon-grid");
+  gtk_grid_set_column_spacing (GTK_GRID (grid), 12);
+  gtk_grid_set_row_spacing (GTK_GRID (grid), 12);
+  gtk_grid_set_column_homogeneous (GTK_GRID (grid), TRUE);
+  gtk_widget_set_halign (grid, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (grid, GTK_ALIGN_START);
+
+  int scale = std::max (gtk_widget_get_scale_factor (GTK_WIDGET (self)), 1);
+  int icon_size = std::clamp ((dlg_w - 140) / 5, 48, 64);
+  int load_px = std::clamp (icon_size * std::max (scale, 2), 96, 256);
+  int tile_w = std::clamp ((dlg_w - 96) / 4, 108, 148);
+  int tile_h = icon_size + 68;
+  int label_spacing = lookup_icon_label_spacing ();
+  int cols = std::max (2, (dlg_w - 64) / (tile_w + 12));
+
+  self->running_windows = app_index_enumerate_running_windows ();
+  int idx = 0;
+  for (const AppEntry &child : folder.children) {
+    int r = idx / cols;
+    int c = idx % cols;
+    bool running =
+        !match_entry_running_windows (child, self->running_windows).empty ();
+    GtkWidget *tile = build_app_tile (self, child, icon_size, load_px,
+                                      self->page, tile_w, tile_h, label_spacing,
+                                      running);
+    gtk_grid_attach (GTK_GRID (grid), tile, c, r, 1, 1);
+    ++idx;
+  }
+
+  gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scroll), grid);
+  gtk_box_append (GTK_BOX (card), scroll);
+  gtk_box_append (GTK_BOX (backdrop), card);
+
+  self->folder_backdrop = backdrop;
+  self->folder_dialog_grid = grid;
+  gtk_overlay_add_overlay (GTK_OVERLAY (self->root_overlay), backdrop);
+  maybe_start_icon_worker (self);
+}
+
+void
+on_folder_tile_clicked (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
+{
+  auto *fctx = static_cast<FolderTileCtx *> (user_data);
+  open_folder_dialog (fctx->self, fctx->item);
+}
+
+GtkWidget *
+build_folder_tile (WinomeAppGrid *self, const AppGridItem &folder,
+                   int icon_size, int load_px, int page_idx, int tile_w,
+                   int tile_h, int label_spacing, bool any_running)
+{
+  GtkWidget *btn = gtk_button_new ();
+  gtk_widget_set_name (btn, "winome-app-folder-tile");
+  gtk_widget_add_css_class (btn, "overview-tile");
+  gtk_widget_add_css_class (btn, "app-folder");
+  gtk_widget_set_size_request (btn, tile_w, tile_h);
+  gtk_widget_set_halign (btn, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (btn, GTK_ALIGN_CENTER);
+  gtk_widget_set_tooltip_text (btn, folder.title.c_str ());
+
+  GtkWidget *overlay = gtk_overlay_new ();
+
+  GtkWidget *content =
+      gtk_box_new (GTK_ORIENTATION_VERTICAL, label_spacing);
+  gtk_widget_add_css_class (content, "overview-icon");
+  gtk_widget_add_css_class (content, "overview-icon-with-label");
+  gtk_widget_set_halign (content, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (content, GTK_ALIGN_CENTER);
+  gtk_widget_set_margin_bottom (content, 6);
+
+  GtkWidget *preview_frame = gtk_grid_new ();
+  gtk_grid_set_column_spacing (GTK_GRID (preview_frame), 4);
+  gtk_grid_set_row_spacing (GTK_GRID (preview_frame), 4);
+  gtk_grid_set_column_homogeneous (GTK_GRID (preview_frame), TRUE);
+  gtk_grid_set_row_homogeneous (GTK_GRID (preview_frame), TRUE);
+  gtk_widget_set_size_request (preview_frame, icon_size, icon_size);
+  gtk_widget_set_halign (preview_frame, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (preview_frame, GTK_ALIGN_CENTER);
+
+  int mini_px = std::max ((icon_size - 8) / 2, 16);
+  size_t limit = std::min<size_t> (folder.children.size (), 4);
+  for (size_t i = 0; i < limit; ++i) {
+    const AppEntry &child = folder.children[i];
+    GtkWidget *mini = winome_app_icon_new (mini_px);
+    if (GdkTexture *tex = app_icon_cache_lookup (child.id, load_px)) {
+      winome_app_icon_set_texture (mini, tex);
+      g_object_unref (tex);
+    } else if (self->async != nullptr) {
+      self->async->pending_jobs.push_back (PendingIconJob{child, page_idx});
+      self->async->icon_targets[child.id].push_back (mini);
+    }
+    gtk_widget_set_halign (mini, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign (mini, GTK_ALIGN_CENTER);
+    gtk_grid_attach (GTK_GRID (preview_frame), mini,
+                     static_cast<int> (i % 2), static_cast<int> (i / 2), 1, 1);
+  }
+  gtk_box_append (GTK_BOX (content), preview_frame);
+
+  GtkWidget *lbl = gtk_label_new (folder.title.c_str ());
+  gtk_label_set_lines (GTK_LABEL (lbl), 2);
+  gtk_label_set_wrap (GTK_LABEL (lbl), TRUE);
+  gtk_label_set_wrap_mode (GTK_LABEL (lbl), PANGO_WRAP_WORD_CHAR);
+  gtk_label_set_ellipsize (GTK_LABEL (lbl), PANGO_ELLIPSIZE_END);
+  gtk_label_set_justify (GTK_LABEL (lbl), GTK_JUSTIFY_CENTER);
+  gtk_label_set_max_width_chars (GTK_LABEL (lbl), 14);
+  gtk_widget_set_halign (lbl, GTK_ALIGN_CENTER);
+  gtk_box_append (GTK_BOX (content), lbl);
+
+  gtk_overlay_set_child (GTK_OVERLAY (overlay), content);
+
+  GtkWidget *dot = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_widget_add_css_class (dot, "app-grid-running-dot");
+  gtk_widget_set_halign (dot, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (dot, GTK_ALIGN_END);
+  gtk_widget_set_visible (dot, any_running);
+  gtk_overlay_add_overlay (GTK_OVERLAY (overlay), dot);
+
+  gtk_button_set_child (GTK_BUTTON (btn), overlay);
+
+  auto *fctx = new FolderTileCtx{self, folder};
+  g_object_set_data_full (
+      G_OBJECT (btn), "winome-folder-action", fctx,
+      [] (gpointer p) { delete static_cast<FolderTileCtx *> (p); });
+  g_object_set_data (G_OBJECT (btn), "winome-running-dot", dot);
+  g_signal_connect (btn, "clicked", G_CALLBACK (on_folder_tile_clicked), fctx);
+
+  return btn;
+}
+
+void
+update_tile_dots_in_grid (GtkWidget *grid,
+                          const std::vector<RunningWindow> &running_windows)
+{
+  if (grid == nullptr)
+    return;
+  for (GtkWidget *tile = gtk_widget_get_first_child (grid); tile != nullptr;
+       tile = gtk_widget_get_next_sibling (tile)) {
+    auto *dot = GTK_WIDGET (
+        g_object_get_data (G_OBJECT (tile), "winome-running-dot"));
+    if (dot == nullptr)
+      continue;
+    if (auto *ctx = static_cast<TileActionCtx *> (
+            g_object_get_data (G_OBJECT (tile), "winome-tile-action"))) {
+      bool running = !match_entry_running_windows (ctx->entry, running_windows)
+                          .empty ();
+      gtk_widget_set_visible (dot, running);
+    } else if (auto *fctx = static_cast<FolderTileCtx *> (
+                   g_object_get_data (G_OBJECT (tile), "winome-folder-action"))) {
+      bool any_running = false;
+      for (const AppEntry &child : fctx->item.children) {
+        if (!match_entry_running_windows (child, running_windows).empty ()) {
+          any_running = true;
+          break;
+        }
+      }
+      gtk_widget_set_visible (dot, any_running);
+    }
+  }
+}
+
 void
 update_running_dots_in_place (WinomeAppGrid *self)
 {
@@ -931,20 +1214,9 @@ update_running_dots_in_place (WinomeAppGrid *self)
   self->running_windows = app_index_enumerate_running_windows ();
   for (GtkWidget *page_w = gtk_widget_get_first_child (self->pages_stack);
        page_w != nullptr; page_w = gtk_widget_get_next_sibling (page_w)) {
-    for (GtkWidget *tile = gtk_widget_get_first_child (page_w); tile != nullptr;
-         tile = gtk_widget_get_next_sibling (tile)) {
-      auto *ctx = static_cast<TileActionCtx *> (
-          g_object_get_data (G_OBJECT (tile), "winome-tile-action"));
-      auto *dot = GTK_WIDGET (
-          g_object_get_data (G_OBJECT (tile), "winome-running-dot"));
-      if (ctx != nullptr && dot != nullptr) {
-        bool running = !match_entry_running_windows (
-                            ctx->entry, self->running_windows)
-                            .empty ();
-        gtk_widget_set_visible (dot, running);
-      }
-    }
+    update_tile_dots_in_grid (page_w, self->running_windows);
   }
+  update_tile_dots_in_grid (self->folder_dialog_grid, self->running_windows);
 }
 
 void
@@ -1032,13 +1304,26 @@ rebuild_all_pages (WinomeAppGrid *self)
       for (int i = slice.begin; i < slice.end; ++i) {
         int r = idx / dim.cols;
         int c = idx % dim.cols;
-        bool running =
-            !match_entry_running_windows (self->filtered[i],
-                                          self->running_windows)
-                 .empty ();
-        GtkWidget *tile = build_app_tile (self, self->filtered[i],
-                                          dim.icon_size, load_px, p, tile_w,
-                                          tile_h, label_spacing, running);
+        const AppGridItem &item = self->filtered[i];
+        GtkWidget *tile = nullptr;
+        if (item.kind == AppGridItemKind::Folder) {
+          bool any_running = false;
+          for (const AppEntry &child : item.children) {
+            if (!match_entry_running_windows (child, self->running_windows)
+                     .empty ()) {
+              any_running = true;
+              break;
+            }
+          }
+          tile = build_folder_tile (self, item, dim.icon_size, load_px, p,
+                                    tile_w, tile_h, label_spacing, any_running);
+        } else {
+          bool running =
+              !match_entry_running_windows (item.app, self->running_windows)
+                   .empty ();
+          tile = build_app_tile (self, item.app, dim.icon_size, load_px, p,
+                                 tile_w, tile_h, label_spacing, running);
+        }
         gtk_grid_attach (GTK_GRID (page_grid), tile, c, r, 1, 1);
         ++idx;
       }
@@ -1113,6 +1398,7 @@ winome_app_grid_dispose (GObject *object)
     self->refresh_timer = 0;
   }
   app_grid_close_menu (GTK_WIDGET (self));
+  close_folder_dialog (self);
   clear_menu_tile_highlight (self);
   self->page_dots.clear ();
   G_OBJECT_CLASS (winome_app_grid_parent_class)->dispose (object);
@@ -1124,13 +1410,16 @@ winome_app_grid_finalize (GObject *object)
   WinomeAppGrid *self = WINOME_APP_GRID (object);
   using StringT = std::string;
   using AppVecT = std::vector<AppEntry>;
+  using PinnedVecT = std::vector<StartMenuPinnedItem>;
+  using GridItemVecT = std::vector<AppGridItem>;
   using RunVecT = std::vector<RunningWindow>;
   using DotVecT = std::vector<GtkWidget *>;
   delete self->async;
   self->async = nullptr;
   self->page_dots.~DotVecT ();
   self->running_windows.~RunVecT ();
-  self->filtered.~AppVecT ();
+  self->filtered.~GridItemVecT ();
+  self->pinned_layout.~PinnedVecT ();
   self->all_apps.~AppVecT ();
   self->query_lower.~StringT ();
   G_OBJECT_CLASS (winome_app_grid_parent_class)->finalize (object);
@@ -1143,7 +1432,8 @@ winome_app_grid_init (WinomeAppGrid *self)
   // default member initializers.
   new (&self->query_lower) std::string ();
   new (&self->all_apps) std::vector<AppEntry> ();
-  new (&self->filtered) std::vector<AppEntry> ();
+  new (&self->pinned_layout) std::vector<StartMenuPinnedItem> ();
+  new (&self->filtered) std::vector<AppGridItem> ();
   new (&self->running_windows) std::vector<RunningWindow> ();
   new (&self->page_dots) std::vector<GtkWidget *> ();
   self->async = new AppGridAsyncState ();
@@ -1154,9 +1444,17 @@ winome_app_grid_init (WinomeAppGrid *self)
 
   gtk_orientable_set_orientation (GTK_ORIENTABLE (self),
                                   GTK_ORIENTATION_VERTICAL);
-  gtk_box_set_spacing (GTK_BOX (self), 8);
+  gtk_box_set_spacing (GTK_BOX (self), 0);
   gtk_widget_set_halign (GTK_WIDGET (self), GTK_ALIGN_CENTER);
   gtk_widget_set_valign (GTK_WIDGET (self), GTK_ALIGN_CENTER);
+
+  self->root_overlay = gtk_overlay_new ();
+  gtk_widget_set_hexpand (self->root_overlay, TRUE);
+  gtk_widget_set_vexpand (self->root_overlay, TRUE);
+
+  self->content_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 8);
+  gtk_widget_set_halign (self->content_box, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (self->content_box, GTK_ALIGN_CENTER);
 
   int arrow_size = 24;
   if (StEngine *e = StEngine::get ()) {
@@ -1222,12 +1520,15 @@ winome_app_grid_init (WinomeAppGrid *self)
                     self);
   gtk_box_append (GTK_BOX (self->body_row), self->next_btn);
 
-  gtk_box_append (GTK_BOX (self), self->body_row);
+  gtk_box_append (GTK_BOX (self->content_box), self->body_row);
 
   self->indicators_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
   gtk_widget_add_css_class (self->indicators_box, "page-indicators");
   gtk_widget_set_halign (self->indicators_box, GTK_ALIGN_CENTER);
-  gtk_box_append (GTK_BOX (self), self->indicators_box);
+  gtk_box_append (GTK_BOX (self->content_box), self->indicators_box);
+
+  gtk_overlay_set_child (GTK_OVERLAY (self->root_overlay), self->content_box);
+  gtk_box_append (GTK_BOX (self), self->root_overlay);
 
   GtkEventController *scroll = gtk_event_controller_scroll_new (
       GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
@@ -1341,9 +1642,13 @@ app_grid_set_query (GtkWidget *grid, const std::string &query_lower)
   if (!self->index_loaded ||
       (self->async != nullptr && self->async->built_revision != rev)) {
     self->all_apps = app_index_get_all ();
+    self->pinned_layout = app_index_get_pinned_layout ();
     self->index_loaded = true;
   }
-  self->filtered = filter_and_sort_apps (self->all_apps, self->query_lower);
+  close_folder_dialog (self);
+  self->filtered =
+      build_app_grid_items (self->all_apps, self->pinned_layout,
+                            self->query_lower);
   rebuild_all_pages (self);
 }
 
@@ -1372,9 +1677,13 @@ app_grid_rebuild (GtkWidget *grid, int avail_w, int avail_h)
   if (!self->index_loaded ||
       (self->async != nullptr && self->async->built_revision != rev)) {
     self->all_apps = app_index_get_all ();
+    self->pinned_layout = app_index_get_pinned_layout ();
     self->index_loaded = true;
   }
-  self->filtered = filter_and_sort_apps (self->all_apps, self->query_lower);
+  close_folder_dialog (self);
+  self->filtered =
+      build_app_grid_items (self->all_apps, self->pinned_layout,
+                            self->query_lower);
   rebuild_all_pages (self);
 }
 
@@ -1447,7 +1756,11 @@ app_grid_launch_first (GtkWidget *grid)
   WinomeAppGrid *self = WINOME_APP_GRID (grid);
   if (self->filtered.empty ())
     return false;
-  return activate_or_launch_entry (self->filtered[0], false);
+  if (self->filtered[0].kind == AppGridItemKind::Folder) {
+    open_folder_dialog (self, self->filtered[0]);
+    return false;
+  }
+  return activate_or_launch_entry (self->filtered[0].app, false);
 }
 
 void
@@ -1464,6 +1777,14 @@ app_grid_close_menu (GtkWidget *grid)
     if (gtk_widget_get_parent (m) != nullptr)
       gtk_widget_unparent (m);
   }
+}
+
+bool
+app_grid_close_open_folder (GtkWidget *grid)
+{
+  if (grid == nullptr)
+    return false;
+  return close_folder_dialog (WINOME_APP_GRID (grid));
 }
 
 }  // namespace winome

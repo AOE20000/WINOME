@@ -20,7 +20,13 @@ test_deps = [
   cc.find_library('shlwapi', required: true),
   cc.find_library('version', required: true),
   cc.find_library('psapi', required: true),
+  cc.find_library('bcrypt', required: true),
 ]
+
+winome_mock_plugin = executable('winome-mock-plugin',
+  files('mock-plugin.cpp'),
+  win_subsystem: 'console',
+)
 
 winome_tests = executable('winome-tests',
   files(
@@ -33,6 +39,7 @@ winome_tests = executable('winome-tests',
     '../src/winrt-bridge.cpp',
     '../src/notifications.cpp',
     '../src/systray.cpp',
+    '../src/native-taskbar.cpp',
     '../src/monitor-manager.cpp',
     '../src/easing.cpp',
     '../src/wifi-networks.cpp',
@@ -45,13 +52,17 @@ winome_tests = executable('winome-tests',
     '../src/end-session-dialog.cpp',
     '../src/shell-ipc.cpp',
     '../src/window-theming.cpp',
+    '../src/crash-dialog.cpp',
+    '../src/debug-runtime.cpp',
+    '../src/plugin-host.cpp',
+    '../src/run-dialog.cpp',
   ),
   dependencies: test_deps,
   include_directories: [winome_test_inc],
   cpp_args: ['-DUNICODE', '-D_UNICODE'],
 )
 
-test('unit-tests', winome_tests)
+test('unit-tests', winome_tests, depends: [winome_mock_plugin])
 
 python3 = find_program('python3', 'python')
 test('css-converter', python3,

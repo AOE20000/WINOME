@@ -12,6 +12,8 @@
 #include "app-index.h"
 #include "config.h"
 #include "easing.h"
+#include "fonts.h"
+#include "host-utils.h"
 #include "i18n.h"
 #include "overview-trigger.h"
 #include "st-engine.h"
@@ -304,6 +306,7 @@ exe_file_description (const std::wstring &exe)
 struct EnumCtx {
   HMONITOR monitor;
   std::vector<HWND> *windows;
+  bool use_blacklist = true;
 };
 
 BOOL CALLBACK
@@ -311,7 +314,8 @@ dash_collect (HWND hwnd, LPARAM lparam)
 {
   EnumCtx *ctx = reinterpret_cast<EnumCtx *> (lparam);
   if (dash_is_our_process (hwnd) || dash_is_cloaked (hwnd) ||
-      !dash_is_alt_tab_window (hwnd))
+      !dash_is_alt_tab_window (hwnd) ||
+      is_overview_default_blacklisted_hwnd (hwnd, ctx->use_blacklist))
     return TRUE;
 
   RECT r = {};
@@ -644,6 +648,7 @@ show_dash_context_menu (WinomeDash *self, int index)
   const DashTileRect &r = self->tile_rects[index];
 
   GtkWidget *popover = gtk_popover_new ();
+  install_bundled_fonts (popover);
   gtk_widget_add_css_class (popover, "winome-context-popover");
   gtk_widget_set_parent (popover, GTK_WIDGET (self));
   gtk_popover_set_has_arrow (GTK_POPOVER (popover), TRUE);
@@ -1167,7 +1172,8 @@ overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
 
   // Enumerate windows top-down and group into running applications.
   std::vector<HWND> windows;
-  EnumCtx ctx{monitor, &windows};
+  EnumCtx ctx{monitor, &windows,
+              winome::get_config ().overview_window_blacklist};
   EnumWindows (dash_collect, reinterpret_cast<LPARAM> (&ctx));
 
   struct RunningGroup {

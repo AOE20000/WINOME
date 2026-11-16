@@ -1,0 +1,10 @@
+{
+  "id": "sysmon-sample",
+  "name": "System Monitor Sample",
+  "version": "1.0.0",
+  "exec": "python.exe",
+  "args": ["-u", "plugin.py"],
+  "capabilities": ["topbar", "quicksettings", "notify", "desktop.read"],
+  "max_memory_mb": 64,
+  "enabled": true
+}

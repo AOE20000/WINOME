@@ -18,4 +18,5 @@ cc = meson.get_compiler('cpp')
 
 subdir('st-compat')
 subdir('src')
+subdir('ctl')
 subdir('tests')

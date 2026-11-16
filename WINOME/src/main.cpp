@@ -8,19 +8,30 @@
 
 #include <windows.h>
 #include <dbghelp.h>
+#include <shellapi.h>
+#include <atomic>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <string>
 
 #include "config.h"
 #include "app-index.h"
+#include "crash-dialog.h"
+#include "debug-runtime.h"
 #include "end-session-dialog.h"
 #include "host-utils.h"
+#include "i18n.h"
+#include "looking-glass.h"
 #include "native-taskbar.h"
 #include "overview-trigger.h"
 #include "overview.h"
 #include "perf-metrics.h"
+#include "plugin-host.h"
+#include "quick-settings.h"
+#include "run-dialog.h"
 #include "shell-ipc.h"
 #include "shell-panel.h"
 #include "win-event-hook.h"
@@ -67,6 +78,23 @@ setup_log_file (void)
 // Primary monitor bounds captured when the panel is positioned; restored in
 // on_shutdown so the shell recalculates the work area around the taskbar.
 static RECT g_primary_monitor = {0, 0, 0, 0};
+static wchar_t g_crash_state_path[MAX_PATH] = {};
+static wchar_t g_log_file_path[MAX_PATH] = {};
+static wchar_t g_app_data_path[MAX_PATH] = {};
+static std::atomic_bool g_crash_recorded{false};
+
+static void
+init_crash_paths (void)
+{
+  std::wstring dir = winome::app_data_dir ();
+  if (dir.empty ())
+    return;
+  wcsncpy (g_app_data_path, dir.c_str (), MAX_PATH - 1);
+  _snwprintf (g_crash_state_path, MAX_PATH - 1, L"%ls\\crash-state.json",
+              dir.c_str ());
+  _snwprintf (g_log_file_path, MAX_PATH - 1, L"%ls\\winome.log",
+              dir.c_str ());
+}
 
 static std::wstring
 recovery_file_path (void)
@@ -77,6 +105,15 @@ recovery_file_path (void)
   return dir + L"\\recovery.dat";
 }
 
+static std::wstring
+crash_state_file_path (void)
+{
+  std::wstring dir = winome::app_data_dir ();
+  if (dir.empty ())
+    return {};
+  return dir + L"\\crash-state.json";
+}
+
 static void
 save_recovery_workarea (const RECT &rc)
 {
@@ -84,13 +121,20 @@ save_recovery_workarea (const RECT &rc)
   if (path.empty () || rc.right <= rc.left || rc.bottom <= rc.top)
     return;
 
+  winome::RecoverySnapshot snap;
+  snap.valid = true;
+  snap.taskbar_state = winome::NativeTaskbar::original_state ();
+  snap.primary_work = rc;
+  const std::string payload = winome::serialize_recovery_snapshot (snap);
+
   HANDLE file = CreateFileW (path.c_str (), GENERIC_WRITE, 0, nullptr,
                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (file == INVALID_HANDLE_VALUE)
     return;
 
   DWORD written = 0;
-  WriteFile (file, &rc, sizeof (rc), &written, nullptr);
+  WriteFile (file, payload.data (), static_cast<DWORD> (payload.size ()),
+             &written, nullptr);
   CloseHandle (file);
 }
 
@@ -98,6 +142,14 @@ static void
 clear_recovery_file (void)
 {
   std::wstring path = recovery_file_path ();
+  if (!path.empty ())
+    DeleteFileW (path.c_str ());
+}
+
+static void
+clear_crash_state_file (void)
+{
+  std::wstring path = crash_state_file_path ();
   if (!path.empty ())
     DeleteFileW (path.c_str ());
 }
@@ -111,42 +163,69 @@ has_recovery_file (void)
   return GetFileAttributesW (path.c_str ()) != INVALID_FILE_ATTRIBUTES;
 }
 
-static void
-apply_and_clear_recovery (bool force_taskbar_restore)
+static bool
+apply_recovery_keep_or_clear (bool force_taskbar_restore, bool clear_files)
 {
   std::wstring path = recovery_file_path ();
   bool recovered = false;
+  int32_t desired_state = ABS_ALWAYSONTOP;
 
   if (!path.empty ()) {
     HANDLE file = CreateFileW (path.c_str (), GENERIC_READ, FILE_SHARE_READ,
                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
                                nullptr);
     if (file != INVALID_HANDLE_VALUE) {
-      RECT rc {};
-      DWORD read_bytes = 0;
-      if (ReadFile (file, &rc, sizeof (rc), &read_bytes, nullptr) &&
-          read_bytes == sizeof (rc) &&
-          rc.right > rc.left && rc.bottom > rc.top) {
-        SystemParametersInfoW (SPI_SETWORKAREA, 0, &rc, 0);
-        recovered = true;
+      LARGE_INTEGER sz{};
+      if (GetFileSizeEx (file, &sz) && sz.QuadPart > 0 && sz.QuadPart <= 65536) {
+        std::string raw (static_cast<size_t> (sz.QuadPart), '\0');
+        DWORD read_bytes = 0;
+        if (ReadFile (file, raw.data (), static_cast<DWORD> (sz.QuadPart),
+                      &read_bytes, nullptr)) {
+          raw.resize (read_bytes);
+          winome::RecoverySnapshot snap;
+          if (winome::parse_recovery_snapshot (raw, &snap) && snap.valid) {
+            RECT rc = snap.primary_work;
+            SystemParametersInfoW (SPI_SETWORKAREA, 0, &rc, SPIF_SENDCHANGE);
+            recovered = true;
+            if (!force_taskbar_restore)
+              desired_state = snap.taskbar_state;
+          }
+        }
       }
       CloseHandle (file);
     }
   }
 
-  if (recovered || force_taskbar_restore)
-    winome::NativeTaskbar::force_restore_all ();
+  if (!recovered && g_primary_monitor.right > g_primary_monitor.left) {
+    RECT rc = g_primary_monitor;
+    SystemParametersInfoW (SPI_SETWORKAREA, 0, &rc, SPIF_SENDCHANGE);
+  }
 
-  clear_recovery_file ();
+  bool taskbar_visible = true;
+  if (recovered || force_taskbar_restore) {
+    taskbar_visible = winome::NativeTaskbar::force_restore_all (
+        force_taskbar_restore ? ABS_ALWAYSONTOP : desired_state);
+  }
+
+  if (clear_files)
+    clear_recovery_file ();
+  return taskbar_visible;
+}
+
+static void
+apply_and_clear_recovery (bool force_taskbar_restore)
+{
+  apply_recovery_keep_or_clear (force_taskbar_restore, true);
 }
 
 static void
 restore_environment_emergency (void)
 {
   if (g_primary_monitor.right > g_primary_monitor.left)
-    SystemParametersInfoW (SPI_SETWORKAREA, 0, &g_primary_monitor, 0);
+    SystemParametersInfoW (SPI_SETWORKAREA, 0, &g_primary_monitor, SPIF_SENDCHANGE);
   winome::NativeTaskbar::restore ();
   clear_recovery_file ();
+  clear_crash_state_file ();
 }
 
 using MiniDumpWriteDumpFn = BOOL (WINAPI *)(
@@ -156,8 +235,13 @@ using MiniDumpWriteDumpFn = BOOL (WINAPI *)(
     PMINIDUMP_CALLBACK_INFORMATION);
 
 static void
-write_crash_minidump (EXCEPTION_POINTERS *info)
+write_crash_minidump (EXCEPTION_POINTERS *info,
+                      char *out_utf8,
+                      size_t out_utf8_cap)
 {
+  if (out_utf8 != nullptr && out_utf8_cap > 0)
+    out_utf8[0] = '\0';
+
   HMODULE dbghelp = LoadLibraryW (L"dbghelp.dll");
   if (dbghelp == nullptr)
     return;
@@ -169,21 +253,21 @@ write_crash_minidump (EXCEPTION_POINTERS *info)
     return;
   }
 
-  std::wstring dir = winome::app_data_dir ();
-  if (dir.empty ()) {
+  wchar_t crash_dir[MAX_PATH] = {};
+  if (g_app_data_path[0] == L'\0') {
     FreeLibrary (dbghelp);
     return;
   }
-  CreateDirectoryW (dir.c_str (), nullptr);
-  std::wstring crash_dir = dir + L"\\crashes";
-  CreateDirectoryW (crash_dir.c_str (), nullptr);
+  CreateDirectoryW (g_app_data_path, nullptr);
+  _snwprintf (crash_dir, MAX_PATH - 1, L"%ls\\crashes", g_app_data_path);
+  CreateDirectoryW (crash_dir, nullptr);
 
   SYSTEMTIME st {};
   GetLocalTime (&st);
   wchar_t path[MAX_PATH] = {};
   _snwprintf (path, MAX_PATH - 1,
               L"%ls\\winome-%04u%02u%02u-%02u%02u%02u-%lu.dmp",
-              crash_dir.c_str (),
+              crash_dir,
               st.wYear, st.wMonth, st.wDay,
               st.wHour, st.wMinute, st.wSecond,
               static_cast<unsigned long> (GetCurrentProcessId ()));
@@ -195,19 +279,93 @@ write_crash_minidump (EXCEPTION_POINTERS *info)
     mei.ThreadId = GetCurrentThreadId ();
     mei.ExceptionPointers = info;
     mei.ClientPointers = FALSE;
-    write_dump (GetCurrentProcess (), GetCurrentProcessId (), file,
-                MiniDumpNormal, info ? &mei : nullptr, nullptr, nullptr);
+    if (write_dump (GetCurrentProcess (), GetCurrentProcessId (), file,
+                    MiniDumpNormal, info ? &mei : nullptr, nullptr, nullptr) &&
+        out_utf8 != nullptr && out_utf8_cap > 1) {
+      int n = WideCharToMultiByte (CP_UTF8, 0, path, -1, out_utf8,
+                                   static_cast<int> (out_utf8_cap),
+                                   nullptr, nullptr);
+      if (n <= 0)
+        out_utf8[0] = '\0';
+    }
     CloseHandle (file);
   }
   FreeLibrary (dbghelp);
 }
 
+static void
+handle_fatal_crash_and_keep_recovery (const char *reason,
+                                      uint32_t code,
+                                      EXCEPTION_POINTERS *info)
+{
+  if (g_crash_recorded.exchange (true, std::memory_order_acq_rel))
+    return;
+
+  char dump_utf8[MAX_PATH * 3] = {};
+  write_crash_minidump (info, dump_utf8, sizeof (dump_utf8));
+  winome::write_crash_state_emergency_file (
+      g_crash_state_path, reason, code, GetCurrentProcessId (), dump_utf8,
+      winome::is_safe_mode ());
+
+  // Lock/join-free best-effort restoration; preserve recovery.dat so the
+  // detached watchdog confirms full restoration and presents the recovery UI.
+  if (g_primary_monitor.right > g_primary_monitor.left)
+    SystemParametersInfoW (SPI_SETWORKAREA, 0, &g_primary_monitor, 0);
+  winome::NativeTaskbar::restore_emergency_no_join ();
+}
+
 static LONG WINAPI
 unhandled_exception_filter (EXCEPTION_POINTERS *info)
 {
-  write_crash_minidump (info);
-  restore_environment_emergency ();
-  return EXCEPTION_CONTINUE_SEARCH;
+  const DWORD code = (info != nullptr && info->ExceptionRecord != nullptr)
+                         ? info->ExceptionRecord->ExceptionCode
+                         : 0xFFFFFFFFu;
+  char msg[128];
+  std::snprintf (msg, sizeof (msg),
+                 "Win32 Unhandled Structured Exception (0x%08lX)",
+                 static_cast<unsigned long> (code));
+  handle_fatal_crash_and_keep_recovery (msg, static_cast<uint32_t> (code), info);
+
+  if (IsDebuggerPresent ())
+    return EXCEPTION_CONTINUE_SEARCH;
+  // Terminate cleanly right away so --watchdog restores taskbar immediately
+  // without stalling behind Windows Error Reporting dialogs.
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void
+on_crt_signal (int sig)
+{
+  char msg[96];
+  std::snprintf (msg, sizeof (msg), "CRT Fatal Signal (%d)", sig);
+  handle_fatal_crash_and_keep_recovery (
+      msg, static_cast<uint32_t> (128 + sig), nullptr);
+  std::signal (sig, SIG_DFL);
+  std::_Exit (128 + sig);
+}
+
+static void
+on_cpp_terminate (void)
+{
+  handle_fatal_crash_and_keep_recovery (
+      "Unhandled C++ Exception (std::terminate)", 3, nullptr);
+  std::_Exit (3);
+}
+
+static void
+on_glib_log (const gchar *log_domain,
+             GLogLevelFlags log_level,
+             const gchar *message,
+             gpointer user_data)
+{
+  if ((log_level & G_LOG_LEVEL_ERROR) != 0) {
+    char msg[256];
+    std::snprintf (msg, sizeof (msg), "GLib Fatal Error [%s]: %s",
+                   log_domain != nullptr ? log_domain : "GLib",
+                   message != nullptr ? message : "(null)");
+    handle_fatal_crash_and_keep_recovery (msg, 3, nullptr);
+  }
+  g_log_default_handler (log_domain, log_level, message, user_data);
 }
 
 static BOOL WINAPI
@@ -225,6 +383,32 @@ console_ctrl_handler (DWORD ctrl_type)
     break;
   }
   return FALSE;
+}
+
+static void
+spawn_self_with_args (const wchar_t *extra_args)
+{
+  wchar_t exe_path[MAX_PATH] {};
+  DWORD len = GetModuleFileNameW (nullptr, exe_path, MAX_PATH);
+  if (len == 0 || len >= MAX_PATH)
+    return;
+
+  std::wstring cmd = L"\"";
+  cmd += exe_path;
+  cmd += L"\"";
+  if (extra_args != nullptr && extra_args[0] != L'\0') {
+    cmd += L" ";
+    cmd += extra_args;
+  }
+
+  STARTUPINFOW si {};
+  si.cb = sizeof (si);
+  PROCESS_INFORMATION pi {};
+  if (CreateProcessW (exe_path, cmd.data (), nullptr, nullptr, FALSE,
+                      DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
+    CloseHandle (pi.hThread);
+    CloseHandle (pi.hProcess);
+  }
 }
 
 static void
@@ -267,7 +451,7 @@ pin_enum_proc (HWND hwnd, LPARAM lParam)
   DWORD pid = 0;
   GetWindowThreadProcessId (hwnd, &pid);
   if (pid == GetCurrentProcessId () && IsWindowVisible (hwnd))
-    winome::vd::pin_window (hwnd);
+    winome::vd::pin_window_async (hwnd);
   return TRUE;
 }
 
@@ -287,7 +471,7 @@ static HWINEVENTHOOK g_pin_show_hook = nullptr;
 static gboolean
 pin_window_idle (gpointer data)
 {
-  winome::vd::pin_window ((HWND) (guintptr) data);
+  winome::vd::pin_window_async ((HWND) (guintptr) data);
   return G_SOURCE_REMOVE;
 }
 
@@ -588,6 +772,8 @@ struct IpcNotifyData {
   std::string app;
 };
 
+static winome::IpcCallbacks g_main_ipc_cbs {};
+
 static gboolean
 idle_ipc_notify (gpointer data)
 {
@@ -598,6 +784,105 @@ idle_ipc_notify (gpointer data)
     delete nd;
   }
   return G_SOURCE_REMOVE;
+}
+
+static gboolean
+idle_ipc_theme_reload (gpointer G_GNUC_UNUSED data)
+{
+  winome_shell_reload_theme ();
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
+idle_ipc_lg_open (gpointer G_GNUC_UNUSED data)
+{
+  winome::open_looking_glass ();
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
+idle_ipc_lg_close (gpointer G_GNUC_UNUSED data)
+{
+  winome::close_looking_glass ();
+  return G_SOURCE_REMOVE;
+}
+
+struct IpcConfigSetData {
+  std::string key;
+  std::string val;
+};
+
+static bool
+apply_config_set_kv (const std::string &key, const std::string &val)
+{
+  auto parse_bool = [&] (bool *out) {
+    if (val == "true" || val == "1" || val == "on") {
+      *out = true;
+      return true;
+    }
+    if (val == "false" || val == "0" || val == "off") {
+      *out = false;
+      return true;
+    }
+    return false;
+  };
+  winome::WinomeConfig cfg = winome::get_config ();
+  bool ok = false;
+  if (key == "developer_mode")
+    ok = parse_bool (&cfg.developer_mode);
+  else if (key == "hot_corner_enabled")
+    ok = parse_bool (&cfg.hot_corner_enabled);
+  else if (key == "win_key_overview")
+    ok = parse_bool (&cfg.win_key_overview);
+  else if (key == "overview_window_blacklist")
+    ok = parse_bool (&cfg.overview_window_blacklist);
+  else if (key == "multi_monitor_panels")
+    ok = parse_bool (&cfg.multi_monitor_panels);
+  else if (key == "end_session_confirm")
+    ok = parse_bool (&cfg.end_session_confirm);
+  else if (key == "unify_dark_titlebars")
+    ok = parse_bool (&cfg.unify_dark_titlebars);
+  else if (key == "unify_rounded_corners")
+    ok = parse_bool (&cfg.unify_rounded_corners);
+  else if (key == "clock_show_seconds")
+    ok = parse_bool (&cfg.clock_show_seconds);
+  else if (key == "show_battery_percentage")
+    ok = parse_bool (&cfg.show_battery_percentage);
+  else if (key == "hot_corner_cooldown_ms") {
+    cfg.hot_corner_cooldown_ms = std::atoi (val.c_str ());
+    ok = true;
+  } else if (key == "language") {
+    cfg.language = val;
+    ok = true;
+  } else if (key == "clock_format") {
+    cfg.clock_format = val;
+    ok = true;
+  }
+  if (!ok)
+    return false;
+  winome::update_config (cfg);
+  if (key == "developer_mode" && !cfg.developer_mode)
+    winome::close_looking_glass ();
+  if (key == "unify_dark_titlebars" || key == "unify_rounded_corners")
+    winome::window_theming_sync_all ();
+  return true;
+}
+
+static gboolean
+idle_ipc_config_set (gpointer data)
+{
+  auto *d = static_cast<IpcConfigSetData *> (data);
+  if (d != nullptr) {
+    apply_config_set_kv (d->key, d->val);
+    delete d;
+  }
+  return G_SOURCE_REMOVE;
+}
+
+static void
+on_vd_changed_for_plugins (int count, int active, void *)
+{
+  winome::plugin_host_emit_desktop_changed (count, active);
 }
 
 static void
@@ -635,49 +920,198 @@ on_activate (GtkApplication      *app,
 
   // Bidirectional Named Pipe IPC server (\\.\pipe\WINOME_Shell_IPC).
   const gint64 ipc_t0 = g_get_monotonic_time ();
-  winome::IpcCallbacks ipc_cbs {};
-  ipc_cbs.overview_open = +[] () {
+  g_main_ipc_cbs = winome::IpcCallbacks {};
+  g_main_ipc_cbs.overview_open = +[] () {
     g_idle_add (idle_ipc_overview_open, nullptr);
   };
-  ipc_cbs.overview_close = +[] () {
+  g_main_ipc_cbs.overview_close = +[] () {
     g_idle_add (idle_ipc_overview_close, nullptr);
   };
-  ipc_cbs.overview_toggle = +[] () {
+  g_main_ipc_cbs.overview_toggle = +[] () {
     g_idle_add (idle_ipc_overview_toggle, nullptr);
   };
-  ipc_cbs.overview_app_grid = +[] () {
+  g_main_ipc_cbs.overview_app_grid = +[] () {
     winome::overview_shift_to_app_grid_async ();
   };
-  ipc_cbs.overview_is_open = +[] () -> bool {
+  g_main_ipc_cbs.overview_is_open = +[] () -> bool {
     return winome::overview_active ();
   };
-  ipc_cbs.settings_open = +[] (const std::string &page) {
+  g_main_ipc_cbs.settings_open = +[] (const std::string &page) {
     g_idle_add (idle_open_settings_page, new std::string (page));
   };
-  ipc_cbs.config_reload = +[] () {
+  g_main_ipc_cbs.config_reload = +[] () {
     g_idle_add (idle_reload_config, nullptr);
   };
-  ipc_cbs.desktop_switch = +[] (int index) -> bool {
+  g_main_ipc_cbs.config_set = +[] (const std::string &key,
+                                   const std::string &val) -> bool {
+    // Validate on caller thread; execute listener updates on GTK main thread.
+    static const char *const kAllowed[] = {
+        "developer_mode", "hot_corner_enabled", "win_key_overview",
+        "overview_window_blacklist", "multi_monitor_panels",
+        "end_session_confirm", "unify_dark_titlebars", "unify_rounded_corners",
+        "clock_show_seconds", "show_battery_percentage",
+        "hot_corner_cooldown_ms", "language", "clock_format"};
+    bool known = false;
+    for (const char *k : kAllowed) {
+      if (key == k) {
+        known = true;
+        break;
+      }
+    }
+    if (!known)
+      return false;
+    g_idle_add (idle_ipc_config_set, new IpcConfigSetData {key, val});
+    return true;
+  };
+  g_main_ipc_cbs.desktop_switch = +[] (int index) -> bool {
     const bool ok = winome::vd::switch_to (index);
     if (ok)
       winome::vd::notify_change_hint_async ();
     return ok;
   };
-  ipc_cbs.desktop_list = +[] () {
+  g_main_ipc_cbs.desktop_list = +[] () {
     return winome::vd::desktops ();
   };
-  ipc_cbs.desktop_active = +[] () -> int {
+  g_main_ipc_cbs.desktop_active = +[] () -> int {
     return winome::vd::current_index ();
   };
-  ipc_cbs.notify = +[] (const std::string &title,
-                        const std::string &body,
-                        const std::string &app) {
+  g_main_ipc_cbs.desktop_create = +[] () -> bool {
+    const bool ok = winome::vd::create_desktop ();
+    if (ok)
+      winome::vd::notify_change_hint_async ();
+    return ok;
+  };
+  g_main_ipc_cbs.desktop_remove = +[] (int index) -> bool {
+    const bool ok = winome::vd::remove_desktop (index);
+    if (ok)
+      winome::vd::notify_change_hint_async ();
+    return ok;
+  };
+  g_main_ipc_cbs.notify = +[] (const std::string &title,
+                               const std::string &body,
+                               const std::string &app) {
     g_idle_add (idle_ipc_notify, new IpcNotifyData {title, body, app});
   };
-  ipc_cbs.quit = +[] () {
+  g_main_ipc_cbs.theme_reload = +[] () -> bool {
+    g_idle_add (idle_ipc_theme_reload, nullptr);
+    return true;
+  };
+  g_main_ipc_cbs.looking_glass_open = +[] () -> bool {
+    if (!winome::get_config ().developer_mode)
+      return false;
+    g_idle_add (idle_ipc_lg_open, nullptr);
+    return true;
+  };
+  g_main_ipc_cbs.looking_glass_close = +[] () -> bool {
+    g_idle_add (idle_ipc_lg_close, nullptr);
+    return true;
+  };
+  g_main_ipc_cbs.run_exec = +[] (const std::string &cmdline,
+                                 std::string *out_err) -> bool {
+    winome::RunDialogCallbacks rcbs {};
+    rcbs.open_looking_glass = winome::open_looking_glass;
+    rcbs.reload_theme = winome_shell_reload_theme;
+    rcbs.restart_shell = +[] () {
+      std::wstring args = L"--after-pid " + std::to_wstring (GetCurrentProcessId ());
+      if (winome::is_safe_mode ())
+        args += L" --safe-mode";
+      spawn_self_with_args (args.c_str ());
+      g_idle_add (idle_quit_app, nullptr);
+    };
+    rcbs.quit_shell = +[] () {
+      g_idle_add (idle_quit_app, nullptr);
+    };
+    // Marshal internal commands safely via g_idle_add when invoked from IPC.
+    const auto act = winome::classify_run_internal_command (
+        cmdline, winome::get_config ().developer_mode);
+    if (act == winome::RunInternalAction::OpenLookingGlass) {
+      g_idle_add (idle_ipc_lg_open, nullptr);
+      return true;
+    }
+    if (act == winome::RunInternalAction::ReloadTheme) {
+      g_idle_add (idle_ipc_theme_reload, nullptr);
+      return true;
+    }
+    return winome::execute_run_command_string (cmdline, false, rcbs, out_err);
+  };
+  g_main_ipc_cbs.plugin_list_json = winome::plugin_host_list_json;
+  g_main_ipc_cbs.plugin_action = winome::plugin_host_action;
+  g_main_ipc_cbs.quit = +[] () {
     g_idle_add (idle_quit_app, nullptr);
   };
-  winome::ipc_server_start (ipc_cbs);
+
+  winome::RunDialogCallbacks run_cbs {};
+  run_cbs.open_looking_glass = winome::open_looking_glass;
+  run_cbs.reload_theme = winome_shell_reload_theme;
+  run_cbs.restart_shell = +[] () {
+    std::wstring args = L"--after-pid " + std::to_wstring (GetCurrentProcessId ());
+    if (winome::is_safe_mode ())
+      args += L" --safe-mode";
+    spawn_self_with_args (args.c_str ());
+    if (g_gtk_app != nullptr)
+      g_application_quit (G_APPLICATION (g_gtk_app));
+  };
+  run_cbs.quit_shell = +[] () {
+    if (g_gtk_app != nullptr)
+      g_application_quit (G_APPLICATION (g_gtk_app));
+  };
+  winome::run_dialog_init (run_cbs);
+
+  winome::LookingGlassCallbacks lg_cbs {};
+  lg_cbs.dispatch_cmd = +[] (const std::string &req) -> std::string {
+    return winome::ipc_dispatch_request_json (req, g_main_ipc_cbs);
+  };
+  lg_cbs.restack_windows = +[] () {
+    winome::overview_restack ();
+  };
+  lg_cbs.reload_theme = +[] () -> bool {
+    return winome_shell_reload_theme ();
+  };
+  lg_cbs.plugin_list_json = winome::plugin_host_list_json;
+  lg_cbs.plugin_action = winome::plugin_host_action;
+  winome::looking_glass_init (lg_cbs);
+
+  winome_shell_panel_set_plugin_click_cb (
+      +[] (const char *plugin_id, const char *slot) {
+        winome::plugin_host_emit_topbar_click (
+            plugin_id ? plugin_id : "", slot ? slot : "");
+      });
+  winome_quick_settings_set_plugin_toggle_cb (
+      +[] (const char *plugin_id, const char *slot, gboolean active) {
+        winome::plugin_host_emit_quicktoggle (
+            plugin_id ? plugin_id : "", slot ? slot : "", active != FALSE);
+      });
+
+  winome::PluginHostCallbacks plugin_cbs {};
+  plugin_cbs.topbar_upsert = +[] (const winome::PluginTopBarSpec &spec) {
+    winome_shell_panel_plugin_upsert (
+        spec.key.c_str (), spec.plugin_id.c_str (), spec.slot.c_str (),
+        spec.icon.c_str (), spec.text.c_str (), spec.tooltip.c_str ());
+  };
+  plugin_cbs.topbar_remove = +[] (const std::string &, const std::string &key) {
+    winome_shell_panel_plugin_remove (key.c_str ());
+  };
+  plugin_cbs.quicktoggle_upsert =
+      +[] (const winome::PluginQuickToggleSpec &spec) {
+        winome_quick_settings_plugin_upsert (
+            spec.key.c_str (), spec.plugin_id.c_str (), spec.slot.c_str (),
+            spec.icon.c_str (), spec.title.c_str (), spec.subtitle.c_str (),
+            spec.active ? TRUE : FALSE);
+      };
+  plugin_cbs.quicktoggle_remove =
+      +[] (const std::string &, const std::string &key) {
+        winome_quick_settings_plugin_remove (key.c_str ());
+      };
+  plugin_cbs.notify = +[] (const std::string &title,
+                           const std::string &body,
+                           const std::string &app_name) {
+    winome::notify_shell (title, body, app_name);
+  };
+  plugin_cbs.plugins_changed = winome::refresh_looking_glass_plugins;
+  winome::plugin_host_init (plugin_cbs);
+  winome::vd::add_change_listener (on_vd_changed_for_plugins, nullptr);
+
+  winome::ipc_server_start (g_main_ipc_cbs);
   winome::perf_record_phase_ms (
       "ipc", (g_get_monotonic_time () - ipc_t0) / 1000.0);
 
@@ -711,17 +1145,23 @@ static void
 on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
              gpointer G_GNUC_UNUSED user_data)
 {
+  winome::vd::remove_change_listener (on_vd_changed_for_plugins, nullptr);
+  winome::plugin_host_shutdown ();
   winome::ipc_server_stop ();
   destroy_control_window ();
   g_gtk_app = nullptr;
 
+  winome::run_dialog_close ();
+  winome::close_looking_glass ();
   winome::close_end_session_dialog ();
   winome::close_settings_window ();
+  winome::ws_osd_shutdown ();
   winome::window_theming_shutdown ();
   winome::app_icon_cache_clear ();
   winome::monitor_manager_shutdown ();
   winome::stop_hot_corner ();
   winome::stop_fullscreen_watcher ();
+  winome::app_index_stop_watch ();
   winome::systray_shutdown ();
   winome::stop_volume_monitor ();
   winome_wifi_shutdown_notifications ();
@@ -735,39 +1175,149 @@ on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
 
   winome::stop_overview_trigger ();
   winome::stop_win_event_hook ();
+  winome::vd::shutdown ();
 
   // Release the panel-strip work area reservation before restoring the
   // taskbar, so the shell recalculates the work area around it.
   if (g_primary_monitor.right > g_primary_monitor.left)
-    SystemParametersInfoW (SPI_SETWORKAREA, 0, &g_primary_monitor, 0);
+    SystemParametersInfoW (SPI_SETWORKAREA, 0, &g_primary_monitor, SPIF_SENDCHANGE);
 
   // Restore the native taskbar on exit (only if we hid it).
   winome::NativeTaskbar::restore ();
   clear_recovery_file ();
+  clear_crash_state_file ();
+}
+
+static bool
+watchdog_restore_callback (void *user_data)
+{
+  (void)user_data;
+  return apply_recovery_keep_or_clear (true, true);
+}
+
+static int
+run_watchdog_mode (DWORD pid, bool show_ui)
+{
+  winome::set_process_dpi_aware ();
+  init_crash_paths ();
+
+  DWORD exit_code = 0;
+  if (pid != 0) {
+    HANDLE proc = OpenProcess (
+        SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (proc != nullptr) {
+      WaitForSingleObject (proc, INFINITE);
+      GetExitCodeProcess (proc, &exit_code);
+      CloseHandle (proc);
+    }
+  }
+
+  const bool had_recovery = has_recovery_file ();
+  const bool had_crash_file =
+      !crash_state_file_path ().empty () &&
+      GetFileAttributesW (crash_state_file_path ().c_str ()) != INVALID_FILE_ATTRIBUTES;
+  const bool abnormal = had_recovery || had_crash_file ||
+                        (pid != 0 && exit_code != 0 && exit_code != STILL_ACTIVE);
+  if (!abnormal)
+    return 0;
+
+  // Always restore workarea & native taskbar FIRST before showing any UI.
+  const bool restored = apply_recovery_keep_or_clear (true, true);
+  if (!show_ui) {
+    clear_crash_state_file ();
+    return 0;
+  }
+
+  (void)winome::get_config ();
+  const bool zh = winome::is_zh ();
+
+  winome::CrashState st;
+  {
+    std::wstring cpath = crash_state_file_path ();
+    if (!cpath.empty ()) {
+      HANDLE f = CreateFileW (cpath.c_str (), GENERIC_READ, FILE_SHARE_READ,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+      if (f != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER sz{};
+        if (GetFileSizeEx (f, &sz) && sz.QuadPart > 0 && sz.QuadPart <= 65536) {
+          std::string raw (static_cast<size_t> (sz.QuadPart), '\0');
+          DWORD rbytes = 0;
+          if (ReadFile (f, raw.data (), static_cast<DWORD> (sz.QuadPart),
+                        &rbytes, nullptr)) {
+            raw.resize (rbytes);
+            winome::parse_crash_state (raw, &st);
+          }
+        }
+        CloseHandle (f);
+      }
+      clear_crash_state_file ();
+    }
+  }
+
+  if (st.reason.empty ()) {
+    st.reason = zh ? "进程被外部强行终止或未捕获异常退出"
+                   : "Process terminated unexpectedly or was killed externally";
+  }
+  if (st.exit_code == 0 && exit_code != 0)
+    st.exit_code = exit_code;
+  if (st.pid == 0)
+    st.pid = pid;
+  st.taskbar_restored = restored;
+  st.log_tail = winome::read_log_tail_utf8 (g_log_file_path, 3500);
+
+  winome::CrashRecoveryDialogInput input;
+  input.state = std::move (st);
+  input.data_dir = winome::app_data_dir ();
+  input.zh = zh;
+  input.on_restore_now = watchdog_restore_callback;
+  input.user_data = nullptr;
+
+  const auto action = winome::show_crash_recovery_dialog (input);
+  if (action == winome::CrashDialogAction::RestartSafeMode)
+    spawn_self_with_args (L"--safe-mode");
+  else if (action == winome::CrashDialogAction::RestartNormal)
+    spawn_self_with_args (nullptr);
+
+  return 0;
 }
 
 int
 main (int argc, char **argv)
 {
   winome::perf_mark_process_start ();
-  // Recovery mode: restore native taskbar and any saved work area, then exit.
+
+  // Parse headless / recovery / watchdog flags first.
+  bool no_crash_ui = false;
+  DWORD wait_prev_pid = 0;
+  for (int i = 1; i < argc; ++i) {
+    if (std::string (argv[i]) == "--no-crash-ui")
+      no_crash_ui = true;
+    else if (std::string (argv[i]) == "--safe-mode")
+      winome::set_safe_mode (true);
+    else if (std::string (argv[i]) == "--after-pid" && i + 1 < argc)
+      wait_prev_pid = static_cast<DWORD> (std::strtoul (argv[i + 1], nullptr, 10));
+  }
+  if (wait_prev_pid != 0) {
+    HANDLE prev = OpenProcess (SYNCHRONIZE, FALSE, wait_prev_pid);
+    if (prev != nullptr) {
+      WaitForSingleObject (prev, 5000);
+      CloseHandle (prev);
+    }
+  }
+
   for (int i = 1; i < argc; ++i) {
     if (std::string (argv[i]) == "--restore") {
       apply_and_clear_recovery (true);
+      clear_crash_state_file ();
       return 0;
     }
     if (std::string (argv[i]) == "--watchdog" && i + 1 < argc) {
       DWORD pid = static_cast<DWORD> (std::strtoul (argv[i + 1], nullptr, 10));
-      if (pid != 0) {
-        HANDLE proc = OpenProcess (SYNCHRONIZE, FALSE, pid);
-        if (proc != nullptr) {
-          WaitForSingleObject (proc, INFINITE);
-          CloseHandle (proc);
-        }
-        if (has_recovery_file ())
-          apply_and_clear_recovery (true);
-      }
-      return 0;
+      return run_watchdog_mode (pid, !no_crash_ui);
+    }
+    if (std::string (argv[i]) == "--crash-ui") {
+      return run_watchdog_mode (0, true);
     }
     if (std::string (argv[i]) == "--status") {
       if (GetFileType (GetStdHandle (STD_OUTPUT_HANDLE)) == FILE_TYPE_UNKNOWN &&
@@ -830,14 +1380,23 @@ main (int argc, char **argv)
 
   // Route stdout/stderr to a log file first: this process is a GUI app and
   // must never pop a console window.
+  init_crash_paths ();
   setup_log_file ();
+  winome::debug_install_log_capture ();
 
   // Recover taskbar and work area if a prior session terminated abnormally.
   if (has_recovery_file ())
     apply_and_clear_recovery (true);
+  clear_crash_state_file ();
 
   SetUnhandledExceptionFilter (unhandled_exception_filter);
   SetConsoleCtrlHandler (console_ctrl_handler, TRUE);
+  std::set_terminate (on_cpp_terminate);
+  std::signal (SIGABRT, on_crt_signal);
+  std::signal (SIGSEGV, on_crt_signal);
+  std::signal (SIGILL, on_crt_signal);
+  std::signal (SIGFPE, on_crt_signal);
+  g_log_set_default_handler (on_glib_log, nullptr);
 
   // Snapshot the clean work area before hiding the taskbar so watchdog can
   // recover even if the process exits before on_activate completes.

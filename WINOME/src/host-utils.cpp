@@ -5,7 +5,10 @@
 #include "host-utils.h"
 
 #include <windows.h>
+#include <dwmapi.h>
 #include <shellscalingapi.h>
+
+#include <cctype>
 
 namespace winome {
 
@@ -114,6 +117,122 @@ std::string app_data_dir_ascii() {
                       static_cast<int>(chosen.size()),
                       out.data(), bytes, nullptr, nullptr);
   return out;
+}
+
+bool is_overview_default_blacklisted_window_info(
+    const std::string& class_name_utf8,
+    const std::string& proc_name_utf8,
+    const std::string& title_utf8,
+    bool cloaked) {
+  auto ascii_lower = [](const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s)
+      out.push_back(static_cast<char>(std::tolower(c)));
+    return out;
+  };
+  auto trim_ws = [](const std::string& s) {
+    size_t b = 0;
+    while (b < s.size() &&
+           (s[b] == ' ' || s[b] == '\t' || s[b] == '\r' || s[b] == '\n')) {
+      ++b;
+    }
+    size_t e = s.size();
+    while (e > b &&
+           (s[e - 1] == ' ' || s[e - 1] == '\t' ||
+            s[e - 1] == '\r' || s[e - 1] == '\n')) {
+      --e;
+    }
+    return s.substr(b, e - b);
+  };
+  auto compact_ascii_lower = [](const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+      if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+        continue;
+      out.push_back(static_cast<char>(std::tolower(c)));
+    }
+    return out;
+  };
+
+  const std::string cls_low = ascii_lower(trim_ws(class_name_utf8));
+  std::string proc_low = ascii_lower(trim_ws(proc_name_utf8));
+  const size_t sep = proc_low.find_last_of("\\/");
+  if (sep != std::string::npos)
+    proc_low = proc_low.substr(sep + 1);
+
+  const std::string title_trimmed = trim_ws(title_utf8);
+  const std::string title_compact = compact_ascii_lower(title_trimmed);
+
+  // 1. "Windows 输入体验" / "Windows Input Experience" (TextInputHost).
+  if (proc_low == "textinputhost.exe" ||
+      proc_low == "windowsinternal.composableshell.experiences.textinput.inputapp.exe" ||
+      title_compact == "windows\xE8\xBE\x93\xE5\x85\xA5\xE4\xBD\x93\xE9\xAA\x8C" ||
+      title_compact == "windowsinputexperience") {
+    return true;
+  }
+
+  // 2. Nameless, blank/ghost windows hosted by explorer.exe (such as hidden
+  // ApplicationFrameWindow shells or un-titled WorkerW containers), while
+  // keeping normal CabinetWClass / ExploreWClass folder windows and dialogs.
+  if (proc_low == "explorer.exe" && title_trimmed.empty()) {
+    if (cloaked)
+      return true;
+    const bool is_real_explorer_ui =
+        cls_low == "cabinetwclass" ||
+        cls_low == "explorewclass" ||
+        cls_low == "#32770";
+    if (!is_real_explorer_ui)
+      return true;
+  }
+
+  return false;
+}
+
+bool is_overview_default_blacklisted_hwnd(HWND hwnd, bool enabled) {
+  if (!enabled || hwnd == nullptr)
+    return false;
+
+  auto wide_to_utf8_buf = [](const wchar_t* w) -> std::string {
+    if (w == nullptr || w[0] == L'\0')
+      return {};
+    int need = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (need <= 1)
+      return {};
+    std::string out(static_cast<size_t>(need - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), need, nullptr, nullptr);
+    return out;
+  };
+
+  wchar_t cls[128] = {};
+  GetClassNameW(hwnd, cls, 128);
+
+  wchar_t title[256] = {};
+  GetWindowTextW(hwnd, title, 256);
+
+  std::wstring proc_name;
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (pid != 0) {
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (proc != nullptr) {
+      wchar_t path[MAX_PATH] = {};
+      DWORD len = MAX_PATH;
+      if (QueryFullProcessImageNameW(proc, 0, path, &len) && len > 0)
+        proc_name.assign(path, len);
+      CloseHandle(proc);
+    }
+  }
+
+  BOOL cloaked = FALSE;
+  DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+
+  return is_overview_default_blacklisted_window_info(
+      wide_to_utf8_buf(cls),
+      wide_to_utf8_buf(proc_name.c_str()),
+      wide_to_utf8_buf(title),
+      cloaked != FALSE);
 }
 
 }  // namespace winome

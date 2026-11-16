@@ -30,8 +30,10 @@
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include <algorithm>
 #include <string>
 #include <thread>
+#include <vector>
 
 // Centralized zh/en localization respecting config overrides.
 static const char *
@@ -1647,6 +1649,32 @@ winome_quick_settings_grid_attach (GtkWidget *grid, GtkWidget *child,
   gtk_widget_set_parent (child, grid);
 }
 
+static void
+winome_quick_settings_grid_detach (GtkWidget *grid, GtkWidget *child)
+{
+  WinomeQuickSettingsGrid *self = WINOME_QUICK_SETTINGS_GRID (grid);
+  if (self == NULL || child == NULL)
+    return;
+  if (self->drawer_anchor == child) {
+    grid_stop_anim (self);
+    grid_clear_pending (self);
+    grid_detach_drawer (self);
+    self->drawer_slot_h = 0.0;
+    self->drawer_opacity = 0.0;
+    self->drawer_phase = DrawerPhase::Closed;
+  }
+  for (guint i = 0; i < self->children->len; i++) {
+    QuickGridChild *c =
+        static_cast<QuickGridChild *> (g_ptr_array_index (self->children, i));
+    if (c->widget == child) {
+      gtk_widget_unparent (child);
+      g_ptr_array_remove_index (self->children, i);
+      gtk_widget_queue_resize (grid);
+      return;
+    }
+  }
+}
+
 static GtkWidget *
 find_quick_settings_root (GtkWidget *widget)
 {
@@ -2521,6 +2549,8 @@ build_bluetooth_menu (gpointer G_GNUC_UNUSED user_data)
   return menu;
 }
 
+static void qs_register_and_sync_plugins (GtkWidget *root);
+
 GtkWidget *
 winome_quick_settings_new (void)
 {
@@ -2717,9 +2747,217 @@ winome_quick_settings_new (void)
   g_object_set_data (G_OBJECT (root), "dnd-toggle", dnd);
   g_object_set_data (G_OBJECT (root), "airplane-toggle", airplane);
 
+  qs_register_and_sync_plugins (root);
   winome_quick_settings_refresh (root);
 
   return root;
+}
+
+struct QuickPluginEntry {
+  std::string key;
+  std::string plugin_id;
+  std::string slot;
+  std::string icon;
+  std::string title;
+  std::string subtitle;
+  bool active = false;
+};
+
+struct QuickPluginWidgetRow {
+  std::string key;
+  std::string icon_name;
+  GtkWidget *button = nullptr;
+  GtkWidget *icon = nullptr;
+  GtkWidget *title = nullptr;
+  GtkWidget *subtitle = nullptr;
+};
+
+struct QuickPluginTogglePayload {
+  std::string plugin_id;
+  std::string slot;
+};
+
+static std::vector<QuickPluginEntry> g_qs_plugin_entries;
+static std::vector<GtkWidget *> g_qs_root_instances;
+static WinomePluginQuickToggleCb g_qs_plugin_toggle_cb = nullptr;
+
+static void
+on_qs_plugin_toggled (GtkToggleButton *button, gpointer G_GNUC_UNUSED data)
+{
+  auto *payload = static_cast<QuickPluginTogglePayload *> (
+      g_object_get_data (G_OBJECT (button), "qs-plugin-payload"));
+  if (payload != nullptr && g_qs_plugin_toggle_cb != nullptr) {
+    g_qs_plugin_toggle_cb (payload->plugin_id.c_str (),
+                           payload->slot.c_str (),
+                           gtk_toggle_button_get_active (button));
+  }
+}
+
+static void
+sync_quick_settings_plugins (GtkWidget *quick_settings)
+{
+  if (quick_settings == NULL)
+    return;
+  GtkWidget *grid = GTK_WIDGET (
+      g_object_get_data (G_OBJECT (quick_settings), "qs-grid"));
+  if (grid == NULL)
+    return;
+
+  auto *rows = static_cast<std::vector<QuickPluginWidgetRow> *> (
+      g_object_get_data (G_OBJECT (quick_settings), "qs-plugin-rows"));
+  if (rows == nullptr) {
+    rows = new std::vector<QuickPluginWidgetRow> ();
+    g_object_set_data_full (
+        G_OBJECT (quick_settings), "qs-plugin-rows", rows,
+        +[](gpointer p) {
+          delete static_cast<std::vector<QuickPluginWidgetRow> *> (p);
+        });
+  }
+
+  for (size_t i = rows->size (); i > 0; --i) {
+    auto &r = (*rows)[i - 1];
+    const QuickPluginEntry *match = nullptr;
+    for (const auto &e : g_qs_plugin_entries) {
+      if (e.key == r.key) {
+        match = &e;
+        break;
+      }
+    }
+    const bool sub_shape_mismatch =
+        match != nullptr && ((r.subtitle != nullptr) != !match->subtitle.empty ());
+    if (match == nullptr || sub_shape_mismatch) {
+      winome_quick_settings_grid_detach (grid, r.button);
+      rows->erase (rows->begin () + static_cast<ptrdiff_t> (i - 1));
+    }
+  }
+
+  for (const auto &e : g_qs_plugin_entries) {
+    QuickPluginWidgetRow *found = nullptr;
+    for (auto &r : *rows) {
+      if (r.key == e.key) {
+        found = &r;
+        break;
+      }
+    }
+
+    if (found != nullptr) {
+      if (found->icon != nullptr && found->icon_name != e.icon) {
+        gtk_image_set_from_icon_name (GTK_IMAGE (found->icon), e.icon.c_str ());
+        found->icon_name = e.icon;
+      }
+      if (found->title != nullptr)
+        gtk_label_set_text (GTK_LABEL (found->title), e.title.c_str ());
+      if (found->subtitle != nullptr && !e.subtitle.empty ())
+        gtk_label_set_text (GTK_LABEL (found->subtitle), e.subtitle.c_str ());
+
+      g_signal_handlers_block_by_func (found->button,
+          (gpointer) on_qs_plugin_toggled, NULL);
+      gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (found->button),
+                                    e.active ? TRUE : FALSE);
+      g_signal_handlers_unblock_by_func (found->button,
+          (gpointer) on_qs_plugin_toggled, NULL);
+      continue;
+    }
+
+    QuickPluginWidgetRow row;
+    row.key = e.key;
+    row.icon_name = e.icon;
+    row.button = create_toggle_capsule (
+        true,
+        e.icon.c_str (),
+        e.title.c_str (),
+        e.subtitle.empty () ? NULL : e.subtitle.c_str (),
+        &row.icon,
+        &row.title,
+        &row.subtitle);
+    gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (row.button),
+                                  e.active ? TRUE : FALSE);
+    auto *payload = new QuickPluginTogglePayload{e.plugin_id, e.slot};
+    g_object_set_data_full (
+        G_OBJECT (row.button), "qs-plugin-payload", payload,
+        +[](gpointer p) { delete static_cast<QuickPluginTogglePayload *> (p); });
+    g_signal_connect (row.button, "toggled",
+                      G_CALLBACK (on_qs_plugin_toggled), NULL);
+    winome_quick_settings_grid_attach (grid, row.button, 1);
+    rows->push_back (std::move (row));
+  }
+  gtk_widget_queue_resize (grid);
+}
+
+static void
+on_qs_root_destroy (GtkWidget *widget, gpointer G_GNUC_UNUSED data)
+{
+  g_qs_root_instances.erase (
+      std::remove (g_qs_root_instances.begin (), g_qs_root_instances.end (),
+                   widget),
+      g_qs_root_instances.end ());
+}
+
+static void
+qs_register_and_sync_plugins (GtkWidget *root)
+{
+  g_qs_root_instances.push_back (root);
+  g_signal_connect (root, "destroy", G_CALLBACK (on_qs_root_destroy), NULL);
+  sync_quick_settings_plugins (root);
+}
+
+void
+winome_quick_settings_set_plugin_toggle_cb (WinomePluginQuickToggleCb cb)
+{
+  g_qs_plugin_toggle_cb = cb;
+}
+
+void
+winome_quick_settings_plugin_upsert (const char *key,
+                                     const char *plugin_id,
+                                     const char *slot,
+                                     const char *icon_name,
+                                     const char *title,
+                                     const char *subtitle,
+                                     gboolean active)
+{
+  if (key == nullptr || plugin_id == nullptr)
+    return;
+  QuickPluginEntry entry;
+  entry.key = key;
+  entry.plugin_id = plugin_id;
+  entry.slot = slot ? slot : "";
+  entry.icon = (icon_name != nullptr && *icon_name != '\0')
+                   ? icon_name
+                   : "application-x-addon-symbolic";
+  entry.title = title ? title : plugin_id;
+  entry.subtitle = subtitle ? subtitle : "";
+  entry.active = active != FALSE;
+
+  bool updated = false;
+  for (auto &existing : g_qs_plugin_entries) {
+    if (existing.key == entry.key) {
+      existing = entry;
+      updated = true;
+      break;
+    }
+  }
+  if (!updated)
+    g_qs_plugin_entries.push_back (std::move (entry));
+
+  for (GtkWidget *qs : g_qs_root_instances)
+    sync_quick_settings_plugins (qs);
+}
+
+void
+winome_quick_settings_plugin_remove (const char *key)
+{
+  if (key == nullptr)
+    return;
+  const size_t before = g_qs_plugin_entries.size ();
+  g_qs_plugin_entries.erase (
+      std::remove_if (g_qs_plugin_entries.begin (), g_qs_plugin_entries.end (),
+                      [key](const QuickPluginEntry &e) { return e.key == key; }),
+      g_qs_plugin_entries.end ());
+  if (g_qs_plugin_entries.size () != before) {
+    for (GtkWidget *qs : g_qs_root_instances)
+      sync_quick_settings_plugins (qs);
+  }
 }
 
 void

@@ -5,10 +5,14 @@
 
 #include "shell-ipc.h"
 
+#include "app-index.h"
 #include "config.h"
+#include "debug-runtime.h"
 #include "perf-metrics.h"
+#include "systray.h"
 
 #include <windows.h>
+#include <sddl.h>
 #include <glib.h>
 
 #include <algorithm>
@@ -24,7 +28,7 @@
 namespace winome {
 namespace {
 
-constexpr size_t kMaxIpcPayloadBytes = 65536;
+constexpr size_t kMaxIpcPayloadBytes = 262144;
 
 void append_json_escaped(const std::string& s, std::string* out) {
   out->push_back('"');
@@ -148,9 +152,42 @@ struct ParsedRequest {
   std::string title;
   std::string body;
   std::string app;
+  std::string name;
+  std::string value;
+  std::string tag;
+  bool has_value = false;
   bool has_index = false;
   int index = -1;
+  int count = 0;
 };
+
+bool parse_json_scalar_as_string(const std::string& s, size_t* pos, std::string* out) {
+  skip_ws(s, pos);
+  if (*pos >= s.size())
+    return false;
+  if (s[*pos] == '"')
+    return parse_json_str(s, pos, out);
+  if (s.compare(*pos, 4, "true") == 0) {
+    *pos += 4;
+    *out = "true";
+    return true;
+  }
+  if (s.compare(*pos, 5, "false") == 0) {
+    *pos += 5;
+    *out = "false";
+    return true;
+  }
+  size_t start = *pos;
+  if (s[*pos] == '-' || s[*pos] == '+')
+    ++(*pos);
+  size_t digits = *pos;
+  while (*pos < s.size() && std::isdigit(static_cast<unsigned char>(s[*pos])))
+    ++(*pos);
+  if (*pos == digits)
+    return false;
+  *out = s.substr(start, *pos - start);
+  return true;
+}
 
 bool parse_flat_request(const std::string& json, ParsedRequest* out) {
   if (out == nullptr)
@@ -185,9 +222,18 @@ bool parse_flat_request(const std::string& json, ParsedRequest* out) {
       ok = parse_json_str(json, &pos, &out->body);
     } else if (key == "app") {
       ok = parse_json_str(json, &pos, &out->app);
+    } else if (key == "name") {
+      ok = parse_json_str(json, &pos, &out->name);
+    } else if (key == "tag") {
+      ok = parse_json_str(json, &pos, &out->tag);
+    } else if (key == "value") {
+      ok = parse_json_scalar_as_string(json, &pos, &out->value);
+      out->has_value = ok;
     } else if (key == "index") {
       ok = parse_json_int(json, &pos, &out->index);
       out->has_index = ok;
+    } else if (key == "count") {
+      ok = parse_json_int(json, &pos, &out->count);
     } else {
       ok = skip_val(json, &pos);
     }
@@ -230,10 +276,16 @@ std::string build_status_json(const IpcCallbacks& cbs) {
   const auto caps = capability_snapshot_all();
   const vd::DesktopSnapshot ds = vd::cached_snapshot();
   const bool ov_open = cbs.overview_is_open ? cbs.overview_is_open() : false;
+  const DebugFlags df = debug_get_flags();
 
   char num[256];
   std::string out = "{\"ok\":true,\"result\":{\"version\":\"0.1.0\",";
   out += ov_open ? "\"overview_open\":true," : "\"overview_open\":false,";
+  out += is_safe_mode() ? "\"safe_mode\":true," : "\"safe_mode\":false,";
+  out += get_config().developer_mode ? "\"developer_mode\":true,"
+                                     : "\"developer_mode\":false,";
+  out += "\"log_seq\":" + std::to_string(debug_latest_log_seq()) + ",";
+  out += "\"debug_flags\":" + debug_flags_to_json(df) + ",";
 
   std::snprintf(num, sizeof(num),
                 "\"desktops\":{\"valid\":%s,\"count\":%d,\"active\":%d},",
@@ -373,16 +425,94 @@ void write_pipe_reply(HANDLE pipe, const std::string& payload) {
   FlushFileBuffers(pipe);
 }
 
-HANDLE create_pipe_instance() {
-  return CreateNamedPipeW(
-      kShellPipeName,
-      PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-      PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-      4,
-      kMaxIpcPayloadBytes,
-      kMaxIpcPayloadBytes,
-      1000,
-      nullptr);
+class PipeSecurity {
+ public:
+  PipeSecurity() {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok))
+      return;
+    DWORD need = 0;
+    GetTokenInformation(tok, TokenUser, nullptr, 0, &need);
+    if (need > 0 && need < 4096) {
+      std::vector<BYTE> buf(need);
+      if (GetTokenInformation(tok, TokenUser, buf.data(), need, &need)) {
+        auto* tu = reinterpret_cast<TOKEN_USER*>(buf.data());
+        LPWSTR sid_str = nullptr;
+        if (ConvertSidToStringSidW(tu->User.Sid, &sid_str) && sid_str != nullptr) {
+          const std::wstring sddl = ipc_build_user_pipe_sddl(sid_str);
+          if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                  sddl.c_str(), SDDL_REVISION_1, &sd_full_, nullptr)) {
+            sa_full_.nLength = sizeof(sa_full_);
+            sa_full_.lpSecurityDescriptor = sd_full_;
+            sa_full_.bInheritHandle = FALSE;
+          }
+          const std::wstring dacl_only =
+              std::wstring(L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;") + sid_str + L")";
+          if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                  dacl_only.c_str(), SDDL_REVISION_1, &sd_dacl_, nullptr)) {
+            sa_dacl_.nLength = sizeof(sa_dacl_);
+            sa_dacl_.lpSecurityDescriptor = sd_dacl_;
+            sa_dacl_.bInheritHandle = FALSE;
+          }
+          LocalFree(sid_str);
+        }
+      }
+    }
+    CloseHandle(tok);
+  }
+
+  ~PipeSecurity() {
+    if (sd_full_ != nullptr)
+      LocalFree(sd_full_);
+    if (sd_dacl_ != nullptr)
+      LocalFree(sd_dacl_);
+  }
+
+  LPSECURITY_ATTRIBUTES primary_sa() {
+    if (sd_full_ != nullptr)
+      return &sa_full_;
+    if (sd_dacl_ != nullptr)
+      return &sa_dacl_;
+    return nullptr;
+  }
+
+  LPSECURITY_ATTRIBUTES fallback_sa() {
+    if (sd_dacl_ != nullptr)
+      return &sa_dacl_;
+    return nullptr;
+  }
+
+ private:
+  PSECURITY_DESCRIPTOR sd_full_ = nullptr;
+  PSECURITY_DESCRIPTOR sd_dacl_ = nullptr;
+  SECURITY_ATTRIBUTES sa_full_{};
+  SECURITY_ATTRIBUTES sa_dacl_{};
+};
+
+HANDLE create_pipe_instance(PipeSecurity* sec) {
+  auto make_pipe = [](LPSECURITY_ATTRIBUTES sa) {
+    return CreateNamedPipeW(
+        kShellPipeName,
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+        4,
+        kMaxIpcPayloadBytes,
+        kMaxIpcPayloadBytes,
+        1000,
+        sa);
+  };
+
+  if (sec != nullptr && sec->primary_sa() != nullptr) {
+    HANDLE h = make_pipe(sec->primary_sa());
+    if (h != INVALID_HANDLE_VALUE)
+      return h;
+    if (sec->fallback_sa() != nullptr) {
+      h = make_pipe(sec->fallback_sa());
+      if (h != INVALID_HANDLE_VALUE)
+        return h;
+    }
+  }
+  return make_pipe(nullptr);
 }
 
 bool start_connect(HANDLE pipe, HANDLE ev, OVERLAPPED* ov, bool* out_pending) {
@@ -416,6 +546,7 @@ struct PipeSlot {
 };
 
 void server_thread_main() {
+  PipeSecurity pipe_sec;
   PipeSlot slots[2]{};
   slots[0].ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   slots[1].ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -439,7 +570,7 @@ void server_thread_main() {
     PipeSlot& next = slots[1 - cur_idx];
 
     if (s.pipe == INVALID_HANDLE_VALUE) {
-      s.pipe = create_pipe_instance();
+      s.pipe = create_pipe_instance(&pipe_sec);
       s.armed = false;
       s.pending = false;
       if (s.pipe == INVALID_HANDLE_VALUE) {
@@ -491,7 +622,7 @@ void server_thread_main() {
     // Pre-create and arm the standby listening instance at a stable OVERLAPPED
     // address BEFORE replying and disconnecting s.pipe, eliminating gaps.
     if (next.pipe == INVALID_HANDLE_VALUE) {
-      next.pipe = create_pipe_instance();
+      next.pipe = create_pipe_instance(&pipe_sec);
       next.armed = false;
       next.pending = false;
       if (next.pipe != INVALID_HANDLE_VALUE) {
@@ -535,7 +666,81 @@ void server_thread_main() {
   }
 }
 
+bool find_subsystem_by_name(const std::string& name, SubsystemId* out_id) {
+  if (out_id == nullptr || name.empty())
+    return false;
+  for (size_t i = 0; i < static_cast<size_t>(SubsystemId::Count); ++i) {
+    auto id = static_cast<SubsystemId>(i);
+    const char* sname = capability_name(id);
+    if (sname != nullptr && _stricmp(sname, name.c_str()) == 0) {
+      *out_id = id;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool apply_config_kv_default(const std::string& key, const std::string& val) {
+  auto parse_bool_str = [&](bool* b) {
+    if (val == "true" || val == "1" || val == "on") {
+      *b = true;
+      return true;
+    }
+    if (val == "false" || val == "0" || val == "off") {
+      *b = false;
+      return true;
+    }
+    return false;
+  };
+
+  WinomeConfig cfg = get_config();
+  bool ok = false;
+  if (key == "developer_mode")
+    ok = parse_bool_str(&cfg.developer_mode);
+  else if (key == "hot_corner_enabled")
+    ok = parse_bool_str(&cfg.hot_corner_enabled);
+  else if (key == "win_key_overview")
+    ok = parse_bool_str(&cfg.win_key_overview);
+  else if (key == "overview_window_blacklist")
+    ok = parse_bool_str(&cfg.overview_window_blacklist);
+  else if (key == "multi_monitor_panels")
+    ok = parse_bool_str(&cfg.multi_monitor_panels);
+  else if (key == "end_session_confirm")
+    ok = parse_bool_str(&cfg.end_session_confirm);
+  else if (key == "unify_dark_titlebars")
+    ok = parse_bool_str(&cfg.unify_dark_titlebars);
+  else if (key == "unify_rounded_corners")
+    ok = parse_bool_str(&cfg.unify_rounded_corners);
+  else if (key == "clock_show_seconds")
+    ok = parse_bool_str(&cfg.clock_show_seconds);
+  else if (key == "show_battery_percentage")
+    ok = parse_bool_str(&cfg.show_battery_percentage);
+  else if (key == "hot_corner_cooldown_ms") {
+    cfg.hot_corner_cooldown_ms = std::atoi(val.c_str());
+    ok = true;
+  } else if (key == "language") {
+    cfg.language = val;
+    ok = true;
+  } else if (key == "clock_format") {
+    cfg.clock_format = val;
+    ok = true;
+  }
+  if (!ok)
+    return false;
+  update_config(cfg);
+  return true;
+}
+
 }  // namespace
+
+std::wstring ipc_build_user_pipe_sddl(const wchar_t* user_sid_str) {
+  if (user_sid_str == nullptr || user_sid_str[0] == L'\0')
+    return {};
+  std::wstring sddl = L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;";
+  sddl += user_sid_str;
+  sddl += L")S:(ML;;NW;;;ME)";
+  return sddl;
+}
 
 std::string ipc_dispatch_request_json(const std::string& req_json,
                                       const IpcCallbacks& cbs) {
@@ -543,11 +748,122 @@ std::string ipc_dispatch_request_json(const std::string& req_json,
   if (!parse_flat_request(req_json, &req) || req.cmd.empty())
     return json_error("invalid JSON request or missing cmd");
 
+  if (debug_get_flags().ipc_trace && req.cmd != "logs.tail")
+    debug_append_log("ipc", std::string("[ipc] cmd=") + req.cmd);
+
   if (req.cmd == "ping") {
     return "{\"ok\":true,\"result\":{\"pong\":true,\"version\":\"0.1.0\"}}";
   }
   if (req.cmd == "status") {
     return build_status_json(cbs);
+  }
+  if (req.cmd == "logs.tail") {
+    const uint64_t after_seq =
+        req.index > 0 ? static_cast<uint64_t>(req.index) : 0;
+    const size_t limit =
+        req.count > 0 ? static_cast<size_t>(std::min(req.count, 512)) : 50;
+    const auto entries = debug_get_logs_since(after_seq, req.tag, limit);
+    return std::string("{\"ok\":true,\"result\":") +
+           debug_logs_to_json(entries) + "}";
+  }
+  if (req.cmd == "logs.clear") {
+    debug_clear_logs();
+    return "{\"ok\":true}";
+  }
+  if (req.cmd == "debug.flags.get") {
+    return std::string("{\"ok\":true,\"result\":") +
+           debug_flags_to_json(debug_get_flags()) + "}";
+  }
+  if (req.cmd == "debug.flags.set") {
+    if (req.name.empty() || !req.has_value)
+      return json_error("debug.flags.set requires name and value");
+    const bool b =
+        (req.value == "true" || req.value == "1" || req.value == "on");
+    if (!debug_set_flag_by_name(req.name, b))
+      return json_error("unknown debug flag");
+    return std::string("{\"ok\":true,\"result\":") +
+           debug_flags_to_json(debug_get_flags()) + "}";
+  }
+  if (req.cmd == "subsystem.trip" || req.cmd == "subsystem.recover") {
+    SubsystemId id{};
+    if (!find_subsystem_by_name(req.name, &id))
+      return json_error("unknown subsystem name");
+    if (req.cmd == "subsystem.trip")
+      capability_record_failure(id, "manual-ipc-trip", 1);
+    else
+      capability_set(id, CapabilityState::Active, "manual-ipc-recover");
+    const CapabilityStatus st = capability_get(id);
+    std::string out = "{\"ok\":true,\"result\":{\"name\":";
+    append_json_escaped(st.name ? st.name : "", &out);
+    out += ",\"state\":";
+    append_json_escaped(capability_state_label(st.state), &out);
+    out += ",\"detail\":";
+    append_json_escaped(st.detail, &out);
+    out += "}}";
+    return out;
+  }
+  if (req.cmd == "inspect.windows") {
+    const auto wins = debug_inspect_windows();
+    return std::string("{\"ok\":true,\"result\":") +
+           debug_windows_to_json(wins) + "}";
+  }
+  if (req.cmd == "inspect.tray") {
+    return std::string("{\"ok\":true,\"result\":") +
+           systray_debug_inspect_json() + "}";
+  }
+  if (req.cmd == "inspect.appgrid") {
+    return std::string("{\"ok\":true,\"result\":") +
+           app_index_debug_dump_json() + "}";
+  }
+  if (req.cmd == "inspect.panel") {
+    if (cbs.inspect_panel_json)
+      return std::string("{\"ok\":true,\"result\":") +
+             cbs.inspect_panel_json() + "}";
+    char buf[192];
+    std::snprintf(buf, sizeof(buf),
+                  "{\"ok\":true,\"result\":{\"safe_mode\":%s,\"developer_mode\":%s}}",
+                  is_safe_mode() ? "true" : "false",
+                  get_config().developer_mode ? "true" : "false");
+    return buf;
+  }
+  if (req.cmd == "theme.reload") {
+    const bool ok = cbs.theme_reload ? cbs.theme_reload() : false;
+    return ok ? "{\"ok\":true}" : json_error("theme reload unavailable");
+  }
+  if (req.cmd == "looking_glass.open") {
+    const bool ok = cbs.looking_glass_open ? cbs.looking_glass_open() : false;
+    return ok ? "{\"ok\":true}"
+              : json_error("enable developer_mode in Settings first");
+  }
+  if (req.cmd == "looking_glass.close") {
+    const bool ok = cbs.looking_glass_close ? cbs.looking_glass_close() : false;
+    return ok ? "{\"ok\":true}" : "{\"ok\":true}";
+  }
+  if (req.cmd == "run.exec") {
+    if (req.name.empty())
+      return json_error("run.exec requires non-empty name command");
+    std::string err;
+    const bool ok = cbs.run_exec ? cbs.run_exec(req.name, &err) : false;
+    if (ok)
+      return "{\"ok\":true}";
+    return json_error(err.empty() ? "command execution unavailable" : err);
+  }
+  if (req.cmd == "plugin.list") {
+    const std::string body =
+        cbs.plugin_list_json ? cbs.plugin_list_json() : "{\"plugins\":[]}";
+    return std::string("{\"ok\":true,\"result\":") + body + "}";
+  }
+  if (req.cmd == "plugin.start" || req.cmd == "plugin.stop" ||
+      req.cmd == "plugin.restart" || req.cmd == "plugin.enable" ||
+      req.cmd == "plugin.disable" || req.cmd == "plugin.reset") {
+    if (req.name.empty())
+      return json_error("plugin command requires plugin id in name");
+    const std::string op = req.cmd.substr(7);
+    std::string err;
+    const bool ok =
+        cbs.plugin_action ? cbs.plugin_action(op, req.name, &err) : false;
+    return ok ? "{\"ok\":true}"
+              : json_error(err.empty() ? "plugin action unavailable" : err);
   }
   if (req.cmd == "overview.open") {
     if (cbs.overview_open)
@@ -582,6 +898,13 @@ std::string ipc_dispatch_request_json(const std::string& req_json,
     out += "}";
     return out;
   }
+  if (req.cmd == "config.set") {
+    if (req.name.empty() || !req.has_value)
+      return json_error("config.set requires name and value");
+    const bool ok = cbs.config_set ? cbs.config_set(req.name, req.value)
+                                   : apply_config_kv_default(req.name, req.value);
+    return ok ? "{\"ok\":true}" : json_error("invalid config key or value");
+  }
   if (req.cmd == "config.reload") {
     if (cbs.config_reload)
       cbs.config_reload();
@@ -614,6 +937,16 @@ std::string ipc_dispatch_request_json(const std::string& req_json,
       return json_error("desktop.switch requires non-negative index");
     const bool ok = cbs.desktop_switch ? cbs.desktop_switch(req.index) : false;
     return ok ? "{\"ok\":true}" : json_error("desktop switch failed");
+  }
+  if (req.cmd == "desktop.create") {
+    const bool ok = cbs.desktop_create ? cbs.desktop_create() : false;
+    return ok ? "{\"ok\":true}" : json_error("desktop create failed");
+  }
+  if (req.cmd == "desktop.remove") {
+    if (!req.has_index || req.index < 0)
+      return json_error("desktop.remove requires non-negative index");
+    const bool ok = cbs.desktop_remove ? cbs.desktop_remove(req.index) : false;
+    return ok ? "{\"ok\":true}" : json_error("desktop remove failed");
   }
   if (req.cmd == "notify") {
     if (req.title.empty())

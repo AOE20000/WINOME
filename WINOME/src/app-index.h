@@ -22,13 +22,50 @@ struct AppEntry {
   std::string name;         // display name (UTF-8)
   std::string name_lower;   // lowercased display name
   std::string target_lower; // lowercased target exe basename
-  std::wstring launch_path; // .lnk / .exe path passed to ShellExecuteW
+  std::wstring launch_path; // .lnk / .url / .exe path passed to ShellExecuteW
   std::wstring target_exe;  // resolved target .exe path (may be empty for UWP)
-  std::wstring icon_path;   // explicit custom icon path from .lnk (optional)
+  std::wstring icon_path;   // explicit custom icon path from .lnk / .url (optional)
   int icon_index = 0;
-  std::wstring aumid;       // PKEY_AppUserModel_ID if set on the shortcut
+  std::wstring aumid;       // PKEY_AppUserModel_ID or AppsFolder AUMID
+  std::string launch_url;   // [InternetShortcut] URL (for .url shortcuts, lowercased)
   bool is_uwp = false;
+  std::string folder_name;  // Start Menu\Programs subfolder display name (empty if root/UWP)
+  int folder_order = -1;    // directory order index of folder_name (-1 if none)
+  int item_order = 0;       // directory order index within folder/root
+  bool from_user_programs = false;
 };
+
+enum class AppGridItemKind { App, Folder };
+
+struct AppGridItem {
+  AppGridItemKind kind = AppGridItemKind::App;
+  std::string id;
+  std::string title;
+  AppEntry app;
+  std::vector<AppEntry> children;
+};
+
+struct StartMenuPinnedItem {
+  enum class Kind { DesktopLink, PackagedApp, DesktopAppId, Folder };
+  Kind kind = Kind::DesktopLink;
+  std::string value;
+  std::vector<StartMenuPinnedItem> children;
+};
+
+// Pure helpers exposed for deterministic unit testing and UI consumers.
+bool decrypt_start2_bin_bytes(const std::string& raw_bytes,
+                              std::string* out_json);
+std::vector<StartMenuPinnedItem> parse_windows_start_layout_json(
+    const std::string& json_text);
+std::vector<StartMenuPinnedItem> load_windows_start_menu_pinned();
+std::vector<StartMenuPinnedItem> app_index_get_pinned_layout();
+std::vector<AppGridItem> build_app_grid_items(
+    const std::vector<AppEntry>& apps,
+    const std::vector<StartMenuPinnedItem>& pinned_items,
+    const std::string& query_lower);
+std::string app_index_debug_dump_json();
+void app_index_start_watch();
+void app_index_stop_watch();
 
 // Pure helpers (unit-tested in winome-tests).
 bool is_ignored_shortcut_name (const std::string &name_lower);

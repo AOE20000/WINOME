@@ -33,6 +33,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -151,6 +152,7 @@ struct Job {
   HWND in_hwnd = nullptr;
   int in_index = 0;
   bool ok = false;
+  bool done = false;
 };
 
 // COM state — only ever touched on the worker thread.
@@ -500,21 +502,15 @@ ComState g_com;  // worker-thread-only
 
 std::mutex g_queue_mu;
 std::condition_variable g_cv;
-std::shared_ptr<Job> g_pending;            // queued job (single slot)
-std::vector<std::shared_ptr<Job>> g_done;  // completed jobs awaiting pickup
+std::deque<std::shared_ptr<Job>> g_queue;  // FIFO job queue; never drop concurrent callers
 bool g_worker_quit = false;
-bool g_worker_stuck = false;  // a call never returned; abandon the module
+bool g_worker_stuck = false;  // true while a COM call has exceeded timeout
 
 // Forward-declared for mutation paths below; implemented in observer section.
 void obs_schedule_hint_async (void);
 
-// Execute @job on the worker thread. Blocks until COMPLETION (not pickup —
-// waking on pickup raced with the worker still writing the results), with a
-// hard timeout: the explorer-side VD RPC service can deadlock (e.g. for
-// callers at a lower integrity level than the shell); rather than freezing
-// the GTK main thread, give up after the timeout and disable the module.
 void
-run_on_worker (const std::shared_ptr<Job> &job)
+run_on_worker (const std::shared_ptr<Job> &job, bool wait_for_result = true)
 {
   static std::once_flag worker_once;
   static std::thread worker;
@@ -528,12 +524,12 @@ run_on_worker (const std::shared_ptr<Job> &job)
 
       std::unique_lock<std::mutex> lock (g_queue_mu);
       for (;;) {
-        g_cv.wait (lock, [] { return g_pending != nullptr || g_worker_quit; });
+        g_cv.wait (lock, [] { return !g_queue.empty () || g_worker_quit; });
         if (g_worker_quit)
           break;
 
-        std::shared_ptr<Job> cur = std::move (g_pending);
-        g_pending.reset ();
+        std::shared_ptr<Job> cur = std::move (g_queue.front ());
+        g_queue.pop_front ();
         lock.unlock ();
 
         switch (cur->op) {
@@ -670,32 +666,39 @@ run_on_worker (const std::shared_ptr<Job> &job)
         }
 
         lock.lock ();
-        if (!g_worker_stuck) {
-          g_done.push_back (std::move (cur));
-          g_cv.notify_all ();
+        cur->done = true;
+        if (g_worker_stuck) {
+          g_worker_stuck = false;
+          winome::capability_set (winome::SubsystemId::VirtualDesktop,
+                                  winome::CapabilityState::Active,
+                                  "Explorer VD COM recovered");
         }
+        g_cv.notify_all ();
       }
     });
     worker.detach ();  // never join: Release after combase teardown crashes
   });
 
   std::unique_lock<std::mutex> lock (g_queue_mu);
-  if (g_worker_stuck) {
+  if (g_worker_stuck || g_worker_quit) {
     job->ok = false;
     return;
   }
-  g_pending = job;
+  if (!wait_for_result && g_queue.size () >= 64) {
+    job->ok = false;
+    return;
+  }
+  g_queue.push_back (job);
   g_cv.notify_all ();
+  if (!wait_for_result)
+    return;
+
   // 8s is far above a healthy round trip (single-digit ms) and below any
-  // user-tolerable UI freeze.
-  bool done = g_cv.wait_for (lock, std::chrono::seconds (8), [&job] {
-    return std::find (g_done.begin (), g_done.end (), job) != g_done.end ();
+  // permanent UI hang; FIFO queue prevents concurrent callers from dropping jobs.
+  bool finished = g_cv.wait_for (lock, std::chrono::seconds (8), [&job] {
+    return job->done || g_worker_quit;
   });
-  if (done) {
-    auto it = std::find (g_done.begin (), g_done.end (), job);
-    if (it != g_done.end ())
-      g_done.erase (it);
-  } else {
+  if (!finished && !job->done) {
     g_worker_stuck = true;
     winome::capability_set (winome::SubsystemId::VirtualDesktop,
                             winome::CapabilityState::Tripped,
@@ -724,6 +727,19 @@ struct ObserverState {
   guint init_delay_id = 0;
   guint fallback_timer_id = 0;
   guint debounce_id = 0;
+
+  ~ObserverState () {
+    std::thread to_join;
+    {
+      std::lock_guard<std::mutex> lock (mu);
+      worker_stop = true;
+      worker_started = false;
+      to_join = std::move (worker);
+    }
+    cv.notify_all ();
+    if (to_join.joinable ())
+      to_join.join ();
+  }
 };
 
 ObserverState &
@@ -966,8 +982,30 @@ pin_window (HWND hwnd)
   auto job = std::make_shared<Job> ();
   job->op = Job::Op::PinWindow;
   job->in_hwnd = hwnd;
-  run_on_worker (job);
+  run_on_worker (job, true);
   return job->ok;
+}
+
+void
+pin_window_async (HWND hwnd)
+{
+  if (hwnd == nullptr)
+    return;
+  auto job = std::make_shared<Job> ();
+  job->op = Job::Op::PinWindow;
+  job->in_hwnd = hwnd;
+  run_on_worker (job, false);
+}
+
+void
+reset_circuit_breaker (void)
+{
+  std::lock_guard<std::mutex> lock (g_queue_mu);
+  g_worker_stuck = false;
+  g_queue.clear ();
+  winome::capability_set (winome::SubsystemId::VirtualDesktop,
+                          winome::CapabilityState::Active,
+                          "manual recovery");
 }
 
 VtableProfile
@@ -1175,6 +1213,40 @@ bool
 available (void)
 {
   return !desktops ().empty ();
+}
+
+void
+shutdown (void)
+{
+  std::thread to_join;
+  HWINEVENTHOOK hook_to_remove = nullptr;
+  guint rm_init = 0, rm_fallback = 0, rm_debounce = 0;
+  ObserverState &s = obs_state ();
+  {
+    std::lock_guard<std::mutex> lock (s.mu);
+    s.listeners.clear ();
+    if (s.worker_started) {
+      s.worker_stop = true;
+      s.worker_started = false;
+      to_join = std::move (s.worker);
+    }
+    hook_to_remove = s.desktop_hook;
+    s.desktop_hook = nullptr;
+    rm_init = s.init_delay_id;
+    s.init_delay_id = 0;
+    rm_fallback = s.fallback_timer_id;
+    s.fallback_timer_id = 0;
+    rm_debounce = s.debounce_id;
+    s.debounce_id = 0;
+  }
+  if (rm_init != 0) g_source_remove (rm_init);
+  if (rm_fallback != 0) g_source_remove (rm_fallback);
+  if (rm_debounce != 0) g_source_remove (rm_debounce);
+  if (hook_to_remove != nullptr) UnhookWinEvent (hook_to_remove);
+  if (to_join.joinable ()) {
+    s.cv.notify_all ();
+    to_join.join ();
+  }
 }
 
 }  // namespace vd

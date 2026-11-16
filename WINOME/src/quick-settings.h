@@ -57,3 +57,17 @@ GtkWidget *winome_quick_menu_new_full (const WinomeMenuEntry *entries,
 
 GtkWidget *winome_quick_menu_new (const WinomeMenuEntry *entries,
                                   guint n_entries);
+
+// Declarative QuickSettings plugin toggles.
+typedef void (*WinomePluginQuickToggleCb) (const char *plugin_id,
+                                             const char *slot,
+                                             gboolean active);
+void winome_quick_settings_set_plugin_toggle_cb (WinomePluginQuickToggleCb cb);
+void winome_quick_settings_plugin_upsert (const char *key,
+                                          const char *plugin_id,
+                                          const char *slot,
+                                          const char *icon_name,
+                                          const char *title,
+                                          const char *subtitle,
+                                          gboolean active);
+void winome_quick_settings_plugin_remove (const char *key);
