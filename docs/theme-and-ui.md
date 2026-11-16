@@ -55,7 +55,7 @@ WINOME 以 sassc 编译后的上游样式表 [gnome-shell-dark.css](../WINOME/sr
    - 当前基线：`OK  83 upstream properties all accounted for; 46 reached the GTK4 stylesheet.`
 2. **控件类名结构检查**（[check-widget-classes.py](../WINOME/tools/check-widget-classes.py)）：
    - 交叉核对 `gnome-shell-gtk4.css` 中的作用域样式类与 C++ 源码中的 `gtk_widget_*_css_class` 调用，抓出「样式存在但代码未建节点」或「代码加了但样式表未定义的死类」。
-   - 当前基线：`OK  137 styled classes; 63 created by the source; 0 optional, 68 styled-but-unused.`
+   - 当前基线：`OK  137 styled classes; 65 created by the source; 0 optional, 66 styled-but-unused.`
 
 ---
 
@@ -118,8 +118,13 @@ GTK4 没有内置动画框架（无 `GtkAnimation`），而上游广泛依赖 `C
 
 - **内置图标资源与占位图（`src/theme/winome.gresource.xml`）**：随包嵌入 12 个上游 GNOME symbolic SVG（`carousel-arrow-*`、`cog-wheel`、`dark-mode`、`group-collapse`、`notification-expand`、`ornament-check`、`preview-close`、`screenshooter`、`check`、`message-indicator`、`no-notifications`）及 `calendar-today.svg`、`workspace-placeholder.svg`，彻底摆脱外部系统图标主题缺失导致的方块或尺寸错乱。
 - **顶栏、通知与快速设置细化**：`QuickSettings` 电源子菜单支持 `Quit WINOME`；Wi-Fi 加密接入改用模态密码弹窗（对齐 `.modal-dialog`）；`SettingsWindow` 采用深色 Adwaita 标题栏与设置页视觉风格；时钟指示器、今日圆点、通知列表空状态与折叠按钮对齐上游节点树。
-- **概览 Chrome 与应用网格 / 右键菜单对齐**：修复概览悬停标题被 DWM 缩略图遮挡与标题过长省略、`workspace-placeholder` 空桌面占位；为 `AppGrid` 接入自定义 `WinomeAppIcon`（`GSK_SCALING_FILTER_TRILINEAR`）避免低清模糊，完善应用右键 AppMenu popover（白字对比度、打开的窗口分组、管理员启动、固定到 Dash 与打开位置）以及双击 Win 键平滑切入 `APP_GRID`。
+- **概览 Chrome 与应用网格 / 文件夹编组对齐**：修复概览悬停标题被 DWM 缩略图遮挡与标题过长省略、`workspace-placeholder` 空桌面占位；为 `AppGrid` 接入自定义 `WinomeAppIcon`（`GSK_SCALING_FILTER_TRILINEAR`）、应用文件夹瓦片（`.overview-tile.app-folder` 2×2 预览）与居中 `.app-folder-dialog`（`.folder-name-container`、`.folder-name-label`、`.icon-grid` 与 `.icon-button`）、应用右键 AppMenu popover（白字对比度、打开的窗口分组、管理员启动、固定到 Dash 与打开位置）以及双击 Win 键平滑切入 `APP_GRID`。
 - **CSS 覆盖与回归校验**：`convert-st-css.py` 扩展了 `APP_GRID`、上下文 popover、模态窗及 `QuickToggleMenu` 所需规则，由 `tests/test-css-converter.py` 自动回归保护；全套上游 St 属性已有 `46 / 83` 进入转换后 GTK4 样式表。
 - **阶段 1 新增 UI 组件**：
   - **EndSession 60 秒确认弹窗**（`src/end-session-dialog.{h,cpp}`）：复用 `.modal-dialog`、`.modal-dialog-content-box`、`.message-dialog-content`、`.message-dialog-title`、`.message-dialog-description` 与 `.modal-dialog-button-box`，内置 1s 倒计时更新、`Esc` 取消、工作区居中置顶及中/英文单复数格式；
-  - **Settings 外观统一与诊断页**（`src/settings-window.cpp`、`src/window-theming.{h,cpp}`）：外观页提供零注入可选开关（`unify_dark_titlebars`、`unify_rounded_corners`），行为页提供 `end_session_confirm` 开关与快捷键一览，新增 `Diagnostics` 标签页集中展示进程内存/GDI/USER、启动各阶段耗时、概览动画帧统计及 `SubsystemId` 健康熔断状态。
+  - **Settings 外观统一与诊断页**（`src/settings-window.cpp`、`src/window-theming.{h,cpp}`）：外观页提供零注入可选开关（`unify_dark_titlebars`、`unify_rounded_corners`），行为页提供 `end_session_confirm`、`developer_mode`（「Open Console」直开控制台）开关与快捷键一览（含 `Alt+F2`），`Diagnostics` 标签页展示实时遥测、`--safe-mode` 提示与 `SubsystemId` 健康熔断状态。
+- **阶段 2–4 新增运维与扩展界面**：
+  - **纯 Win32 崩溃后操作窗口**（`src/crash-dialog.{h,cpp}`）：零 GTK4/OpenGL 依赖的原生 Win32 弹窗，异常退出后立即恢复任务栏并提供安全/正常重启及日志目录入口；
+  - **Looking Glass 开发者控制台**（`src/looking-glass.{h,cpp}`，`#LookingGlassDialog`）：无全局调试热键，仅经设置页或 `Alt+F2 -> lg` 打开；包含 Command、Logs（按 `tag` 过滤含 `plugin:<id>`）、Inspector（GTK Inspector / `StEngine` 选择器实时探针 / `%LOCALAPPDATA%\WINOME\user-debug.css` 热重载）、Windows（实况 Z-Order 与强制重排）与 Plugins & Flags 5 页交互；
+  - **GNOME `Alt+F2` 运行弹窗**（`src/run-dialog.{h,cpp}`）：复用 `.modal-dialog.run-dialog` 样式与上/下键 32 条历史、Tab PATH 前缀补全、`Ctrl+Enter` 终端执行；
+  - **声明式插件 UI 槽位**：顶栏 `right_box` 新增 `#panelPlugins` 动态复用 `.panel-button`，快速设置内通过 `WinomeQuickSettingsGrid` 的 `winome_quick_settings_grid_detach()` 与 `create_toggle_capsule()` 动态增删 `.quick-toggle` 卡片。

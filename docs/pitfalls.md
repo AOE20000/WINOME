@@ -31,7 +31,15 @@
 - **WLAN 同名 BSSID 去重与扫描缓存**：Windows 按 BSSID 返回多行，需按 SSID 合并保留最强信号；可见网络列表受 Windows 驱动扫描缓存影响，有时仅返回当前 AP 的若干 BSSID，每次打开菜单重新扫描即可。
 - **PowrProf 方案 GUID 与头文件**：节能 `a1841308…`、均衡 `381b4222…`（Win11 另有随机化均衡 GUID `b9a9a03a…`）、性能 `8c5e7fda…`；`PowerEnumerate` 首参 `HKEY` 传 `NULL`、枚举标志用 `ACCESS_SCHEME`；`PowerGetActiveScheme(HKEY, GUID**)` 位于 `powersetting.h`，返回的 GUID 需 `LocalFree`。
 - **检查 Win32 `BOOL` 返回值**：`ExitWindowsEx`、`SetSuspendState` 等操作受会话权限与电源策略限制，务必检查返回状态。
-- **UAC 清单对 CLI 子命令的影响**：由于 `winome.exe` 清单声明 `requireAdministrator`，非提权控制台直接启动 `winome.exe --status` 会触发 UAC 提权错误；运行时诊断可从已提权终端查询，或直接连接 `\\.\pipe\WINOME_Shell_IPC` 进行 IPC 通信。
+- **UAC 清单与非提权 Named Pipe 访问**：`winome.exe` 清单声明 `requireAdministrator`，非提权终端直接运行 `winome.exe --status` 会被 UAC 阻拦；应使用不带 UAC 清单的 `winome-ctl.exe`，并配合服务端 `ipc_build_user_pipe_sddl()` 设置的 `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<USER_SID>)S:(ML;;NW;;;ME)` 让同用户 Medium-IL 进程免提权稳定连通 `\\.\pipe\WINOME_Shell_IPC`。
+- **MinGW `<windows.h>` 低级键盘钩子常量**：MinGW 头文件未定义 `LLKHF_REPEAT`，判断键盘钩子自动连发必须像 `overview-trigger.cpp` 那样自行维护按键状态位（如 `g_alt_f2_down`）。
+- **子进程线程 `wait_worker` 自销毁规则**：`plugin-host.cpp` 中若子进程自然崩溃退出而无外部停止方执行 `wait_thread.join()`，`wait_worker` 退出销毁最后一份 `shared_ptr<PluginRun>` 前必须在互斥锁下自行 `detach()` 未被接管的 `std::thread`，否则 C++ 会对仍处于 `joinable()` 的线程触发 `std::terminate()`。
+- **优雅平滑重启单实例锁竞态**：触发 `Alt+F2 -> r` 重启时，新进程必须先经 `--after-pid <old_pid>` 等待旧实例释放 `Local\WINOME_Shell_SingleInstance` 后再抢锁，否则会被判定为重复实例而直接唤醒旧进程后自退。
+- **Win32 拥有窗口（Owner-Owned）Z-Order 禁忌**：`g_chrome_hwnd` / `g_icon_hwnd` / `g_caption_hwnd` 以 `g_overview_hwnd` 为 Owner，不可先放子窗口再 `SetWindowPos(owner, child, ...)`，否则 Win32 强制重排并将面板压到概览下面（`contract=BROKEN`）；正确顺序为先置 `g_overview_hwnd` 于 `g_panel_hwnd` 之后，再用 `SWP_NOOWNERZORDER` 将各悬停 Chrome 窗夹在 `panel` 与 `overview` 之间。
+- **VD 工作线程并发入队与退场 join**：`virtual-desktop.cpp` 原单槽位 `g_pending` 会在 `obs_worker` / `hotkey_worker` / UI 并发时覆盖丢单导致误触发 `8s` 假超时与永久 `Tripped`，须使用 FIFO `std::deque<Job>`；退出时 `ws_osd_shutdown()` 与 `ObserverState::~ObserverState()` 必须收拢 `worker` 线程，避免静态析构触发 `std::terminate()`。
+- **UI 线程禁止同步调用 `ShellExecuteW` / `PangoWin32` 回退**：`app_index_launch` 与 `run-dialog` 外部启动必须在带 STA `CoInitializeEx` 的后台线程执行，否则 DDE/Shell 挂起会卡死 GTK 主循环并导致 `overview-trigger` 时序错乱；`fonts.cpp` 调用 `pango_cairo_font_map_set_default` 确保 GTK 内置 Tooltip / `GtkPopover` 不再回退到 `PangoWin32`（`pango_win32_font_logfont` 断言）；`GtkDrawingArea` 不可设置 `-1` 负 margin（会触发 `min 5 < 6` 布局警告）。
+- **Win11 UIA 系统托盘防 20s–412s 级联超时**：`Shell_TrayWnd` 根窗 `FindAll(TreeScope_Descendants, TrueCondition)` 会遍历全部任务栏应用与多级子桥接且 Windows UIA 默认 `TransactionTimeout` 为 `20s`，若 IPC 线程同步 probe 并与后台轮询并发操作 `Shell_TrayWnd` 显隐/矩形会触发级联 COM 卡顿（实测高达 `412s`）并拖慢右键 10s。必须配置 `IUIAutomation2` 连接/事务超时（`800ms`/`1500ms`）、仅对 `DesktopWindowContentBridge` 子窗使用 `FindAllBuildCache` 批量取值、将用户动作与周期扫描拆分为双 MTA 线程（`shell_tray_mu` 串行保护），且 `systray_debug_inspect_json()` 仅非阻塞返回缓存状态与 `SendMessageTimeoutW` 子窗结果、`winome-ctl` 通过 `PeekNamedPipe` 限定回复超时。
+- **Win11 概览幽灵系统窗口识别**：`TextInputHost.exe`（`Windows.UI.Core.CoreWindow` / `"Windows 输入体验"`）与 `explorer.exe` 无标题 cloaked `ApplicationFrameWindow` / `WorkerW` 均带 `WS_VISIBLE`、无 `WS_EX_TOOLWINDOW` 且由 VirtualDesktop API 判定在当前桌面可见，需通过 `host-utils` 默认黑名单（`overview_window_blacklist`）在概览、Dash 与应用运行点枚举阶段统一排除，避免误删真实 `CabinetWClass` 资源管理器与 `ApplicationFrameHost.exe` 托管 UWP 应用。
 
 ---
 
