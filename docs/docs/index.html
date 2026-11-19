@@ -3,31 +3,63 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>WINOME — Windows GNOME Shell</title>
+  <title>WINOME — 适用于 Windows 的原生 GNOME Shell 桌面环境</title>
+  <meta name="description" content="WINOME 是一款基于 C++17 与 GTK4 的 Windows 桌面环境，在 Windows 10/11 上原生复刻 Linux GNOME Shell 交互体验，支持 Activities 概览、顶栏状态区、动态虚拟桌面与插件扩展。">
+  <meta name="keywords" content="WINOME, Windows GNOME, Windows 桌面环境, GNOME Shell Windows, Windows 11 美化, 替代 Explorer, GTK4">
+  <link rel="canonical" href="https://github.io">
   <meta name="google-site-verification" content="KDNwbrnQGs_3TjjicvcNecAX2chNAJ1Zy_TVIzu6aOY" />
   <style>
     body {
-      max-width: 760px;
+      max-width: 780px;
       margin: 4rem auto;
       padding: 0 1.25rem;
-      font: 1.1rem/1.7 system-ui, sans-serif;
+      font: 1.05rem/1.75 system-ui, -apple-system, sans-serif;
       color: #24292f;
     }
-    a { color: #0969da; }
+    h1 { margin-bottom: 0.25rem; }
+    h2 { margin-top: 2rem; border-bottom: 1px solid #d0d7de; padding-bottom: 0.3rem; }
+    a { color: #0969da; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .btn {
+      display: inline-block;
+      margin-top: 0.75rem;
+      padding: 0.5rem 1rem;
+      background: #24292f;
+      color: #fff;
+      border-radius: 6px;
+      font-weight: 500;
+    }
+    .btn:hover { background: #32383f; text-decoration: none; }
+    code { background: #f6f8fa; padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.92em; }
   </style>
 </head>
 <body>
-  <h1>WINOME</h1>
-  <p>适用于 Microsoft Windows 的 Linux Gnome 桌面环境。</p>
+  <header>
+    <h1>WINOME — Windows GNOME Shell</h1>
+    <p>适用于 Microsoft Windows 的原生 Linux GNOME 桌面环境复刻，基于 C++17、GTK4 与 St CSS 引擎构建。</p>
+    <p>
+      <a class="btn" href="https://github.com/AOE20000/WINOME">查看 GitHub 仓库与源码</a>
+    </p>
+  </header>
 
-  <h2>项目介绍</h2>
-  <p>在这里介绍 WINOME 的目标、主要功能和使用场景。</p>
+  <main>
+    <h2>项目介绍</h2>
+    <p>WINOME 不是简单的桌面皮肤或主题包，而是一个由 Windows 原生 API（DWM、WinRT、WASAPI、COM 虚拟桌面接口）驱动的完整桌面 Shell 体验。它接管原生任务栏与系统托盘，为 Windows 10/11 带来原汁原味的 GNOME 40+ 交互逻辑。</p>
 
-  <h2>安装与使用</h2>
-  <p>补充安装步骤、系统要求和使用说明。</p>
+    <h2>核心特性</h2>
+    <ul>
+      <li><strong>Activities 全屏概览</strong>：单按 <code>Win</code> 键或触发左上角热角呼出窗口选择器，双击 <code>Win</code> 键进入分页应用网格，支持拖拽窗口跨虚拟桌面管理。</li>
+      <li><strong>置顶状态栏与快速设置</strong>：复刻 GNOME 顶部面板、双栏日期与通知中心、SMTC 媒体控制，以及蓝牙、Wi-Fi、亮度与音量快速调节抽屉。</li>
+      <li><strong>进程外插件与开发者控制台</strong>：内置进程隔离的 JSON 插件宿主机与 <code>Alt+F2</code> / Looking Glass 实时样式调试台。</li>
+      <li><strong>高可靠安全守护</strong>：配备独立看门狗进程与 <code>winome.exe --restore</code> 一键还原机制，确保任何情况下均可快速恢复 Windows 原生任务栏。</li>
+    </ul>
 
-  <p>
-    <a href="https://github.com/AOE20000/WINOME">查看 GitHub 仓库</a>
-  </p>
+    <h2>快速开始与系统要求</h2>
+    <ul>
+      <li><strong>系统要求</strong>：Windows 10 / Windows 11（推荐 Win11 22621 或 24H2+ 以获得完整虚拟桌面接口支持）。</li>
+      <li><strong>下载与构建</strong>：前往 <a href="https://github.com">GitHub Releases</a> 获取自包含便携版压缩包，或通过 MSYS2 UCRT64 运行 <code>./build.sh release</code> 从源码构建。</li>
+      <li><strong>运行提示</strong>：隐藏原生任务栏需以<strong>管理员权限</strong>运行 <code>winome.exe</code>。</li>
+    </ul>
+  </main>
 </body>
 </html>
