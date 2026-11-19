@@ -54,4 +54,8 @@ void overview_toggle_app_grid();
 void overview_shift_to_app_grid_async();
 bool overview_can_shift_to_app_grid();
 
+// Discard any saved pre-overview foreground HWND and release foreground lock
+// before launching or activating a target outside the overview.
+void overview_discard_restore_focus();
+
 }  // namespace winome

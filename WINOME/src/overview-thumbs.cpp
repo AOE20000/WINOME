@@ -455,6 +455,8 @@ overview_thumbs_repopulate (GtkWidget *thumbs, int count, int active,
                             double porthole_h, GdkTexture *wallpaper,
                             bool can_manage, bool force_show)
 {
+  if (thumbs == nullptr)
+    return;
   WinomeThumbs *self = WINOME_THUMBS (thumbs);
   resolve_theme (self);
 
@@ -465,11 +467,15 @@ overview_thumbs_repopulate (GtkWidget *thumbs, int count, int active,
   self->active = -1;
   self->hover_index = -1;
   self->hover_close = false;
+  self->drop_target = -1;
+  self->indicator_value = -1.0;
   self->scale = 0;
 
   ThumbLayoutSummary summary =
       compute_thumbs_summary (count, can_manage, force_show);
   if (!summary.visible || porthole_h <= 0 || porthole_w <= 0 || box_h <= 0) {
+    g_clear_object (&self->wallpaper);
+    gtk_widget_queue_draw (thumbs);
     gtk_widget_queue_resize (thumbs);
     return;
   }
@@ -487,6 +493,8 @@ overview_thumbs_repopulate (GtkWidget *thumbs, int count, int active,
   double thumb_h = std::round (porthole_h * scale);
   double thumb_w = std::round (porthole_h * scale * (porthole_w / porthole_h));
   if (thumb_h < 1 || thumb_w < 1) {
+    g_clear_object (&self->wallpaper);
+    gtk_widget_queue_draw (thumbs);
     gtk_widget_queue_resize (thumbs);
     return;
   }
@@ -507,12 +515,9 @@ overview_thumbs_repopulate (GtkWidget *thumbs, int count, int active,
   self->active = active;
   self->scale = thumb_h / porthole_h;
 
-  g_clear_object (&self->wallpaper);
-  if (wallpaper != nullptr) {
-    self->wallpaper = wallpaper;
-    g_object_ref (self->wallpaper);
-  }
+  g_set_object (&self->wallpaper, wallpaper);
 
+  gtk_widget_queue_draw (thumbs);
   gtk_widget_queue_resize (thumbs);
 }
 

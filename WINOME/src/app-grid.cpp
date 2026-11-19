@@ -150,10 +150,15 @@ winome_app_icon_new (int icon_size)
 void
 winome_app_icon_set_texture (GtkWidget *widget, GdkTexture *texture)
 {
+  if (widget == nullptr || !GTK_IS_WIDGET (widget))
+    return;
   WinomeAppIcon *self = WINOME_APP_ICON (widget);
   if (g_set_object (&self->texture, texture)) {
     g_clear_object (&self->fallback);
-    gtk_widget_queue_draw (widget);
+    if (gtk_widget_get_parent (widget) != nullptr &&
+        gtk_widget_get_root (widget) != nullptr) {
+      gtk_widget_queue_draw (widget);
+    }
   }
 }
 
@@ -172,12 +177,99 @@ struct AppGridAsyncState {
   uint64_t built_revision = 0;
   bool prewarm_active = false;
   uint64_t icon_gen = 0;
-  uint64_t worker_gen = 0;
+  int active_workers = 0;
   std::shared_ptr<std::atomic<bool>> alive =
       std::make_shared<std::atomic<bool>> (true);
+  std::shared_ptr<std::atomic<uint64_t>> shared_gen =
+      std::make_shared<std::atomic<uint64_t>> (0);
   std::vector<PendingIconJob> pending_jobs;
   std::unordered_map<std::string, std::vector<GtkWidget *>> icon_targets;
+
+  ~AppGridAsyncState () {
+    for (auto &kv : icon_targets) {
+      for (GtkWidget *w : kv.second) {
+        if (w != nullptr)
+          g_object_unref (w);
+      }
+    }
+    icon_targets.clear ();
+  }
 };
+
+void
+add_icon_target (AppGridAsyncState *st, const std::string &id,
+                 GtkWidget *icon_w)
+{
+  if (st == nullptr || icon_w == nullptr)
+    return;
+  st->icon_targets[id].push_back (
+      static_cast<GtkWidget *> (g_object_ref (icon_w)));
+}
+
+void
+clear_icon_targets (AppGridAsyncState *st)
+{
+  if (st == nullptr)
+    return;
+  for (auto &kv : st->icon_targets) {
+    for (GtkWidget *w : kv.second) {
+      if (w != nullptr)
+        g_object_unref (w);
+    }
+  }
+  st->icon_targets.clear ();
+}
+
+void
+prune_detached_icon_targets (AppGridAsyncState *st)
+{
+  if (st == nullptr)
+    return;
+  for (auto it = st->icon_targets.begin (); it != st->icon_targets.end ();) {
+    auto &vec = it->second;
+    size_t write_idx = 0;
+    for (size_t i = 0; i < vec.size (); ++i) {
+      GtkWidget *w = vec[i];
+      if (w != nullptr && GTK_IS_WIDGET (w) &&
+          gtk_widget_get_parent (w) != nullptr) {
+        vec[write_idx++] = w;
+      } else if (w != nullptr) {
+        g_object_unref (w);
+      }
+    }
+    vec.resize (write_idx);
+    if (vec.empty ())
+      it = st->icon_targets.erase (it);
+    else
+      ++it;
+  }
+}
+
+void
+apply_texture_to_targets (AppGridAsyncState *st, const std::string &id,
+                          GdkTexture *tex)
+{
+  if (st == nullptr || tex == nullptr)
+    return;
+  auto it = st->icon_targets.find (id);
+  if (it == st->icon_targets.end ())
+    return;
+  auto &vec = it->second;
+  size_t write_idx = 0;
+  for (size_t i = 0; i < vec.size (); ++i) {
+    GtkWidget *w = vec[i];
+    if (w != nullptr && GTK_IS_WIDGET (w) &&
+        gtk_widget_get_parent (w) != nullptr) {
+      winome_app_icon_set_texture (w, tex);
+      vec[write_idx++] = w;
+    } else if (w != nullptr) {
+      g_object_unref (w);
+    }
+  }
+  vec.resize (write_idx);
+  if (vec.empty ())
+    st->icon_targets.erase (it);
+}
 
 struct WinomeAppGrid {
   GtkBox parent_instance;
@@ -711,11 +803,14 @@ lookup_icon_label_spacing (void)
   return 6;
 }
 
+void maybe_start_icon_worker (WinomeAppGrid *self);
+
 struct IconBatchPayload {
   WinomeAppGrid *self = nullptr;
   std::shared_ptr<std::atomic<bool>> alive;
   uint64_t gen = 0;
   int size = 0;
+  bool worker_done = false;
   std::vector<RawDecodedIcon> items;
 };
 
@@ -727,23 +822,23 @@ on_icon_batch_idle (gpointer user_data)
       payload->alive && payload->alive->load (std::memory_order_acquire);
   if (alive && payload->self != nullptr && payload->self->async != nullptr) {
     AppGridAsyncState *st = payload->self->async;
-    bool current_gen =
-        (payload->gen == st->icon_gen && payload->size == st->built_load_px);
+    bool matching_size = (payload->size == st->built_load_px);
     for (RawDecodedIcon &raw : payload->items) {
       if (raw.bytes == nullptr)
         continue;
       GdkTexture *tex = app_icon_texture_from_raw (raw);
       if (tex != nullptr) {
         app_icon_cache_store (raw.id, raw.size, tex);
-        if (current_gen) {
-          auto it = st->icon_targets.find (raw.id);
-          if (it != st->icon_targets.end ()) {
-            for (GtkWidget *icon_w : it->second)
-              winome_app_icon_set_texture (icon_w, tex);
-          }
-        }
+        if (matching_size)
+          apply_texture_to_targets (st, raw.id, tex);
         g_object_unref (tex);
       }
+    }
+    if (payload->worker_done) {
+      if (st->active_workers > 0)
+        --st->active_workers;
+      if (!st->pending_jobs.empty ())
+        maybe_start_icon_worker (payload->self);
     }
   }
   for (RawDecodedIcon &raw : payload->items)
@@ -767,11 +862,7 @@ maybe_start_icon_worker (WinomeAppGrid *self)
   int load_px = st->built_load_px;
   for (const PendingIconJob &job : st->pending_jobs) {
     if (GdkTexture *tex = app_icon_cache_lookup (job.entry.id, load_px)) {
-      auto it = st->icon_targets.find (job.entry.id);
-      if (it != st->icon_targets.end ()) {
-        for (GtkWidget *icon_w : it->second)
-          winome_app_icon_set_texture (icon_w, tex);
-      }
+      apply_texture_to_targets (st, job.entry.id, tex);
       g_object_unref (tex);
     } else {
       remaining.push_back (job);
@@ -784,9 +875,8 @@ maybe_start_icon_worker (WinomeAppGrid *self)
   // Never spawn detached worker threads inside unmapped headless unit tests.
   if (!gtk_widget_get_realized (GTK_WIDGET (self)) && !st->prewarm_active)
     return;
-  if (st->worker_gen == st->icon_gen)
+  if (st->active_workers > 0)
     return;
-  st->worker_gen = st->icon_gen;
 
   int active_page = self->page;
   std::vector<PendingIconJob> jobs;
@@ -796,6 +886,7 @@ maybe_start_icon_worker (WinomeAppGrid *self)
     if (seen.insert (job.entry.id).second)
       jobs.push_back (job);
   }
+  st->pending_jobs.clear ();
   std::stable_sort (
       jobs.begin (), jobs.end (),
       [active_page] (const PendingIconJob &a, const PendingIconJob &b) {
@@ -808,9 +899,12 @@ maybe_start_icon_worker (WinomeAppGrid *self)
         return a.page < b.page;
       });
 
+  ++st->active_workers;
   uint64_t gen = st->icon_gen;
   std::shared_ptr<std::atomic<bool>> alive = st->alive;
-  std::thread ([self, jobs = std::move (jobs), gen, load_px, alive] () {
+  std::shared_ptr<std::atomic<uint64_t>> shared_gen = st->shared_gen;
+  std::thread ([self, jobs = std::move (jobs), gen, load_px, alive,
+                shared_gen] () {
     HRESULT hr = CoInitializeEx (
         nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     bool did_co = SUCCEEDED (hr);
@@ -819,32 +913,35 @@ maybe_start_icon_worker (WinomeAppGrid *self)
     std::vector<RawDecodedIcon> batch;
     batch.reserve (kBatchSize);
 
-    auto flush_batch = [&] () {
-      if (batch.empty ())
+    auto flush_batch = [&] (bool done) {
+      if (batch.empty () && !done)
         return;
       auto *payload = new IconBatchPayload ();
       payload->self = self;
       payload->alive = alive;
       payload->gen = gen;
       payload->size = load_px;
+      payload->worker_done = done;
       payload->items = std::move (batch);
       batch.clear ();
       g_idle_add (on_icon_batch_idle, payload);
     };
 
     for (const PendingIconJob &job : jobs) {
-      if (!alive->load (std::memory_order_acquire))
+      if (!alive->load (std::memory_order_acquire) ||
+          shared_gen->load (std::memory_order_acquire) != gen) {
         break;
+      }
       RawDecodedIcon raw = app_icon_decode_entry_raw (job.entry, load_px);
       if (raw.bytes != nullptr) {
         batch.push_back (std::move (raw));
         if (batch.size () >= kBatchSize)
-          flush_batch ();
+          flush_batch (false);
       } else {
         app_icon_raw_clear (raw);
       }
     }
-    flush_batch ();
+    flush_batch (true);
 
     if (did_co)
       CoUninitialize ();
@@ -886,7 +983,7 @@ build_app_tile (WinomeAppGrid *self, const AppEntry &entry, int icon_size,
     g_object_unref (tex);
   } else if (self->async != nullptr) {
     self->async->pending_jobs.push_back (PendingIconJob{entry, page_idx});
-    self->async->icon_targets[entry.id].push_back (icon_w);
+    add_icon_target (self->async, entry.id, icon_w);
   }
   gtk_widget_set_halign (icon_w, GTK_ALIGN_CENTER);
   gtk_box_append (GTK_BOX (content), icon_w);
@@ -949,6 +1046,8 @@ close_folder_dialog (WinomeAppGrid *self)
                                 self->folder_backdrop);
   self->folder_backdrop = nullptr;
   self->folder_dialog_grid = nullptr;
+  if (self->async != nullptr)
+    prune_detached_icon_targets (self->async);
   return true;
 }
 
@@ -1055,7 +1154,10 @@ open_folder_dialog (WinomeAppGrid *self, const AppGridItem &folder)
 
   int scale = std::max (gtk_widget_get_scale_factor (GTK_WIDGET (self)), 1);
   int icon_size = std::clamp ((dlg_w - 140) / 5, 48, 64);
-  int load_px = std::clamp (icon_size * std::max (scale, 2), 96, 256);
+  int load_px =
+      (self->async != nullptr && self->async->built_load_px > 0)
+          ? self->async->built_load_px
+          : std::clamp (icon_size * std::max (scale, 2), 96, 256);
   int tile_w = std::clamp ((dlg_w - 96) / 4, 108, 148);
   int tile_h = icon_size + 68;
   int label_spacing = lookup_icon_label_spacing ();
@@ -1135,7 +1237,7 @@ build_folder_tile (WinomeAppGrid *self, const AppGridItem &folder,
       g_object_unref (tex);
     } else if (self->async != nullptr) {
       self->async->pending_jobs.push_back (PendingIconJob{child, page_idx});
-      self->async->icon_targets[child.id].push_back (mini);
+      add_icon_target (self->async, child.id, mini);
     }
     gtk_widget_set_halign (mini, GTK_ALIGN_CENTER);
     gtk_widget_set_valign (mini, GTK_ALIGN_CENTER);
@@ -1223,9 +1325,10 @@ void
 rebuild_all_pages (WinomeAppGrid *self)
 {
   if (self->async != nullptr) {
-    ++self->async->icon_gen;
+    uint64_t next_gen = ++self->async->icon_gen;
+    self->async->shared_gen->store (next_gen, std::memory_order_release);
     self->async->pending_jobs.clear ();
-    self->async->icon_targets.clear ();
+    clear_icon_targets (self->async);
   }
 
   app_grid_close_menu (GTK_WIDGET (self));
@@ -1385,9 +1488,10 @@ winome_app_grid_dispose (GObject *object)
   WinomeAppGrid *self = WINOME_APP_GRID (object);
   if (self->async != nullptr) {
     self->async->alive->store (false, std::memory_order_release);
-    ++self->async->icon_gen;
+    uint64_t next_gen = ++self->async->icon_gen;
+    self->async->shared_gen->store (next_gen, std::memory_order_release);
     self->async->pending_jobs.clear ();
-    self->async->icon_targets.clear ();
+    clear_icon_targets (self->async);
   }
   if (self->scroll_timer != 0) {
     g_source_remove (self->scroll_timer);
@@ -1773,9 +1877,11 @@ app_grid_close_menu (GtkWidget *grid)
   if (self->active_menu != nullptr) {
     GtkWidget *m = self->active_menu;
     self->active_menu = nullptr;
+    g_object_ref (m);
     gtk_popover_popdown (GTK_POPOVER (m));
     if (gtk_widget_get_parent (m) != nullptr)
       gtk_widget_unparent (m);
+    g_object_unref (m);
   }
 }
 

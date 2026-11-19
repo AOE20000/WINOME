@@ -9,6 +9,7 @@
 // IShellItemImageFactory on the exe path, converted to GdkTexture.
 
 #include "overview-dash.h"
+#include "overview.h"
 #include "app-index.h"
 #include "config.h"
 #include "easing.h"
@@ -18,6 +19,7 @@
 #include "overview-trigger.h"
 #include "st-engine.h"
 #include "system-status.h"
+#include "virtual-desktop.h"
 
 #include <gdk/gdk.h>
 #include <dwmapi.h>
@@ -26,9 +28,11 @@
 #include <shobjidl.h>
 
 #include <algorithm>
+#include <cwchar>
 #include <new>
 #include <string>
 #include <vector>
+#include <wchar.h>
 
 namespace winome {
 
@@ -85,6 +89,7 @@ struct WinomeDash {
   int pinned_count = 0;    // items [0..pinned_count) are persisted favorites
   double separator_x = -1; // >= 0 when a separator separates favorites & running
   int icon_size = 64;      // logical px
+  int item_gap = kItemGap; // logical px horizontal tile spacing
 
   int pill_x = 0, pill_y = 0, pill_w = 0, pill_h = 0; // widget-relative
   std::vector<DashTileRect> tile_rects;
@@ -265,6 +270,8 @@ utf8 (const std::wstring &w)
     return {};
   int n = WideCharToMultiByte (CP_UTF8, 0, w.c_str (), (int)w.size (),
                                nullptr, 0, nullptr, nullptr);
+  if (n <= 0)
+    return {};
   std::string out (n, 0);
   WideCharToMultiByte (CP_UTF8, 0, w.c_str (), (int)w.size (), out.data (),
                        n, nullptr, nullptr);
@@ -274,6 +281,8 @@ utf8 (const std::wstring &w)
 std::string
 exe_file_description (const std::wstring &exe)
 {
+  if (exe.empty ())
+    return {};
   DWORD zero = 0;
   DWORD size = GetFileVersionInfoSizeW (exe.c_str (), &zero);
   if (size == 0)
@@ -282,6 +291,9 @@ exe_file_description (const std::wstring &exe)
   if (!GetFileVersionInfoW (exe.c_str (), 0, size, buffer.data ()))
     return {};
 
+  const char *buf_begin = buffer.data ();
+  const char *buf_end = buf_begin + size;
+
   struct LangCodePage {
     WORD language;
     WORD code_page;
@@ -289,16 +301,28 @@ exe_file_description (const std::wstring &exe)
   UINT count = 0;
   std::string result;
   if (VerQueryValueW (buffer.data (), L"\\VarFileInfo\\Translation",
-                      (LPVOID *)&langs, &count) &&
-      count > 0) {
+                      reinterpret_cast<LPVOID *> (&langs), &count) &&
+      langs != nullptr && count >= sizeof (LangCodePage) &&
+      reinterpret_cast<const char *> (langs) >= buf_begin &&
+      reinterpret_cast<const char *> (langs) + sizeof (LangCodePage) <= buf_end) {
     wchar_t query[128];
-    swprintf (query, 128, L"\\StringFileInfo\\%04x%04x\\FileDescription",
-              langs[0].language, langs[0].code_page);
+    std::swprintf (query, 128, L"\\StringFileInfo\\%04x%04x\\FileDescription",
+                   langs[0].language, langs[0].code_page);
     wchar_t *desc = nullptr;
     UINT len = 0;
-    if (VerQueryValueW (buffer.data (), query, (LPVOID *)&desc, &len) &&
-        desc != nullptr)
-      result = utf8 (desc);
+    if (VerQueryValueW (buffer.data (), query,
+                        reinterpret_cast<LPVOID *> (&desc), &len) &&
+        desc != nullptr && len > 0) {
+      const char *desc_bytes = reinterpret_cast<const char *> (desc);
+      if (desc_bytes >= buf_begin && desc_bytes < buf_end) {
+        size_t max_wchars = std::min<size_t> (
+            static_cast<size_t> (len),
+            static_cast<size_t> (buf_end - desc_bytes) / sizeof (wchar_t));
+        size_t bounded = ::wcsnlen (desc, max_wchars);
+        if (bounded > 0)
+          result = utf8 (std::wstring (desc, bounded));
+      }
+    }
   }
   return result;
 }
@@ -306,6 +330,7 @@ exe_file_description (const std::wstring &exe)
 struct EnumCtx {
   HMONITOR monitor;
   std::vector<HWND> *windows;
+  bool vd_filter = false;
   bool use_blacklist = true;
 };
 
@@ -313,10 +338,16 @@ BOOL CALLBACK
 dash_collect (HWND hwnd, LPARAM lparam)
 {
   EnumCtx *ctx = reinterpret_cast<EnumCtx *> (lparam);
-  if (dash_is_our_process (hwnd) || dash_is_cloaked (hwnd) ||
-      !dash_is_alt_tab_window (hwnd) ||
+  if (dash_is_our_process (hwnd) || !dash_is_alt_tab_window (hwnd) ||
       is_overview_default_blacklisted_hwnd (hwnd, ctx->use_blacklist))
     return TRUE;
+
+  if (ctx->vd_filter) {
+    if (!vd::window_on_current (hwnd))
+      return TRUE;
+  } else if (dash_is_cloaked (hwnd)) {
+    return TRUE;
+  }
 
   RECT r = {};
   if (IsIconic (hwnd)) {
@@ -324,7 +355,8 @@ dash_collect (HWND hwnd, LPARAM lparam)
     wp.length = sizeof (wp);
     if (GetWindowPlacement (hwnd, &wp))
       r = wp.rcNormalPosition;
-  } else {
+  } else if (!SUCCEEDED (DwmGetWindowAttribute (
+                 hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof (r)))) {
     GetWindowRect (hwnd, &r);
   }
   if (r.right <= r.left || r.bottom <= r.top)
@@ -346,6 +378,33 @@ clear_apps (WinomeDash *self)
   self->apps.clear ();
 }
 
+int
+dash_total_width_for (int n_apps, int icon_size, int item_gap, bool has_split)
+{
+  int tiles = std::max (n_apps, 0) + 1;
+  int tile = icon_size + 2 * kTilePad;
+  int pill_w = 2 * kDashPadH + tiles * tile +
+               std::max (tiles - 1, 0) * item_gap +
+               (has_split ? kSeparatorGap : 0);
+  return pill_w + 2 * kDashSidePadding;
+}
+
+int
+dash_monitor_logical_width (HMONITOR monitor, int scale)
+{
+  int safe_scale = std::max (scale, 1);
+  int mw = 0;
+  if (monitor != nullptr) {
+    MONITORINFO mi{};
+    mi.cbSize = sizeof (mi);
+    if (GetMonitorInfoW (monitor, &mi))
+      mw = mi.rcMonitor.right - mi.rcMonitor.left;
+  }
+  if (mw <= 0)
+    mw = GetSystemMetrics (SM_CXSCREEN);
+  return mw > 0 ? std::max (mw / safe_scale, 1) : 0;
+}
+
 void
 recompute_layout (WinomeDash *self)
 {
@@ -358,7 +417,8 @@ recompute_layout (WinomeDash *self)
   bool has_split =
       self->pinned_count > 0 && self->pinned_count < n_apps;
 
-  self->pill_w = 2 * kDashPadH + tiles * tile + (tiles - 1) * kItemGap +
+  self->pill_w = 2 * kDashPadH + tiles * tile +
+                 std::max (tiles - 1, 0) * self->item_gap +
                  (has_split ? kSeparatorGap : 0);
   self->pill_h = 2 * kDashPadV + tile;
   self->pill_x = kDashSidePadding;
@@ -368,18 +428,19 @@ recompute_layout (WinomeDash *self)
   double y = self->pill_y + kDashPadV;
   for (int i = 0; i < tiles; ++i) {
     if (has_split && i == self->pinned_count) {
-      self->separator_x = x + (kSeparatorGap - kItemGap) / 2.0 - 0.5;
+      self->separator_x = x + (kSeparatorGap - self->item_gap) / 2.0 - 0.5;
       x += kSeparatorGap;
     }
     self->tile_rects.push_back ({x, y, (double)tile, (double)tile});
-    x += tile + kItemGap;
+    x += tile + self->item_gap;
   }
 }
 
 void
 place_label (WinomeDash *self, int index)
 {
-  if (index < 0 || index >= (int)self->tile_rects.size ())
+  if (self->label == nullptr || self->root_fixed == nullptr ||
+      index < 0 || index >= (int)self->tile_rects.size ())
     return;
 
   DashApp *app =
@@ -396,7 +457,8 @@ place_label (WinomeDash *self, int index)
 
   graphene_point_t src_pt = GRAPHENE_POINT_INIT (0.f, 0.f);
   graphene_point_t dst_pt = GRAPHENE_POINT_INIT (0.f, 0.f);
-  if (gtk_widget_compute_point (GTK_WIDGET (self), self->root_fixed,
+  if (gtk_widget_get_parent (self->label) == self->root_fixed &&
+      gtk_widget_compute_point (GTK_WIDGET (self), self->root_fixed,
                                 &src_pt, &dst_pt)) {
     double cx = dst_pt.x + tile_cx;
     double top = dst_pt.y + tile_top;
@@ -480,6 +542,7 @@ activate_app (WinomeDash *self, int index)
     break;
   }
   if (best == nullptr) {
+    overview_discard_restore_focus ();
     if (app_index_launch_id (self->apps[index].id, false) ||
         (!self->apps[index].exe_path.empty () &&
          reinterpret_cast<INT_PTR> (ShellExecuteW (
@@ -490,6 +553,7 @@ activate_app (WinomeDash *self, int index)
     return;
   }
 
+  overview_discard_restore_focus ();
   if (IsIconic (best))
     ShowWindow (best, SW_RESTORE);
   SetForegroundWindow (best);
@@ -499,6 +563,7 @@ activate_app (WinomeDash *self, int index)
 void
 open_start_menu_and_close ()
 {
+  overview_discard_restore_focus ();
   close_overview ("show-apps");
   open_start_menu ();
 }
@@ -563,6 +628,7 @@ on_dash_menu_new_window (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
   std::string app_id = ctx->app_id;
   std::wstring exe_path = ctx->exe_path;
   overview_dash_close_menu (GTK_WIDGET (self));
+  overview_discard_restore_focus ();
   if (app_index_launch_id (app_id, false) ||
       (!exe_path.empty () &&
        reinterpret_cast<INT_PTR> (ShellExecuteW (
@@ -609,6 +675,7 @@ on_dash_menu_window (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
   WinomeDash *self = wctx->self;
   HWND hwnd = wctx->hwnd;
   overview_dash_close_menu (GTK_WIDGET (self));
+  overview_discard_restore_focus ();
   if (app_index_activate_hwnd (hwnd))
     close_overview ("dash-activate-window");
 }
@@ -621,8 +688,11 @@ on_dash_menu_location (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
   std::string app_id = ctx->app_id;
   overview_dash_close_menu (GTK_WIDGET (self));
   AppEntry entry;
-  if (app_index_find_by_id (app_id, &entry) && app_index_open_location (entry))
-    close_overview ("dash-open-location");
+  if (app_index_find_by_id (app_id, &entry)) {
+    overview_discard_restore_focus ();
+    if (app_index_open_location (entry))
+      close_overview ("dash-open-location");
+  }
 }
 
 GtkWidget *
@@ -979,6 +1049,7 @@ winome_dash_init (WinomeDash *self)
   new (&self->tile_rects) std::vector<DashTileRect> ();
   self->separator_x = -1;
   self->icon_size = 64;
+  self->item_gap = kItemGap;
   self->hover_index = -1;
   self->last_max_height = 96;
   gtk_widget_set_cursor_from_name (GTK_WIDGET (self), "default");
@@ -995,9 +1066,21 @@ winome_dash_dispose (GObject *object)
   }
   ++self->label_anim_gen;
   if (self->label != nullptr) {
-    gtk_widget_set_visible (self->label, FALSE);
-    gtk_fixed_remove (GTK_FIXED (self->root_fixed), self->label);
+    GtkWidget *lbl = self->label;
+    g_object_remove_weak_pointer (G_OBJECT (lbl),
+                                  reinterpret_cast<gpointer *> (&self->label));
     self->label = nullptr;
+    gtk_widget_set_visible (lbl, FALSE);
+    if (self->root_fixed != nullptr &&
+        gtk_widget_get_parent (lbl) == self->root_fixed) {
+      gtk_fixed_remove (GTK_FIXED (self->root_fixed), lbl);
+    }
+  }
+  if (self->root_fixed != nullptr) {
+    g_object_remove_weak_pointer (
+        G_OBJECT (self->root_fixed),
+        reinterpret_cast<gpointer *> (&self->root_fixed));
+    self->root_fixed = nullptr;
   }
   clear_apps (self);
   G_OBJECT_CLASS (winome_dash_parent_class)->dispose (object);
@@ -1082,12 +1165,19 @@ overview_dash_new (GtkWidget *root_fixed)
   WinomeDash *self =
       (WinomeDash *)g_object_new (winome_dash_get_type (), nullptr);
   self->root_fixed = root_fixed;
+  if (self->root_fixed != nullptr) {
+    g_object_add_weak_pointer (
+        G_OBJECT (self->root_fixed),
+        reinterpret_cast<gpointer *> (&self->root_fixed));
+  }
 
   // Hover label (.dash-label pill), floating above the dash.
   self->label = gtk_label_new ("");
   gtk_widget_add_css_class (self->label, "dash-label");
   gtk_widget_set_visible (self->label, FALSE);
   gtk_fixed_put (GTK_FIXED (root_fixed), self->label, 0, 0);
+  g_object_add_weak_pointer (G_OBJECT (self->label),
+                             reinterpret_cast<gpointer *> (&self->label));
 
   // Controllers: motion for hover + label, left/right click for activation/menu.
   GtkEventController *motion =
@@ -1142,15 +1232,21 @@ overview_dash_close_menu (GtkWidget *dash)
   if (self->active_menu != nullptr) {
     GtkWidget *m = self->active_menu;
     self->active_menu = nullptr;
+    // Hold a temporary ref across popdown so a synchronous "closed" signal
+    // unparenting the popover cannot finalize `m` before we check its parent.
+    g_object_ref (m);
     gtk_popover_popdown (GTK_POPOVER (m));
     if (gtk_widget_get_parent (m) != nullptr)
       gtk_widget_unparent (m);
+    g_object_unref (m);
   }
 }
 
 void
 overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
 {
+  if (dash == nullptr)
+    return;
   WinomeDash *self = WINOME_DASH (dash);
   overview_dash_close_menu (dash);
   hide_label (self);
@@ -1159,20 +1255,18 @@ overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
   self->last_max_height = max_height;
   clear_apps (self);
 
-  // Icon size: largest base size that fits the available dash height.
-  double scale = gtk_widget_get_scale_factor (dash);
+  // Icon size ceiling from available dash height.
+  int scale = std::max (gtk_widget_get_scale_factor (dash), 1);
   int avail = max_height - 2 * kDashPadV - 2 * kTilePad - kDashBottomMargin;
-  self->icon_size = kBaseIconSizes[0];
+  int max_v_icon = kBaseIconSizes[0];
   for (int i = 0; i < kBaseIconSizesCount; ++i) {
     if (kBaseIconSizes[i] <= avail)
-      self->icon_size = kBaseIconSizes[i];
+      max_v_icon = kBaseIconSizes[i];
   }
-  int super_scale = std::max ((int)(scale + 0.5), 2);
-  int icon_px = std::clamp (self->icon_size * super_scale, 96, 256);
 
   // Enumerate windows top-down and group into running applications.
   std::vector<HWND> windows;
-  EnumCtx ctx{monitor, &windows,
+  EnumCtx ctx{monitor, &windows, vd::available (),
               winome::get_config ().overview_window_blacklist};
   EnumWindows (dash_collect, reinterpret_cast<LPARAM> (&ctx));
 
@@ -1224,6 +1318,16 @@ overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
     return SIZE_MAX;
   };
 
+  struct DashCandidate {
+    DashApp app;
+    AppEntry entry;
+    bool has_entry = false;
+    bool from_running = false;
+    bool fallback_path = false;
+  };
+  std::vector<DashCandidate> pinned_cands;
+  std::vector<DashCandidate> running_cands;
+
   // 1. Persisted Favorites (in configured order).
   for (const std::string &raw_pin : cfg.pinned_apps) {
     std::string pin_id = normalize_app_id (raw_pin);
@@ -1231,8 +1335,8 @@ overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
       continue;
 
     bool dup = false;
-    for (const DashApp &existing : self->apps) {
-      if (existing.id == pin_id) {
+    for (const DashCandidate &existing : pinned_cands) {
+      if (existing.app.id == pin_id) {
         dup = true;
         break;
       }
@@ -1246,49 +1350,125 @@ overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
     if (ridx == SIZE_MAX && has_entry && !entry.target_exe.empty ())
       ridx = find_running_match (normalize_app_id (utf8 (entry.target_exe)));
 
-    DashApp app;
-    app.id = pin_id;
-    app.pinned = true;
+    DashCandidate cand;
+    cand.app.id = pin_id;
+    cand.app.pinned = true;
+    cand.has_entry = has_entry;
+    if (has_entry)
+      cand.entry = std::move (entry);
 
     if (ridx != SIZE_MAX) {
       running_consumed[ridx] = true;
-      app.exe_path = running[ridx].exe;
-      app.windows = std::move (running[ridx].windows);
-      app.name = has_entry ? entry.name : running[ridx].name;
-      app.icon = app_icon_for_window (app.windows[0], app.exe_path, icon_px,
-                                      app.id);
-    } else if (has_entry) {
-      app.exe_path = entry.target_exe;
-      app.name = entry.name;
-      app.icon = app_icon_for_entry (entry, icon_px);
+      cand.app.exe_path = running[ridx].exe;
+      cand.app.windows = std::move (running[ridx].windows);
+      cand.app.name = cand.has_entry ? cand.entry.name : running[ridx].name;
+      cand.from_running = true;
+    } else if (cand.has_entry) {
+      cand.app.exe_path = cand.entry.target_exe;
+      cand.app.name = cand.entry.name;
     } else {
       std::wstring wpath = app_utf8_to_wide (pin_id);
       if (GetFileAttributesW (wpath.c_str ()) == INVALID_FILE_ATTRIBUTES)
         continue; // ignore stale uninstalled favorite path
-      app.exe_path = wpath;
-      app.name = pinned_fallback_label (pin_id);
-      app.icon = app_icon_for_path (wpath, icon_px, pin_id);
+      cand.app.exe_path = std::move (wpath);
+      cand.app.name = pinned_fallback_label (pin_id);
+      cand.fallback_path = true;
     }
 
-    self->apps.push_back (std::move (app));
+    pinned_cands.push_back (std::move (cand));
   }
-  self->pinned_count = (int)self->apps.size ();
 
   // 2. Remaining running apps not in favorites.
   for (size_t i = 0; i < running.size (); ++i) {
     if (running_consumed[i])
       continue;
     RunningGroup &g = running[i];
-    DashApp app;
-    app.id = g.id;
-    app.exe_path = g.exe;
-    app.name = g.name;
-    app.windows = std::move (g.windows);
-    app.pinned = false;
-    app.icon =
-        app_icon_for_window (app.windows[0], app.exe_path, icon_px, app.id);
-    self->apps.push_back (std::move (app));
+    DashCandidate cand;
+    cand.app.id = g.id;
+    cand.app.exe_path = g.exe;
+    cand.app.name = g.name;
+    cand.app.windows = std::move (g.windows);
+    cand.app.pinned = false;
+    cand.from_running = true;
+    running_cands.push_back (std::move (cand));
   }
+
+  // Fit dash horizontally to the target monitor width so dash_x never goes
+  // negative and the trailing Show Apps button always remains visible on screen.
+  int max_logical_w = dash_monitor_logical_width (monitor, scale);
+  int chosen_icon = max_v_icon;
+  int chosen_gap = kItemGap;
+  int keep_pinned = (int)pinned_cands.size ();
+  int keep_running = (int)running_cands.size ();
+
+  if (max_logical_w > 0) {
+    auto fits = [&] (int np, int nr, int isize, int gap) {
+      bool split = (np > 0 && nr > 0);
+      return dash_total_width_for (np + nr, isize, gap, split) <= max_logical_w;
+    };
+
+    bool matched = false;
+    for (int i = kBaseIconSizesCount - 1; i >= 0; --i) {
+      if (kBaseIconSizes[i] > max_v_icon)
+        continue;
+      if (fits (keep_pinned, keep_running, kBaseIconSizes[i], kItemGap)) {
+        chosen_icon = kBaseIconSizes[i];
+        chosen_gap = kItemGap;
+        matched = true;
+        break;
+      }
+    }
+
+    if (!matched) {
+      chosen_icon = kBaseIconSizes[0];
+      static constexpr int kCompactGaps[] = {2, 0};
+      for (int gap : kCompactGaps) {
+        if (fits (keep_pinned, keep_running, chosen_icon, gap)) {
+          chosen_gap = gap;
+          matched = true;
+          break;
+        }
+      }
+    }
+
+    if (!matched) {
+      chosen_icon = kBaseIconSizes[0];
+      chosen_gap = 0;
+      while (keep_running > 0 &&
+             !fits (keep_pinned, keep_running, chosen_icon, chosen_gap)) {
+        --keep_running;
+      }
+      while (keep_pinned > 0 &&
+             !fits (keep_pinned, keep_running, chosen_icon, chosen_gap)) {
+        --keep_pinned;
+      }
+    }
+  }
+
+  self->icon_size = chosen_icon;
+  self->item_gap = chosen_gap;
+  int super_scale = std::max (scale, 2);
+  int icon_px = std::clamp (self->icon_size * super_scale, 96, 256);
+
+  auto finalize_candidate = [&] (DashCandidate &cand) {
+    if (cand.from_running) {
+      cand.app.icon = app_icon_for_window (cand.app.windows[0],
+                                           cand.app.exe_path, icon_px,
+                                           cand.app.id);
+    } else if (cand.has_entry) {
+      cand.app.icon = app_icon_for_entry (cand.entry, icon_px);
+    } else if (cand.fallback_path) {
+      cand.app.icon = app_icon_for_path (cand.app.exe_path, icon_px,
+                                         cand.app.id);
+    }
+    self->apps.push_back (std::move (cand.app));
+  };
+
+  for (int i = 0; i < keep_pinned; ++i)
+    finalize_candidate (pinned_cands[i]);
+  self->pinned_count = keep_pinned;
+  for (int i = 0; i < keep_running; ++i)
+    finalize_candidate (running_cands[i]);
 
   recompute_layout (self);
   gtk_widget_queue_resize (dash);

@@ -52,7 +52,7 @@ struct Layout {
 double
 compute_window_scale (const OvWindowInfo &window, double monitor_height)
 {
-  double h = window.rect.bottom - window.rect.top;
+  double h = std::max ((double)(window.rect.bottom - window.rect.top), 0.0);
   double ratio = monitor_height > 0 ? h / monitor_height : 1.0;
   return lerp (1.5, 1.0, ratio);
 }
@@ -62,6 +62,11 @@ void
 compute_row_sizes (Layout *layout)
 {
   for (Row &row : layout->rows) {
+    if (row.windows.empty ()) {
+      row.width = 0;
+      row.height = 0;
+      continue;
+    }
     row.width = row.fullWidth * layout->scale +
                 (row.windows.size () - 1) * layout->columnSpacing;
     row.height = row.fullHeight * layout->scale;
@@ -72,8 +77,14 @@ compute_row_sizes (Layout *layout)
 bool
 keep_same_row (const Row &row, double width, double ideal_row_width)
 {
+  if (row.windows.empty ())
+    return true;
+
   if (row.fullWidth + width <= ideal_row_width)
     return true;
+
+  if (ideal_row_width <= 0.0)
+    return false;
 
   double old_ratio = row.fullWidth / ideal_row_width;
   double new_ratio = (row.fullWidth + width) / ideal_row_width;
@@ -100,10 +111,11 @@ compute_layout (const std::vector<OvWindowInfo> &windows, int num_rows,
   std::vector<Row> &rows = layout->rows;
 
   double total_width = 0;
-  for (const OvWindowInfo &window : windows)
-    total_width += (window.rect.right - window.rect.left) *
-                   compute_window_scale (window, monitor_height);
-  double ideal_row_width = total_width / num_rows;
+  for (const OvWindowInfo &window : windows) {
+    double w = std::max ((double)(window.rect.right - window.rect.left), 0.0);
+    total_width += w * compute_window_scale (window, monitor_height);
+  }
+  double ideal_row_width = num_rows > 0 ? total_width / num_rows : total_width;
 
   // Sort windows vertically to minimize travel distance.
   std::vector<const OvWindowInfo *> sorted;
@@ -116,25 +128,32 @@ compute_layout (const std::vector<OvWindowInfo> &windows, int num_rows,
                     });
 
   size_t window_idx = 0;
-  for (int i = 0; i < num_rows; ++i) {
+  for (int i = 0; i < num_rows && window_idx < sorted.size (); ++i) {
     rows.emplace_back ();
     Row &row = rows.back ();
 
     for (; window_idx < sorted.size (); ++window_idx) {
       const OvWindowInfo *window = sorted[window_idx];
       double s = compute_window_scale (*window, monitor_height);
-      double width = (window->rect.right - window->rect.left) * s;
-      double height = (window->rect.bottom - window->rect.top) * s;
-      row.fullHeight = std::max (row.fullHeight, height);
+      double width =
+          std::max ((double)(window->rect.right - window->rect.left), 0.0) * s;
+      double height =
+          std::max ((double)(window->rect.bottom - window->rect.top), 0.0) * s;
 
       if (keep_same_row (row, width, ideal_row_width) || i == num_rows - 1) {
         row.windows.push_back (window);
         row.fullWidth += width;
+        row.fullHeight = std::max (row.fullHeight, height);
       } else {
         break;
       }
     }
   }
+
+  rows.erase (
+      std::remove_if (rows.begin (), rows.end (),
+                      [] (const Row &r) { return r.windows.empty (); }),
+      rows.end ());
 
   double grid_height = 0;
   const Row *max_row = nullptr;
@@ -150,7 +169,7 @@ compute_layout (const std::vector<OvWindowInfo> &windows, int num_rows,
     grid_height += row.fullHeight;
   }
 
-  layout->numRows = num_rows;
+  layout->numRows = (int)rows.size ();
   layout->maxColumns = max_row ? max_row->windows.size () : 0;
   layout->gridWidth = max_row ? max_row->fullWidth : 0;
   layout->gridHeight = grid_height;
@@ -160,25 +179,32 @@ compute_layout (const std::vector<OvWindowInfo> &windows, int num_rows,
 void
 compute_scale_and_space (Layout *layout, const RECT &area)
 {
-  double aw = area.right - area.left;
-  double ah = area.bottom - area.top;
-  double hspacing = (layout->maxColumns - 1) * layout->columnSpacing;
-  double vspacing = (layout->numRows - 1) * layout->rowSpacing;
+  double aw = std::max ((double)(area.right - area.left), 0.0);
+  double ah = std::max ((double)(area.bottom - area.top), 0.0);
+  double hspacing = layout->maxColumns > 0
+                        ? (layout->maxColumns - 1) * layout->columnSpacing
+                        : 0.0;
+  double vspacing = layout->numRows > 0
+                        ? (layout->numRows - 1) * layout->rowSpacing
+                        : 0.0;
 
-  double spaced_width = aw - hspacing;
-  double spaced_height = ah - vspacing;
+  double spaced_width = std::max (aw - hspacing, 0.0);
+  double spaced_height = std::max (ah - vspacing, 0.0);
 
   double horizontal_scale =
       layout->gridWidth > 0 ? spaced_width / layout->gridWidth : 1.0;
   double vertical_scale =
       layout->gridHeight > 0 ? spaced_height / layout->gridHeight : 1.0;
 
-  double scale = std::min ({horizontal_scale, vertical_scale,
-                            kWindowPreviewMaximumScale});
+  double scale = std::clamp (
+      std::min ({horizontal_scale, vertical_scale,
+                 kWindowPreviewMaximumScale}),
+      0.0, kWindowPreviewMaximumScale);
 
   double scaled_w = layout->gridWidth * scale + hspacing;
   double scaled_h = layout->gridHeight * scale + vspacing;
-  double space = (scaled_w * scaled_h) / (aw * ah);
+  double area_px = aw * ah;
+  double space = area_px > 0 ? (scaled_w * scaled_h) / area_px : 0.0;
 
   layout->scale = scale;
   layout->space = space;
@@ -209,8 +235,11 @@ compute_window_slots (Layout *layout, const RECT &area, double monitor_height,
   compute_row_sizes (layout);
 
   std::vector<Row> &rows = layout->rows;
-  double aw = area.right - area.left;
-  double ah = area.bottom - area.top;
+  if (rows.empty ())
+    return;
+
+  double aw = std::max ((double)(area.right - area.left), 0.0);
+  double ah = std::max ((double)(area.bottom - area.top), 0.0);
 
   double height_without_spacing = 0;
   for (const Row &row : rows)
@@ -218,16 +247,24 @@ compute_window_slots (Layout *layout, const RECT &area, double monitor_height,
 
   double vertical_spacing = (rows.size () - 1) * layout->rowSpacing;
   double additional_vertical_scale =
-      std::min (1.0, (ah - vertical_spacing) / height_without_spacing);
+      height_without_spacing > 0
+          ? std::clamp ((ah - vertical_spacing) / height_without_spacing,
+                        0.0, 1.0)
+          : 1.0;
 
   double compensation = 0;
   double y = 0;
 
   for (Row &row : rows) {
+    if (row.windows.empty ())
+      continue;
     double horizontal_spacing = (row.windows.size () - 1) * layout->columnSpacing;
     double width_without_spacing = row.width - horizontal_spacing;
     double additional_horizontal_scale =
-        std::min (1.0, (aw - horizontal_spacing) / width_without_spacing);
+        width_without_spacing > 0
+            ? std::clamp ((aw - horizontal_spacing) / width_without_spacing,
+                          0.0, 1.0)
+            : 1.0;
 
     if (additional_horizontal_scale < additional_vertical_scale) {
       row.additionalScale = additional_horizontal_scale;
@@ -257,8 +294,10 @@ compute_window_slots (Layout *layout, const RECT &area, double monitor_height,
     double x = row.x;
 
     for (const OvWindowInfo *window : row.windows) {
-      double w = window->rect.right - window->rect.left;
-      double h = window->rect.bottom - window->rect.top;
+      double w =
+          std::max ((double)(window->rect.right - window->rect.left), 0.0);
+      double h =
+          std::max ((double)(window->rect.bottom - window->rect.top), 0.0);
 
       // upstream: scale * windowScale * row.additionalScale, then clamped
       // to WINDOW_PREVIEW_MAXIMUM_SCALE for the clone itself (the cell keeps

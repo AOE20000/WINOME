@@ -13,6 +13,8 @@
 #include <glib.h>
 
 #include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <thread>
 
@@ -24,6 +26,10 @@ constexpr UINT kMsgSyncHookState = WM_APP + 41;
 
 struct HotCornerShared {
   std::atomic<HWND> panel_hwnd{nullptr};
+  // SeqLock-protected monitor bounds so WH_MOUSE_LL reads a consistent,
+  // untorn RECT without ever blocking on a mutex.
+  std::mutex bounds_write_mu;
+  std::atomic<uint64_t> bounds_seq{0};
   std::atomic<LONG> left{0};
   std::atomic<LONG> top{0};
   std::atomic<LONG> right{0};
@@ -36,7 +42,10 @@ struct HotCornerShared {
   std::atomic<DWORD> hook_tid{0};
 
   std::mutex thread_mu;
+  std::condition_variable thread_cv;
   std::thread hook_thread;
+  bool thread_ready = false;
+  bool stop_requested = false;
   HHOOK mouse_hook = nullptr;
 };
 
@@ -50,6 +59,38 @@ gboolean invoke_open_overview(gpointer G_GNUC_UNUSED data) {
   return G_SOURCE_REMOVE;
 }
 
+void store_cached_bounds(const RECT& rc) {
+  std::lock_guard<std::mutex> lk(g_hc.bounds_write_mu);
+  const uint64_t s = g_hc.bounds_seq.load(std::memory_order_relaxed);
+  g_hc.bounds_seq.store(s + 1, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  g_hc.left.store(rc.left, std::memory_order_relaxed);
+  g_hc.top.store(rc.top, std::memory_order_relaxed);
+  g_hc.right.store(rc.right, std::memory_order_relaxed);
+  g_hc.bottom.store(rc.bottom, std::memory_order_relaxed);
+  g_hc.bounds_seq.store(s + 2, std::memory_order_release);
+}
+
+RECT load_cached_bounds() {
+  for (;;) {
+    const uint64_t s1 = g_hc.bounds_seq.load(std::memory_order_acquire);
+    if ((s1 & 1u) != 0u) {
+      YieldProcessor();
+      continue;
+    }
+    const RECT out{
+        g_hc.left.load(std::memory_order_relaxed),
+        g_hc.top.load(std::memory_order_relaxed),
+        g_hc.right.load(std::memory_order_relaxed),
+        g_hc.bottom.load(std::memory_order_relaxed),
+    };
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const uint64_t s2 = g_hc.bounds_seq.load(std::memory_order_relaxed);
+    if (s1 == s2)
+      return out;
+  }
+}
+
 void refresh_cached_bounds() {
   HWND panel = g_hc.panel_hwnd.load(std::memory_order_acquire);
   if (panel == nullptr || !IsWindow(panel))
@@ -58,10 +99,7 @@ void refresh_cached_bounds() {
   MONITORINFO mi{};
   mi.cbSize = sizeof(mi);
   if (mon != nullptr && GetMonitorInfoW(mon, &mi)) {
-    g_hc.left.store(mi.rcMonitor.left, std::memory_order_relaxed);
-    g_hc.top.store(mi.rcMonitor.top, std::memory_order_relaxed);
-    g_hc.right.store(mi.rcMonitor.right, std::memory_order_relaxed);
-    g_hc.bottom.store(mi.rcMonitor.bottom, std::memory_order_release);
+    store_cached_bounds(mi.rcMonitor);
   }
 }
 
@@ -78,12 +116,7 @@ void sync_hook_install_on_hook_thread() {
           if (nCode == HC_ACTION && wParam == WM_MOUSEMOVE) {
             const MSLLHOOKSTRUCT* ms =
                 reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
-            RECT mon{
-                g_hc.left.load(std::memory_order_relaxed),
-                g_hc.top.load(std::memory_order_relaxed),
-                g_hc.right.load(std::memory_order_relaxed),
-                g_hc.bottom.load(std::memory_order_acquire),
-            };
+            const RECT mon = load_cached_bounds();
             const bool inside =
                 hot_corner_hit_test(ms->pt.x, ms->pt.y, mon, kCornerSize);
             const bool prev =
@@ -114,7 +147,19 @@ void sync_hook_install_on_hook_thread() {
 void hook_thread_main() {
   MSG dummy{};
   PeekMessageW(&dummy, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
-  g_hc.hook_tid.store(GetCurrentThreadId(), std::memory_order_release);
+
+  {
+    std::lock_guard<std::mutex> lock(g_hc.thread_mu);
+    if (g_hc.stop_requested) {
+      g_hc.hook_tid.store(0, std::memory_order_release);
+      g_hc.thread_ready = true;
+      g_hc.thread_cv.notify_all();
+      return;
+    }
+    g_hc.hook_tid.store(GetCurrentThreadId(), std::memory_order_release);
+    g_hc.thread_ready = true;
+    g_hc.thread_cv.notify_all();
+  }
 
   sync_hook_install_on_hook_thread();
 
@@ -132,7 +177,12 @@ void hook_thread_main() {
     UnhookWindowsHookEx(g_hc.mouse_hook);
     g_hc.mouse_hook = nullptr;
   }
-  g_hc.hook_tid.store(0, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(g_hc.thread_mu);
+    g_hc.hook_tid.store(0, std::memory_order_release);
+    g_hc.thread_ready = true;
+    g_hc.thread_cv.notify_all();
+  }
 }
 
 void post_sync_to_hook_thread() {
@@ -152,7 +202,7 @@ void on_hot_corner_config_changed(void* data) {
 }  // namespace
 
 void start_hot_corner(HWND panel_hwnd) {
-  std::lock_guard<std::mutex> lock(g_hc.thread_mu);
+  std::unique_lock<std::mutex> lock(g_hc.thread_mu);
   g_hc.panel_hwnd.store(panel_hwnd, std::memory_order_release);
   const auto& cfg = get_config();
   g_hc.enabled.store(cfg.hot_corner_enabled, std::memory_order_release);
@@ -162,7 +212,10 @@ void start_hot_corner(HWND panel_hwnd) {
 
   if (!g_hc.hook_thread.joinable()) {
     add_config_listener(on_hot_corner_config_changed, nullptr);
+    g_hc.stop_requested = false;
+    g_hc.thread_ready = false;
     g_hc.hook_thread = std::thread(hook_thread_main);
+    g_hc.thread_cv.wait(lock, [] { return g_hc.thread_ready; });
   } else {
     post_sync_to_hook_thread();
   }
@@ -172,11 +225,15 @@ void stop_hot_corner(void) {
   remove_config_listener(on_hot_corner_config_changed, nullptr);
   std::thread to_join;
   {
-    std::lock_guard<std::mutex> lock(g_hc.thread_mu);
-    DWORD tid = g_hc.hook_tid.exchange(0, std::memory_order_acq_rel);
-    if (tid != 0)
-      PostThreadMessageW(tid, WM_QUIT, 0, 0);
-    to_join = std::move(g_hc.hook_thread);
+    std::unique_lock<std::mutex> lock(g_hc.thread_mu);
+    g_hc.stop_requested = true;
+    if (g_hc.hook_thread.joinable()) {
+      g_hc.thread_cv.wait(lock, [] { return g_hc.thread_ready; });
+      DWORD tid = g_hc.hook_tid.exchange(0, std::memory_order_acq_rel);
+      if (tid != 0)
+        PostThreadMessageW(tid, WM_QUIT, 0, 0);
+      to_join = std::move(g_hc.hook_thread);
+    }
   }
   if (to_join.joinable())
     to_join.join();

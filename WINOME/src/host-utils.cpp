@@ -124,11 +124,15 @@ bool is_overview_default_blacklisted_window_info(
     const std::string& proc_name_utf8,
     const std::string& title_utf8,
     bool cloaked) {
-  auto ascii_lower = [](const std::string& s) {
+  auto to_ascii_lower_char = [](unsigned char c) -> char {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a')
+                                  : static_cast<char>(c);
+  };
+  auto ascii_lower = [&](const std::string& s) {
     std::string out;
     out.reserve(s.size());
     for (unsigned char c : s)
-      out.push_back(static_cast<char>(std::tolower(c)));
+      out.push_back(to_ascii_lower_char(c));
     return out;
   };
   auto trim_ws = [](const std::string& s) {
@@ -145,13 +149,13 @@ bool is_overview_default_blacklisted_window_info(
     }
     return s.substr(b, e - b);
   };
-  auto compact_ascii_lower = [](const std::string& s) {
+  auto compact_ascii_lower = [&](const std::string& s) {
     std::string out;
     out.reserve(s.size());
     for (unsigned char c : s) {
       if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
         continue;
-      out.push_back(static_cast<char>(std::tolower(c)));
+      out.push_back(to_ascii_lower_char(c));
     }
     return out;
   };
