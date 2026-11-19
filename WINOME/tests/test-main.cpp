@@ -20,6 +20,7 @@
 #include "overview-thumbs.h"
 #include "overview-trigger.h"
 #include "fullscreen-watcher.h"
+#include "winome-version.h"
 #include "perf-metrics.h"
 #include "plugin-host.h"
 #include "run-dialog.h"
@@ -907,9 +908,12 @@ void test_ipc_dispatch_and_named_pipe_roundtrip() {
   const std::string ping = winome::ipc_dispatch_request_json("{\"cmd\":\"ping\"}", cbs);
   CHECK(ping.find("\"ok\":true") != std::string::npos);
   CHECK(ping.find("\"pong\":true") != std::string::npos);
+  CHECK(ping.find(std::string("\"version\":\"") + WINOME_VERSION + "\"") != std::string::npos);
+  CHECK(std::string(WINOME_VERSION) == "0.1.2");
 
   const std::string st = winome::ipc_dispatch_request_json("{\"cmd\":\"status\"}", cbs);
   CHECK(st.find("\"ok\":true") != std::string::npos);
+  CHECK(st.find(std::string("\"version\":\"") + WINOME_VERSION + "\"") != std::string::npos);
   CHECK(st.find("\"overview_open\":true") != std::string::npos);
   CHECK(st.find("\"capabilities\":[") != std::string::npos);
   CHECK(st.find("\"telemetry\":{") != std::string::npos);
@@ -2096,6 +2100,74 @@ void test_workarea_clamp_guard_and_fullscreen_hysteresis() {
   CHECK(res.cancel_unhide_timer);
 }
 
+void test_hook_watchdog_and_lockfree_ring() {
+  // Lock-free SPSC ring FIFO, full backpressure, wraparound, and clear.
+  winome::AtomicTriggerRing<int, 4> ring;
+  int v = -1;
+  CHECK(!ring.try_pop(&v));
+  CHECK(ring.try_push(10));
+  CHECK(ring.try_push(20));
+  CHECK(ring.try_push(30));
+  CHECK(!ring.try_push(40));  // capacity 4 holds 3 items (1 slot distinguishes full)
+  CHECK(ring.try_pop(&v) && v == 10);
+  CHECK(ring.try_push(40));
+  CHECK(ring.try_pop(&v) && v == 20);
+  CHECK(ring.try_pop(&v) && v == 30);
+  CHECK(ring.try_pop(&v) && v == 40);
+  CHECK(!ring.try_pop(&v));
+  CHECK(ring.try_push(99));
+  ring.clear();
+  CHECK(!ring.try_pop(&v));
+
+  // Freshly held keys (< threshold) do not trigger watchdog reset or reinstall.
+  winome::HookWatchdogInput in{};
+  in.now_tick = 5000;
+  in.win_down = true;
+  in.win_last_keydown_tick = 4500;
+  auto out = winome::evaluate_hook_watchdog(in);
+  CHECK(!out.reset_win);
+  CHECK(!out.safe_to_reinstall);
+
+  // Stuck un-injected Win keydown (> 2500ms without keyup/auto-repeat) resets & allows reinstall.
+  in.now_tick = 7100;
+  out = winome::evaluate_hook_watchdog(in);
+  CHECK(out.reset_win);
+  CHECK(out.safe_to_reinstall);
+
+  // Stuck injected Win key whose physical key is released (> 200ms) resets cleanly.
+  in = {};
+  in.now_tick = 8500;
+  in.win_down = true;
+  in.win_injected = true;
+  in.win_physically_down = false;
+  in.win_inject_tick = 8200;
+  out = winome::evaluate_hook_watchdog(in);
+  CHECK(out.reset_win);
+  CHECK(out.safe_to_reinstall);
+
+  // Physically held injected Win key stays active.
+  in.win_physically_down = true;
+  out = winome::evaluate_hook_watchdog(in);
+  CHECK(!out.reset_win);
+  CHECK(!out.safe_to_reinstall);
+
+  // Stuck Esc / Alt+F2 / Win+Tab swallowed flags (> 1500ms) recover cleanly instead of
+  // locking out the periodic WH_KEYBOARD_LL watchdog forever.
+  in = {};
+  in.now_tick = 12000;
+  in.esc_swallowed = true;
+  in.esc_swallow_tick = 10000;
+  in.alt_f2_down = true;
+  in.alt_f2_tick = 10000;
+  in.swallowed_combo_vk = VK_TAB;
+  in.combo_swallow_tick = 10000;
+  out = winome::evaluate_hook_watchdog(in);
+  CHECK(out.clear_esc);
+  CHECK(out.clear_alt_f2);
+  CHECK(out.clear_combo);
+  CHECK(out.safe_to_reinstall);
+}
+
 }  // namespace
 
 int main() {
@@ -2133,6 +2205,7 @@ int main() {
   test_winrt_safe_com_getter_and_notifications();
   test_win_hotkey_passthrough_classification();
   test_workarea_clamp_guard_and_fullscreen_hysteresis();
+  test_hook_watchdog_and_lockfree_ring();
 
   if (g_failures == 0)
     std::printf("ALL WINOME UNIT TESTS PASSED\n");

@@ -36,10 +36,15 @@ struct HotCornerShared {
   std::atomic<LONG> bottom{0};
   std::atomic<bool> suppressed{false};
   std::atomic<bool> in_corner{false};
+  std::atomic<ULONGLONG> in_corner_since_tick{0};
   std::atomic<gint64> last_trigger_ms{0};
   std::atomic<int> cooldown_ms{500};
   std::atomic<bool> enabled{true};
   std::atomic<DWORD> hook_tid{0};
+
+  HANDLE trigger_event = nullptr;
+  std::atomic<bool> dispatch_stop{false};
+  std::thread dispatch_thread;
 
   std::mutex thread_mu;
   std::condition_variable thread_cv;
@@ -104,6 +109,8 @@ void refresh_cached_bounds() {
 }
 
 LRESULT CALLBACK hot_corner_mouse_proc(int nCode, WPARAM wParam, LPARAM lParam) {
+  if (nCode < 0)
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
   if (nCode == HC_ACTION && wParam == WM_MOUSEMOVE) {
     const MSLLHOOKSTRUCT* ms =
         reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
@@ -112,6 +119,10 @@ LRESULT CALLBACK hot_corner_mouse_proc(int nCode, WPARAM wParam, LPARAM lParam) 
         hot_corner_hit_test(ms->pt.x, ms->pt.y, mon, kCornerSize);
     const bool prev =
         g_hc.in_corner.exchange(inside, std::memory_order_acq_rel);
+    if (inside != prev) {
+      g_hc.in_corner_since_tick.store(inside ? GetTickCount64() : 0,
+                                      std::memory_order_release);
+    }
     if (inside && !prev &&
         g_hc.enabled.load(std::memory_order_relaxed) &&
         !g_hc.suppressed.load(std::memory_order_relaxed)) {
@@ -121,12 +132,25 @@ LRESULT CALLBACK hot_corner_mouse_proc(int nCode, WPARAM wParam, LPARAM lParam) 
       const int cd = g_hc.cooldown_ms.load(std::memory_order_relaxed);
       if (now_ms - prev_ms >= static_cast<gint64>(cd)) {
         g_hc.last_trigger_ms.store(now_ms, std::memory_order_relaxed);
-        g_idle_add_full(G_PRIORITY_HIGH_IDLE, invoke_open_overview,
-                        nullptr, nullptr);
+        // Never call GLib g_idle_add_full inside WH_MOUSE_LL: GMainContext
+        // lock contention during Overview animations stalls the hook past
+        // LowLevelHooksTimeout. Wake the dedicated dispatch thread instead.
+        if (g_hc.trigger_event != nullptr)
+          SetEvent(g_hc.trigger_event);
       }
     }
   }
   return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+void dispatch_thread_main() {
+  while (!g_hc.dispatch_stop.load(std::memory_order_acquire)) {
+    WaitForSingleObject(g_hc.trigger_event, INFINITE);
+    if (g_hc.dispatch_stop.load(std::memory_order_acquire))
+      break;
+    g_idle_add_full(G_PRIORITY_HIGH_IDLE, invoke_open_overview,
+                    nullptr, nullptr);
+  }
 }
 
 void sync_hook_install_on_hook_thread(bool force_reinstall = false) {
@@ -134,29 +158,44 @@ void sync_hook_install_on_hook_thread(bool force_reinstall = false) {
       g_hc.enabled.load(std::memory_order_acquire) &&
       !g_hc.suppressed.load(std::memory_order_acquire);
 
+  HMODULE self_mod = GetModuleHandleW(nullptr);
   if (want_hook) {
     if (g_hc.mouse_hook == nullptr) {
       g_hc.in_corner.store(false, std::memory_order_relaxed);
+      g_hc.in_corner_since_tick.store(0, std::memory_order_relaxed);
       g_hc.mouse_hook =
-          SetWindowsHookExW(WH_MOUSE_LL, hot_corner_mouse_proc, nullptr, 0);
-    } else if (force_reinstall &&
-               !g_hc.in_corner.load(std::memory_order_relaxed)) {
-      HHOOK fresh =
-          SetWindowsHookExW(WH_MOUSE_LL, hot_corner_mouse_proc, nullptr, 0);
-      if (fresh != nullptr) {
-        UnhookWindowsHookEx(g_hc.mouse_hook);
-        g_hc.mouse_hook = fresh;
+          SetWindowsHookExW(WH_MOUSE_LL, hot_corner_mouse_proc, self_mod, 0);
+    } else if (force_reinstall) {
+      if (g_hc.in_corner.load(std::memory_order_relaxed)) {
+        const ULONGLONG since =
+            g_hc.in_corner_since_tick.load(std::memory_order_acquire);
+        POINT pt{};
+        if (since != 0 && (GetTickCount64() - since) >= 1500 &&
+            GetCursorPos(&pt) &&
+            !hot_corner_hit_test(pt.x, pt.y, load_cached_bounds(), kCornerSize)) {
+          g_hc.in_corner.store(false, std::memory_order_relaxed);
+          g_hc.in_corner_since_tick.store(0, std::memory_order_relaxed);
+        }
+      }
+      if (!g_hc.in_corner.load(std::memory_order_relaxed)) {
+        HHOOK fresh =
+            SetWindowsHookExW(WH_MOUSE_LL, hot_corner_mouse_proc, self_mod, 0);
+        if (fresh != nullptr) {
+          UnhookWindowsHookEx(g_hc.mouse_hook);
+          g_hc.mouse_hook = fresh;
+        }
       }
     }
   } else if (g_hc.mouse_hook != nullptr) {
     UnhookWindowsHookEx(g_hc.mouse_hook);
     g_hc.mouse_hook = nullptr;
     g_hc.in_corner.store(false, std::memory_order_relaxed);
+    g_hc.in_corner_since_tick.store(0, std::memory_order_relaxed);
   }
 }
 
 void hook_thread_main() {
-  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
   MSG dummy{};
   PeekMessageW(&dummy, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 
@@ -174,24 +213,36 @@ void hook_thread_main() {
   }
 
   sync_hook_install_on_hook_thread();
-  UINT_PTR timer_id = SetTimer(nullptr, 0, 4000, nullptr);
+  constexpr DWORD kWatchdogIntervalMs = 2500;
+  ULONGLONG last_watchdog_tick = GetTickCount64();
 
-  MSG msg{};
-  while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-    if (msg.message == kMsgSyncHookState) {
-      sync_hook_install_on_hook_thread();
-      continue;
+  bool running = true;
+  while (running) {
+    const DWORD wait_rc = MsgWaitForMultipleObjectsEx(
+        0, nullptr, kWatchdogIntervalMs, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    MSG msg{};
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+      if (msg.message == WM_QUIT) {
+        running = false;
+        break;
+      }
+      if (msg.message == kMsgSyncHookState) {
+        sync_hook_install_on_hook_thread();
+        continue;
+      }
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
     }
-    if (msg.message == WM_TIMER && msg.wParam == timer_id) {
+    if (!running)
+      break;
+
+    const ULONGLONG now_tick = GetTickCount64();
+    if (wait_rc == WAIT_TIMEOUT || (now_tick - last_watchdog_tick) >= kWatchdogIntervalMs) {
+      last_watchdog_tick = now_tick;
       sync_hook_install_on_hook_thread(true);
-      continue;
     }
-    TranslateMessage(&msg);
-    DispatchMessageW(&msg);
   }
 
-  if (timer_id != 0)
-    KillTimer(nullptr, timer_id);
   if (g_hc.mouse_hook != nullptr) {
     UnhookWindowsHookEx(g_hc.mouse_hook);
     g_hc.mouse_hook = nullptr;
@@ -231,6 +282,11 @@ void start_hot_corner(HWND panel_hwnd) {
 
   if (!g_hc.hook_thread.joinable()) {
     add_config_listener(on_hot_corner_config_changed, nullptr);
+    g_hc.dispatch_stop.store(false, std::memory_order_release);
+    if (g_hc.trigger_event == nullptr)
+      g_hc.trigger_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_hc.dispatch_thread.joinable() && g_hc.trigger_event != nullptr)
+      g_hc.dispatch_thread = std::thread(dispatch_thread_main);
     g_hc.stop_requested = false;
     g_hc.thread_ready = false;
     g_hc.hook_thread = std::thread(hook_thread_main);
@@ -243,6 +299,7 @@ void start_hot_corner(HWND panel_hwnd) {
 void stop_hot_corner(void) {
   remove_config_listener(on_hot_corner_config_changed, nullptr);
   std::thread to_join;
+  std::thread dispatch_to_join;
   {
     std::unique_lock<std::mutex> lock(g_hc.thread_mu);
     g_hc.stop_requested = true;
@@ -253,9 +310,21 @@ void stop_hot_corner(void) {
         PostThreadMessageW(tid, WM_QUIT, 0, 0);
       to_join = std::move(g_hc.hook_thread);
     }
+    if (g_hc.dispatch_thread.joinable()) {
+      g_hc.dispatch_stop.store(true, std::memory_order_release);
+      if (g_hc.trigger_event != nullptr)
+        SetEvent(g_hc.trigger_event);
+      dispatch_to_join = std::move(g_hc.dispatch_thread);
+    }
   }
   if (to_join.joinable())
     to_join.join();
+  if (dispatch_to_join.joinable())
+    dispatch_to_join.join();
+  if (g_hc.trigger_event != nullptr) {
+    CloseHandle(g_hc.trigger_event);
+    g_hc.trigger_event = nullptr;
+  }
 }
 
 void hot_corner_set_suppressed(bool suppressed) {

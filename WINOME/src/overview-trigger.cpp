@@ -69,12 +69,44 @@ ULONGLONG g_win_down_tick = 0;
 ULONGLONG g_win_last_keydown_tick = 0;
 ULONGLONG g_win_inject_tick = 0;
 DWORD g_swallowed_combo_vk = 0;
+ULONGLONG g_combo_swallow_tick = 0;
 BOOL g_alt_f2_down = FALSE;
+ULONGLONG g_alt_f2_tick = 0;
 BOOL g_esc_swallowed = FALSE;
+ULONGLONG g_esc_swallow_tick = 0;
 HHOOK g_keyboard_hook = nullptr;
 HWINEVENTHOOK g_desktop_switch_hook = nullptr;
 std::atomic<gint64> g_last_win_press_us{0};
 std::atomic<bool> g_win_key_overview_enabled{true};
+
+constexpr UINT kMsgRefreshKeyboardHook = WM_APP + 42;
+
+enum class TriggerActionKind {
+  BareWinUp,
+  OpenStartMenu,
+  WorkspaceMove,
+  NotifyVdHint,
+  ToggleRunDialog,
+  UnfocusedEsc,
+};
+
+struct TriggerAction {
+  TriggerActionKind kind = TriggerActionKind::BareWinUp;
+  int64_t timestamp_us = 0;
+  int delta = 0;
+  bool move_fg = false;
+};
+
+AtomicTriggerRing<TriggerAction, 64> g_trigger_ring;
+HANDLE g_dispatch_event = nullptr;
+std::atomic<bool> g_dispatch_stop{false};
+std::thread g_dispatch_thread;
+
+inline void enqueue_trigger_action(const TriggerAction& act) {
+  g_trigger_ring.try_push(act);
+  if (g_dispatch_event != nullptr)
+    SetEvent(g_dispatch_event);
+}
 
 // Lock-free cached panel HWNDs populated on the GTK main thread so the hook can
 // distinguish panel windows (no Esc handler) from overview/popover/dialogs
@@ -280,9 +312,12 @@ handle_unfocused_esc_idle (gpointer user_data G_GNUC_UNUSED)
   return G_SOURCE_REMOVE;
 }
 
+void request_keyboard_hook_refresh_async();
+
 static gboolean
 dispatch_overview_events_idle (gpointer data G_GNUC_UNUSED)
 {
+  bool saw_transition = false;
   for (;;) {
     OverviewStateData ev{};
     OverviewStateCallback cb = nullptr;
@@ -291,6 +326,8 @@ dispatch_overview_events_idle (gpointer data G_GNUC_UNUSED)
       std::lock_guard<std::mutex> lk (g_state_mu);
       if (g_pending_events.empty ()) {
         g_dispatch_scheduled = false;
+        if (saw_transition)
+          request_keyboard_hook_refresh_async ();
         return G_SOURCE_REMOVE;
       }
       ev = g_pending_events.front ();
@@ -299,6 +336,7 @@ dispatch_overview_events_idle (gpointer data G_GNUC_UNUSED)
       cb_data = g_state_cb_data;
     }
 
+    saw_transition = true;
     if (ev.active != FALSE) {
       g_print ("[trig] open_overview (%s)\n",
                ev.source != nullptr ? ev.source : "?");
@@ -374,8 +412,11 @@ void reset_win_key_state() {
   g_win_last_keydown_tick = 0;
   g_win_inject_tick = 0;
   g_swallowed_combo_vk = 0;
+  g_combo_swallow_tick = 0;
   g_alt_f2_down = FALSE;
+  g_alt_f2_tick = 0;
   g_esc_swallowed = FALSE;
+  g_esc_swallow_tick = 0;
 }
 
 bool is_start_menu_foreground() {
@@ -541,8 +582,164 @@ std::atomic<DWORD> g_trigger_tid{0};
 bool g_trigger_ready = false;
 bool g_trigger_stop_requested = false;
 
+void dispatch_worker_main() {
+  while (!g_dispatch_stop.load(std::memory_order_acquire)) {
+    WaitForSingleObject(g_dispatch_event, INFINITE);
+    TriggerAction act{};
+    while (g_trigger_ring.try_pop(&act)) {
+      switch (act.kind) {
+        case TriggerActionKind::BareWinUp: {
+          if (!g_running.load(std::memory_order_acquire)) {
+            if (is_start_menu_foreground()) {
+              open_start_menu();
+            } else {
+              g_last_win_press_us.store(act.timestamp_us,
+                                        std::memory_order_release);
+              open_overview("win-key");
+            }
+          } else {
+            const gint64 prev =
+                g_last_win_press_us.exchange(0, std::memory_order_acq_rel);
+            if (prev > 0 && (act.timestamp_us - prev) <= 550000) {
+              overview_shift_to_app_grid_async();
+            } else {
+              close_overview("win-key");
+            }
+          }
+          break;
+        }
+        case TriggerActionKind::OpenStartMenu: {
+          if (g_running.load(std::memory_order_acquire)) {
+            g_idle_add_full(
+                G_PRIORITY_HIGH_IDLE,
+                +[](gpointer) -> gboolean {
+                  overview_discard_restore_focus();
+                  close_overview("win-tab");
+                  g_idle_add(
+                      +[](gpointer) -> gboolean {
+                        open_start_menu();
+                        return G_SOURCE_REMOVE;
+                      },
+                      nullptr);
+                  return G_SOURCE_REMOVE;
+                },
+                nullptr, nullptr);
+          } else {
+            open_start_menu();
+          }
+          break;
+        }
+        case TriggerActionKind::WorkspaceMove:
+          enqueue_desktop_hotkey(act.delta, act.move_fg);
+          break;
+        case TriggerActionKind::NotifyVdHint:
+          vd::notify_change_hint_async();
+          break;
+        case TriggerActionKind::ToggleRunDialog:
+          if (debug_get_flags().hotkey_trace)
+            debug_append_log("trig", "[trig] Alt+F2 -> toggle RunDialog");
+          run_dialog_toggle_async();
+          break;
+        case TriggerActionKind::UnfocusedEsc:
+          g_idle_add_full(G_PRIORITY_HIGH_IDLE, handle_unfocused_esc_idle,
+                          nullptr, nullptr);
+          break;
+      }
+    }
+  }
+}
+
+void start_dispatch_worker() {
+  g_trigger_ring.clear();
+  g_dispatch_stop.store(false, std::memory_order_release);
+  if (g_dispatch_event == nullptr)
+    g_dispatch_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  if (!g_dispatch_thread.joinable() && g_dispatch_event != nullptr)
+    g_dispatch_thread = std::thread(dispatch_worker_main);
+}
+
+void stop_dispatch_worker() {
+  g_dispatch_stop.store(true, std::memory_order_release);
+  if (g_dispatch_event != nullptr)
+    SetEvent(g_dispatch_event);
+  if (g_dispatch_thread.joinable())
+    g_dispatch_thread.join();
+  g_trigger_ring.clear();
+  if (g_dispatch_event != nullptr) {
+    CloseHandle(g_dispatch_event);
+    g_dispatch_event = nullptr;
+  }
+}
+
+void request_keyboard_hook_refresh_async() {
+  const DWORD tid = g_trigger_tid.load(std::memory_order_acquire);
+  if (tid != 0)
+    PostThreadMessageW(tid, kMsgRefreshKeyboardHook, 0, 0);
+}
+
+void maybe_refresh_keyboard_hook(ULONGLONG now_tick,
+                                 ULONGLONG* last_reinstall_tick,
+                                 ULONGLONG min_spacing_ms) {
+  HookWatchdogInput in{};
+  in.now_tick = now_tick;
+  in.win_down = g_win_down != FALSE;
+  in.win_injected = g_win_injected != FALSE;
+  in.win_physically_down =
+      g_win_down ? ((GetAsyncKeyState(g_win_vk) & 0x8000) != 0) : false;
+  in.win_last_keydown_tick = g_win_last_keydown_tick;
+  in.win_inject_tick = g_win_inject_tick;
+  in.swallowed_combo_vk = static_cast<unsigned>(g_swallowed_combo_vk);
+  in.combo_swallow_tick = g_combo_swallow_tick;
+  in.alt_f2_down = g_alt_f2_down != FALSE;
+  in.alt_f2_tick = g_alt_f2_tick;
+  in.esc_swallowed = g_esc_swallowed != FALSE;
+  in.esc_swallow_tick = g_esc_swallow_tick;
+
+  const HookWatchdogOutcome out = evaluate_hook_watchdog(in);
+  if (out.reset_win || out.clear_combo || out.clear_alt_f2 || out.clear_esc) {
+    g_print("[trig] cleared stale hook flags win=%d combo=%d f2=%d esc=%d\n",
+            out.reset_win ? 1 : 0, out.clear_combo ? 1 : 0,
+            out.clear_alt_f2 ? 1 : 0, out.clear_esc ? 1 : 0);
+  }
+  if (out.reset_win) {
+    reset_win_key_state();
+  } else {
+    if (out.clear_combo) {
+      g_swallowed_combo_vk = 0;
+      g_combo_swallow_tick = 0;
+    }
+    if (out.clear_alt_f2) {
+      g_alt_f2_down = FALSE;
+      g_alt_f2_tick = 0;
+    }
+    if (out.clear_esc) {
+      g_esc_swallowed = FALSE;
+      g_esc_swallow_tick = 0;
+    }
+  }
+
+  if (!out.safe_to_reinstall)
+    return;
+  if (*last_reinstall_tick != 0 &&
+      (now_tick - *last_reinstall_tick) < min_spacing_ms) {
+    return;
+  }
+
+  HHOOK fresh = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
+                                  GetModuleHandleW(nullptr), 0);
+  if (fresh != nullptr) {
+    if (g_keyboard_hook != nullptr)
+      UnhookWindowsHookEx(g_keyboard_hook);
+    g_keyboard_hook = fresh;
+    *last_reinstall_tick = now_tick;
+  } else {
+    g_print("[trig] SetWindowsHookExW(WH_KEYBOARD_LL) failed gle=%lu\n",
+            GetLastError());
+  }
+}
+
 void trigger_thread_main() {
-  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
   MSG dummy;
   PeekMessageW(&dummy, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 
@@ -560,33 +757,42 @@ void trigger_thread_main() {
   }
 
   g_keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
-                                      nullptr, 0);
+                                      GetModuleHandleW(nullptr), 0);
   g_desktop_switch_hook = SetWinEventHook(
       EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH, nullptr,
       on_desktop_switch_event, 0, 0, WINEVENT_OUTOFCONTEXT);
-  UINT_PTR timer_id = SetTimer(nullptr, 0, 4000, nullptr);
 
-  MSG msg;
-  while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-    if (msg.message == WM_TIMER && msg.wParam == timer_id) {
-      if (!g_win_down && g_swallowed_combo_vk == 0 &&
-          !g_alt_f2_down && !g_esc_swallowed) {
-        HHOOK fresh = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
-                                        nullptr, 0);
-        if (fresh != nullptr) {
-          if (g_keyboard_hook != nullptr)
-            UnhookWindowsHookEx(g_keyboard_hook);
-          g_keyboard_hook = fresh;
-        }
+  constexpr DWORD kWatchdogIntervalMs = 2500;
+  ULONGLONG last_reinstall_tick = GetTickCount64();
+
+  bool running = true;
+  while (running) {
+    const DWORD wait_rc = MsgWaitForMultipleObjectsEx(
+        0, nullptr, kWatchdogIntervalMs, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    MSG msg{};
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+      if (msg.message == WM_QUIT) {
+        running = false;
+        break;
       }
-      continue;
+      if (msg.message == kMsgRefreshKeyboardHook) {
+        maybe_refresh_keyboard_hook(GetTickCount64(), &last_reinstall_tick, 400);
+        continue;
+      }
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
     }
-    TranslateMessage(&msg);
-    DispatchMessageW(&msg);
+    if (!running)
+      break;
+
+    const ULONGLONG now_tick = GetTickCount64();
+    if (wait_rc == WAIT_TIMEOUT ||
+        (now_tick - last_reinstall_tick) >= kWatchdogIntervalMs) {
+      maybe_refresh_keyboard_hook(now_tick, &last_reinstall_tick,
+                                  kWatchdogIntervalMs);
+    }
   }
 
-  if (timer_id != 0)
-    KillTimer(nullptr, timer_id);
   if (g_desktop_switch_hook != nullptr) {
     UnhookWinEvent(g_desktop_switch_hook);
     g_desktop_switch_hook = nullptr;
@@ -615,6 +821,8 @@ void enqueue_desktop_hotkey(int delta, bool move_fg) {
 }
 
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+  if (nCode < 0)
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
   if (nCode == HC_ACTION) {
     KBDLLHOOKSTRUCT* state = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
 
@@ -647,6 +855,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (up && g_swallowed_combo_vk != 0 &&
         state->vkCode == g_swallowed_combo_vk) {
       g_swallowed_combo_vk = 0;
+      g_combo_swallow_tick = 0;
       return 1;
     }
 
@@ -702,30 +911,19 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
           g_win_injected = FALSE;
         }
         if (bare) {
-          gint64 now = g_get_monotonic_time();
-          if (!g_running.load(std::memory_order_acquire)) {
-            if (is_start_menu_foreground()) {
-              open_start_menu();
-            } else {
-              g_last_win_press_us.store(now, std::memory_order_release);
-              open_overview("win-key");
-            }
-          } else {
-            gint64 prev =
-                g_last_win_press_us.exchange(0, std::memory_order_acq_rel);
-            if (prev > 0 && (now - prev) <= 550000) {
-              overview_shift_to_app_grid_async();
-            } else {
-              close_overview("win-key");
-            }
-          }
+          TriggerAction act{};
+          act.kind = TriggerActionKind::BareWinUp;
+          act.timestamp_us = g_get_monotonic_time();
+          enqueue_trigger_action(act);
         }
         return 1;
       }
     }
 
-    if (down && !g_win_down)
+    if (down && !g_win_down) {
       g_swallowed_combo_vk = 0;
+      g_combo_swallow_tick = 0;
+    }
 
     if (down && g_win_down) {
       // A key pressed while Win is held: this is a combo, not a bare Win.
@@ -751,24 +949,10 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
           // Win+Tab opens the Start menu instead of Task View (ignore auto-repeat).
           if (g_swallowed_combo_vk != VK_TAB) {
             g_swallowed_combo_vk = VK_TAB;
-            if (g_running.load(std::memory_order_acquire)) {
-              g_idle_add_full(
-                  G_PRIORITY_HIGH_IDLE,
-                  +[](gpointer) -> gboolean {
-                    overview_discard_restore_focus();
-                    close_overview("win-tab");
-                    g_idle_add(
-                        +[](gpointer) -> gboolean {
-                          open_start_menu();
-                          return G_SOURCE_REMOVE;
-                        },
-                        nullptr);
-                    return G_SOURCE_REMOVE;
-                  },
-                  nullptr, nullptr);
-            } else {
-              open_start_menu();
-            }
+            g_combo_swallow_tick = GetTickCount64();
+            TriggerAction act{};
+            act.kind = TriggerActionKind::OpenStartMenu;
+            enqueue_trigger_action(act);
           }
           return 1;
 
@@ -776,15 +960,21 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         case WinKeyComboAction::WorkspaceNext: {
           // GNOME-style workspace switching & active window move via worker.
           g_swallowed_combo_vk = state->vkCode;
-          const int delta =
-              (action == WinKeyComboAction::WorkspacePrev) ? -1 : 1;
-          enqueue_desktop_hotkey(delta, shift_held);
+          g_combo_swallow_tick = GetTickCount64();
+          TriggerAction act{};
+          act.kind = TriggerActionKind::WorkspaceMove;
+          act.delta = (action == WinKeyComboAction::WorkspacePrev) ? -1 : 1;
+          act.move_fg = shift_held;
+          enqueue_trigger_action(act);
           return 1;
         }
 
-        case WinKeyComboAction::PassthroughWithVdHint:
-          vd::notify_change_hint_async();
+        case WinKeyComboAction::PassthroughWithVdHint: {
+          TriggerAction act{};
+          act.kind = TriggerActionKind::NotifyVdHint;
+          enqueue_trigger_action(act);
           [[fallthrough]];
+        }
 
         case WinKeyComboAction::PassthroughCombo:
           if (!g_win_injected) {
@@ -802,6 +992,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     } else if (state->vkCode == VK_F2) {
       if (up) {
         g_alt_f2_down = FALSE;
+        g_alt_f2_tick = 0;
       } else if (down && !g_win_down) {
         const bool alt_held =
             (wParam == WM_SYSKEYDOWN) ||
@@ -811,9 +1002,10 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (alt_held && !ctrl_held && !shift_held) {
           if (!g_alt_f2_down) {
             g_alt_f2_down = TRUE;
-            if (debug_get_flags().hotkey_trace)
-              debug_append_log("trig", "[trig] Alt+F2 -> toggle RunDialog");
-            run_dialog_toggle_async();
+            g_alt_f2_tick = GetTickCount64();
+            TriggerAction act{};
+            act.kind = TriggerActionKind::ToggleRunDialog;
+            enqueue_trigger_action(act);
           }
           return 1;
         }
@@ -822,19 +1014,23 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
       if (up) {
         if (g_esc_swallowed) {
           g_esc_swallowed = FALSE;
+          g_esc_swallow_tick = 0;
           return 1;
         }
       } else if (down && !g_win_down) {
         if (!g_running.load(std::memory_order_acquire)) {
           g_esc_swallowed = FALSE;
+          g_esc_swallow_tick = 0;
         } else if (should_intercept_overview_esc()) {
           // Overview is WS_EX_NOACTIVATE (or the top panel holds focus), so
           // GTK never receives VK_ESCAPE directly. Swallow it and run the
-          // layered Esc dismissal on the GTK main thread.
+          // layered Esc dismissal on the GTK main thread via dispatch worker.
           if (!g_esc_swallowed) {
             g_esc_swallowed = TRUE;
-            g_idle_add_full(G_PRIORITY_HIGH_IDLE, handle_unfocused_esc_idle,
-                            nullptr, nullptr);
+            g_esc_swallow_tick = GetTickCount64();
+            TriggerAction act{};
+            act.kind = TriggerActionKind::UnfocusedEsc;
+            enqueue_trigger_action(act);
           }
           return 1;
         }
@@ -852,6 +1048,7 @@ void start_overview_trigger() {
                                    std::memory_order_release);
   add_config_listener(on_trigger_config_changed, nullptr);
   start_hotkey_worker();
+  start_dispatch_worker();
   g_main_context_invoke(nullptr, refresh_cached_handles_idle, nullptr);
   std::unique_lock<std::mutex> lock(g_trigger_mu);
   if (!g_trigger_thread.joinable()) {
@@ -878,6 +1075,7 @@ void stop_overview_trigger() {
   }
   if (to_join.joinable())
     to_join.join();
+  stop_dispatch_worker();
   stop_hotkey_worker();
 }
 

@@ -11,6 +11,7 @@
 #include "perf-metrics.h"
 #include "virtual-desktop.h"
 #include "window-theming.h"
+#include "winome-version.h"
 
 #include <gtk/gtk.h>
 #include <gdk/win32/gdkwin32.h>
@@ -1015,7 +1016,7 @@ GtkWidget* build_about_page() {
   gtk_image_set_pixel_size(GTK_IMAGE(logo), 48);
 
   GtkWidget* titles = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-  GtkWidget* app_name = gtk_label_new("WINOME Shell 0.1.0");
+  GtkWidget* app_name = gtk_label_new("WINOME Shell " WINOME_VERSION);
   gtk_widget_set_name(app_name, "winomeSettingsHeaderTitle");
   gtk_label_set_xalign(GTK_LABEL(app_name), 0.0f);
 

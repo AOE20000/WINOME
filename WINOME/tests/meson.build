@@ -58,7 +58,7 @@ winome_tests = executable('winome-tests',
     '../src/run-dialog.cpp',
   ),
   dependencies: test_deps,
-  include_directories: [winome_test_inc],
+  include_directories: [winome_test_inc, winome_root_inc],
   cpp_args: ['-DUNICODE', '-D_UNICODE'],
 )
 

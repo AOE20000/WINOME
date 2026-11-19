@@ -10,6 +10,7 @@
 #include "debug-runtime.h"
 #include "perf-metrics.h"
 #include "systray.h"
+#include "winome-version.h"
 
 #include <windows.h>
 #include <sddl.h>
@@ -279,7 +280,8 @@ std::string build_status_json(const IpcCallbacks& cbs) {
   const DebugFlags df = debug_get_flags();
 
   char num[256];
-  std::string out = "{\"ok\":true,\"result\":{\"version\":\"0.1.0\",";
+  std::string out = std::string("{\"ok\":true,\"result\":{\"version\":\"") +
+                    WINOME_VERSION + "\",";
   out += ov_open ? "\"overview_open\":true," : "\"overview_open\":false,";
   out += is_safe_mode() ? "\"safe_mode\":true," : "\"safe_mode\":false,";
   out += get_config().developer_mode ? "\"developer_mode\":true,"
@@ -752,7 +754,8 @@ std::string ipc_dispatch_request_json(const std::string& req_json,
     debug_append_log("ipc", std::string("[ipc] cmd=") + req.cmd);
 
   if (req.cmd == "ping") {
-    return "{\"ok\":true,\"result\":{\"pong\":true,\"version\":\"0.1.0\"}}";
+    return std::string("{\"ok\":true,\"result\":{\"pong\":true,\"version\":\"") +
+           WINOME_VERSION + "\"}}";
   }
   if (req.cmd == "status") {
     return build_status_json(cbs);

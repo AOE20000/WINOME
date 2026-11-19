@@ -7,7 +7,105 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+
 namespace winome {
+
+// Wait-free single-producer / single-consumer ring buffer used so low-level
+// hook callbacks (WH_KEYBOARD_LL) never touch mutexes or GLib locks.
+template <typename T, size_t Capacity>
+class AtomicTriggerRing {
+  static_assert(Capacity >= 2 && (Capacity & (Capacity - 1)) == 0,
+                "Capacity must be a power of two >= 2");
+
+ public:
+  bool try_push(const T& item) {
+    const size_t h = head_.load(std::memory_order_relaxed);
+    const size_t next = (h + 1) & (Capacity - 1);
+    if (next == tail_.load(std::memory_order_acquire))
+      return false;
+    buf_[h] = item;
+    head_.store(next, std::memory_order_release);
+    return true;
+  }
+
+  bool try_pop(T* out) {
+    const size_t t = tail_.load(std::memory_order_relaxed);
+    if (t == head_.load(std::memory_order_acquire))
+      return false;
+    *out = buf_[t];
+    tail_.store((t + 1) & (Capacity - 1), std::memory_order_release);
+    return true;
+  }
+
+  void clear() {
+    tail_.store(head_.load(std::memory_order_acquire), std::memory_order_release);
+  }
+
+ private:
+  std::array<T, Capacity> buf_{};
+  std::atomic<size_t> head_{0};
+  std::atomic<size_t> tail_{0};
+};
+
+struct HookWatchdogInput {
+  uint64_t now_tick = 0;
+  bool win_down = false;
+  bool win_injected = false;
+  bool win_physically_down = false;
+  uint64_t win_last_keydown_tick = 0;
+  uint64_t win_inject_tick = 0;
+  unsigned swallowed_combo_vk = 0;
+  uint64_t combo_swallow_tick = 0;
+  bool alt_f2_down = false;
+  uint64_t alt_f2_tick = 0;
+  bool esc_swallowed = false;
+  uint64_t esc_swallow_tick = 0;
+};
+
+struct HookWatchdogOutcome {
+  bool reset_win = false;
+  bool clear_combo = false;
+  bool clear_alt_f2 = false;
+  bool clear_esc = false;
+  bool safe_to_reinstall = false;
+};
+
+// Determines whether any swallowed hook state has gone stale (e.g. a keyup was
+// lost across UIPI, focus transitions, or silent hook eviction) so the hook
+// watchdog never locks itself out permanently.
+inline HookWatchdogOutcome evaluate_hook_watchdog(const HookWatchdogInput& in) {
+  HookWatchdogOutcome out{};
+  if (in.win_down) {
+    if (in.win_injected) {
+      if ((in.now_tick - in.win_inject_tick) > 200 && !in.win_physically_down)
+        out.reset_win = true;
+    } else if ((in.now_tick - in.win_last_keydown_tick) > 2500) {
+      out.reset_win = true;
+    }
+  }
+  if (in.swallowed_combo_vk != 0 &&
+      (in.now_tick - in.combo_swallow_tick) > 1500) {
+    out.clear_combo = true;
+  }
+  if (in.alt_f2_down && (in.now_tick - in.alt_f2_tick) > 1500)
+    out.clear_alt_f2 = true;
+  if (in.esc_swallowed && (in.now_tick - in.esc_swallow_tick) > 1500)
+    out.clear_esc = true;
+
+  const bool active_win = in.win_down && !out.reset_win;
+  const bool active_combo =
+      (in.swallowed_combo_vk != 0) && !out.clear_combo && !out.reset_win;
+  const bool active_f2 = in.alt_f2_down && !out.clear_alt_f2 && !out.reset_win;
+  const bool active_esc =
+      in.esc_swallowed && !out.clear_esc && !out.reset_win;
+  out.safe_to_reinstall =
+      !active_win && !active_combo && !active_f2 && !active_esc;
+  return out;
+}
 
 enum class WinKeyComboAction {
   ModifierPassthrough,
