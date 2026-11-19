@@ -3,11 +3,13 @@
 // Event-driven per-monitor fullscreen detection & lock-screen panel hiding.
 
 #include "fullscreen-watcher.h"
+#include "host-utils.h"
 #include "hot-corner.h"
 #include "overview-trigger.h"
 #include "overview.h"
 
 #include <windows.h>
+#include <dwmapi.h>
 #include <glib.h>
 
 #include <algorithm>
@@ -81,7 +83,15 @@ bool is_desktop_window(HWND hwnd) {
   return wcscmp(cls, L"Progman") == 0 ||
          wcscmp(cls, L"WorkerW") == 0 ||
          wcscmp(cls, L"SHELLDLL_DefView") == 0 ||
-         wcscmp(cls, L"SysListView32") == 0;
+         wcscmp(cls, L"SysListView32") == 0 ||
+         wcscmp(cls, L"Shell_TrayWnd") == 0 ||
+         wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0 ||
+         wcscmp(cls, L"XamlExplorerHostIslandWindow") == 0 ||
+         wcscmp(cls, L"Windows.UI.Core.CoreWindow") == 0 ||
+         wcscmp(cls, L"EdgeUiInputTopWndClass") == 0 ||
+         wcscmp(cls, L"EdgeUiInputWndClass") == 0 ||
+         wcscmp(cls, L"DummyDWMListenerWindow") == 0 ||
+         wcscmp(cls, L"ForegroundStaging") == 0;
 }
 
 // Compute which monitor (if any) is currently covered by a fullscreen foreground
@@ -93,30 +103,49 @@ void detect_fullscreen_state(bool* all_locked, HMONITOR* fullscreen_mon) {
   if (g_session_locked)
     return;
 
-  HWND fg = GetForegroundWindow();
-  if (fg == nullptr)
-    return;
-
   // Overview always keeps top panels visible.
   if (winome::overview_active())
     return;
 
-  if (belongs_to_process(fg, L"winome.exe"))
+  HWND fg = GetForegroundWindow();
+  if (fg == nullptr)
     return;
 
-  if (is_desktop_window(fg))
+  DWORD fg_pid = 0;
+  GetWindowThreadProcessId(fg, &fg_pid);
+  if (fg_pid == GetCurrentProcessId())
     return;
-
-  wchar_t cls[256] = {0};
-  if (GetClassNameW(fg, cls, 256) > 0 &&
-      wcscmp(cls, L"XamlExplorerHostIslandWindow") == 0) {
-    return;
-  }
 
   if (belongs_to_process(fg, L"LogonUI.exe")) {
     *all_locked = true;
     return;
   }
+
+  if (!IsWindowVisible(fg) || IsIconic(fg))
+    return;
+
+  BOOL cloaked = FALSE;
+  if (SUCCEEDED(DwmGetWindowAttribute(fg, DWMWA_CLOAKED, &cloaked,
+                                      sizeof(cloaked))) &&
+      cloaked != FALSE) {
+    return;
+  }
+
+  if (is_desktop_window(fg))
+    return;
+
+  if (belongs_to_process(fg, L"winome.exe"))
+    return;
+
+  LONG_PTR style = GetWindowLongPtrW(fg, GWL_STYLE);
+  LONG_PTR ex_style = GetWindowLongPtrW(fg, GWL_EXSTYLE);
+  if ((style & WS_CHILD) != 0 ||
+      (ex_style & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) != 0) {
+    return;
+  }
+
+  if (winome::is_overview_default_blacklisted_hwnd(fg, true))
+    return;
 
   if (IsZoomed(fg))
     return;
@@ -132,8 +161,9 @@ void reassert_primary_workarea_and_styles() {
       continue;
 
     LONG_PTR ex = GetWindowLongPtrW(entry.hwnd, GWL_EXSTYLE);
-    if ((ex & WS_EX_TOOLWINDOW) == 0)
-      SetWindowLongPtrW(entry.hwnd, GWL_EXSTYLE, (ex | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW);
+    LONG_PTR want = (ex & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+    if (ex != want)
+      SetWindowLongPtrW(entry.hwnd, GWL_EXSTYLE, want);
 
     if (entry.is_primary) {
       RECT panel_rect{};
@@ -184,6 +214,7 @@ void evaluate_fullscreen_state(void) {
   HMONITOR fs_mon = nullptr;
   detect_fullscreen_state(&all_locked, &fs_mon);
 
+  bool any_shown = false;
   for (auto& entry : g_panels) {
     if (!IsWindow(entry.hwnd))
       continue;
@@ -192,10 +223,14 @@ void evaluate_fullscreen_state(void) {
     if (want_hide != entry.hidden) {
       entry.hidden = want_hide;
       ShowWindow(entry.hwnd, want_hide ? SW_HIDE : SW_SHOWNOACTIVATE);
+      if (!want_hide)
+        any_shown = true;
       if (entry.is_primary)
         hot_corner_set_suppressed(want_hide || g_session_locked);
     }
   }
+  if (any_shown)
+    winome::overview_restack();
 }
 
 void register_panel_window(HWND panel_hwnd) {

@@ -389,12 +389,13 @@ window.quick-settings-popover-window {
   font: 11pt "Cantarell";
 }
 
-/* Transparent panel over the Activities overview, matching native
-   #panel:overview (the :overview pseudo-class is dropped by the conversion;
-   the host toggles this class on the panel window via the overview state
-   callback). The panel strip then shows the overview behind it, GNOME style. */
+/* Opaque #222226 panel over the Activities overview, matching native
+   #overviewGroup's #222226 backdrop. Because #panel and window.winome-overview
+   are separate Win32 toplevel OpenGL surfaces, keeping #panel.overview opaque
+   (#222226 instead of alpha-0 transparent) blends seamlessly with the overview
+   while preventing DWM/WGL alpha-composition flicker on the top bar. */
 #panel.overview {
-  background-color: transparent;
+  background-color: #222226;
 }
 
 /* In-host Activities overview toplevel (layering: popover > panel >

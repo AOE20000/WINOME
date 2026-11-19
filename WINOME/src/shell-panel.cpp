@@ -742,6 +742,10 @@ panel_popover_close_ex (PanelPopover *pp, const char *reason, gboolean immediate
     winome_quick_settings_close_menu (pp->child, FALSE);
 
   g_open_popovers = g_list_remove (g_open_popovers, pp);
+  if (g_open_popovers == nullptr && g_popover_mouse_hook != nullptr) {
+    UnhookWindowsHookEx (g_popover_mouse_hook);
+    g_popover_mouse_hook = nullptr;
+  }
 
   // Clear the stale :hover GTK leaves on the anchor button on Windows.
   gtk_widget_unset_state_flags (pp->button, GTK_STATE_FLAG_PRELIGHT);
@@ -855,6 +859,8 @@ on_popover_map (GtkWidget *widget, gpointer data)
   pp->raise_source_id = g_idle_add (popover_raise_idle, pp);
 }
 
+static void ensure_popover_mouse_hook (void);
+
 static void
 panel_popover_open (PanelPopover *pp)
 {
@@ -944,6 +950,7 @@ panel_popover_open (PanelPopover *pp)
   pp->raise_source_id = g_idle_add (popover_raise_idle, pp);
 
   g_open_popovers = g_list_append (g_open_popovers, pp);
+  ensure_popover_mouse_hook ();
 }
 
 static void
@@ -1159,8 +1166,6 @@ make_panel_popover (GtkWidget *button, GtkWidget *child, gboolean centered)
   GtkEventController *keys = gtk_event_controller_key_new ();
   g_signal_connect (keys, "key-pressed", G_CALLBACK (on_popover_key), pp);
   gtk_widget_add_controller (pp->window, keys);
-
-  ensure_popover_mouse_hook ();
 
   return pp->window;
 }

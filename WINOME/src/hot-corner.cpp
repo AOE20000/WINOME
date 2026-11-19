@@ -103,41 +103,52 @@ void refresh_cached_bounds() {
   }
 }
 
-void sync_hook_install_on_hook_thread() {
+LRESULT CALLBACK hot_corner_mouse_proc(int nCode, WPARAM wParam, LPARAM lParam) {
+  if (nCode == HC_ACTION && wParam == WM_MOUSEMOVE) {
+    const MSLLHOOKSTRUCT* ms =
+        reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+    const RECT mon = load_cached_bounds();
+    const bool inside =
+        hot_corner_hit_test(ms->pt.x, ms->pt.y, mon, kCornerSize);
+    const bool prev =
+        g_hc.in_corner.exchange(inside, std::memory_order_acq_rel);
+    if (inside && !prev &&
+        g_hc.enabled.load(std::memory_order_relaxed) &&
+        !g_hc.suppressed.load(std::memory_order_relaxed)) {
+      const gint64 now_ms = g_get_monotonic_time() / 1000;
+      const gint64 prev_ms =
+          g_hc.last_trigger_ms.load(std::memory_order_relaxed);
+      const int cd = g_hc.cooldown_ms.load(std::memory_order_relaxed);
+      if (now_ms - prev_ms >= static_cast<gint64>(cd)) {
+        g_hc.last_trigger_ms.store(now_ms, std::memory_order_relaxed);
+        g_idle_add_full(G_PRIORITY_HIGH_IDLE, invoke_open_overview,
+                        nullptr, nullptr);
+      }
+    }
+  }
+  return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+void sync_hook_install_on_hook_thread(bool force_reinstall = false) {
   const bool want_hook =
       g_hc.enabled.load(std::memory_order_acquire) &&
       !g_hc.suppressed.load(std::memory_order_acquire);
 
-  if (want_hook && g_hc.mouse_hook == nullptr) {
-    g_hc.in_corner.store(false, std::memory_order_relaxed);
-    g_hc.mouse_hook = SetWindowsHookExW(
-        WH_MOUSE_LL,
-        +[](int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT {
-          if (nCode == HC_ACTION && wParam == WM_MOUSEMOVE) {
-            const MSLLHOOKSTRUCT* ms =
-                reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
-            const RECT mon = load_cached_bounds();
-            const bool inside =
-                hot_corner_hit_test(ms->pt.x, ms->pt.y, mon, kCornerSize);
-            const bool prev =
-                g_hc.in_corner.exchange(inside, std::memory_order_acq_rel);
-            if (inside && !prev &&
-                g_hc.enabled.load(std::memory_order_relaxed) &&
-                !g_hc.suppressed.load(std::memory_order_relaxed)) {
-              const gint64 now_ms = g_get_monotonic_time() / 1000;
-              const gint64 prev_ms =
-                  g_hc.last_trigger_ms.load(std::memory_order_relaxed);
-              const int cd = g_hc.cooldown_ms.load(std::memory_order_relaxed);
-              if (now_ms - prev_ms >= static_cast<gint64>(cd)) {
-                g_hc.last_trigger_ms.store(now_ms, std::memory_order_relaxed);
-                g_main_context_invoke(nullptr, invoke_open_overview, nullptr);
-              }
-            }
-          }
-          return CallNextHookEx(nullptr, nCode, wParam, lParam);
-        },
-        nullptr, 0);
-  } else if (!want_hook && g_hc.mouse_hook != nullptr) {
+  if (want_hook) {
+    if (g_hc.mouse_hook == nullptr) {
+      g_hc.in_corner.store(false, std::memory_order_relaxed);
+      g_hc.mouse_hook =
+          SetWindowsHookExW(WH_MOUSE_LL, hot_corner_mouse_proc, nullptr, 0);
+    } else if (force_reinstall &&
+               !g_hc.in_corner.load(std::memory_order_relaxed)) {
+      HHOOK fresh =
+          SetWindowsHookExW(WH_MOUSE_LL, hot_corner_mouse_proc, nullptr, 0);
+      if (fresh != nullptr) {
+        UnhookWindowsHookEx(g_hc.mouse_hook);
+        g_hc.mouse_hook = fresh;
+      }
+    }
+  } else if (g_hc.mouse_hook != nullptr) {
     UnhookWindowsHookEx(g_hc.mouse_hook);
     g_hc.mouse_hook = nullptr;
     g_hc.in_corner.store(false, std::memory_order_relaxed);
@@ -145,6 +156,7 @@ void sync_hook_install_on_hook_thread() {
 }
 
 void hook_thread_main() {
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   MSG dummy{};
   PeekMessageW(&dummy, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 
@@ -162,6 +174,7 @@ void hook_thread_main() {
   }
 
   sync_hook_install_on_hook_thread();
+  UINT_PTR timer_id = SetTimer(nullptr, 0, 4000, nullptr);
 
   MSG msg{};
   while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -169,10 +182,16 @@ void hook_thread_main() {
       sync_hook_install_on_hook_thread();
       continue;
     }
+    if (msg.message == WM_TIMER && msg.wParam == timer_id) {
+      sync_hook_install_on_hook_thread(true);
+      continue;
+    }
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
   }
 
+  if (timer_id != 0)
+    KillTimer(nullptr, timer_id);
   if (g_hc.mouse_hook != nullptr) {
     UnhookWindowsHookEx(g_hc.mouse_hook);
     g_hc.mouse_hook = nullptr;

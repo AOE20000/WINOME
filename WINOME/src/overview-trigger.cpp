@@ -65,12 +65,14 @@ BOOL g_win_down = FALSE;
 WORD g_win_vk = VK_LWIN;
 BOOL g_win_alone = FALSE;
 BOOL g_win_injected = FALSE;
+ULONGLONG g_win_down_tick = 0;
 ULONGLONG g_win_inject_tick = 0;
 BOOL g_alt_f2_down = FALSE;
 BOOL g_esc_swallowed = FALSE;
 HHOOK g_keyboard_hook = nullptr;
 HWINEVENTHOOK g_desktop_switch_hook = nullptr;
 std::atomic<gint64> g_last_win_press_us{0};
+std::atomic<bool> g_win_key_overview_enabled{true};
 
 // Lock-free cached panel HWNDs populated on the GTK main thread so the hook can
 // distinguish panel windows (no Esc handler) from overview/popover/dialogs
@@ -84,6 +86,7 @@ void *g_state_cb_data = nullptr;
 struct OverviewStateData {
   gboolean active;
   uint64_t seq;
+  const char *source;
 };
 
 std::queue<OverviewStateData> g_pending_events;
@@ -294,14 +297,21 @@ dispatch_overview_events_idle (gpointer data G_GNUC_UNUSED)
       cb_data = g_state_cb_data;
     }
 
-    if (ev.active != FALSE)
+    if (ev.active != FALSE) {
+      g_print ("[trig] open_overview (%s)\n",
+               ev.source != nullptr ? ev.source : "?");
+      if (cb != nullptr)
+        cb (true, cb_data);
       overview_show_async ();
-    else
+      refresh_cached_window_handles ();
+    } else {
+      g_print ("[trig] close_overview (%s)\n",
+               ev.source != nullptr ? ev.source : "?");
       overview_hide_async ();
-
-    refresh_cached_window_handles ();
-    if (cb != nullptr)
-      cb (ev.active != FALSE, cb_data);
+      refresh_cached_window_handles ();
+      if (cb != nullptr)
+        cb (false, cb_data);
+    }
   }
 }
 
@@ -312,7 +322,7 @@ dispatch_overview_events_idle (gpointer data G_GNUC_UNUSED)
 static void
 schedule_overview_dispatch ()
 {
-  g_idle_add_full (G_PRIORITY_DEFAULT, dispatch_overview_events_idle,
+  g_idle_add_full (G_PRIORITY_HIGH_IDLE, dispatch_overview_events_idle,
                    nullptr, nullptr);
 }
 
@@ -336,9 +346,46 @@ void reset_win_key_state() {
   }
   g_win_down = FALSE;
   g_win_alone = FALSE;
+  g_win_down_tick = 0;
   g_win_inject_tick = 0;
   g_alt_f2_down = FALSE;
   g_esc_swallowed = FALSE;
+}
+
+bool is_start_menu_foreground() {
+  HWND fg = GetForegroundWindow();
+  if (fg == nullptr)
+    return false;
+  wchar_t cls[128] = {};
+  if (GetClassNameW(fg, cls, 128) <= 0)
+    return false;
+  if (std::wcscmp(cls, L"Windows.UI.Core.CoreWindow") != 0 &&
+      std::wcscmp(cls, L"XamlExplorerHostIslandWindow") != 0) {
+    return false;
+  }
+  DWORD pid = 0;
+  GetWindowThreadProcessId(fg, &pid);
+  if (pid == 0 || pid == GetCurrentProcessId())
+    return false;
+  HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (proc == nullptr)
+    return false;
+  wchar_t path[MAX_PATH] = {};
+  DWORD len = MAX_PATH;
+  BOOL ok = QueryFullProcessImageNameW(proc, 0, path, &len);
+  CloseHandle(proc);
+  if (!ok)
+    return false;
+  const wchar_t* base = std::wcsrchr(path, L'\\');
+  base = (base != nullptr) ? (base + 1) : path;
+  return _wcsicmp(base, L"StartMenuExperienceHost.exe") == 0 ||
+         _wcsicmp(base, L"SearchHost.exe") == 0 ||
+         _wcsicmp(base, L"SearchApp.exe") == 0;
+}
+
+void on_trigger_config_changed(void* data G_GNUC_UNUSED) {
+  g_win_key_overview_enabled.store(get_config().win_key_overview,
+                                   std::memory_order_release);
 }
 
 void CALLBACK on_desktop_switch_event(HWINEVENTHOOK hook G_GNUC_UNUSED,
@@ -465,6 +512,7 @@ bool g_trigger_ready = false;
 bool g_trigger_stop_requested = false;
 
 void trigger_thread_main() {
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   MSG dummy;
   PeekMessageW(&dummy, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 
@@ -486,13 +534,28 @@ void trigger_thread_main() {
   g_desktop_switch_hook = SetWinEventHook(
       EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH, nullptr,
       on_desktop_switch_event, 0, 0, WINEVENT_OUTOFCONTEXT);
+  UINT_PTR timer_id = SetTimer(nullptr, 0, 4000, nullptr);
 
   MSG msg;
   while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    if (msg.message == WM_TIMER && msg.wParam == timer_id) {
+      if (!g_win_down && !g_alt_f2_down && !g_esc_swallowed) {
+        HHOOK fresh = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
+                                        nullptr, 0);
+        if (fresh != nullptr) {
+          if (g_keyboard_hook != nullptr)
+            UnhookWindowsHookEx(g_keyboard_hook);
+          g_keyboard_hook = fresh;
+        }
+      }
+      continue;
+    }
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
   }
 
+  if (timer_id != 0)
+    KillTimer(nullptr, timer_id);
   if (g_desktop_switch_hook != nullptr) {
     UnhookWinEvent(g_desktop_switch_hook);
     g_desktop_switch_hook = nullptr;
@@ -532,26 +595,30 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     const bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
     const bool up = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
 
-    // Fallback recovery: if a Win+key combo already injected Win down and
-    // Windows later reports that Win key up (e.g. after secure desktop /
-    // lock screen where the Win keyup bypassed this hook), clear stale state
-    // before evaluating the incoming non-Win key.
-    if (g_win_down && g_win_injected &&
-        state->vkCode != VK_LWIN && state->vkCode != VK_RWIN) {
+    // Fallback recovery: if a previous Win keydown lost its matching keyup
+    // (e.g. across secure desktop / UAC / elevated window), clear stale state
+    // (and release any synthetic Win keydown) before evaluating a non-Win key.
+    if (g_win_down && state->vkCode != VK_LWIN && state->vkCode != VK_RWIN) {
       const ULONGLONG now_tick = GetTickCount64();
-      if ((now_tick - g_win_inject_tick) > 30 &&
+      const ULONGLONG ref_tick =
+          g_win_injected ? g_win_inject_tick : g_win_down_tick;
+      if ((now_tick - ref_tick) > 40 &&
           (GetAsyncKeyState(g_win_vk) & 0x8000) == 0) {
-        g_win_down = FALSE;
-        g_win_alone = FALSE;
-        g_win_injected = FALSE;
-        g_win_inject_tick = 0;
+        reset_win_key_state();
       }
     }
 
     if (state->vkCode == VK_LWIN || state->vkCode == VK_RWIN) {
       if (down) {
-        if (!g_win_down && !get_config().win_key_overview)
+        if (!g_win_down &&
+            !g_win_key_overview_enabled.load(std::memory_order_acquire))
           return CallNextHookEx(nullptr, nCode, wParam, lParam);
+        // If a previous Win keydown got stuck >2s ago without a keyup, reset
+        // before starting the new press.
+        if (g_win_down && (GetTickCount64() - g_win_down_tick) > 2000 &&
+            !g_win_alone) {
+          reset_win_key_state();
+        }
         // Swallow the Win keydown so Windows does not open the Start menu.
         // If another key follows, the Win keydown is re-injected for Win+<key>.
         // Only the first keydown initializes the state: holding Win generates
@@ -562,6 +629,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
           g_win_vk = static_cast<WORD>(state->vkCode);
           g_win_alone = TRUE;
           g_win_injected = FALSE;
+          g_win_down_tick = GetTickCount64();
           g_win_inject_tick = 0;
         } else if (state->vkCode != g_win_vk) {
           g_win_alone = FALSE;
@@ -576,6 +644,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         g_win_down = FALSE;
         const bool bare = g_win_alone;
         g_win_alone = FALSE;
+        g_win_down_tick = 0;
         g_win_inject_tick = 0;
         if (g_win_injected) {
           // Release the synthetic Win keydown that enabled the Win+<key> combo.
@@ -586,16 +655,21 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
           // A bare Win press opens the Activities overview; a rapid second Win
           // press (within 550ms while opening or in WINDOW_PICKER) interrupts
           // smoothly into the App Grid like GNOME Shell's overlay-key flow.
+          // If the native Windows Start menu is currently the active foreground
+          // window (either opened via Win+Tab or leaked when an elevated window
+          // held focus), pressing bare Win closes the Start menu directly.
           gint64 now = g_get_monotonic_time();
           if (!g_running.load(std::memory_order_acquire)) {
-            g_last_win_press_us.store(now, std::memory_order_release);
-            open_overview("win-key");
+            if (is_start_menu_foreground()) {
+              open_start_menu();
+            } else {
+              g_last_win_press_us.store(now, std::memory_order_release);
+              open_overview("win-key");
+            }
           } else {
             gint64 prev =
                 g_last_win_press_us.exchange(0, std::memory_order_acq_rel);
-            if (prev > 0 && (now - prev) <= 550000 &&
-                overview_can_shift_to_app_grid()) {
-              g_print("[trig] double win-key -> app-grid\n");
+            if (prev > 0 && (now - prev) <= 550000) {
               overview_shift_to_app_grid_async();
             } else {
               close_overview("win-key");
@@ -683,7 +757,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
           // layered Esc dismissal on the GTK main thread.
           if (!g_esc_swallowed) {
             g_esc_swallowed = TRUE;
-            g_main_context_invoke(nullptr, handle_unfocused_esc_idle, nullptr);
+            g_idle_add_full(G_PRIORITY_HIGH_IDLE, handle_unfocused_esc_idle,
+                            nullptr, nullptr);
           }
           return 1;
         }
@@ -697,6 +772,9 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 void start_overview_trigger() {
+  g_win_key_overview_enabled.store(get_config().win_key_overview,
+                                   std::memory_order_release);
+  add_config_listener(on_trigger_config_changed, nullptr);
   start_hotkey_worker();
   g_main_context_invoke(nullptr, refresh_cached_handles_idle, nullptr);
   std::unique_lock<std::mutex> lock(g_trigger_mu);
@@ -709,6 +787,7 @@ void start_overview_trigger() {
 }
 
 void stop_overview_trigger() {
+  remove_config_listener(on_trigger_config_changed, nullptr);
   std::thread to_join;
   {
     std::unique_lock<std::mutex> lock(g_trigger_mu);
@@ -729,12 +808,13 @@ void stop_overview_trigger() {
 namespace {
 
 // Must be called with g_state_mu held.
-uint64_t open_overview_locked(bool *out_schedule) {
+uint64_t open_overview_locked(const char *source, bool *out_schedule) {
   if (g_running.load(std::memory_order_acquire))
     return 0;
   g_running.store(true, std::memory_order_release);
   const uint64_t seq = g_state_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
-  g_pending_events.push(OverviewStateData{TRUE, seq});
+  g_pending_events.push(
+      OverviewStateData{TRUE, seq, source != nullptr ? source : "?"});
   if (!g_dispatch_scheduled) {
     g_dispatch_scheduled = true;
     *out_schedule = true;
@@ -743,13 +823,14 @@ uint64_t open_overview_locked(bool *out_schedule) {
 }
 
 // Must be called with g_state_mu held.
-uint64_t close_overview_locked(bool *out_schedule) {
+uint64_t close_overview_locked(const char *source, bool *out_schedule) {
   if (!g_running.load(std::memory_order_acquire))
     return 0;
   g_running.store(false, std::memory_order_release);
   const uint64_t seq = g_state_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
   g_last_win_press_us.store(0, std::memory_order_release);
-  g_pending_events.push(OverviewStateData{FALSE, seq});
+  g_pending_events.push(
+      OverviewStateData{FALSE, seq, source != nullptr ? source : "?"});
   if (!g_dispatch_scheduled) {
     g_dispatch_scheduled = true;
     *out_schedule = true;
@@ -760,52 +841,36 @@ uint64_t close_overview_locked(bool *out_schedule) {
 }  // namespace
 
 void open_overview(const char *source) {
-  uint64_t seq = 0;
   bool schedule = false;
   {
     std::lock_guard<std::mutex> lk(g_state_mu);
-    seq = open_overview_locked(&schedule);
+    open_overview_locked(source, &schedule);
   }
   if (schedule)
     schedule_overview_dispatch();
-  if (seq != 0)
-    g_print("[trig] open_overview (%s)\n", source != nullptr ? source : "?");
 }
 
 void close_overview(const char *source) {
-  uint64_t seq = 0;
   bool schedule = false;
   {
     std::lock_guard<std::mutex> lk(g_state_mu);
-    seq = close_overview_locked(&schedule);
+    close_overview_locked(source, &schedule);
   }
   if (schedule)
     schedule_overview_dispatch();
-  if (seq != 0)
-    g_print("[trig] close_overview (%s)\n", source != nullptr ? source : "?");
 }
 
 void toggle_overview(const char *source) {
-  uint64_t seq = 0;
-  bool opened = false;
   bool schedule = false;
   {
     std::lock_guard<std::mutex> lk(g_state_mu);
-    if (!g_running.load(std::memory_order_acquire)) {
-      seq = open_overview_locked(&schedule);
-      opened = (seq != 0);
-    } else {
-      seq = close_overview_locked(&schedule);
-      opened = false;
-    }
+    if (!g_running.load(std::memory_order_acquire))
+      open_overview_locked(source, &schedule);
+    else
+      close_overview_locked(source, &schedule);
   }
   if (schedule)
     schedule_overview_dispatch();
-  if (seq != 0) {
-    g_print("[trig] %s (%s)\n",
-            opened ? "open_overview" : "close_overview",
-            source != nullptr ? source : "?");
-  }
 }
 
 bool overview_active() {

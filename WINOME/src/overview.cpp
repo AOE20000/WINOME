@@ -188,6 +188,9 @@ constexpr double kGridSlideOffsetPx = 36.0;
 ControlsState g_target_state = ControlsState::HIDDEN;
 ControlsState g_pending_show_state = ControlsState::WINDOW_PICKER;
 std::atomic<bool> g_atomic_can_shift_app_grid{false};
+std::atomic<bool> g_pending_shift_app_grid{false};
+WNDPROC g_orig_overview_wndproc = nullptr;
+bool g_overview_surface_hooked = false;
 bool g_placed = false;
 bool g_thumbs_has_pills = false;
 int g_grid_x = 0, g_grid_y = 0, g_grid_w = 0, g_grid_h = 0;
@@ -264,6 +267,7 @@ struct SlotEntry {
   RECT current;       // animated rect currently set on the thumbnail
   HWND target;
   HTHUMBNAIL thumb;
+  int z_order = 0;    // 0 = frontmost desktop window from EnumWindows
   bool minimized = false;
   BYTE anim_from_opacity = 255;
   BYTE anim_to_opacity = 255;
@@ -488,8 +492,28 @@ is_external_foreground_target (HWND fg)
     return false;
   DWORD fg_pid = 0;
   GetWindowThreadProcessId (fg, &fg_pid);
-  return fg_pid != 0 && fg_pid != GetCurrentProcessId ();
+  if (fg_pid == 0 || fg_pid == GetCurrentProcessId ())
+    return false;
+  wchar_t cls[128] = {};
+  if (GetClassNameW (fg, cls, 128) > 0) {
+    if (std::wcscmp (cls, L"Windows.UI.Core.CoreWindow") == 0 ||
+        std::wcscmp (cls, L"XamlExplorerHostIslandWindow") == 0 ||
+        std::wcscmp (cls, L"Shell_TrayWnd") == 0 ||
+        std::wcscmp (cls, L"Shell_SecondaryTrayWnd") == 0 ||
+        std::wcscmp (cls, L"Progman") == 0 ||
+        std::wcscmp (cls, L"WorkerW") == 0 ||
+        std::wcscmp (cls, L"SHELLDLL_DefView") == 0 ||
+        std::wcscmp (cls, L"SysListView32") == 0) {
+      return false;
+    }
+  }
+  if (is_overview_default_blacklisted_hwnd (fg, true))
+    return false;
+  return true;
 }
+
+void
+promote_slot_thumb_to_top (SlotEntry &e);
 
 void
 activate_slot_and_close (int index, const char *reason)
@@ -497,6 +521,7 @@ activate_slot_and_close (int index, const char *reason)
   overview_discard_restore_focus ();
   if (index >= 0 && index < (int)g_slots.size () &&
       IsWindow (g_slots[index].target)) {
+    promote_slot_thumb_to_top (g_slots[index]);
     HWND target = g_slots[index].target;
     if (IsIconic (target))
       ShowWindow (target, SW_RESTORE);
@@ -884,19 +909,23 @@ ensure_hwnd_topmost (HWND hwnd)
     return;
   if ((GetWindowLongPtrW (hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0) {
     SetWindowPos (hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                      SWP_NOOWNERZORDER);
   }
 }
 
 static void
 chrome_bind_owner (HWND hwnd)
 {
-  if (hwnd == nullptr || !IsWindow (hwnd) || hwnd == g_overview_hwnd ||
-      g_overview_hwnd == nullptr || !IsWindow (g_overview_hwnd))
+  // Keep chrome popups unowned (GWLP_HWNDPARENT == 0): restack_locked()
+  // explicitly manages the topmost z-order chain (popover > panel > chrome >
+  // overview), and Win32 owner-child z-order coupling would otherwise drag
+  // g_overview_hwnd above g_panel_hwnd whenever GDK or SetForegroundWindow
+  // touches any window in the group without SWP_NOOWNERZORDER.
+  if (hwnd == nullptr || !IsWindow (hwnd))
     return;
-  LONG_PTR owner = reinterpret_cast<LONG_PTR> (g_overview_hwnd);
-  if (GetWindowLongPtrW (hwnd, GWLP_HWNDPARENT) != owner)
-    SetWindowLongPtrW (hwnd, GWLP_HWNDPARENT, owner);
+  if (GetWindowLongPtrW (hwnd, GWLP_HWNDPARENT) != 0)
+    SetWindowLongPtrW (hwnd, GWLP_HWNDPARENT, 0);
 }
 
 static void
@@ -939,7 +968,8 @@ chrome_window_apply_want (GtkWidget *win, HWND hwnd, const RECT &want,
   HWND prev = GetWindow (hwnd, GW_HWNDPREV);
   bool same_z = (after == HWND_TOPMOST) ? (prev == nullptr) : (prev == after);
   if (!same_rect || !vis || !same_z) {
-    UINT flags = SWP_NOACTIVATE | (vis ? 0 : SWP_SHOWWINDOW) |
+    UINT flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER |
+                 (vis ? 0 : SWP_SHOWWINDOW) |
                  (same_rect ? (SWP_NOMOVE | SWP_NOSIZE) : 0);
     SetWindowPos (hwnd, after, want.left, want.top, want_w, want_h, flags);
   }
@@ -1801,12 +1831,40 @@ apply_thumb_rect (SlotEntry &e, const RECT &rect, BYTE opacity)
 }
 
 void
+promote_slot_thumb_to_top (SlotEntry &e)
+{
+  if (g_overview_hwnd == nullptr || e.target == nullptr || e.thumb == nullptr)
+    return;
+  DwmUnregisterThumbnail (e.thumb);
+  e.thumb = nullptr;
+  HTHUMBNAIL thumb = nullptr;
+  if (SUCCEEDED (DwmRegisterThumbnail (g_overview_hwnd, e.target, &thumb)) &&
+      thumb != nullptr) {
+    e.thumb = thumb;
+    apply_thumb_rect (e, e.current, e.current_opacity);
+  }
+}
+
+void
 create_previews (bool at_start_rects, LONG x_offset)
 {
   if (g_overview_hwnd == nullptr)
     return;
 
-  for (SlotEntry &e : g_slots) {
+  // DWM composites thumbnails registered on the same destination HWND in
+  // registration order (earlier = bottom, later = top). Register in reverse
+  // desktop Z-order (backmost window first, frontmost window z_order == 0
+  // last) so the active foreground window always renders on top of background
+  // windows during the open/close transitions.
+  std::vector<size_t> order (g_slots.size ());
+  for (size_t i = 0; i < g_slots.size (); ++i)
+    order[i] = i;
+  std::stable_sort (order.begin (), order.end (), [] (size_t a, size_t b) {
+    return g_slots[a].z_order > g_slots[b].z_order;
+  });
+
+  for (size_t idx : order) {
+    SlotEntry &e = g_slots[idx];
     HTHUMBNAIL thumb = nullptr;
     if (SUCCEEDED (DwmRegisterThumbnail (g_overview_hwnd, e.target, &thumb)) &&
         thumb != nullptr) {
@@ -1890,7 +1948,8 @@ create_mini_previews (HMONITOR monitor, const RECT &monitor_rect,
     // Porthole px -> pill px (physical).
     double s = overview_thumbs_get_scale (g_thumbs) * scale;
 
-    for (size_t i = 0; i < all.size (); ++i) {
+    // Register back-to-front so frontmost windows render on top inside pills.
+    for (size_t i = all.size (); i-- > 0;) {
       if (window_desktop[i] != d)
         continue;
 
@@ -2157,6 +2216,77 @@ position_widgets (const PlacedGeometry &geo, bool opening, LONG switch_off_x = 0
 
 // --- z-order ----------------------------------------------------------------------
 
+static void dump_zorder (const char *tag);
+static void restack_locked (void);
+static void switch_finish (bool restore_hover = true);
+
+static LRESULT CALLBACK
+overview_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+  if (msg == WM_WINDOWPOSCHANGING && lParam != 0 &&
+      (GetWindowLongPtrW (hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0 &&
+      g_panel_hwnd != nullptr && IsWindow (g_panel_hwnd) &&
+      IsWindowVisible (g_panel_hwnd) &&
+      (GetWindowLongPtrW (g_panel_hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0) {
+    auto *wp = reinterpret_cast<WINDOWPOS *> (lParam);
+    if ((wp->flags & SWP_NOZORDER) == 0) {
+      HWND allowed_anchor = g_panel_hwnd;
+      HWND chrome_layers[] = {g_chrome_hwnd, g_icon_hwnd, g_caption_hwnd};
+      for (HWND h : chrome_layers) {
+        if (is_visible_hwnd (h) &&
+            (GetWindowLongPtrW (h, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0) {
+          allowed_anchor = h;
+        }
+      }
+      if (wp->hwndInsertAfter != g_panel_hwnd &&
+          wp->hwndInsertAfter != g_chrome_hwnd &&
+          wp->hwndInsertAfter != g_icon_hwnd &&
+          wp->hwndInsertAfter != g_caption_hwnd) {
+        wp->hwndInsertAfter = allowed_anchor;
+        wp->flags |= SWP_NOOWNERZORDER;
+      }
+    }
+  }
+  WNDPROC orig = g_orig_overview_wndproc;
+  LRESULT res = orig != nullptr
+                    ? CallWindowProcW (orig, hwnd, msg, wParam, lParam)
+                    : DefWindowProcW (hwnd, msg, wParam, lParam);
+  if (msg == WM_ACTIVATE && LOWORD (wParam) != WA_INACTIVE) {
+    restack_locked ();
+  }
+  return res;
+}
+
+static void
+ensure_overview_subclass (HWND hwnd)
+{
+  if (hwnd == nullptr || !IsWindow (hwnd))
+    return;
+  WNDPROC cur = reinterpret_cast<WNDPROC> (
+      GetWindowLongPtrW (hwnd, GWLP_WNDPROC));
+  if (cur != nullptr && cur != overview_subclass_wndproc) {
+    g_orig_overview_wndproc = cur;
+    SetWindowLongPtrW (hwnd, GWLP_WNDPROC,
+                       reinterpret_cast<LONG_PTR> (overview_subclass_wndproc));
+  }
+}
+
+static void
+unsubclass_overview_hwnd (void)
+{
+  if (g_overview_hwnd != nullptr && IsWindow (g_overview_hwnd) &&
+      g_orig_overview_wndproc != nullptr) {
+    WNDPROC cur = reinterpret_cast<WNDPROC> (
+        GetWindowLongPtrW (g_overview_hwnd, GWLP_WNDPROC));
+    if (cur == overview_subclass_wndproc) {
+      SetWindowLongPtrW (
+          g_overview_hwnd, GWLP_WNDPROC,
+          reinterpret_cast<LONG_PTR> (g_orig_overview_wndproc));
+    }
+  }
+  g_orig_overview_wndproc = nullptr;
+}
+
 void
 apply_ex_styles (HWND hwnd)
 {
@@ -2166,20 +2296,19 @@ apply_ex_styles (HWND hwnd)
   // excluded from Alt+Tab and the taskbar.
   LONG_PTR ex = GetWindowLongPtrW (hwnd, GWL_EXSTYLE);
   LONG_PTR want = (ex | WS_EX_TOOLWINDOW) & ~(WS_EX_NOACTIVATE | WS_EX_APPWINDOW);
-  if (want != ex)
+  UINT swp_flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+  if (want != ex) {
     SetWindowLongPtrW (hwnd, GWL_EXSTYLE, want);
+    swp_flags |= SWP_FRAMECHANGED;
+  }
   ensure_hwnd_topmost (hwnd);
+  ensure_overview_subclass (hwnd);
 
   HWND after = (g_panel_hwnd != nullptr && IsWindow (g_panel_hwnd))
                    ? g_panel_hwnd
                    : HWND_TOPMOST;
-  SetWindowPos (hwnd, after, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+  SetWindowPos (hwnd, after, 0, 0, 0, 0, swp_flags);
 }
-
-static void dump_zorder (const char *tag);
-static void restack_locked (void);
-static void switch_finish (bool restore_hover = true);
 
 // Rebuild slots, thumbnails and widget positions for the current monitor.
 // Must run after the overview window is mapped (GDK's first-map sequence
@@ -2222,7 +2351,8 @@ place_overview_locked (bool opening, int switch_dir)
   int w = mi.rcMonitor.right - mi.rcMonitor.left;
   int h = mi.rcMonitor.bottom - mi.rcMonitor.top;
   SetWindowPos (g_overview_hwnd, g_panel_hwnd, mi.rcMonitor.left,
-                mi.rcMonitor.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                mi.rcMonitor.top, w, h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
 
   int panel_height = 0;
   RECT pr;
@@ -2312,6 +2442,13 @@ place_overview_locked (bool opening, int switch_dir)
     SlotEntry e;
     e.target = s.window.hwnd;
     e.start = s.window.rect;
+    e.z_order = (int)windows.size ();
+    for (size_t wi = 0; wi < windows.size (); ++wi) {
+      if (windows[wi].hwnd == e.target) {
+        e.z_order = (int)wi;
+        break;
+      }
+    }
     e.minimized = IsIconic (s.window.hwnd) != FALSE;
     int sw = (int)((s.window.rect.right - s.window.rect.left) * s.scale);
     int sh = (int)((s.window.rect.bottom - s.window.rect.top) * s.scale);
@@ -2355,8 +2492,16 @@ place_overview_locked (bool opening, int switch_dir)
     g_slots.push_back (e);
   }
 
-  // Register DWM thumbnails once: start at real desktop rects when opening,
-  // slide-in start offset when switching desktops, or settled rects otherwise.
+  // Settle focus and Win32 z-order BEFORE registering DWM thumbnails so that
+  // SetForegroundWindow / BringWindowToTop / SetWindowPos do not reshuffle the
+  // window or flash the bare wallpaper surface after thumbnails appear at t=0.
+  if (opening && winome_shell_panel_top_popover_hwnd () == nullptr)
+    focus_overview_window (false);
+  restack_locked ();
+
+  // Register DWM thumbnails once (in back-to-front desktop Z-order): start at
+  // real desktop rects when opening, slide-in start offset when switching
+  // desktops, or settled rects otherwise.
   create_previews (opening, switch_off_x);
 
   // Mini window previews inside the workspace thumbnail pills.
@@ -2369,10 +2514,7 @@ place_overview_locked (bool opening, int switch_dir)
            (long)(g_ws_box.bottom - g_ws_box.top),
            overview_dash_get_width (g_dash));
 
-  restack_locked ();
   if (opening) {
-    if (winome_shell_panel_top_popover_hwnd () == nullptr)
-      focus_overview_window (false);
     ControlsState desired = g_pending_show_state;
     g_bg_cur = g_bg_full;
     g_bg_radius = 0.0;
@@ -2444,7 +2586,10 @@ overview_place_opening_idle (gpointer user_data)
 {
   (void)user_data;
   g_place_opening_source = 0;
-  place_overview_locked (true);
+  if (!g_placed)
+    place_overview_locked (true);
+  else
+    restack_locked ();
   return G_SOURCE_REMOVE;
 }
 
@@ -2483,8 +2628,8 @@ dump_zorder (const char *tag)
 
 // Verify the popover > panel > chrome windows > overview chain is already
 // in order: the periodic 400ms tick and the popover-raise retries then no-op
-// instead of re-sending SWP_FRAMECHANGED SetWindowPos calls, each of which
-// forces a WM_NCCALCSIZE round-trip and reshuffles the topmost band.
+// instead of re-sending SetWindowPos calls, each of which reshuffles the
+// topmost band.
 static bool
 zorder_drifted (void)
 {
@@ -2513,11 +2658,18 @@ zorder_drifted (void)
   for (int i = 1; i < n; ++i)
     if (GetWindow (chain[i], GW_HWNDPREV) != chain[i - 1])
       return true;
-  // Without a popover the panel must be the very top window; with one open
-  // whatever sits above the popover (foreign topmost windows) is not ours to
-  // police.
-  if (chain[0] == g_panel_hwnd)
-    return GetWindow (g_panel_hwnd, GW_HWNDPREV) != nullptr;
+  // Without a popover the panel must sit above all visible topmost windows;
+  // ignore invisible/cloaked/zero-sized OS helper windows (Default IME, etc.).
+  if (chain[0] == g_panel_hwnd) {
+    for (HWND prev = GetWindow (g_panel_hwnd, GW_HWNDPREV); prev != nullptr;
+         prev = GetWindow (prev, GW_HWNDPREV)) {
+      if (IsWindowVisible (prev) && !is_cloaked (prev)) {
+        RECT r{};
+        if (GetWindowRect (prev, &r) && r.right > r.left && r.bottom > r.top)
+          return true;
+      }
+    }
+  }
   return false;
 }
 
@@ -2538,32 +2690,41 @@ restack_locked (void)
   if (!SetWindowPos (g_panel_hwnd, popover != nullptr ? popover : HWND_TOPMOST,
                      0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
-                         SWP_FRAMECHANGED))
+                         SWP_NOOWNERZORDER))
     g_print ("[restack] panel failed gle=%lu\n", GetLastError ());
 
-  // Place the owner (overview) directly below the panel first, THEN insert
-  // visible owned chrome windows between panel and overview with SWP_NOOWNERZORDER.
-  // Moving the owner AFTER its owned children would violate Win32 owner-child
-  // z-order rules and kick the panel below the overview group.
-  if (is_visible_hwnd (g_overview_hwnd)) {
-    ensure_hwnd_topmost (g_overview_hwnd);
-    if (!SetWindowPos (g_overview_hwnd, g_panel_hwnd, 0, 0, 0, 0,
-                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
-                           SWP_NOOWNERZORDER | SWP_FRAMECHANGED)) {
-      g_print ("[restack] overview failed gle=%lu\n", GetLastError ());
-    }
-  }
-
-  HWND below_panel = g_panel_hwnd;
+  HWND prev_hwnd = g_panel_hwnd;
   HWND chrome_layers[] = {g_chrome_hwnd, g_icon_hwnd, g_caption_hwnd};
   for (HWND h : chrome_layers) {
     if (!is_visible_hwnd (h))
       continue;
+    chrome_bind_owner (h);
     ensure_hwnd_topmost (h);
-    SetWindowPos (h, below_panel, 0, 0, 0, 0,
+    SetWindowPos (h, prev_hwnd, 0, 0, 0, 0,
                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
-                      SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-    below_panel = h;
+                      SWP_NOOWNERZORDER);
+    prev_hwnd = h;
+  }
+
+  if (is_visible_hwnd (g_overview_hwnd)) {
+    ensure_hwnd_topmost (g_overview_hwnd);
+    if (!SetWindowPos (g_overview_hwnd, prev_hwnd, 0, 0, 0, 0,
+                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                           SWP_NOOWNERZORDER)) {
+      g_print ("[restack] overview failed gle=%lu\n", GetLastError ());
+    }
+    prev_hwnd = g_overview_hwnd;
+  }
+
+  // Park hidden chrome popups below the overview so they never sit between
+  // g_panel_hwnd and g_overview_hwnd in the Win32 z-order chain.
+  for (HWND h : chrome_layers) {
+    if (h == nullptr || !IsWindow (h) || is_visible_hwnd (h))
+      continue;
+    chrome_bind_owner (h);
+    SetWindowPos (h, prev_hwnd, 0, 0, 0, 0,
+                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                      SWP_NOOWNERZORDER);
   }
 }
 
@@ -2929,6 +3090,7 @@ start_state_transition (ControlsState to_state, guint duration_ms)
     }
   }
 
+  restack_locked ();
   g_anim.source =
       gtk_widget_add_tick_callback (g_window, anim_tick, nullptr, nullptr);
 }
@@ -2953,6 +3115,10 @@ finish_hide (void)
     gtk_widget_remove_tick_callback (g_window, g_anim.source);
     g_anim.source = 0;
   }
+  bool was_overview_fg =
+      (g_overview_hwnd != nullptr && GetForegroundWindow () == g_overview_hwnd);
+  if (g_window != nullptr && gtk_widget_get_visible (g_window))
+    gtk_widget_set_visible (g_window, FALSE);
   destroy_previews ();
   switch_cancel ();
   destroy_mini_previews ();
@@ -2964,6 +3130,7 @@ finish_hide (void)
   g_pending_desktop_sync = false;
   g_pending_desktop_target = -1;
   g_atomic_can_shift_app_grid.store (false, std::memory_order_release);
+  g_pending_shift_app_grid.store (false, std::memory_order_release);
   g_drag_active = false;
   g_drag_slot = -1;
   g_drag_hwnd = nullptr;
@@ -3011,16 +3178,13 @@ finish_hide (void)
   HWND restore_hwnd = g_prev_foreground_hwnd;
   g_prev_foreground_hwnd = nullptr;
   AllowSetForegroundWindow (ASFW_ANY);
-  if (!was_discarded && is_external_foreground_target (restore_hwnd) &&
-      g_overview_hwnd != nullptr &&
-      GetForegroundWindow () == g_overview_hwnd &&
+  if (!was_discarded && was_overview_fg &&
+      is_external_foreground_target (restore_hwnd) &&
       IsWindowVisible (restore_hwnd) && !IsIconic (restore_hwnd) &&
       !is_cloaked (restore_hwnd) &&
       (g_desktops.empty () || vd::window_on_current (restore_hwnd))) {
     SetForegroundWindow (restore_hwnd);
   }
-  if (g_window != nullptr && gtk_widget_get_visible (g_window))
-    gtk_widget_set_visible (g_window, FALSE);
 }
 
 static void
@@ -3212,6 +3376,7 @@ on_drag_update (GtkGestureDrag *drag G_GNUC_UNUSED, double dx, double dy,
       return;
     g_drag_active = true;
     set_hover (-1, true);
+    promote_slot_thumb_to_top (g_slots[g_drag_slot]);
 
     int scale = gtk_widget_get_scale_factor (g_window);
     if (!g_drag_thumbs_revealed)
@@ -3296,15 +3461,25 @@ acquire_overview_foreground (HWND hwnd)
     return;
   apply_ex_styles (hwnd);
   if (GetForegroundWindow () != hwnd && !SetForegroundWindow (hwnd)) {
-    HWND fg = GetForegroundWindow ();
-    if (fg != nullptr && IsWindow (fg)) {
-      DWORD fg_tid = GetWindowThreadProcessId (fg, nullptr);
-      DWORD cur_tid = GetCurrentThreadId ();
-      if (fg_tid != 0 && fg_tid != cur_tid &&
-          AttachThreadInput (cur_tid, fg_tid, TRUE)) {
-        SetForegroundWindow (hwnd);
-        BringWindowToTop (hwnd);
-        AttachThreadInput (cur_tid, fg_tid, FALSE);
+    // Unlock Windows foreground activation across AppContainer/UWP threads
+    // (such as StartMenuExperienceHost.exe) where AttachThreadInput fails,
+    // which also automatically light-dismisses an open native Start menu.
+    INPUT unlock_input = {};
+    unlock_input.type = INPUT_KEYBOARD;
+    unlock_input.ki.wVk = 0xFF;
+    unlock_input.ki.dwExtraInfo = 0x574E4F31;  // kSyntheticWinExtra
+    unlock_input.ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput (1, &unlock_input, sizeof (INPUT));
+    if (!SetForegroundWindow (hwnd)) {
+      HWND fg = GetForegroundWindow ();
+      if (fg != nullptr && IsWindow (fg)) {
+        DWORD fg_tid = GetWindowThreadProcessId (fg, nullptr);
+        DWORD cur_tid = GetCurrentThreadId ();
+        if (fg_tid != 0 && fg_tid != cur_tid &&
+            AttachThreadInput (cur_tid, fg_tid, TRUE)) {
+          SetForegroundWindow (hwnd);
+          AttachThreadInput (cur_tid, fg_tid, FALSE);
+        }
       }
     }
   }
@@ -3363,6 +3538,7 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
 
   if (g_panel_height > 0 && py < g_panel_height) {
     g_print ("[ov] click (%d,%d) ignored (panel strip)\n", px, py);
+    restack_locked ();
     return;
   }
 
@@ -3442,6 +3618,17 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
   }
 
   g_print ("[ov] click (%d,%d) ignored (outside workspace)\n", px, py);
+  restack_locked ();
+}
+
+static void
+on_overview_surface_layout (GdkSurface *surface G_GNUC_UNUSED,
+                            int width G_GNUC_UNUSED,
+                            int height G_GNUC_UNUSED,
+                            gpointer user_data G_GNUC_UNUSED)
+{
+  if (g_window != nullptr && gtk_widget_get_visible (g_window))
+    restack_locked ();
 }
 
 void
@@ -3449,9 +3636,16 @@ on_realize (GtkWidget *widget, gpointer user_data)
 {
   (void)user_data;
   GdkSurface *surface = gtk_native_get_surface (GTK_NATIVE (widget));
-  if (surface != nullptr)
-    apply_ex_styles (
-        static_cast<HWND> (gdk_win32_surface_get_handle (surface)));
+  if (surface != nullptr) {
+    HWND hwnd = static_cast<HWND> (gdk_win32_surface_get_handle (surface));
+    g_overview_hwnd = hwnd;
+    apply_ex_styles (hwnd);
+    if (!g_overview_surface_hooked) {
+      g_overview_surface_hooked = true;
+      g_signal_connect (surface, "layout",
+                        G_CALLBACK (on_overview_surface_layout), nullptr);
+    }
+  }
 }
 
 void
@@ -3663,15 +3857,18 @@ gboolean
 shift_app_grid_idle (gpointer user_data)
 {
   (void)user_data;
-  if (!overview_active () || g_window == nullptr ||
-      !gtk_widget_get_visible (g_window)) {
+  g_print ("[trig] double win-key -> app-grid\n");
+  if (!overview_active () || g_window == nullptr) {
+    g_pending_shift_app_grid.store (false, std::memory_order_release);
     return G_SOURCE_REMOVE;
   }
-  if (!g_placed) {
+  if (!gtk_widget_get_visible (g_window) || !g_placed) {
+    g_pending_shift_app_grid.store (true, std::memory_order_release);
     g_pending_show_state = ControlsState::APP_GRID;
     g_atomic_can_shift_app_grid.store (false, std::memory_order_release);
     return G_SOURCE_REMOVE;
   }
+  g_pending_shift_app_grid.store (false, std::memory_order_release);
   if (g_target_state == ControlsState::HIDDEN)
     return G_SOURCE_REMOVE;
   if (g_target_state == ControlsState::WINDOW_PICKER) {
@@ -3679,6 +3876,7 @@ shift_app_grid_idle (gpointer user_data)
       app_grid_refresh_running (g_app_grid);
     start_state_transition (ControlsState::APP_GRID, kOpenMs);
   }
+  restack_locked ();
   return G_SOURCE_REMOVE;
 }
 
@@ -3998,15 +4196,16 @@ overview_init (HWND panel_hwnd)
   g_signal_connect (
       g_window, "unrealize",
       G_CALLBACK (+[] (GtkWidget *w G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
-        // Detach Win32 GWLP_HWNDPARENT ownership before g_overview_hwnd is
-        // destroyed so Win32 does not implicitly destroy owned chrome HWNDs
-        // before GTK destroys chrome_win/icon_win/caption_win cleanly.
+        unsubclass_overview_hwnd ();
+        g_overview_surface_hooked = false;
         chrome_detach_owners ();
       }),
       nullptr);
   g_signal_connect (
       g_window, "destroy",
       G_CALLBACK (+[] (GtkWidget *w, gpointer ud G_GNUC_UNUSED) {
+        unsubclass_overview_hwnd ();
+        g_overview_surface_hooked = false;
         cancel_pending_place_idles ();
         cancel_delayed_rebuild ();
         cancel_hover_idle ();
@@ -4071,6 +4270,7 @@ overview_init (HWND panel_hwnd)
         g_pending_desktop_sync = false;
         g_pending_desktop_target = -1;
         g_atomic_can_shift_app_grid.store (false, std::memory_order_release);
+        g_pending_shift_app_grid.store (false, std::memory_order_release);
         g_drag_active = false;
         g_drag_slot = -1;
         g_drag_hwnd = nullptr;
@@ -4107,8 +4307,12 @@ overview_show (void)
     }
   }
 
-  g_pending_show_state = ControlsState::WINDOW_PICKER;
-  g_atomic_can_shift_app_grid.store (true, std::memory_order_release);
+  const bool shift_requested =
+      g_pending_shift_app_grid.exchange (false, std::memory_order_acq_rel);
+  g_pending_show_state = shift_requested ? ControlsState::APP_GRID
+                                         : ControlsState::WINDOW_PICKER;
+  g_atomic_can_shift_app_grid.store (!shift_requested,
+                                     std::memory_order_release);
 
   if (!gtk_widget_get_visible (g_window)) {
     HWND fg = GetForegroundWindow ();
@@ -4121,11 +4325,21 @@ overview_show (void)
     g_app_grid_mode = false;
     g_print ("[ov] show (requesting map)\n");
     gtk_widget_set_visible (g_window, TRUE);
+    if (!g_placed) {
+      place_overview_locked (true);
+    }
+    if (g_place_opening_source == 0) {
+      g_place_opening_source = g_idle_add_full (
+          G_PRIORITY_HIGH_IDLE, overview_place_opening_idle, nullptr, nullptr);
+    }
   } else if (g_placed && g_target_state == ControlsState::HIDDEN) {
-    // Closing animation was mid-flight; reverse seamlessly back to picker.
-    start_state_transition (ControlsState::WINDOW_PICKER, kOpenMs);
+    // Closing animation was mid-flight; reverse seamlessly back to picker or grid.
+    if (g_pending_show_state == ControlsState::APP_GRID && g_app_grid != nullptr)
+      app_grid_refresh_running (g_app_grid);
+    start_state_transition (g_pending_show_state, kOpenMs);
     if (winome_shell_panel_top_popover_hwnd () == nullptr)
       focus_overview_window (false);
+    restack_locked ();
   } else if (g_placed) {
     if (g_place_idle_source == 0) {
       g_place_idle_source = g_idle_add_full (
@@ -4139,6 +4353,7 @@ overview_hide (void)
 {
   g_print ("[ov] hide\n");
   g_atomic_can_shift_app_grid.store (false, std::memory_order_release);
+  g_pending_shift_app_grid.store (false, std::memory_order_release);
   set_hover (-1, true);
   if (g_window == nullptr || !gtk_widget_get_visible (g_window) || !g_placed) {
     finish_hide ();
@@ -4186,6 +4401,7 @@ void
 overview_hide_async (void)
 {
   g_atomic_can_shift_app_grid.store (false, std::memory_order_release);
+  g_pending_shift_app_grid.store (false, std::memory_order_release);
   g_main_context_invoke (nullptr, hide_idle, nullptr);
 }
 
@@ -4241,13 +4457,15 @@ overview_toggle_app_grid (void)
   if (next == ControlsState::APP_GRID && g_app_grid != nullptr)
     app_grid_refresh_running (g_app_grid);
   start_state_transition (next, kOpenMs);
+  restack_locked ();
 }
 
 void
 overview_shift_to_app_grid_async (void)
 {
+  g_pending_shift_app_grid.store (true, std::memory_order_release);
   g_atomic_can_shift_app_grid.store (false, std::memory_order_release);
-  g_main_context_invoke (nullptr, shift_app_grid_idle, nullptr);
+  g_idle_add_full (G_PRIORITY_HIGH_IDLE, shift_app_grid_idle, nullptr, nullptr);
 }
 
 bool
