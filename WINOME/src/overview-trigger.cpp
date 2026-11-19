@@ -66,7 +66,9 @@ WORD g_win_vk = VK_LWIN;
 BOOL g_win_alone = FALSE;
 BOOL g_win_injected = FALSE;
 ULONGLONG g_win_down_tick = 0;
+ULONGLONG g_win_last_keydown_tick = 0;
 ULONGLONG g_win_inject_tick = 0;
+DWORD g_swallowed_combo_vk = 0;
 BOOL g_alt_f2_down = FALSE;
 BOOL g_esc_swallowed = FALSE;
 HHOOK g_keyboard_hook = nullptr;
@@ -326,17 +328,39 @@ schedule_overview_dispatch ()
                    nullptr, nullptr);
 }
 
-// Inject a Win keypress (keydown or keyup) into the input stream, tagged so
-// LowLevelKeyboardProc ignores it. Used to (a) re-inject the consumed Win
-// keydown so Win+<key> combinations still reach the system, and (b) open the
-// Start menu with a bare Win press.
-void inject_win_key(bool key_up, WORD vk = VK_LWIN) {
+INPUT make_synthetic_key_input(WORD vk, WORD scan, DWORD flags) {
   INPUT input = {};
   input.type = INPUT_KEYBOARD;
   input.ki.wVk = vk;
+  input.ki.wScan =
+      scan != 0 ? scan : static_cast<WORD>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+  input.ki.dwFlags = flags;
   input.ki.dwExtraInfo = kSyntheticWinExtra;
-  input.ki.dwFlags = key_up ? KEYEVENTF_KEYUP : 0;
+  return input;
+}
+
+// Inject a Win keypress (keydown or keyup) into the input stream, tagged so
+// LowLevelKeyboardProc ignores it.
+void inject_win_key(bool key_up, WORD vk = VK_LWIN) {
+  const DWORD flags = KEYEVENTF_EXTENDEDKEY | (key_up ? KEYEVENTF_KEYUP : 0);
+  INPUT input = make_synthetic_key_input(vk, 0, flags);
   SendInput(1, &input, sizeof(INPUT));
+}
+
+// Atomically inject Win keydown immediately followed by the combo keydown in
+// one SendInput batch so Windows processes Win+<key> (e.g. Win+V, Win+E,
+// Win+R) in strict modifier-before-trigger order rather than letting the
+// original key beat the injected Win keydown.
+bool inject_win_with_combo_key(WORD win_vk, const KBDLLHOOKSTRUCT* state) {
+  const DWORD combo_flags =
+      ((state->flags & LLKHF_EXTENDED) != 0) ? KEYEVENTF_EXTENDEDKEY : 0;
+  INPUT inputs[2] = {
+      make_synthetic_key_input(win_vk, 0, KEYEVENTF_EXTENDEDKEY),
+      make_synthetic_key_input(static_cast<WORD>(state->vkCode),
+                               static_cast<WORD>(state->scanCode),
+                               combo_flags),
+  };
+  return SendInput(2, inputs, sizeof(INPUT)) == 2;
 }
 
 void reset_win_key_state() {
@@ -347,7 +371,9 @@ void reset_win_key_state() {
   g_win_down = FALSE;
   g_win_alone = FALSE;
   g_win_down_tick = 0;
+  g_win_last_keydown_tick = 0;
   g_win_inject_tick = 0;
+  g_swallowed_combo_vk = 0;
   g_alt_f2_down = FALSE;
   g_esc_swallowed = FALSE;
 }
@@ -402,8 +428,12 @@ void CALLBACK on_desktop_switch_event(HWINEVENTHOOK hook G_GNUC_UNUSED,
 }  // namespace
 
 void open_start_menu() {
-  inject_win_key(false);
-  inject_win_key(true);
+  INPUT inputs[2] = {
+      make_synthetic_key_input(VK_LWIN, 0, KEYEVENTF_EXTENDEDKEY),
+      make_synthetic_key_input(VK_LWIN, 0,
+                               KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
+  };
+  SendInput(2, inputs, sizeof(INPUT));
 }
 
 namespace {
@@ -539,7 +569,8 @@ void trigger_thread_main() {
   MSG msg;
   while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
     if (msg.message == WM_TIMER && msg.wParam == timer_id) {
-      if (!g_win_down && !g_alt_f2_down && !g_esc_swallowed) {
+      if (!g_win_down && g_swallowed_combo_vk == 0 &&
+          !g_alt_f2_down && !g_esc_swallowed) {
         HHOOK fresh = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
                                         nullptr, 0);
         if (fresh != nullptr) {
@@ -597,15 +628,26 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
     // Fallback recovery: if a previous Win keydown lost its matching keyup
     // (e.g. across secure desktop / UAC / elevated window), clear stale state
-    // (and release any synthetic Win keydown) before evaluating a non-Win key.
+    // before evaluating a non-Win key.
+    // Note: while !g_win_injected, Win keydown was swallowed by this hook so
+    // GetAsyncKeyState(g_win_vk) is ALWAYS 0 even while physically held — only
+    // query GetAsyncKeyState once Win has actually been injected!
     if (g_win_down && state->vkCode != VK_LWIN && state->vkCode != VK_RWIN) {
       const ULONGLONG now_tick = GetTickCount64();
-      const ULONGLONG ref_tick =
-          g_win_injected ? g_win_inject_tick : g_win_down_tick;
-      if ((now_tick - ref_tick) > 40 &&
-          (GetAsyncKeyState(g_win_vk) & 0x8000) == 0) {
+      if (g_win_injected) {
+        if ((now_tick - g_win_inject_tick) > 40 &&
+            (GetAsyncKeyState(g_win_vk) & 0x8000) == 0) {
+          reset_win_key_state();
+        }
+      } else if ((now_tick - g_win_last_keydown_tick) > 2500) {
         reset_win_key_state();
       }
+    }
+
+    if (up && g_swallowed_combo_vk != 0 &&
+        state->vkCode == g_swallowed_combo_vk) {
+      g_swallowed_combo_vk = 0;
+      return 1;
     }
 
     if (state->vkCode == VK_LWIN || state->vkCode == VK_RWIN) {
@@ -613,26 +655,33 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (!g_win_down &&
             !g_win_key_overview_enabled.load(std::memory_order_acquire))
           return CallNextHookEx(nullptr, nCode, wParam, lParam);
-        // If a previous Win keydown got stuck >2s ago without a keyup, reset
-        // before starting the new press.
-        if (g_win_down && (GetTickCount64() - g_win_down_tick) > 2000 &&
-            !g_win_alone) {
+        const ULONGLONG now_tick = GetTickCount64();
+        // If a previous Win keydown got stuck without a keyup (e.g. UAC),
+        // reset before starting the new press. When g_win_injected is true and
+        // Win is still physically reported down, keep tracking it normally.
+        if (g_win_down &&
+            (g_win_injected
+                 ? ((GetAsyncKeyState(g_win_vk) & 0x8000) == 0)
+                 : ((!g_win_alone && (now_tick - g_win_down_tick) > 2000) ||
+                    (now_tick - g_win_last_keydown_tick) > 2500))) {
           reset_win_key_state();
         }
         // Swallow the Win keydown so Windows does not open the Start menu.
-        // If another key follows, the Win keydown is re-injected for Win+<key>.
-        // Only the first keydown initializes the state: holding Win generates
-        // auto-repeat keydowns that must not reset it (otherwise a Win+<key>
-        // combo pressed with the key held would be mistaken for a bare Win).
+        // Only the first keydown initializes state; typematic auto-repeats keep
+        // updating g_win_last_keydown_tick while physically held.
         if (!g_win_down) {
           g_win_down = TRUE;
           g_win_vk = static_cast<WORD>(state->vkCode);
           g_win_alone = TRUE;
           g_win_injected = FALSE;
-          g_win_down_tick = GetTickCount64();
+          g_win_down_tick = now_tick;
+          g_win_last_keydown_tick = now_tick;
           g_win_inject_tick = 0;
-        } else if (state->vkCode != g_win_vk) {
-          g_win_alone = FALSE;
+        } else {
+          if (state->vkCode != g_win_vk)
+            g_win_alone = FALSE;
+          else
+            g_win_last_keydown_tick = now_tick;
         }
         return 1;
       }
@@ -645,6 +694,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         const bool bare = g_win_alone;
         g_win_alone = FALSE;
         g_win_down_tick = 0;
+        g_win_last_keydown_tick = 0;
         g_win_inject_tick = 0;
         if (g_win_injected) {
           // Release the synthetic Win keydown that enabled the Win+<key> combo.
@@ -652,12 +702,6 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
           g_win_injected = FALSE;
         }
         if (bare) {
-          // A bare Win press opens the Activities overview; a rapid second Win
-          // press (within 550ms while opening or in WINDOW_PICKER) interrupts
-          // smoothly into the App Grid like GNOME Shell's overlay-key flow.
-          // If the native Windows Start menu is currently the active foreground
-          // window (either opened via Win+Tab or leaked when an elevated window
-          // held focus), pressing bare Win closes the Start menu directly.
           gint64 now = g_get_monotonic_time();
           if (!g_running.load(std::memory_order_acquire)) {
             if (is_start_menu_foreground()) {
@@ -680,6 +724,9 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
       }
     }
 
+    if (down && !g_win_down)
+      g_swallowed_combo_vk = 0;
+
     if (down && g_win_down) {
       // A key pressed while Win is held: this is a combo, not a bare Win.
       g_win_alone = FALSE;
@@ -689,39 +736,68 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
           (wParam == WM_SYSKEYDOWN) ||
           ((GetAsyncKeyState(VK_MENU) & 0x8000) != 0);
 
-      // Only a plain Win+Tab (no Alt) is remapped. With Alt held, Tab arrives
-      // as WM_SYSKEYDOWN (Win+Alt+Tab = Task View); that and every other
-      // unrelated hotkey fall through to CallNextHookEx unchanged below.
-      if (state->vkCode == VK_TAB && wParam == WM_KEYDOWN) {
-        // Win+Tab normally opens Task View; open the Start menu instead.
-        open_start_menu();
-        return 1;
-      }
+      const WinKeyComboAction action = classify_win_key_combo(
+          state->vkCode, wParam == WM_SYSKEYDOWN,
+          ctrl_held, shift_held, alt_held, g_win_injected != FALSE);
 
-      // GNOME-style workspace switching & active window move:
-      //   Win+PageUp / Win+PageDown         -> switch workspace prev/next
-      //   Win+Shift+PageUp / Win+Shift+PgDn -> move foreground window & follow
-      // Dispatched via HotkeyWorker so WH_KEYBOARD_LL never blocks on Explorer COM.
-      if (!ctrl_held && !alt_held &&
-          (state->vkCode == VK_PRIOR || state->vkCode == VK_NEXT)) {
-        const int delta = (state->vkCode == VK_PRIOR) ? -1 : 1;
-        enqueue_desktop_hotkey(delta, shift_held);
-        return 1;
-      }
+      switch (action) {
+        case WinKeyComboAction::ModifierPassthrough:
+          // Let Ctrl/Shift/Alt pass through without prematurely injecting Win
+          // so Win+Shift+PageUp never leaks Win and Win+Shift+S / Win+Ctrl+Arrows
+          // atomically deliver Win right before the non-modifier trigger key.
+          return CallNextHookEx(nullptr, nCode, wParam, lParam);
 
-      // Trigger immediate observer refresh on native Windows VD hotkeys.
-      if (ctrl_held && !alt_held &&
-          (state->vkCode == VK_LEFT || state->vkCode == VK_RIGHT ||
-           state->vkCode == 'D' || state->vkCode == VK_F4)) {
-        vd::notify_change_hint_async();
-      }
+        case WinKeyComboAction::StartMenu:
+          // Win+Tab opens the Start menu instead of Task View (ignore auto-repeat).
+          if (g_swallowed_combo_vk != VK_TAB) {
+            g_swallowed_combo_vk = VK_TAB;
+            if (g_running.load(std::memory_order_acquire)) {
+              g_idle_add_full(
+                  G_PRIORITY_HIGH_IDLE,
+                  +[](gpointer) -> gboolean {
+                    overview_discard_restore_focus();
+                    close_overview("win-tab");
+                    g_idle_add(
+                        +[](gpointer) -> gboolean {
+                          open_start_menu();
+                          return G_SOURCE_REMOVE;
+                        },
+                        nullptr);
+                    return G_SOURCE_REMOVE;
+                  },
+                  nullptr, nullptr);
+            } else {
+              open_start_menu();
+            }
+          }
+          return 1;
 
-      if (!g_win_injected) {
-        // Re-inject the swallowed Win keydown so the system processes Win+key
-        // (Win+E, Win+R, ...) as usual.
-        inject_win_key(false, g_win_vk);
-        g_win_injected = TRUE;
-        g_win_inject_tick = GetTickCount64();
+        case WinKeyComboAction::WorkspacePrev:
+        case WinKeyComboAction::WorkspaceNext: {
+          // GNOME-style workspace switching & active window move via worker.
+          g_swallowed_combo_vk = state->vkCode;
+          const int delta =
+              (action == WinKeyComboAction::WorkspacePrev) ? -1 : 1;
+          enqueue_desktop_hotkey(delta, shift_held);
+          return 1;
+        }
+
+        case WinKeyComboAction::PassthroughWithVdHint:
+          vd::notify_change_hint_async();
+          [[fallthrough]];
+
+        case WinKeyComboAction::PassthroughCombo:
+          if (!g_win_injected) {
+            // Atomically inject [Win down, key down] in strict order and swallow
+            // the original keydown so shortcuts like Win+V, Win+E, Win+R reach
+            // Windows with Win already active.
+            if (inject_win_with_combo_key(g_win_vk, state)) {
+              g_win_injected = TRUE;
+              g_win_inject_tick = GetTickCount64();
+              return 1;
+            }
+          }
+          break;
       }
     } else if (state->vkCode == VK_F2) {
       if (up) {

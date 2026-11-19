@@ -1,25 +1,25 @@
 # 开发环境与构建指南 (Windows / MSYS2 UCRT64)
 
-MSYS2 已安装到 `E:\msys64`（UCRT64 工具链），GTK4 开发环境就绪。
+WINOME 在 Windows 下使用 MSYS2（UCRT64 工具链 + GTK4）进行开发与构建。下文路径示例以 `<MSYS2_ROOT>`（默认通常为 `C:\msys64`，可按实际安装盘符调整）表示 MSYS2 安装根目录。
 
-## 已安装工具
+## 参考工具链版本
 
-| 工具 | 版本 | 路径 |
-|------|------|------|
-| GTK4 | 4.22.4 | `E:\msys64\ucrt64` |
-| GCC | 16.2.0 | `E:\msys64\ucrt64\bin\gcc.exe` |
-| Meson | 1.12.0 | `E:\msys64\ucrt64\bin\meson.exe` |
-| Ninja | 1.13.2 | `E:\msys64\ucrt64\bin\ninja.exe` |
-| pkg-config | 3.0.5 | `E:\msys64\ucrt64\bin\pkg-config.exe` |
-| sassc | 3.6.2 | `E:\msys64\ucrt64\bin\sassc.exe` |
+| 工具 | 参考版本 | UCRT64 路径 |
+|------|----------|-------------|
+| GTK4 | 4.22.4 | `<MSYS2_ROOT>\ucrt64` |
+| GCC | 16.2.0 | `<MSYS2_ROOT>\ucrt64\bin\gcc.exe` |
+| Meson | 1.12.0 | `<MSYS2_ROOT>\ucrt64\bin\meson.exe` |
+| Ninja | 1.13.2 | `<MSYS2_ROOT>\ucrt64\bin\ninja.exe` |
+| pkg-config | 3.0.5 | `<MSYS2_ROOT>\ucrt64\bin\pkg-config.exe` |
+| sassc | 3.6.2 | `<MSYS2_ROOT>\ucrt64\bin\sassc.exe` |
 
-### 环境变量（用户级）
+### 推荐环境变量
 
-- `MSYS2_ROOT=E:\msys64`
+- `MSYS2_ROOT=<MSYS2_ROOT>`（如 `C:\msys64`）
 - `MSYSTEM=UCRT64`
-- `XDG_DATA_DIRS=E:\msys64\ucrt64\share`
+- `XDG_DATA_DIRS=<MSYS2_ROOT>\ucrt64\share`
 
-### 依赖包安装参考
+### 依赖包安装
 
 ```bash
 pacman -S mingw-w64-ucrt-x86_64-gtk4 mingw-w64-ucrt-x86_64-pkgconf \
@@ -29,12 +29,12 @@ pacman -S mingw-w64-ucrt-x86_64-gtk4 mingw-w64-ucrt-x86_64-pkgconf \
 
 ### 调用方式
 
-推荐在 MSYS2 UCRT64 终端内开发（`E:\msys64\msys2.exe` 或 `msys2_shell.cmd -ucrt64`）。
+推荐在 MSYS2 UCRT64 终端内开发（`<MSYS2_ROOT>\msys2.exe` 或 `msys2_shell.cmd -ucrt64`）。
 
-在 PowerShell 中调用时，`gcc` 直调可能无法定位 `cc1`，请使用 bash 包装：
+在 PowerShell 中调用时，`gcc` 直调可能无法定位 `cc1`，请使用 bash 包装（将 `<MSYS2_ROOT>` 替换为实际路径，例如 `C:\msys64`）：
 
 ```powershell
-E:\msys64\usr\bin\bash.exe -lc 'export PATH=/ucrt64/bin:$PATH && ...'
+C:\msys64\usr\bin\bash.exe -lc 'export PATH=/ucrt64/bin:$PATH && ...'
 ```
 
 ---
@@ -54,8 +54,8 @@ WINOME 主工程在 `WINOME/` 目录下，统一使用仓库根目录的交互�
 
 | 方案 | 配置 | 构建目录 | 实测产物基线 | 说明 |
 |------|------|----------|--------------|------|
-| `release` | `release` + LTO + `NDEBUG` | `WINOME/build-release/` | ~1.9MB | 最小体积、最快指令 |
-| `test` | `debugoptimized` | `WINOME/build/` | ~12MB | 项目默认，保留 `g_print` 诊断日志与断言 |
+| `release` | `release` + LTO + `NDEBUG` | `WINOME/build-release/` | ~2.7–2.9MB | 最小体积、最快指令 |
+| `test` | `debugoptimized` | `WINOME/build/` | ~22MB | 项目默认，保留 `g_print` 诊断日志与断言 |
 | `debug` | `debug` (`-O0 -g`) | `WINOME/build-debug/` | — | GDB 友好 |
 
 三方案使用**独立构建目录**，切换互不触发重编；LTO 安全（COM 接口走运行时 `vcall` 裸函数指针，链接器无法去虚拟化）。
@@ -85,7 +85,8 @@ python3 WINOME/tools/check-widget-classes.py WINOME/build/src/theme/gnome-shell-
 
 ```bash
 export PATH=/ucrt64/bin:$PATH
-export TMP='E:\tmp_winome' TEMP='E:\tmp_winome' TMPDIR='E:\tmp_winome'
+export TMP='C:\tmp_winome' TEMP='C:\tmp_winome' TMPDIR='C:\tmp_winome'
+mkdir -p /c/tmp_winome
 cd WINOME
 meson setup build
 ninja -C build
@@ -112,9 +113,9 @@ ninja -C build
   lto-wrapper.exe: fatal error: cc returned 1 exit status
   ```
 - **原因**：LTO 链接时 GCC 将临时目录原样传给原生 `collect2.exe` / `lto1.exe`，后者按 **Win32 路径**解析。MSYS 风格的 `/tmp` 在中文用户名下无法解析。该问题仅影响 `b_lto=true` 的 `release` 方案，`test`（`debugoptimized`）不走 LTO。
-- **对策**：`TMP` / `TEMP` / `TMPDIR` 必须设为 **Windows 绝对 ASCII 路径**，`build.sh` 默认设为 `E:\tmp_winome`，可用环境变量覆盖：
+- **对策**：`TMP` / `TEMP` / `TMPDIR` 必须设为 **Windows 绝对 ASCII 路径**。若仅单盘或非 `E:` 环境使用 `./build.sh`，请通过 `WINOME_TMP` 覆盖（脚本默认指向 `E:\tmp_winome`）：
   ```bash
-  WINOME_TMP='D:\some\ascii\path' ./build.sh release
+  WINOME_TMP='C:\tmp_winome' ./build.sh release
   ```
 
 ### 3. 链接失败伪像：运行中进程占用 `winome.exe`

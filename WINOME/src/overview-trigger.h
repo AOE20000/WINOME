@@ -9,6 +9,58 @@
 
 namespace winome {
 
+enum class WinKeyComboAction {
+  ModifierPassthrough,
+  StartMenu,
+  WorkspacePrev,
+  WorkspaceNext,
+  PassthroughWithVdHint,
+  PassthroughCombo,
+};
+
+// Returns true if @vk is a Shift/Ctrl/Alt modifier key that should pass
+// through while Win is held without prematurely injecting Win.
+inline bool is_win_combo_modifier_vk(unsigned vk) {
+  return vk == 0x10 /* VK_SHIFT */ || vk == 0x11 /* VK_CONTROL */ ||
+         vk == 0x12 /* VK_MENU */ || vk == 0xA0 /* VK_LSHIFT */ ||
+         vk == 0xA1 /* VK_RSHIFT */ || vk == 0xA2 /* VK_LCONTROL */ ||
+         vk == 0xA3 /* VK_RCONTROL */ || vk == 0xA4 /* VK_LMENU */ ||
+         vk == 0xA5 /* VK_RMENU */;
+}
+
+// Classifies a keydown arriving while Win is held down. WINOME only consumes
+// plain Win+Tab (Start menu) and Win(+Shift)+PageUp/PageDown (workspaces);
+// every non-conflicting Win shortcut (e.g. Win+V clipboard, Win+E, Win+R,
+// Win+Shift+S, Win+Ctrl+Arrows, Win+Alt+Tab) is passed through.
+inline WinKeyComboAction classify_win_key_combo(unsigned vk,
+                                                bool is_syskeydown,
+                                                bool ctrl_held,
+                                                bool shift_held,
+                                                bool alt_held,
+                                                bool win_already_injected) {
+  if (is_win_combo_modifier_vk(vk))
+    return WinKeyComboAction::ModifierPassthrough;
+
+  if (!win_already_injected && !is_syskeydown && !ctrl_held && !alt_held &&
+      !shift_held && vk == 0x09 /* VK_TAB */) {
+    return WinKeyComboAction::StartMenu;
+  }
+
+  if (!win_already_injected && !ctrl_held && !alt_held &&
+      (vk == 0x21 /* VK_PRIOR */ || vk == 0x22 /* VK_NEXT */)) {
+    return (vk == 0x21) ? WinKeyComboAction::WorkspacePrev
+                        : WinKeyComboAction::WorkspaceNext;
+  }
+
+  if (ctrl_held && !alt_held &&
+      (vk == 0x25 /* VK_LEFT */ || vk == 0x27 /* VK_RIGHT */ ||
+       vk == 'D' || vk == 0x73 /* VK_F4 */)) {
+    return WinKeyComboAction::PassthroughWithVdHint;
+  }
+
+  return WinKeyComboAction::PassthroughCombo;
+}
+
 // Callback invoked (on the main thread) whenever the Activities overview opens
 // or closes. Used e.g. by the panel to close its popovers when the overview
 // takes over.

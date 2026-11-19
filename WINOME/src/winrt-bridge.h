@@ -49,6 +49,16 @@ bool winrt_get_notifications(std::vector<WinomeSystemNotification>* out,
 bool winrt_remove_notification(uint32_t id);
 bool winrt_clear_notifications();
 
+// Invokes a zero-argument COM property getter vtable slot
+// (`HRESULT STDMETHODCALLTYPE fn(void*, void**)`), probing via a second call
+// while `owner` stays alive to detect and compensate for getters (such as
+// Windows 11 wpnapps.dll!NotificationVisual::get_Bindings) that return an
+// internal COM pointer without calling AddRef().
+long winrt_acquire_com_getter_safe(void* owner,
+                                   size_t vtable_slot,
+                                   void** out,
+                                   bool* out_compensated_addref = nullptr);
+
 // Tear down the background WinRT MTA worker thread on application exit.
 void winrt_shutdown();
 

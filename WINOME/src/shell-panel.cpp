@@ -30,6 +30,7 @@
 #include "overview-trigger.h"
 #include "overview.h"
 #include "fonts.h"
+#include "fullscreen-watcher.h"
 
 #include <gdk/win32/gdkwin32.h>
 #include <dwmapi.h>
@@ -273,8 +274,11 @@ winome_panel_layout_measure (GtkWidget *widget,
     *minimum = min_sum;
     *natural = nat_sum;
   } else {
-    *minimum = min_max;
-    *natural = nat_max;
+    // Cap requested panel height to the theme bar height so font fallback or
+    // child widgets never expand the top bar HWND beyond reserved workarea.
+    const int h = panel_height ();
+    *minimum = MIN (min_max, h);
+    *natural = h;
   }
 
   if (minimum_baseline)
@@ -1919,6 +1923,7 @@ winome_shell_reload_theme (void)
   bool st_ok = true;
   if (winome::StEngine *eng = winome::StEngine::get ())
     st_ok = eng->load_stylesheet_resource ("resource:///org/winome/theme/gnome-shell-dark.css");
+  winome::set_expected_panel_height (panel_height ());
   g_print ("[theme] theme reloaded (st_ok=%d)\n", st_ok ? 1 : 0);
   return st_ok;
 }
@@ -2108,6 +2113,27 @@ on_panel_destroy (GtkWidget *panel, gpointer user_data)
   }
 }
 
+static void
+on_panel_realize (GtkWidget *panel, gpointer G_GNUC_UNUSED user_data)
+{
+  GdkSurface *surface = gtk_native_get_surface (GTK_NATIVE (panel));
+  if (surface == nullptr)
+    return;
+  HWND hwnd = static_cast<HWND> (gdk_win32_surface_get_handle (surface));
+  if (hwnd == nullptr)
+    return;
+  const LONG_PTR style = GetWindowLongPtrW (hwnd, GWL_STYLE);
+  const LONG_PTR stripped =
+      style & ~static_cast<LONG_PTR> (WS_THICKFRAME | WS_MAXIMIZEBOX |
+                                      WS_MINIMIZEBOX);
+  if (stripped != style) {
+    SetWindowLongPtrW (hwnd, GWL_STYLE, stripped);
+    SetWindowPos (hwnd, nullptr, 0, 0, 0, 0,
+                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                      SWP_FRAMECHANGED);
+  }
+}
+
 static GtkWidget *
 build_shell_panel (bool primary)
 {
@@ -2118,11 +2144,15 @@ build_shell_panel (bool primary)
   GtkWidget *right_box;
   PanelStatus *status;
 
+  if (primary)
+    winome::set_expected_panel_height (panel_height ());
+
   panel = gtk_window_new ();
   gtk_window_set_title (GTK_WINDOW (panel),
                         primary ? "WINOME Shell" : "WINOME Secondary Panel");
   gtk_window_set_decorated (GTK_WINDOW (panel), FALSE);
   gtk_window_set_default_size (GTK_WINDOW (panel), -1, panel_height ());
+  g_signal_connect (panel, "realize", G_CALLBACK (on_panel_realize), nullptr);
 
   gtk_widget_set_name (panel, "panel");
 

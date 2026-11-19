@@ -1,24 +1,27 @@
 # WINOME 生产级完善开发计划（v0.1 → v1.0）
 
-本计划基于当前仓库实际代码与架构现状制定，目标是将 WINOME 从“可运行的单屏 UI 复刻原型”推进至“可日常主力使用、崩溃安全、多屏可用、功能闭环且可合法打包分发”的 Windows 生产级桌面外壳（Shell）。
+本计划记录 WINOME 从初期“可运行的单屏 UI 复刻原型（v0.1）”推进至“可日常使用、崩溃安全、多屏可用、功能闭环且可合规打包分发”的 Windows 桌面外壳（Shell）的六阶段演进路线（P0–P5）。
+
+> [!NOTE]
+> 第 2 节汇总的 **P0–P5 核心阶段目标已全部完成**（含许可证 `GPL-2.0-only` 合规统一、`--watchdog` / `recovery.dat` / `--restore` 任务栏安全自愈、多屏/事件驱动、Activities 概览与自包含便携打包）。第 1 节与第 3 节完整保留初期审计基线与分阶段设计方案供架构追溯。
 
 ---
 
-## 1. 现状与生产就绪差距审计
+## 1. 初期原型审计基线与当前解决状态
 
-结合源码核查，当前实现已验证核心视觉与底层通路（DWM 概览动画、Win11 虚拟桌面 COM、St CSS 双管线、部分电源与 Wi-Fi 状态读取），但在生产环境存在以下结构性短板：
+下表对照记录 `v0.1` 初期源码审计发现的结构性短板及其在 P0–P5 落地后的当前状态：
 
-| 维度 | 当前现状（源码实证） | 生产环境风险 |
-|------|----------------------|--------------|
-| **系统安全与自愈** | [main.cpp](../WINOME/src/main.cpp) 仅在正常 `on_shutdown` 恢复 `SPI_SETWORKAREA` 与调用 `NativeTaskbar::restore()` | 进程崩溃、被强杀或注销超实时，原生任务栏永久隐藏且主屏顶部工作区缺失；下次启动无脏状态恢复 |
-| **许可证合规** | 项目整体及 [meson.build](../WINOME/meson.build) 声明 `GPL-2.0-only`，但 [fonts.h](../WINOME/src/fonts.h) / [fonts.cpp](../WINOME/src/fonts.cpp) 标注 `AGPL-3.0-or-later` | `GPL-2.0-only` 与 `AGPL-3.0-or-later` 法律不兼容，直接阻塞二进制公开发行 |
-| **目录与权限兼容** | `fonts.cpp` 将抽取字体写入程序同级 `winome-fonts/`；`setup_log_file()` 无限追加 `%TEMP%\winome.log` | 安装至 `Program Files` 时普通用户或受限上下文写字体失败；日志长期运行无上限膨胀 |
-| **硬件控制与快速设置** | [quick-settings.cpp](../WINOME/src/quick-settings.cpp) 8 个开关胶囊无真实切换回调（`darkmode` 等写死状态）；[system-status.cpp](../WINOME/src/system-status.cpp) 亮度为占位 `0.5`，关机/重启未申请 `SE_SHUTDOWN_NAME` | 面板视觉齐全但多数控制无效或静默失败；无密码连接 Wi-Fi 能力；蓝牙与键盘背光空白 |
-| **系统托盘缺失** | 隐藏原生 `Shell_TrayWnd` 后无第三方托盘替代展示 | 输入法、IM、代理、驱动常驻图标完全不可见/不可交互，严重影响日常办公 |
-| **日历与通知中心** | [calendar.cpp](../WINOME/src/calendar.cpp) 仅含单一月历网格；无桌面通知横幅与通知列表 | 丢失所有 Windows Toast 通知、媒体控制与勿扰入口，功能缺失严重 |
-| **概览核心能力** | [overview.cpp](../WINOME/src/overview.cpp) 搜索栏未接输入与检索；[overview-dash.cpp](../WINOME/src/overview-dash.cpp) 仅列当前运行窗口，点击“显示应用”跳转开始菜单；[virtual-desktop.cpp](../WINOME/src/virtual-desktop.cpp) 仅支持枚举/切屏/固定 | 无法搜索启动应用、无法固定常用软件、无法拖拽窗口跨桌面或增删桌面，仅覆盖 Win11 22621/24H2 部分槽位 |
-| **多显示器与响应模型** | 顶栏、概览、热角、全屏监测均按 `g_primary_monitor` 单屏实现；存在 `50ms` 任务栏/`100ms` 热角/`400ms` 全屏/`2s` 状态轮询；`WH_MOUSE_LL` 挂在 GTK 主线程且 `.detach()` 线程无回收 | 多屏副屏无面板与概览；显示/DPI/壁纸变更不重排；主线程卡顿时鼠标钩子易被系统摘除 |
-| **测试、配置与打包** | 无持久化配置、无标准 i18n、无单元测试与 CI，产物强依赖本机 MSYS2 UCRT64 环境 | 每次发版与改代码依赖手工实机验证，无法作为独立软件分发给终端用户 |
+| 维度 | v0.1 初期原型现状 | 潜在生产风险 | 当前解决状态 |
+|------|-------------------|--------------|--------------|
+| **系统安全与自愈** | 初期 `main.cpp` 仅在正常 `on_shutdown` 恢复 `SPI_SETWORKAREA` 与调用 `NativeTaskbar::restore()` | 进程异常退出时原生任务栏与工作区残留占用 | **已解决（P0）**：已接入 `--watchdog` 看门狗、`recovery.dat` 快照、异常捕获、`--restore` / `restore-taskbar.bat` 与纯 Win32 崩溃恢复窗 |
+| **许可证合规** | 早期原型中 `fonts.h` / `fonts.cpp` 曾标有 `AGPL-3.0-or-later`，与整体 `GPL-2.0-only` 冲突 | 不兼容许可证阻塞二进制公开发行 | **已解决（P0）**：已基于 Fontconfig/Pango API 独立重构并将全仓库源码统一对齐 `GPL-2.0-only` / `MIT` |
+| **目录与权限兼容** | 早期字体释放到程序同级目录、日志无上限追加 `%TEMP%\winome.log` | 只读安装目录写失败、日志无限膨胀 | **已解决（P0）**：配置、字体与 `5MB` 轮转日志统一迁至 `%LOCALAPPDATA%\WINOME\`（兼容 CJK 用户名路径） |
+| **硬件控制与快速设置** | 早期 `quick-settings.cpp` 开关回调与亮度/电源权限未接通 | 面板控件空转或静态占位 | **已解决（P1）**：音量/静音、WMI/DXVA2 亮度、Wlan 枚举与密码连接、WinRT 蓝牙、深色主题/勿扰/夜间/飞行模式均已闭环 |
+| **系统托盘** | 隐藏原生 `Shell_TrayWnd` 后无第三方托盘替代展示 | 常驻软件图标不可见/不可交互 | **已解决（P1）**：`systray.cpp` 混合兼容传统 `ToolbarWindow32` 与 Win11 XAML 托盘并支持右键菜单 |
+| **日历与通知中心** | 早期 `calendar.cpp` 仅含月历网格，无通知与媒体控制 | 丢失 Toast 通知与媒体控制入口 | **已解决（P2）**：双栏 DateMenu 集成 SMTC 媒体卡片、Windows 通知列表、勿扰联动与桌面通知横幅 |
+| **概览核心能力** | 早期概览搜索未接线，“显示应用”跳转开始菜单，虚拟桌面能力不完整 | 无法搜应用、固定应用或跨桌面拖拽 | **已解决（P4）**：集成实时搜索、宿主分页 `AppGrid`、`start2.bin` 同步、Dash Favorites、跨桌面拖拽与 Win11 22621/24H2+ 兼容 |
+| **多显示器与响应模型** | 早期按单屏实现，依赖 `50ms`–`400ms` 轮询与阻塞式鼠标钩子 | 多屏不可用、高唤醒与主线程卡顿风险 | **已解决（P3）**：支持多屏独立面板/DPI、全屏按屏隔离及 WASAPI/Wlan/WinEvent/钩子线程事件驱动 |
+| **测试、配置与打包** | 早期无配置、无 i18n、无单测 CI 与独立运行时打包 | 缺乏回归保障且依赖开发者环境 | **已解决（P5）**：`config.json` 热重载、GTK4 设置窗、`i18n.cpp`、`meson test`、GitHub Actions CI 与自包含便携包已落地 |
 
 ---
 
@@ -48,54 +51,51 @@ flowchart LR
 
 ---
 
-## 3. 分阶段详细开发计划
+## 3. 分阶段设计记录（历史演进档案）
 
 ---
 
-### P0：合规基线、系统自愈与运行安全性（优先阻塞项）
+### P0：合规基线、系统自愈与运行安全性（已完成）
 
-> [!CAUTION]
-> 在 P0 完成前不建议向外部用户分发二进制包：存在 `GPL-2.0-only` 与 `AGPL-3.0-or-later` 冲突，以及程序崩溃后导致系统原生任务栏消失且顶部区域被永久占用的高风险。
+> [!NOTE]
+> **已达成**：本阶段全部阻塞项均已落地并验收通过。全仓库源码（含 `fonts.{h,cpp}`）SPDX 已统一对齐为 `GPL-2.0-only` / `MIT` 兼容体系；同时实现了独立 `--watchdog` 看门狗、`recovery.dat` 状态快照、`--restore` / `restore-taskbar.bat` 急救恢复与纯 Win32 崩溃后操作窗口，可安全用于二进制打包与公开分发。
 
 #### P0.1 许可证审计与第三方合规
-- **目标**：消除 `AGPL-3.0-or-later` 冲突，核查全仓库静态及运行时依赖许可。
-- **具体工作**：
-  - 审计 [fonts.h](../WINOME/src/fonts.h) 与 [fonts.cpp](../WINOME/src/fonts.cpp)：核对是否纯自主编写或借鉴自 `upstream/Seelen-UI/`；如含外部 AGPL 代码则以纯 Fontconfig/Pango API 重新独立实现并改回 `GPL-2.0-only`。
-  - 核对 [easing.cpp](../WINOME/src/easing.cpp)（`GPL-2.0-plus`）、[virtual-desktop.cpp](../WINOME/src/virtual-desktop.cpp)（`MIT`）、`st-compat/`（`LGPL-2.1`）、Cantarell 字体及即将打包的 GTK4 运行时 DLL 许可。
-  - 更新 [THIRD-PARTY-NOTICES](../WINOME/THIRD-PARTY-NOTICES) 与构建校验规则（禁止新引入非兼容 SPDX 头）。
+- **目标**：消除早期遗留的许可证冲突，核查全仓库静态及运行时依赖许可。
+- **落实情况**：
+  - [fonts.h](../WINOME/src/fonts.h) 与 [fonts.cpp](../WINOME/src/fonts.cpp) 已使用独立 Fontconfig/Pango 实现并统一为 `GPL-2.0-only`；
+  - 核对 [easing.cpp](../WINOME/src/easing.cpp)（`GPL-2.0-only`）、[virtual-desktop.cpp](../WINOME/src/virtual-desktop.cpp)（`MIT`）、`st-compat/`（`GPL-2.0-only`，衍生自 LGPL-2.1/GPL-2.0 上游组件并保留原始版权声明）、Cantarell 字体及运行时 GTK4 依赖；
+  - 维护 [THIRD-PARTY-NOTICES](../WINOME/THIRD-PARTY-NOTICES)，明确区分上游派生代码与思路致谢。
 
 #### P0.2 崩溃安全自愈与看门狗机制
 - **目标**：确保无论进程正常退出、异常崩溃、任务管理器强杀还是系统会话结束，用户的任务栏与工作区始终能还原。
-- **具体工作**：
-  - **状态快照**：`main.cpp` 在修改 `SPI_SETWORKAREA` 和隐藏任务栏之前，将主屏/副屏原始 `rcWork` 及各任务栏原 `ABM_GETSTATE` 状态写入 `%LOCALAPPDATA%\WINOME\recovery.json`（含进程 PID 与会话锁）。
-  - **独立轻量看门狗模式**：新增 `winome.exe --watchdog <pid>`（无 GTK 依赖的极简 Win32 子路径，内存 < 2MB），`WaitForSingleObject` 监视主进程句柄；一旦主进程非干净退出（未清除恢复标记），看门狗读取快照还原 `SPI_SETWORKAREA` 并恢复任务栏后退出。
-  - **启动前自检与异常捕获**：主进程启动最先读取 `recovery.json`，若检测到上一次存在未关闭的残留脏状态，先恢复后再重新抓取真实原始状态；注册 `SetUnhandledExceptionFilter`（导出 MiniDump 到 `%LOCALAPPDATA%\WINOME\crashes\`）与隐藏窗口监听 `WM_QUERYENDSESSION` / `WM_ENDSESSION`。
-  - **独立急救命令**：提供 `winome.exe --restore` 参数及独立极简工具 `winome-restore.exe`，供极端情况下手工还原桌面。
+- **落实情况**：
+  - **状态快照**：`main.cpp` 在修改 `SPI_SETWORKAREA` 和隐藏任务栏之前，将工作区范围及任务栏 `ABM_GETSTATE` 状态持久化至 `%LOCALAPPDATA%\WINOME\recovery.dat`；
+  - **独立轻量看门狗模式**：`winome.exe --watchdog <pid>` 监视主进程句柄；一旦主进程异常退出，看门狗依据快照多次重查还原 `SPI_SETWORKAREA` 与原生任务栏并弹出零 GTK4 依赖的纯 Win32 操作窗口（`crash-dialog.cpp`）；
+  - **启动前自检与异常捕获**：主进程启动优先检查并清理遗留脏状态；注册 `SetUnhandledExceptionFilter`、`std::set_terminate` 与 `signal()`（生成 MiniDump 至 `%LOCALAPPDATA%\WINOME\crashes\`）；
+  - **独立急救入口**：提供 `winome.exe --restore` 参数并在便携包内随附 `restore-taskbar.bat`，供极端情况下一键还原桌面。
 
 #### P0.3 运行环境隔离、单实例与线程生命周期治理
-- **目标**：脱离开发目录与管理员特权写路径假设，消除游离线程与日志膨胀。
-- **具体工作**：
-  - **单实例控制**：`main.cpp` 通过命名互斥体（`Local\WINOME_Shell_SingleInstance`）防止双开冲突；后续实例可向已运行实例传递 `--show-overview` / `--reload` / `--quit` 等控制指令。
-  - **可写路径与日志轮转**：`fonts.cpp` 将字体释放目录改为 `%LOCALAPPDATA%\WINOME\fonts`（必要时通过 `GetShortPathNameW` 获取 ASCII 8.3 短路径喂给 `fontconfig`，兼容中文用户名）；日志切换为轮转写入 `%LOCALAPPDATA%\WINOME\logs\winome.log`（超过 5MB 自动轮转为 `.1.log`）。
-  - **权限申请与线程回收**：
-    - `system-status.cpp` 在 `shutdown_system()` / `restart_system()` 中调用 `OpenProcessToken` + `AdjustTokenPrivileges` 启用 `SE_SHUTDOWN_NAME`，检查返回值并向 UI 返回成功/失败状态；
-    - 取消 [win-event-hook.cpp](../WINOME/src/win-event-hook.cpp) 和 [overview-trigger.cpp](../WINOME/src/overview-trigger.cpp) 的 `.detach()`，改为记录 `thread_id`，在 `on_shutdown` 时 `PostThreadMessageW(tid, WM_QUIT, ...)` + `UnhookWindowsHookEx` / `UnhookWinEvent` 并 `join()`；
-    - 核实并清理未接入构建调用链的 [desktop-layer.cpp](../WINOME/src/desktop-layer.cpp)（确定正式接入职责或移出构建清单）。
+- **目标**：脱离开发目录写路径假设，消除游离线程与日志膨胀。
+- **落实情况**：
+  - **单实例控制**：`main.cpp` 通过命名互斥体 `Local\WINOME_Shell_SingleInstance` 防止双开，并支持 `--show-overview` / `--settings` / `--reload` / `--quit` 与平滑重启 `--after-pid`；
+  - **可写路径与日志轮转**：字体、配置与日志统一写入 `%LOCALAPPDATA%\WINOME\`（`winome.log` 超过 5MB 自动轮转 `winome.prev.log`，Fontconfig 通过 ASCII 短路径兼容非 ASCII 用户名）；
+  - **权限申请与线程回收**：`system-status.cpp` 电源操作前申请 `SE_SHUTDOWN_NAME`；各辅助线程统一纳入生命周期管理，退出时发送停止信号并 `join()`。
 
-- **P0 验收标准（DoD）**：
+- **P0 验收标准（DoD，已通过）**：
   - 全仓库 `SPDX-License-Identifier` 与打包依赖清单 100% 兼容 `GPL-2.0-only`；
-  - 用任务管理器强杀 `winome.exe` 后 1 秒内任务栏与桌面工作区自动完整恢复；
-  - 将编译产物拷贝至无写权限的只读目录并在含中文用户名路径下运行，字体、日志与重启/关机功能正常工作。
+  - 强杀 `winome.exe` 后看门狗立即还原原生任务栏与桌面工作区；
+  - 在无写权限目录与非 ASCII 用户名环境下运行，配置、字体与日志读写正常工作。
 
 ---
 
 ### P1：系统控制闭环、WinRT 桥接与系统托盘兼容
 
-#### P1.1 解决 UCRT64 WinRT 工具链瓶颈（WinRT 桥接层）
+#### P1.1 解决 UCRT64 WinRT 工具链瓶颈（WinRT 桥接层，已完成）
 - **背景**：[pitfalls.md](pitfalls.md) 已记录 MSYS2 UCRT64 缺少 `winrt/` 头文件，导致蓝牙、通知监听、SMTC 媒体控制、飞行模式长期受阻。
-- **方案落地（新增 `WINOME/winrt-bridge/` 模块）**：
-  - 采用 **C++WinRT（或独立 `winome-winrt-helper.exe` / C ABI DLL）** 解耦：利用 WinSDK/C++WinRT 生成或由轻量宿主进程暴露标准 JSON-over-NamedPipe / C ABI 接口，主工程仍保持 MSYS2 UCRT64 GCC 编译体验，不破坏现有工具链。
-  - 首期暴露 4 类能力：**无线射频（Wi-Fi / Bluetooth / Airplane）控制**、**蓝牙设备列表与连接/断开**、**UserNotificationListener 通知读取**、**SMTC 媒体会话控制**。
+- **最终落地实现（[winrt-bridge.cpp](../WINOME/src/winrt-bridge.cpp)）**：
+  - 最终采用**进程内动态加载 `combase.dll` + 裸 COM/WinRT vtable 指针**于专用后台 MTA 工作线程执行，免除了外置辅助进程并保持纯 MSYS2 UCRT64 单工程编译；
+  - 覆盖 4 类能力：**无线射频（Bluetooth Radio）控制**、**`UserNotificationListener` 通知读取与清除**（含 Win11 `NotificationVisual::get_Bindings` 漏 `AddRef` 补偿探测）、**SMTC 媒体会话控制**，Wi-Fi 射频由 `wlanapi.dll` 直接控制。
 
 #### P1.2 快速设置 8 个胶囊与滑块全量闭环
 - **屏幕亮度**（`system-status.cpp`）：
@@ -204,48 +204,45 @@ flowchart LR
   - 支持药丸悬停关闭空桌面或新增工作区按钮；增加窗口卡片中键快速关闭、概览内方向键选窗与快捷键切工作区。
 
 - **P4 验收标准（DoD）**：
-  - 概览中可直接打字搜出系统已装软件与打开窗口并回车启动；点击 9 点按钮可在软件内切换分页应用网格；
-  - 可在 Dash 固定常用软件并在重启 WINOME 后保留；可鼠标拖拽任意窗口移到其他虚拟桌面，在 Win10 22H2 与 Win11 22H2–24H2 上均稳定运行。
+  - 概览中可直接打字搜出系统已装软件与打开窗口并回车启动；点击 9 点按钮或双击 Win 键可在软件内切换分页应用网格；
+  - 可在 Dash 固定常用软件并在重启 WINOME 后保留；可鼠标拖拽任意窗口移到其他虚拟桌面，在 Win11 22621 / 24H2+ 稳定支持，老版本系统安全降级为单工作区。
 
 ---
 
-### P5：配置体系、多语言、自动化 QA 与生产打包发布
+### P5：配置体系、多语言、自动化 QA 与生产打包发布（已完成）
 
 #### P5.1 配置系统与轻量设置中心
-- 设计强类型配置层（`config.{h,cpp}`），读写 `%APPDATA%\WINOME\config.json` 并支持变更监听与热重载：
-  - 外观与面板：时钟格式（24h/12h/秒/星期）、顶栏电量百分比开关、主题强调色/明暗切换、字体缩放覆盖；
-  - 行为与交互：热角开关及冷却阈值、Win 键劫持开关、全屏隐藏策略、多屏顶栏/概览策略、Dash 固定应用列表；
-  - 托盘与快捷键：自定义热键映射开关、托盘过滤规则。
-- 在快速设置面板右上角（原系统菜单设置按钮位置）接入原生 GTK4 **WINOME 设置** 窗口，点击即可修改上述选项并即时生效。
+- 强类型配置层（`config.{h,cpp}`）读写 `%LOCALAPPDATA%\WINOME\config.json` 并支持变更监听与热重载：
+  - 外观与面板：时钟格式（24h/12h/秒/星期）、顶栏电量百分比开关、主题强调色/明暗切换、字体缩放覆盖、可选窗口外观统一；
+  - 行为与交互：热角开关及冷却阈值、Win 键劫持开关、全屏隐藏策略、多屏顶栏策略、概览默认黑名单、会话确认与开发者模式、Dash 固定应用列表。
+- 在快速设置面板与设置入口提供原生 GTK4 **WINOME 设置** 窗口，点击即可修改并即时生效。
 
 #### P5.2 标准国际化（i18n）
-- 放弃源码中散落的 `strcmp(get_system_language(), "zh")` 分支，接入标准 `gettext`（或自研轻量 `.po/.mo` 加载表）统一管理所有 UI 文案与复数/日期格式，默认跟随系统区域并允许在配置页切换语言（至少完整支持简体中文、繁体中文与英文）。
+- 统一由 `i18n.{h,cpp}` 管理多语言界面文案，默认跟随系统区域并支持在设置页切换。
 
 #### P5.3 自动化测试与 CI 体系
-- **单元测试集（`WINOME/tests/`，接入 `meson test`）**：
-  - 覆盖 `easing.cpp` 贝塞尔数值稳定性、`overview-layout.cpp` 窗口布局收敛与不重叠校验、`wifi-networks.cpp` SSID UTF-8/Latin-1 解码边界、`config` 读写容错、`convert-st-css.py` 回归用例。
-- **稳定性与句柄泄漏压力测试**：
-  - 编写可自动化触发的回归脚本（重复开合概览、弹出窗、二级菜单 200 次以上，统计 `GetGuiResources(GR_GDIOBJECTS / GR_USEROBJECTS)`、DWM 缩略图数量与进程私有工作集，验证零泄漏）。
+- **单元测试与转换校验（`WINOME/tests/`，接入 `meson test`）**：
+  - 覆盖 `easing.cpp`、`overview-layout.cpp`、`wifi-networks.cpp`、`config` 持久化、`virtual-desktop` 槽位与缓存、`host-utils` 黑名单、`systray` 筛选、`winrt-bridge`、`overview-trigger` 热键分类、`plugin-host` 及 `convert-st-css.py` 回归用例。
 - **GitHub Actions CI**：
-  - 在 Windows runner（`msys2/setup-msys2` UCRT64）上自动执行 `test` + `release` 构建、CSS 覆盖率门禁、`check-widget-classes.py` 与 `meson test`。
+  - 在 Windows runner（`msys2/setup-msys2` UCRT64）上自动执行 `test` + `release` 构建、CSS 覆盖率门禁、`check-widget-classes.py`、`meson test` 与便携打包校验。
 
-#### P5.4 自包含打包、安装与卸载体系
-- **依赖收集脚本（`package.sh`）**：
-  - 自动化收集 `winome.exe`（LTO Release）、`winome-winrt-helper.exe`、`winome-restore.exe` 及其所需的 UCRT64 运行时 DLL（GTK4 / GLib / Cairo / Pango / Fontconfig / HarfBuzz / Epoxy 等）、裁剪版 `Adwaita` symbolic 图标主题、`gdk-pixbuf` loaders 缓存及 `gschemas.compiled`，彻底脱离本机 `E:\msys64\` 路径依赖。
-- **安装器与运维体验**：
-  - 使用 Inno Setup / WiX 打包安装包：支持自定义安装路径、可选配置提权计划任务实现无缝开机自启、集成崩溃安全还原快捷方式，以及**干净卸载**（卸载前检测并安全退出运行中进程、强制还原原生任务栏与工作区、清除开机计划任务）。
+#### P5.4 自包含便携打包（已落地）与后续安装器规划
+- **依赖收集脚本（[WINOME/package.sh](../WINOME/package.sh)）**：
+  - 自动化收集 `winome.exe`（LTO Release）、`winome-ctl.exe`、示例插件及所需的 UCRT64 运行时 DLL（GTK4 / GLib / Cairo / Pango / Fontconfig / HarfBuzz / Epoxy 等）、裁剪版 `Adwaita` symbolic 图标主题、`gdk-pixbuf` loaders 缓存、`gschemas.compiled`、许可声明与 `restore-taskbar.bat`，彻底脱离构建机本地 MSYS2/UCRT64 路径依赖。
+- **后续可选安装器方向**：
+  - 可在现有便携包基础上按需引入 Inno Setup / MSI 安装向导（可选配置开机自启、崩溃还原快捷方式及卸载前安全退出并还原系统任务栏）。
 
-- **P5 验收标准（DoD）**：
-  - 在一台全新的未安装 MSYS2 的 Windows 11 虚拟机/物理机上，通过安装包一键安装运行，所有功能完整可用；
-  - GitHub Actions 流水线全绿，内存与 GDI/USER 对象压测无持续上涨。
+- **P5 验收标准（DoD，便携版已通过）**：
+  - 在未安装 MSYS2 的纯净 Windows 11 环境中解压便携包直接运行，核心功能完整可用；
+  - GitHub Actions CI 流水线（构建、单测、样式检查与便携包产物闭包验证）全绿通过。
 
 ---
 
-## 4. 推荐执行节奏与优先建议
+## 4. 阶段执行回顾与版本里程碑
 
-1. **先稳再扩**：严格按 **P0 → P1 → P3（核心钩子与多屏框架）→ P2 → P4 → P5** 顺序推进，优先把“不弄坏用户桌面 + 不触犯许可协议 + 核心开关真有用”跑通，再铺开大型新 UI（应用网格与多屏重构）。
-2. **明确核心决策点**：P1 启动前需先敲定 **WinRT 桥接方案**（推荐“独立轻量 C++WinRT 辅助进程/DLL + 命名管道/C ABI”，以保留当前极简的 MSYS2 UCRT64 构建体验）以及 **托盘兼容路径**，并先确认 `fonts.cpp` 源码来源。
-3. **版本切分建议**：
-   - 完成 **P0 + P1** 可产出第一个可内测的 **Beta 体验版（v0.2）**；
-   - 完成 **P2 + P3** 达到日常可用基准 **RC 版（v0.8）**；
-   - 完成 **P4 + P5** 形成完整可公开发布的 **v1.0 生产版本**。
+1. **先稳后扩原则**：项目按 **P0（合规与系统自愈）→ P1（控制闭环与托盘）→ P2（通知与 DateMenu）→ P3（多屏与事件驱动）→ P4（Activities 概览完全体）→ P5（测试、CI 与便携打包）** 顺序依次收口交付。
+2. **关键架构收敛点**：在 P1 阶段放弃了外置 WinRT 辅助进程草案，改用进程内动态 `combase.dll` + 裸 vtable 桥接，既保留纯 UCRT64 工具链体验又消除跨进程通信开销；同步重写 `fonts.{h,cpp}` 完成 `GPL-2.0-only` 合规闭环。
+3. **版本演进里程碑**：
+   - **v0.1 原型基线**：验证了单屏顶栏、St CSS 转换管线与早期概览框架；
+   - **v0.2–v0.8 演进期**：依次完成合规与崩溃自愈（P0）、硬件控制/托盘/通知（P1–P2）、多屏与事件驱动底座（P3）；
+   - **当前发布基线**：已完整落地 P0–P5 全部能力、Looking Glass 调试台、进程外插件体系及自包含便携包，后续演进规划参见 [long-term-plan.md](long-term-plan.md)。

@@ -22,8 +22,8 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
   - 概览未打开时记录时间戳并打开概览（`WINDOW_PICKER`）；
   - 概览正在打开或处于 `WINDOW_PICKER` 且 **550ms 内再次按下裸 `Win`** 时，调用 `overview_can_shift_to_app_grid()` + `overview_shift_to_app_grid_async()` 丝滑打断过渡到 `APP_GRID`；其余情况关闭概览。
 - `Win+PageUp` / `Win+PageDown` 切换到相邻虚拟桌面；`Win+Shift+PageUp` / `Win+Shift+PageDown` 将当前前景应用窗口移动到相邻桌面并跟随切换（均投递给持久化 `HotkeyWorker` 后台线程异步执行，绝不阻塞 `WH_KEYBOARD_LL`）。
-- 若期间检测到与其他键组合，重新注入带 `dwExtraInfo` 标记的 `Win` 键，让系统照常处理 `Win+E`、`Win+R`、`Win+D`、`Win+Ctrl+←/→/D/F4`（同步发送 `vd::notify_change_hint_async()` 触发立即刷新）、`Win+Alt+Tab` 等组合键。
-- `Win+Tab` 通过 `SendInput` 合成带标记的裸 `Win` 键打开开始菜单。
+- 仅无修饰键的 `Win+Tab` 通过 `SendInput` 原子合成带标记的 `[LWIN DOWN, LWIN UP]` 打开开始菜单（屏蔽长按重复并吞掉配对 `Tab` 抬起；若概览已开则先安全收起再打开开始菜单）。
+- 其余与 WINOME 不冲突的 `Win+<key>` 组合键（如 `Win+V` 剪贴板、`Win+E`、`Win+R`、`Win+D`、`Win+Shift+S`、`Win+Ctrl+←/→/D/F4` 并同步发送 `vd::notify_change_hint_async()`、`Win+Alt+Tab`、`Win+Shift+Tab` 等）：对先按下的 `Ctrl/Shift/Alt` 修饰键直接透传，待非修饰触发键按下时通过单次 `SendInput(2, ...)` 原子注入 `[g_win_vk DOWN, 触发键 DOWN]` 并吞掉乱序原始触发键按下，确保 `Win` 严格先于目标键到达系统；且未回注前绝不误用 `GetAsyncKeyState(g_win_vk)` 重置状态。
 - `Esc` 在概览激活时关闭概览。
 
 ### 左上角热角（`src/hot-corner.cpp`）
@@ -88,7 +88,7 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 | **Wi-Fi**（`src/wifi-networks.cpp`） | 运行时加载 `wlanapi.dll`，进程常驻 `WlanOpenHandle` 并注册 `WlanRegisterNotification` 事件通知 | 无网卡或缺失 `wlanapi.dll` 时触发状态报告并安静降级；支持异步扫描、BSSID 信号合并、已存 Profile 与内嵌密码输入生成 WLAN XML 连接、断开网络 |
 | **电源模式**（`src/power-modes.cpp`） | `PowrProf` + `powersetting.h` 枚举并切换节能 / 均衡（含 Win11 GUID）/ 性能 | `PowerEnumerate` 探测缺失的方案不显示；无法识别时副标题回退显示均衡 |
 | **系统状态与会话弹窗**（`src/system-status.cpp`、`src/end-session-dialog.cpp`） | 电量 `GetSystemPowerStatus`、音量 WASAPI `IAudioEndpointVolumeCallback`（事件驱动与静音切换）、屏幕亮度 WMI (`ROOT\WMI`) + `dxva2.dll` DDC/CI、电源操作自动申请 `SE_SHUTDOWN_NAME` | 外接显示器/台式机无物理亮度调节能力时动态隐藏亮度滑块行；Restart / Power Off / Log Out 在 `end_session_confirm` 开启时先显示 GNOME `.modal-dialog` 60 秒确认弹窗 |
-| **WinRT 与通知中心**（`src/winrt-bridge.cpp`、`src/notifications.cpp`、`src/calendar.cpp`） | 异步探测并桥接 Windows Radio（蓝牙开关/已配对列表）、SMTC 媒体控制与 `UserNotificationListener`（`std::shared_ptr<State>` 防超时 UAF、`60s` 拒绝冷却、`NotifWorker` 可 join 单线程 `2s`/`6s` 自适应刷新） | 在顶栏弹出双栏 DateMenu（SMTC 媒体卡片 + 通知列表/勿扰开关 + 日历）并在非勿扰/非全屏下显示顶部通知横幅 |
+| **WinRT 与通知中心**（`src/winrt-bridge.cpp`、`src/notifications.cpp`、`src/calendar.cpp`） | 异步探测并桥接 Windows Radio（蓝牙开关/已配对列表）、SMTC 媒体控制与 `UserNotificationListener`（`std::shared_ptr<State>` 防超时 UAF、`winrt_acquire_com_getter_safe()` 补偿 Win11 `wpnapps.dll!NotificationVisual::get_Bindings` 漏 `AddRef` 缺陷、`60s` 拒绝冷却、`NotifWorker` 可 join 单线程 `2s`/`6s` 自适应刷新） | 在顶栏弹出双栏 DateMenu（SMTC 媒体卡片 + 通知列表/勿扰开关 + 日历）并在非勿扰/非全屏下显示顶部通知横幅 |
 | **系统托盘**（`src/systray.cpp`、`src/native-taskbar.cpp`） | 混合采集经典 `ToolbarWindow32` 与 Win11 XAML（`DesktopWindowContentBridge` 中的 `NotifyItemIcon` / `TopLevelWindowForOverflowXamlIsland` / `NotifyIconOverflowWindow`）第三方托盘图标；拆分为独立 `action_worker`（高优点击/溢出切换）与 `scan_worker`（`5s` 巡检并保留 `last_xo_items`，`shell_tray_mu` 保护显隐切换），配置 `IUIAutomation2`（`800ms`/`1500ms` 超时）与 `FindAllBuildCache` 批量拉取属性，并以 `entry.id`/标题双重内存缓存来自 `HKCU\Control Panel\NotifyIconSettings` 的真实图标 | 按 `TraySurface` 直达激活（溢出项免盲扫 `Shell_TrayWnd`），点击/右键立即收起 GTK 浮层并 `AllowSetForegroundWindow(ASFW_ANY)`，优先 `IUIAutomationElement3::ShowContextMenu()`（失败回退 `Shift+F10`/物理右键，右键保活 `1500ms` + `#32768` 检测）；`inspect.tray` 为非阻塞瞬时快照（`SendMessageTimeoutW` 50ms + 缓存 `uia_probe`），`winome-ctl` 启用 `PeekNamedPipe` 回复超时保护 |
 | **多屏、外观统一、配置与设置**（`src/monitor-manager.cpp`、`src/window-theming.cpp`、`src/config.cpp`、`src/i18n.cpp`、`src/settings-window.cpp`） | `EnumDisplayMonitors` 与 `SPI_SETWORKAREA`（`on_workarea_changed`）管理多屏面板与 DPI 变化；`window-theming` 通过 `SetWinEventHook` 零注入应用 DWM 暗色标题栏/圆角（默认关闭）；`%LOCALAPPDATA%\WINOME\config.json` 热重载；深色 Adwaita GTK4 设置窗 | 支持单/全屏顶栏策略、热角与 Win 键策略、概览默认黑名单（`overview_window_blacklist`）、可选窗口外观统一、时钟/电量选项、`Diagnostics` 遥测页与桌面重启自恢复 |
 
@@ -104,7 +104,7 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 - **GPU 渲染与产物基线**：
   - 关键窗口由 OpenGL（`GskGLRenderer` / `ngl`）硬件绘制，`[gpu]` 启动日志记录渲染器与 GL 厂商；
   - **测试构建（`test` / `debugoptimized`）**：`winome.exe` 约 `22MB`；
-  - **生产构建（`release` + LTO + NDEBUG）**：`winome.exe` 约 `2.7MB`（全量便携包 `WINOME-win64-portable.zip` 约 `25–26MB`，含 `winome-ctl.exe` 与示例插件）。
+  - **生产构建（`release` + LTO + NDEBUG）**：`winome.exe` 约 `2.7–2.9MB`（全量便携包 `WINOME-win64-portable.zip` 约 `25–26MB`，含 `winome-ctl.exe` 与示例插件）。
 
 ### 权限要求
 

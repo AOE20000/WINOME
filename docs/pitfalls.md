@@ -54,7 +54,8 @@
   - 传递数组出参使用「指针 + 显式 count」（不用三重指针或哨兵启发式）；
   - 菜单回调所需上下文或条目数据应堆分配并绑定到菜单/面板销毁回调（如 `g_object_set_data_full`），避免传栈变量地址或 `static` 局部数组引起悬空指针或不可重入问题。
 - **自定义 GObject 内嵌 C++ 成员必须显式 placement-new 与析构**：`g_object_new()` 只做零初始化（zero-init），不会调用 C++ 字段（如 `std::vector`、`std::string`）的构造函数或析构函数；必须在 `*_init()` 中对每个非平凡成员执行 placement `new`，并在 `*_finalize()` 中显式调用析构函数再串联 `parent_class->finalize`（参见 `app-grid.cpp` 与 `overview-dash.cpp`）。
-- **WinRT `UserNotificationListener` 与无打包桌面策略**：`winrt-bridge.cpp` 在独立 MTA 工作线程通过 `combase.dll` 动态加载并按裸 vtable 调用 WinRT 接口（遵循同款 GCC LTO 去虚拟化约束）；非商店打包宿主可能被系统策略拒绝通知监听访问，调用方必须检查 `access_allowed` 并静默降级，不得阻塞 UI。
+- **WinRT `UserNotificationListener` 与无打包桌面策略 / `wpnapps.dll` 缺 `AddRef` 陷阱**：`winrt-bridge.cpp` 在独立 MTA 工作线程通过 `combase.dll` 动态加载并按裸 vtable 调用 WinRT 接口（遵循同款 GCC LTO 去虚拟化约束）；非商店打包宿主可能被系统策略拒绝通知监听访问，调用方必须检查 `access_allowed` 并静默降级，不得阻塞 UI。此外，Win11（Build 22621）`wpnapps.dll` 中 `NotificationVisual::get_Bindings`（vtable slot 8）直接返回内部 `m_bindings` 指针而未调用 `AddRef()`，若直接放入所有权型 `ComPtr` 会提前将引用计数释放归零并在释放 `IAsyncOperation` 时触发 `wpnapps.dll+0xA7B09` UAF / `0xC0000374` 堆损坏；已通过 `winrt_acquire_com_getter_safe()` 二次探测并在未递增引用计数时补一次 `AddRef()` 规避，同时兼顾后续已修复系统版本避免泄漏。
+- **`WH_KEYBOARD_LL` 吞键后状态查询与原子序贯透传**：`WH_KEYBOARD_LL` 吞掉 `VK_LWIN`/`VK_RWIN` 后，`win32k` 不会置位 `GetAsyncKeyState(g_win_vk)`，因此在回注 `Win` 之前切忌用 `GetAsyncKeyState` 判定“Win 已松开”（否则按住 `Win` 超过数十毫秒即误重置导致 `Win+Tab`/`Win+V` 失效）；透传不冲突 `Win+<key>` 时还必须在单次 `SendInput(2, ...)` 中原子注入 `[Win DOWN, 组合键 DOWN]` 并吞掉原乱序 `keydown`，且纯修饰键（`Shift`/`Ctrl`/`Alt`）延迟到非修饰触发键才回注 `Win`，保证 `Win+V`、`Win+Shift+S`、`Win+Ctrl+Left/Right` 与 `Win+Shift+PageUp` 互不干扰。
 
 ---
 
@@ -68,7 +69,7 @@
 
 ---
 
-## 5. WinRT 桥接现状与本机环境事实
+## 5. WinRT 桥接与设备环境说明
 
-- **蓝牙 / SMTC / 通知真实数据源（已落地）**：针对 UCRT64 缺少 `ucrt64/include/winrt` 头文件的问题，`winrt-bridge.cpp` 通过运行时加载 `combase.dll`（`RoGetActivationFactory` / `WindowsCreateStringReference`）与裸 COM/WinRT vtable 指针在后台 MTA 线程访问 `Windows.Devices.Radios.Radio`、SMTC 与 `UserNotificationListener`，无需引入 C++/WinRT 编译依赖即可工作；若系统策略禁用未打包进程访问通知监听，按 `access_allowed == false` 安静降级。
-- **本机无线调试环境**：本机具备真实无线网卡（Intel Dual Band Wireless-AC 7265），可在实机验证 `wlanapi.dll` 扫描与连接流程。
+- **蓝牙 / SMTC / 通知真实数据源（已落地）**：针对 UCRT64 缺少 `ucrt64/include/winrt` 头文件的问题，`winrt-bridge.cpp` 通过运行时加载 `combase.dll`（`RoGetActivationFactory` / `WindowsCreateString`）与裸 COM/WinRT vtable 指针在后台 MTA 线程访问 `Windows.Devices.Radios.Radio`、SMTC 与 `UserNotificationListener`，无需引入 C++/WinRT 编译依赖即可工作；若系统策略禁用未打包进程访问通知监听，按 `access_allowed == false` 安静降级。
+- **无线与硬件可选依赖**：Wi-Fi 枚举与连接依赖目标主机存在真实无线网卡及系统 `wlanapi.dll`，蓝牙依赖蓝牙适配器与系统 Radio 接口；无相应硬件的台式机/虚拟机将按能力探针静默降级，不影响其余界面功能。

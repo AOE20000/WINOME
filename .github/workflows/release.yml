@@ -1,0 +1,93 @@
+name: WINOME Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Optional tag name to publish a GitHub Release (e.g. v0.9.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-libepoxy
+            mingw-w64-ucrt-x86_64-librsvg
+            mingw-w64-ucrt-x86_64-adwaita-icon-theme
+            mingw-w64-ucrt-x86_64-python
+
+      - name: Build test configuration and run unit tests
+        run: |
+          export WINOME_TMP="$(cygpath -w "${RUNNER_TEMP:-/tmp}/winome_tmp")"
+          ./build.sh test
+          meson test -C WINOME/build --print-errorlogs
+
+      - name: Check GTK4 widget class coverage
+        run: |
+          python3 WINOME/tools/check-widget-classes.py \
+            WINOME/build/src/theme/gnome-shell-gtk4.css \
+            WINOME/src/*.cpp
+
+      - name: Build release (LTO) configuration and run release tests
+        run: |
+          export WINOME_TMP="$(cygpath -w "${RUNNER_TEMP:-/tmp}/winome_tmp")"
+          ./build.sh release
+          meson test -C WINOME/build-release --print-errorlogs
+
+      - name: Package portable bundle and verify DLL closure
+        run: |
+          ./WINOME/package.sh --no-build
+          if PATH=/usr/bin ldd WINOME/dist/WINOME-portable/winome.exe | grep -qi "not found"; then
+            PATH=/usr/bin ldd WINOME/dist/WINOME-portable/winome.exe | grep -i "not found"
+            exit 1
+          fi
+          (cd WINOME/dist && sha256sum WINOME-win64-portable.zip | tee SHA256SUMS.txt > WINOME-win64-portable.zip.sha256)
+          cat WINOME/dist/SHA256SUMS.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WINOME-win64-portable
+          path: |
+            WINOME/dist/WINOME-win64-portable.zip
+            WINOME/dist/WINOME-win64-portable.zip.sha256
+            WINOME/dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+          name: WINOME ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+          prerelease: ${{ startsWith(inputs.tag != '' && inputs.tag || github.ref_name, 'v0.') || contains(inputs.tag != '' && inputs.tag || github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            WINOME/dist/WINOME-win64-portable.zip
+            WINOME/dist/WINOME-win64-portable.zip.sha256
+            WINOME/dist/SHA256SUMS.txt

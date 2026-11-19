@@ -18,6 +18,8 @@
 #include "overview-dash.h"
 #include "overview-layout.h"
 #include "overview-thumbs.h"
+#include "overview-trigger.h"
+#include "fullscreen-watcher.h"
 #include "perf-metrics.h"
 #include "plugin-host.h"
 #include "run-dialog.h"
@@ -27,6 +29,7 @@
 #include "virtual-desktop.h"
 #include "wifi-networks.h"
 #include "window-theming.h"
+#include "winrt-bridge.h"
 
 #include <cmath>
 
@@ -1788,6 +1791,311 @@ void test_overview_window_blacklist() {
   CHECK(!winome::is_overview_default_blacklisted_hwnd(nullptr, false));
 }
 
+void test_winrt_safe_com_getter_and_notifications() {
+  struct MockVtbl {
+    HRESULT (STDMETHODCALLTYPE* QueryInterface)(void*, REFIID, void**);
+    ULONG (STDMETHODCALLTYPE* AddRef)(void*);
+    ULONG (STDMETHODCALLTYPE* Release)(void*);
+  };
+  struct MockChild {
+    const MockVtbl* vtbl = nullptr;
+    ULONG refs = 1;
+    int* destroy_count = nullptr;
+  };
+  static const MockVtbl kChildVtbl = {
+      +[](void* self, REFIID, void** out) -> HRESULT {
+        auto* c = static_cast<MockChild*>(self);
+        ++c->refs;
+        *out = self;
+        return S_OK;
+      },
+      +[](void* self) -> ULONG {
+        return ++static_cast<MockChild*>(self)->refs;
+      },
+      +[](void* self) -> ULONG {
+        auto* c = static_cast<MockChild*>(self);
+        const ULONG r = --c->refs;
+        if (r == 0) {
+          if (c->destroy_count != nullptr)
+            ++(*c->destroy_count);
+          delete c;
+        }
+        return r;
+      },
+  };
+
+  struct MockOwnerVtbl {
+    HRESULT (STDMETHODCALLTYPE* QueryInterface)(void*, REFIID, void**);
+    ULONG (STDMETHODCALLTYPE* AddRef)(void*);
+    ULONG (STDMETHODCALLTYPE* Release)(void*);
+    HRESULT (STDMETHODCALLTYPE* GetChild)(void*, void**);
+  };
+  enum class GetterMode { BorrowedNoAddRef, AddRefedShared, FreshPerCall };
+  struct MockOwner {
+    const MockOwnerVtbl* vtbl = nullptr;
+    GetterMode mode = GetterMode::BorrowedNoAddRef;
+    MockChild* child = nullptr;
+    int* child_destroys = nullptr;
+  };
+  static const MockOwnerVtbl kOwnerVtbl = {
+      +[](void*, REFIID, void** out) -> HRESULT {
+        if (out != nullptr) *out = nullptr;
+        return E_NOINTERFACE;
+      },
+      +[](void*) -> ULONG { return 1; },
+      +[](void*) -> ULONG { return 1; },
+      +[](void* self, void** out) -> HRESULT {
+        auto* o = static_cast<MockOwner*>(self);
+        if (o->mode == GetterMode::FreshPerCall) {
+          *out = new MockChild{&kChildVtbl, 1, o->child_destroys};
+          return S_OK;
+        }
+        if (o->mode == GetterMode::AddRefedShared)
+          ++o->child->refs;
+        *out = o->child;
+        return S_OK;
+      },
+  };
+
+  // Case 1: Buggy getter omitting AddRef() must compensate and prevent premature free.
+  int destroys1 = 0;
+  auto* child1 = new MockChild{&kChildVtbl, 1, &destroys1};
+  MockOwner owner1{&kOwnerVtbl, GetterMode::BorrowedNoAddRef, child1, &destroys1};
+  void* got1 = nullptr;
+  bool comp1 = false;
+  CHECK(SUCCEEDED(winome::winrt_acquire_com_getter_safe(&owner1, 3, &got1, &comp1)));
+  CHECK(got1 == child1);
+  CHECK(comp1);
+  CHECK(child1->refs == 2);
+  CHECK(kChildVtbl.Release(got1) == 1);
+  CHECK(destroys1 == 0);
+  CHECK(kChildVtbl.Release(child1) == 0);
+  CHECK(destroys1 == 1);
+
+  // Case 2: Standard getter calling AddRef() must NOT double-AddRef / leak.
+  int destroys2 = 0;
+  auto* child2 = new MockChild{&kChildVtbl, 1, &destroys2};
+  MockOwner owner2{&kOwnerVtbl, GetterMode::AddRefedShared, child2, &destroys2};
+  void* got2 = nullptr;
+  bool comp2 = true;
+  CHECK(SUCCEEDED(winome::winrt_acquire_com_getter_safe(&owner2, 3, &got2, &comp2)));
+  CHECK(got2 == child2);
+  CHECK(!comp2);
+  CHECK(child2->refs == 2);
+  CHECK(kChildVtbl.Release(got2) == 1);
+  CHECK(destroys2 == 0);
+  CHECK(kChildVtbl.Release(child2) == 0);
+  CHECK(destroys2 == 1);
+
+  // Case 3: Getter creating fresh object per call cleans up probe copy without leak.
+  int destroys3 = 0;
+  MockOwner owner3{&kOwnerVtbl, GetterMode::FreshPerCall, nullptr, &destroys3};
+  void* got3 = nullptr;
+  bool comp3 = true;
+  CHECK(SUCCEEDED(winome::winrt_acquire_com_getter_safe(&owner3, 3, &got3, &comp3)));
+  CHECK(got3 != nullptr);
+  CHECK(!comp3);
+  CHECK(destroys3 == 1);  // second probe instance released immediately
+  CHECK(static_cast<MockChild*>(got3)->refs == 1);
+  CHECK(kChildVtbl.Release(got3) == 0);
+  CHECK(destroys3 == 2);
+
+  // Live WinRT notification poll regression check under concurrent 104-byte heap noise.
+  for (int i = 0; i < 8; ++i) {
+    std::vector<winome::WinomeSystemNotification> notifs;
+    bool allowed = false;
+    (void)winome::winrt_get_notifications(&notifs, &allowed);
+    for (int k = 0; k < 16; ++k) {
+      void* p = HeapAlloc(GetProcessHeap(), 0, 104);
+      if (p != nullptr)
+        HeapFree(GetProcessHeap(), 0, p);
+    }
+  }
+  winome::winrt_shutdown();
+}
+
+void test_win_hotkey_passthrough_classification() {
+  using winome::WinKeyComboAction;
+
+  // Plain Win+Tab remaps to Start Menu; modified Tab combos pass through.
+  CHECK(winome::classify_win_key_combo(VK_TAB, false, false, false, false, false) ==
+        WinKeyComboAction::StartMenu);
+  CHECK(winome::classify_win_key_combo(VK_TAB, false, false, true, false, false) ==
+        WinKeyComboAction::PassthroughCombo);
+  CHECK(winome::classify_win_key_combo(VK_TAB, false, true, false, false, false) ==
+        WinKeyComboAction::PassthroughCombo);
+  CHECK(winome::classify_win_key_combo(VK_TAB, true, false, false, true, false) ==
+        WinKeyComboAction::PassthroughCombo);
+  CHECK(winome::classify_win_key_combo(VK_TAB, false, false, false, false, true) ==
+        WinKeyComboAction::PassthroughCombo);
+
+  // Non-conflicting Windows shortcuts (e.g. Win+V clipboard, Win+E, Win+R, Win+Shift+S).
+  CHECK(winome::classify_win_key_combo('V', false, false, false, false, false) ==
+        WinKeyComboAction::PassthroughCombo);
+  CHECK(winome::classify_win_key_combo('E', false, false, false, false, false) ==
+        WinKeyComboAction::PassthroughCombo);
+  CHECK(winome::classify_win_key_combo('R', false, false, false, false, false) ==
+        WinKeyComboAction::PassthroughCombo);
+  CHECK(winome::classify_win_key_combo('S', false, false, true, false, false) ==
+        WinKeyComboAction::PassthroughCombo);
+  CHECK(winome::classify_win_key_combo('L', false, false, false, false, false) ==
+        WinKeyComboAction::PassthroughCombo);
+
+  // Modifiers pass through without prematurely re-injecting Win so chords like
+  // Win+Shift+PageUp never leak Win and Win+Shift+S / Win+Ctrl+Left compose cleanly.
+  CHECK(winome::classify_win_key_combo(VK_LSHIFT, false, false, false, false, false) ==
+        WinKeyComboAction::ModifierPassthrough);
+  CHECK(winome::classify_win_key_combo(VK_LCONTROL, false, false, false, false, false) ==
+        WinKeyComboAction::ModifierPassthrough);
+  CHECK(winome::classify_win_key_combo(VK_LMENU, true, false, false, true, false) ==
+        WinKeyComboAction::ModifierPassthrough);
+  CHECK(winome::is_win_combo_modifier_vk(VK_RSHIFT));
+  CHECK(winome::is_win_combo_modifier_vk(VK_RCONTROL));
+  CHECK(winome::is_win_combo_modifier_vk(VK_RMENU));
+  CHECK(!winome::is_win_combo_modifier_vk('V'));
+
+  // WINOME workspace switching shortcuts: Win(+Shift)+PageUp/PageDown.
+  CHECK(winome::classify_win_key_combo(VK_PRIOR, false, false, false, false, false) ==
+        WinKeyComboAction::WorkspacePrev);
+  CHECK(winome::classify_win_key_combo(VK_NEXT, false, false, true, false, false) ==
+        WinKeyComboAction::WorkspaceNext);
+  // Win+Ctrl+PageUp / Win+Alt+PageUp do not conflict with WINOME workspaces.
+  CHECK(winome::classify_win_key_combo(VK_PRIOR, false, true, false, false, false) ==
+        WinKeyComboAction::PassthroughCombo);
+  CHECK(winome::classify_win_key_combo(VK_NEXT, true, false, false, true, false) ==
+        WinKeyComboAction::PassthroughCombo);
+
+  // Native Virtual Desktop hotkeys pass through with VD sync hint.
+  CHECK(winome::classify_win_key_combo(VK_LEFT, false, true, false, false, false) ==
+        WinKeyComboAction::PassthroughWithVdHint);
+  CHECK(winome::classify_win_key_combo(VK_RIGHT, false, true, false, false, false) ==
+        WinKeyComboAction::PassthroughWithVdHint);
+  CHECK(winome::classify_win_key_combo('D', false, true, false, false, false) ==
+        WinKeyComboAction::PassthroughWithVdHint);
+  CHECK(winome::classify_win_key_combo(VK_F4, false, true, false, false, false) ==
+        WinKeyComboAction::PassthroughWithVdHint);
+}
+
+void test_workarea_clamp_guard_and_fullscreen_hysteresis() {
+  const RECT mon{0, 0, 1920, 1080};
+
+  // Panel height sanitization rejects 0, negative, and bloated values.
+  CHECK(winome::clamp_panel_height_for_monitor(mon, 32, 32) == 32);
+  CHECK(winome::clamp_panel_height_for_monitor(mon, 0, 32) == 32);
+  CHECK(winome::clamp_panel_height_for_monitor(mon, -50, 32) == 32);
+  CHECK(winome::clamp_panel_height_for_monitor(mon, 600, 32) == 32);
+  CHECK(winome::clamp_panel_height_for_monitor(mon, 1080, 32) == 32);
+  CHECK(winome::clamp_panel_height_for_monitor(RECT{0, 0, 0, 0}, 32, 32) == 0);
+
+  const RECT panel_rc = winome::compute_primary_panel_rect(mon, 32);
+  CHECK(panel_rc.left == 0);
+  CHECK(panel_rc.top == 0);
+  CHECK(panel_rc.right == 1920);
+  CHECK(panel_rc.bottom == 32);
+
+  // WorkareaAssertGuard: skips unchanged, skips hidden, skips mid-drag, and backs off loops.
+  winome::WorkareaAssertGuard guard;
+  const RECT want{0, 32, 1920, 1080};
+  const RECT reset{0, 0, 1920, 1080};
+
+  CHECK(guard.evaluate(1000, want, want, true, false, false) ==
+        winome::WorkareaAssertAction::SkipUnchanged);
+  CHECK(guard.evaluate(1100, want, reset, true, true, false) ==
+        winome::WorkareaAssertAction::SkipHidden);
+  CHECK(guard.pending_after_defer);
+  CHECK(guard.evaluate(1200, want, reset, true, false, true) ==
+        winome::WorkareaAssertAction::SkipInMoveSize);
+  CHECK(guard.evaluate(1300, want, reset, false, false, false) ==
+        winome::WorkareaAssertAction::SkipInvalidMonitor);
+
+  // Burst protection: applies at >=500ms intervals up to 4 times in 5s, then backs off.
+  CHECK(guard.evaluate(2000, want, reset, true, false, false) ==
+        winome::WorkareaAssertAction::Apply);
+  CHECK(guard.evaluate(2100, want, reset, true, false, false) ==
+        winome::WorkareaAssertAction::DeferCooldown);
+  CHECK(guard.evaluate(2600, want, reset, true, false, false) ==
+        winome::WorkareaAssertAction::Apply);
+  CHECK(guard.evaluate(3200, want, reset, true, false, false) ==
+        winome::WorkareaAssertAction::Apply);
+  CHECK(guard.evaluate(3800, want, reset, true, false, false) ==
+        winome::WorkareaAssertAction::Apply);
+  CHECK(guard.evaluate(4400, want, reset, true, false, false) ==
+        winome::WorkareaAssertAction::DeferBackoff);
+  // Once backoff expires and workarea stays matching long enough, burst counter clears.
+  CHECK(guard.evaluate(9500, want, want, true, false, false) ==
+        winome::WorkareaAssertAction::SkipUnchanged);
+  CHECK(guard.evaluate(10100, want, reset, true, false, false) ==
+        winome::WorkareaAssertAction::Apply);
+
+  // Fullscreen bounds check: rejects near-edge undersized windows & unreserved zoomed windows.
+  const RECT reserved_wa{0, 32, 1920, 1080};
+  const RECT unreserved_wa{0, 0, 1920, 1080};
+  // Normal window near screen edge (6px inset, e.g. from DWM shadow without extended frame).
+  CHECK(!winome::is_fullscreen_bounds_for_monitor(
+      RECT{5, 0, 1915, 1075}, mon, reserved_wa, false));
+  // Genuine fullscreen covering full monitor.
+  CHECK(winome::is_fullscreen_bounds_for_monitor(
+      RECT{0, 0, 1920, 1080}, mon, reserved_wa, false));
+  // Normal maximized window stops at reserved workarea top (32) -> NOT fullscreen.
+  CHECK(!winome::is_fullscreen_bounds_for_monitor(
+      RECT{0, 32, 1920, 1080}, mon, reserved_wa, true));
+  // Zoomed window when workarea top was reset to 0 -> still NOT fullscreen.
+  CHECK(!winome::is_fullscreen_bounds_for_monitor(
+      RECT{0, 0, 1920, 1080}, mon, unreserved_wa, true));
+  // Zoomed borderless fullscreen explicitly extending above reserved top (32 -> 0) -> fullscreen.
+  CHECK(winome::is_fullscreen_bounds_for_monitor(
+      RECT{0, 0, 1920, 1080}, mon, reserved_wa, true));
+
+  // FullscreenHysteresisTracker: holds during transient overlays & 160ms unhide debounce.
+  winome::FullscreenHysteresisTracker tracker;
+  HMONITOR fake_mon = reinterpret_cast<HMONITOR>(static_cast<uintptr_t>(0x1234));
+
+  winome::FullscreenEvalInput in{};
+  in.now_ms = 1000;
+  in.raw_fullscreen_mon = fake_mon;
+  auto res = tracker.step(in);
+  CHECK(res.effective_fullscreen_mon == fake_mon);
+
+  // Transient null/IME/owned popup while fullscreen window still covers monitor -> stays hidden!
+  in = {};
+  in.now_ms = 1200;
+  in.currently_hidden = true;
+  in.fg_is_transient_or_null = true;
+  in.tracked_fs_still_covering = true;
+  in.tracked_fs_mon = fake_mon;
+  res = tracker.step(in);
+  CHECK(res.effective_fullscreen_mon == fake_mon);
+  CHECK(!res.schedule_unhide_timer);
+
+  // Brief non-fullscreen transition -> holds during 160ms debounce, then unhides cleanly.
+  in = {};
+  in.now_ms = 2000;
+  in.currently_hidden = true;
+  in.tracked_fs_mon = fake_mon;
+  res = tracker.step(in);
+  CHECK(res.effective_fullscreen_mon == fake_mon);
+  CHECK(res.schedule_unhide_timer);
+  CHECK(res.unhide_delay_ms == 160);
+
+  in.now_ms = 2100;
+  res = tracker.step(in);
+  CHECK(res.effective_fullscreen_mon == fake_mon);
+
+  in.now_ms = 2160;
+  res = tracker.step(in);
+  CHECK(res.effective_fullscreen_mon == nullptr);
+
+  // Opening Overview always unhides immediately (0ms).
+  in = {};
+  in.now_ms = 3000;
+  in.currently_hidden = true;
+  in.overview_open = true;
+  in.tracked_fs_mon = fake_mon;
+  res = tracker.step(in);
+  CHECK(res.effective_fullscreen_mon == nullptr);
+  CHECK(res.cancel_unhide_timer);
+}
+
 }  // namespace
 
 int main() {
@@ -1822,6 +2130,9 @@ int main() {
   test_start_menu_pinned_layout_and_folder_sync();
   test_systray_v4_and_uia_candidates();
   test_overview_window_blacklist();
+  test_winrt_safe_com_getter_and_notifications();
+  test_win_hotkey_passthrough_classification();
+  test_workarea_clamp_guard_and_fullscreen_hysteresis();
 
   if (g_failures == 0)
     std::printf("ALL WINOME UNIT TESTS PASSED\n");

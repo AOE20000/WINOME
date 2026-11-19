@@ -2633,6 +2633,11 @@ dump_zorder (const char *tag)
 static bool
 zorder_drifted (void)
 {
+  if (g_panel_hwnd == nullptr || !IsWindow (g_panel_hwnd))
+    return false;
+  if (!is_visible_hwnd (g_panel_hwnd) && !is_visible_hwnd (g_overview_hwnd))
+    return false;
+
   HWND chain[6];
   int n = 0;
   HWND popover = static_cast<HWND> (winome_shell_panel_top_popover_hwnd ());

@@ -1,6 +1,6 @@
 # WINOME 开发文档中心
 
-本目录统一收口 WINOME 的项目文档、架构设计、构建说明、踩坑记录与阶段开发日志（替代原 `.workbuddy/` 记忆文件、根目录散落的 `ENV.md` 以及原 `WINOME/README.md` 中的长篇技术笔记）。
+本目录统一收口 WINOME 的项目文档、架构设计、构建说明、踩坑记录与阶段开发日志。
 
 ## 文档导航
 
@@ -17,7 +17,7 @@
 
 ## 项目开发约定
 
-1. **技术路线**：在 Windows 上用原生 Win32/COM 能力支撑的 GNOME Shell UI 复刻。宿主单进程 `winome.exe`（C++17 + GTK4），无注入、无 DLL；源码以逐组件移植 `upstream/gnome-shell` 的 JS/CSS 为准（`upstream/` 仅作只读参考，不派生发布）。
+1. **技术路线**：在 Windows 上用原生 Win32/COM 能力支撑的 GNOME Shell UI 复刻。宿主单进程 `winome.exe`（C++17 + GTK4），无注入、无核心 UI DLL；核心模块按 `upstream/gnome-shell` 逐组件移植，`upstream/` 与 `extracted/` 用作只读/派生参考（其中 `upstream/Seelen-UI` 受 AGPL 约束仅作功能思路致谢，不派生其代码）。
 2. **注释与文档语言**：源码注释使用英文；技术散文与开发文档使用中文。
 3. **模块职责边界**：
    - 概览、应用索引与分页网格 → `WINOME/src/overview*.cpp`、`app-index.cpp`、`app-grid.cpp`

@@ -44,7 +44,7 @@
 
 | 方案 | 配置 | 构建目录 | 说明 |
 |------|------|----------|------|
-| `release` 生产 | release + LTO + NDEBUG | `WINOME/build-release/` | 最小体积、最快指令（约 2.7MB） |
+| `release` 生产 | release + LTO + NDEBUG | `WINOME/build-release/` | 最小体积、最快指令（约 2.7–2.9MB） |
 | `test` 测试 | debugoptimized | `WINOME/build/` | 项目默认，保留 `g_print` 诊断日志 |
 | `debug` 调试 | debug（-O0 -g） | `WINOME/build-debug/` | GDB 友好 |
 
@@ -81,7 +81,7 @@ ninja -C build
 - [x] **进程外 stdio JSON 高可靠插件体系**：`plugin-host.{h,cpp}` 基于 Win32 Job Object 隔离、`%LOCALAPPDATA%\WINOME\plugins\<id>\manifest.json` 能力白名单（`topbar`/`quicksettings`/`notify`/`desktop.read`）、`30 msg/s` 限流与 60 秒 3 次崩溃自动熔断（`Tripped`），并在顶栏状态区与快速设置网格提供声明式扩展槽位（内置 Python 示例 `WINOME/examples/plugins/sysmon-sample/`）
 - [x] **EndSession 60 秒确认弹窗与 DWM 窗口外观统一（可选）**：重启/关机/注销前弹出 GNOME `.modal-dialog` 60 秒倒计时确认弹窗（支持 `config.json` `end_session_confirm` 开关与 `Esc` 取消）；`window-theming.cpp` 提供零注入可选 `unify_dark_titlebars` 与 `unify_rounded_corners` 统一样式
 - [x] 隐藏原生任务栏、事件钩子防重现、系统托盘兼容层（`systray.cpp` 结合 `ToolbarWindow32` 与 Win11 XAML `DesktopWindowContentBridge`/`NotifyItemIcon` 采集第三方托盘图标，采用动作/扫描双线程分离、`IUIAutomation2` 超时、`FindAllBuildCache` 作用域收窄、注册表真图标缓存、`ShowContextMenu()`/`Shift+F10` 右键菜单及非阻塞 `winome-ctl inspect tray`）
-- [x] **概览触发与工作区快捷键**：**Win 键**单按开合 `WINDOW_PICKER`、**550ms 内双击 Win 键**丝滑进阶至 `APP_GRID`、**左上角热角**（`WH_MOUSE_LL`，全屏隐藏时自动卸钩）、`Win+PageUp/PageDown` 切换工作区、`Win+Shift+PageUp/PageDown` 移动活动窗口到相邻工作区并跟随，`Win+Tab` 打开开始菜单，其余 Win 组合键透传，均受 `config.json` 开关控制
+- [x] **概览触发与工作区快捷键**：**Win 键**单按开合 `WINDOW_PICKER`、**550ms 内双击 Win 键**丝滑进阶至 `APP_GRID`、**左上角热角**（`WH_MOUSE_LL`，全屏隐藏时自动卸钩）、`Win+PageUp/PageDown` 切换工作区、`Win+Shift+PageUp/PageDown` 移动活动窗口到相邻工作区并跟随，`Win+Tab` 打开开始菜单，其余不冲突快捷键（如 `Win+V` 剪贴板、`Win+E`、`Win+R`、`Win+Shift+S`、`Win+Ctrl+←/→` 等）通过单次原子 `SendInput` 序贯透传，均受 `config.json` 开关控制
 - [x] 概览显示**最小化窗口**、默认黑名单过滤（`overview_window_blacklist`，默认屏蔽“Windows 输入体验”与 `explorer.exe` 无名无画面窗，可在设置关闭）；面板与弹出窗位于概览之上；顶栏保留工作区；面板按显示器独立判断全屏自动隐藏；隐藏于 Alt-Tab（`WS_EX_TOOLWINDOW`）
 - [x] 多显示器与事件驱动：多屏顶栏/工作区、`WM_DISPLAYCHANGE` / `WM_DPICHANGED` / `WM_SETTINGCHANGE` / `WTSRegisterSessionNotification` 响应，WASAPI 音量与 `WlanRegisterNotification` 事件驱动更新
 - [x] **快速设置与视觉对齐**：电量/电源模式/电源动作（含 `SE_SHUTDOWN_NAME` 与 Quit WINOME）、WASAPI 音量与静音、WMI/DXVA2 屏幕亮度、Wlan 枚举与加密网络模态密码弹窗连接、WinRT 蓝牙设备切换、深色主题/勿扰/夜间模式/飞行模式；内置 GNOME symbolic SVG 图标并复刻 `QuickToggleMenu` 两阶段居中展开抽屉动效
@@ -102,7 +102,7 @@ ninja -C build
 | **Win+PageUp / PageDown** | 切换到上一个 / 下一个虚拟桌面 |
 | **Win+Shift+PageUp / PageDown** | 将当前活动窗口移动到相邻虚拟桌面并跟随切换 |
 | **Alt+F2** | 打开 GNOME `Run a Command` 运行弹窗（开发者模式下支持 `lg`、`rt`、`r`/`restart`、`debugexit`） |
-| **Win+E / Win+R / Win+D …** | 透传给 Windows（组合键保留） |
+| **Win+V / Win+E / Win+R / Win+D / Win+Shift+S …** | 原子序贯透传给 Windows（剪贴板历史、资源管理器、运行、显示桌面、截图等组合键完整保留） |
 | **Win+Alt+Tab** | 任务视图（透传） |
 | **Win+Ctrl+←/→ / D / F4** | 原生虚拟桌面快捷键（透传；同时触发集中式 VD 观察者即时同步） |
 | **Alt+Tab** | 切换窗口（透传，切换器不被抑制） |
@@ -131,4 +131,4 @@ ninja -C build
 
 ## 许可
 
-GPL-2.0，详见 `LICENSE` 与 `WINOME/THIRD-PARTY-NOTICES`。
+`GPL-2.0-only`，详见 [LICENSE](LICENSE) 与 [WINOME/THIRD-PARTY-NOTICES](WINOME/THIRD-PARTY-NOTICES)。

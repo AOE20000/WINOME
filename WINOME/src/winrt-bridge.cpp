@@ -89,10 +89,11 @@ struct ComPtr {
     return *this;
   }
   void reset(void* p = nullptr) {
-    if (ptr != nullptr) {
-      vcall<ULONG>(ptr, 2);  // IUnknown::Release
-    }
+    void* old = ptr;
     ptr = p;
+    if (old != nullptr) {
+      vcall<ULONG>(old, 2);  // IUnknown::Release
+    }
   }
   void** put() {
     reset();
@@ -250,10 +251,13 @@ ComPtr get_activation_factory(const wchar_t* runtime_class, REFIID iid) {
 }
 
 ComPtr qi(void* obj, REFIID iid) {
-  ComPtr res;
-  if (obj != nullptr)
-    vcall<HRESULT>(obj, 0, &iid, res.put());
-  return res;
+  void* out = nullptr;
+  if (obj != nullptr &&
+      SUCCEEDED(vcall<HRESULT>(obj, 0, &iid, &out)) &&
+      out != nullptr) {
+    return ComPtr(out);
+  }
+  return {};
 }
 
 int64_t winrt_filetime_to_unix(int64_t ft100ns) {
@@ -553,6 +557,55 @@ bool bluetooth_radio_op(bool do_set, bool target_enabled,
 
 }  // namespace
 
+long winrt_acquire_com_getter_safe(void* owner,
+                                   size_t vtable_slot,
+                                   void** out,
+                                   bool* out_compensated_addref) {
+  if (out_compensated_addref != nullptr)
+    *out_compensated_addref = false;
+  if (out == nullptr)
+    return E_POINTER;
+  *out = nullptr;
+  if (owner == nullptr)
+    return E_POINTER;
+
+  void* raw1 = nullptr;
+  const HRESULT hr1 = vcall<HRESULT>(owner, vtable_slot, &raw1);
+  if (FAILED(hr1) || raw1 == nullptr)
+    return hr1;
+
+  vcall<ULONG>(raw1, 1);
+  const ULONG rc1 = vcall<ULONG>(raw1, 2);
+
+  void* raw2 = nullptr;
+  const HRESULT hr2 = vcall<HRESULT>(owner, vtable_slot, &raw2);
+  if (SUCCEEDED(hr2) && raw2 != nullptr) {
+    if (raw2 == raw1) {
+      vcall<ULONG>(raw1, 1);
+      const ULONG rc2 = vcall<ULONG>(raw1, 2);
+      if (rc2 > rc1) {
+        vcall<ULONG>(raw2, 2);
+        *out = raw1;
+        return S_OK;
+      }
+      // Missing AddRef() detected: compensate once so caller Release() leaves
+      // the owner's internal reference count intact.
+      vcall<ULONG>(raw1, 1);
+      if (out_compensated_addref != nullptr)
+        *out_compensated_addref = true;
+      *out = raw1;
+      return S_OK;
+    }
+    vcall<ULONG>(raw2, 2);
+    *out = raw1;
+    return S_OK;
+  }
+
+  if (rc1 > 1)
+    vcall<ULONG>(raw1, 2);
+  return SUCCEEDED(hr2) ? E_FAIL : hr2;
+}
+
 bool winrt_get_bluetooth_radio(bool* present, bool* enabled) {
   struct State {
     bool ok = false;
@@ -780,8 +833,13 @@ bool winrt_get_notifications(std::vector<WinomeSystemNotification>* out,
             SUCCEEDED(vcall<HRESULT>(notif.ptr, 8, vis_raw.put())) && vis_raw) {
           ComPtr vis = qi(vis_raw.ptr, kIID_INotificationVisual);
           ComPtr bindings;
+          // Windows 11 wpnapps.dll!NotificationVisual::get_Bindings (slot 8)
+          // omits AddRef() on its internal m_bindings pointer; use the safe
+          // getter wrapper so releasing `bindings` never frees vis's member.
           if (vis &&
-              SUCCEEDED(vcall<HRESULT>(vis.ptr, 8, bindings.put())) && bindings) {
+              SUCCEEDED(winrt_acquire_com_getter_safe(
+                  vis.ptr, 8, bindings.put())) &&
+              bindings) {
             unsigned bcount = 0;
             if (SUCCEEDED(vcall<HRESULT>(bindings.ptr, 7, &bcount))) {
               for (unsigned bi = 0; bi < bcount; ++bi) {
