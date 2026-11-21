@@ -17,6 +17,7 @@
 #include "notifications.h"
 #include "overview-dash.h"
 #include "overview-layout.h"
+#include "overview-search.h"
 #include "overview-thumbs.h"
 #include "overview-trigger.h"
 #include "fullscreen-watcher.h"
@@ -984,7 +985,7 @@ void test_ipc_dispatch_and_named_pipe_roundtrip() {
   CHECK(ping.find("\"ok\":true") != std::string::npos);
   CHECK(ping.find("\"pong\":true") != std::string::npos);
   CHECK(ping.find(std::string("\"version\":\"") + WINOME_VERSION + "\"") != std::string::npos);
-  CHECK(std::string(WINOME_VERSION) == "0.1.2");
+  CHECK(std::string(WINOME_VERSION) == "0.1.3");
 
   const std::string st = winome::ipc_dispatch_request_json("{\"cmd\":\"status\"}", cbs);
   CHECK(st.find("\"ok\":true") != std::string::npos);
@@ -2298,6 +2299,78 @@ void test_hook_watchdog_and_lockfree_ring() {
   CHECK(out.safe_to_reinstall);
 }
 
+void test_overview_search_helpers() {
+  // 1. Multi-term splitting (searchController.js getTermsForSearchString).
+  {
+    auto terms = winome::split_search_terms("   Visual   Studio  CODE  ");
+    CHECK(terms.size() == 3);
+    CHECK(terms[0] == "visual");
+    CHECK(terms[1] == "studio");
+    CHECK(terms[2] == "code");
+
+    auto empty_terms = winome::split_search_terms("   \t  ");
+    CHECK(empty_terms.empty());
+
+    CHECK(winome::match_all_search_terms("visual studio code editor", terms));
+    CHECK(!winome::match_all_search_terms("visual studio only", terms));
+  }
+
+  // 2. Pango Highlighter (misc/util.js Highlighter): XML escaping + case-insensitive <b>.
+  {
+    std::vector<std::string> terms = {"net", "and"};
+    std::string hl = winome::highlight_search_terms_markup(
+        "Network & Android <Test>", terms);
+    CHECK(hl == "<b>Net</b>work &amp; <b>And</b>roid &lt;Test&gt;");
+
+    // Overlapping/adjacent terms merge cleanly without nested <b> tags.
+    std::vector<std::string> overlap = {"abc", "bcd"};
+    std::string hl2 = winome::highlight_search_terms_markup("xxABCDyy", overlap);
+    CHECK(hl2 == "xx<b>ABCD</b>yy");
+  }
+
+  // 3. Scientific, arithmetic, hex, and binary Calculator evaluator.
+  {
+    std::string res;
+    CHECK(winome::try_eval_search_math("12*34", &res));
+    CHECK(res == "408");
+
+    CHECK(winome::try_eval_search_math("sqrt(144) + 2^3", &res));
+    CHECK(res == "20");
+
+    CHECK(winome::try_eval_search_math("(10 + 5) * 2 - 4 / 2", &res));
+    CHECK(res == "28");
+
+    CHECK(winome::try_eval_search_math("0xff", &res));
+    CHECK(res == "255 (0xFF)");
+
+    CHECK(winome::try_eval_search_math("0b1010", &res));
+    CHECK(res == "10 (0xA)");
+
+    CHECK(winome::try_eval_search_math("round(pi * 100)", &res));
+    CHECK(res == "314");
+
+    // Plain numbers without operator/function/radix and divide-by-zero must not match.
+    CHECK(!winome::try_eval_search_math("2026", &res));
+    CHECK(!winome::try_eval_search_math("10 / 0", &res));
+    CHECK(!winome::try_eval_search_math("chrome", &res));
+  }
+
+  // 4. URL & File-path detection.
+  {
+    CHECK(winome::is_url_like_query("https://gnome.org"));
+    CHECK(winome::is_url_like_query("github.com/GNOME/gnome-shell"));
+    CHECK(winome::is_url_like_query("www.example.org"));
+    CHECK(!winome::is_url_like_query("hello world"));
+    CHECK(!winome::is_url_like_query("notepad"));
+
+    CHECK(winome::is_path_like_query("C:\\Users\\Test"));
+    CHECK(winome::is_path_like_query("D:/Projects"));
+    CHECK(winome::is_path_like_query("~/Downloads"));
+    CHECK(winome::is_path_like_query("%USERPROFILE%\\Desktop"));
+    CHECK(!winome::is_path_like_query("settings"));
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -2336,6 +2409,7 @@ int main() {
   test_win_hotkey_passthrough_classification();
   test_workarea_clamp_guard_and_fullscreen_hysteresis();
   test_hook_watchdog_and_lockfree_ring();
+  test_overview_search_helpers();
 
   if (g_failures == 0)
     std::printf("ALL WINOME UNIT TESTS PASSED\n");

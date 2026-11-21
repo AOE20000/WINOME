@@ -373,9 +373,11 @@ window.quick-settings-popover-window {
   box-shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.2);
   font: 11pt "Cantarell";
 }
-/* The calendar popover keeps its own radius (.datemenu-popover). */
+/* The calendar popover keeps its own radius (.datemenu-popover) plus outer
+   padding matching upstream .popup-menu-content (16px around #calendarArea). */
 .quick-settings-popover-card.datemenu-card {
   border-radius: 30px;
+  padding: 14px;
 }
 /* The quick-settings box itself adds the GNOME 18px padding. */
 .quick-settings {
@@ -418,15 +420,57 @@ window.winome-overview-chrome {
   font: 11pt "Cantarell";
 }
 
-/* Search entry: GNOME renders the hint text at the entry's dimmed color
-   (StLabel.hint-text, alpha 0.7) and the magnifier at the scalable icon size
-   (1.091em = 16px), with 4px padding either side (icon padding rule). */
-.search-entry placeholder {
+/* Search entry: strip GTK4 Default-dark entry border/gradient/min-height bleed
+   and match GNOME Shell's borderless dark pill (.search-entry in _search-entry.scss). */
+entry.search-entry {
+  background-image: none;
+  border-image: none;
+  border: none;
+  outline: none;
+  box-shadow: none;
+  border-radius: 999px;
+  min-height: 0;
+  padding: 7px 14px;
+  margin-top: 12px;
+  margin-bottom: 6px;
+  background-color: #35353a;
   color: rgba(250, 250, 251, 0.7);
+  transition-property: background-color, color, box-shadow;
+  transition-duration: 150ms;
 }
-.search-entry image {
+entry.search-entry placeholder {
+  color: rgba(250, 250, 251, 0.65);
+}
+entry.search-entry image {
   -gtk-icon-size: 16px;
   padding: 0 4px;
+  color: rgba(250, 250, 251, 0.65);
+}
+entry.search-entry:hover:not(:focus-within) {
+  background-color: #3f3f45;
+  color: #fafafb;
+}
+entry.search-entry:hover:not(:focus-within) placeholder,
+entry.search-entry:hover:not(:focus-within) image {
+  color: rgba(250, 250, 251, 0.88);
+}
+entry.search-entry:focus,
+entry.search-entry:focus-within,
+entry.search-entry.search-active {
+  background-color: #3e4048;
+  color: #fafafb;
+  border: none;
+  outline: none;
+  box-shadow: inset 0 0 0 2px rgba(133, 181, 238, 0.800);
+}
+entry.search-entry:focus image,
+entry.search-entry:focus-within image,
+entry.search-entry.search-active image {
+  color: #fafafb;
+}
+entry.search-entry:focus placeholder,
+entry.search-entry:focus-within placeholder {
+  color: rgba(250, 250, 251, 0.55);
 }
 
 /* .panel-button horizontal padding mirrors -natural-hpadding: 12px (the St
@@ -445,16 +489,20 @@ window.winome-overview-chrome {
   box-shadow: none;
 }
 
-/* GNOME keeps a panel button highlighted (:active) while its menu is open;
-   GTK4 clears :active when the mouse is released. The host toggles an "open"
-   class so the highlight persists exactly like gnome-shell's popup menu.
-   The clock-display button uses the $highlighted_child pattern: its button
-   itself stays transparent and only the .clock child is highlighted. */
-#panel .panel-button:not(.clock-display).open {
-  background-color: rgba(255, 255, 255, 0.28);
+/* GNOME keeps a panel button highlighted (:active / :overview) while its menu
+   or the Activities overview / App Grid is open; GTK4 clears :active when the
+   mouse is released. The host toggles "open" / "overview" classes so the
+   highlight persists exactly like gnome-shell's panel.js ActivitiesButton and
+   popup menus. */
+#panel .panel-button:not(.clock-display).open,
+#panel.overview .panel-button#panelActivities,
+#panel .panel-button#panelActivities.overview {
+  background-color: rgba(250, 250, 251, 0.28);
 }
-#panel .panel-button:not(.clock-display).open:hover {
-  background-color: rgba(255, 255, 255, 0.32);
+#panel .panel-button:not(.clock-display).open:hover,
+#panel.overview .panel-button#panelActivities:hover,
+#panel .panel-button#panelActivities.overview:hover {
+  background-color: rgba(250, 250, 251, 0.32);
 }
 #panel .panel-button.clock-display.open .clock {
   background-color: rgba(255, 255, 255, 0.28);
@@ -695,15 +743,39 @@ window#winomeToastWindow .notification-banner {
   margin: 8px 10px 12px 10px;
 }
 
-/* Tray popover matches upstream .popup-menu-content 20px radius on its outer
-   card without nesting a second bordered card inside it. */
+/* Tray popover: clean GNOME 47/48 card with 4-column rounded icon tiles and
+   minimalist animated chevron on the top bar. */
+#panel .panel-button.tray-panel-button {
+  padding: 0 9px;
+}
+#panel .panel-button.tray-panel-button .tray-chevron {
+  transition-property: transform;
+  transition-duration: 200ms;
+  transition-timing-function: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+}
+#panel .panel-button.tray-panel-button.open .tray-chevron {
+  transform: rotate(180deg);
+}
 .quick-settings-popover-card.tray-popover-card {
-  border-radius: 20px;
+  border-radius: 24px;
 }
 .tray-menu-box {
-  padding: 14px;
+  padding: 16px;
+}
+.tray-menu-header {
+  padding: 0 2px 2px 4px;
 }
 .tray-menu-title {
+  font-weight: 700;
+  font-size: 1.05em;
+  color: #ffffff;
+}
+.tray-count-badge {
+  background-color: rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.85);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 0.82em;
   font-weight: 700;
 }
 .tray-header-button {
@@ -711,27 +783,74 @@ window#winomeToastWindow .notification-banner {
   border-image: none;
   border-style: none;
   border-radius: 999px;
-  background-color: rgba(255, 255, 255, 0.08);
+  background-color: #48484b;
   color: #ffffff;
-  padding: 4px 10px;
-  min-height: 28px;
+  padding: 5px 12px;
+  min-height: 30px;
   transition-property: background-color, color;
-  transition-duration: 100ms;
+  transition-duration: 120ms;
 }
 .tray-header-button.icon-button {
-  padding: 6px;
-  min-width: 28px;
+  padding: 0;
+  min-width: 32px;
+  min-height: 32px;
 }
 .tray-header-button:hover {
-  background-color: rgba(255, 255, 255, 0.14);
+  background-color: #545459;
 }
 .tray-header-button:active {
-  background-color: rgba(255, 255, 255, 0.20);
+  background-color: #626268;
 }
 .tray-header-button:focus:not(:focus-visible) {
   outline-style: none;
   outline-width: 0;
   box-shadow: none;
+}
+.tray-app-tile {
+  background-image: none;
+  border-image: none;
+  border-style: none;
+  outline: none;
+  box-shadow: none;
+  border-radius: 16px;
+  padding: 8px 6px;
+  background-color: rgba(255, 255, 255, 0.05);
+  color: #ffffff;
+  transition-property: background-color, color;
+  transition-duration: 120ms;
+}
+.tray-app-tile:hover {
+  background-color: rgba(255, 255, 255, 0.13);
+  color: #ffffff;
+}
+.tray-app-tile:active {
+  background-color: rgba(255, 255, 255, 0.21);
+  color: #ffffff;
+}
+.tray-app-tile:focus:not(:focus-visible) {
+  outline-style: none;
+  outline-width: 0;
+  box-shadow: none;
+}
+.tray-app-tile-label {
+  font-size: 0.82em;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.90);
+}
+.tray-empty-box {
+  padding: 20px 12px;
+}
+.tray-empty-icon {
+  color: rgba(255, 255, 255, 0.38);
+}
+.tray-empty-title {
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.55);
+}
+.tray-menu-hint {
+  font-size: 0.80em;
+  color: rgba(255, 255, 255, 0.45);
+  padding-top: 2px;
 }
 separator.popup-separator-menu-item {
   background-color: rgba(255, 255, 255, 0.1);
@@ -847,10 +966,128 @@ window#winomeModalDialogWindow {
   border-top-width: 0;
   border-bottom-width: 0;
   border-left-width: 0;
+  border-right: 1px solid rgba(255, 255, 255, 0.1);
+  margin-right: 4px;
+  padding-right: 12px;
+}
+.message-list .message-list-placeholder,
+.message-list .message-list-placeholder label,
+.message-list .message-list-placeholder image {
+  color: rgba(255, 255, 255, 0.45);
+}
+.message-list .message-list-placeholder label {
+  font-size: 1.182em;
+  font-weight: 700;
+}
+.message-list-controls {
+  padding: 12px 6px 4px 6px;
+}
+.message-list-controls .message-list-clear-button {
+  padding: 5px 16px;
+  min-height: 30px;
+  border-radius: 999px;
+}
+/* Upstream DateMenu calendar column precision (_calendar.scss). */
+.datemenu-calendar-column {
+  margin-left: 10px;
+}
+.datemenu-today-button {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 12px;
+}
+.datemenu-today-button.today-selected,
+.datemenu-today-button.today-selected:hover,
+.datemenu-today-button.today-selected:active {
+  background-color: transparent;
+}
+.datemenu-today-button .day-label {
+  color: rgba(255, 255, 255, 0.72);
+  font-weight: 700;
+}
+.datemenu-today-button .date-label {
+  font-size: 1.364em;
+  font-weight: 800;
+  color: #ffffff;
+}
+.calendar {
+  margin: 0;
+  padding: 0;
+}
+.calendar .calendar-month-header .pager-button {
+  border-radius: 999px;
+  min-width: 34px;
+  min-height: 34px;
+  padding: 0;
+  background-color: transparent;
+  color: #ffffff;
+}
+.calendar .calendar-month-header .pager-button:hover {
+  background-color: #47474c;
+}
+.calendar .calendar-month-header .pager-button:active {
+  background-color: #5d5d63;
+}
+.calendar .calendar-day-heading {
+  background-color: transparent;
+  color: rgba(255, 255, 255, 0.65);
+  font-weight: 700;
+  margin: 2px;
+  padding: 4px 0;
+}
+.calendar .calendar-day {
+  background-color: transparent;
+  border-radius: 999px;
+  min-width: 34px;
+  min-height: 34px;
+  margin: 2px;
+  padding: 0;
+  font-weight: 700;
+}
+.calendar .calendar-day:hover {
+  background-color: #47474c;
+  color: #ffffff;
+}
+.calendar .calendar-day:active,
+.calendar .calendar-day.selected,
+.calendar .calendar-day:selected {
+  background-color: #4c4c51;
+  color: #ffffff;
+}
+.calendar .calendar-day.selected:hover,
+.calendar .calendar-day:selected:hover {
+  background-color: #5d5d63;
+  color: #ffffff;
+}
+.calendar .calendar-day.calendar-today,
+.calendar .calendar-day.calendar-today:selected,
+.calendar .calendar-day.calendar-today.selected {
+  background-color: #3584e4;
+  color: #ffffff;
+}
+.calendar .calendar-day.calendar-today:hover,
+.calendar .calendar-day.calendar-today:selected:hover {
+  background-color: #468ee6;
+  color: #ffffff;
+}
+.calendar .calendar-day.calendar-today:active {
+  background-color: #5d9ce9;
+  color: #ffffff;
+}
+.events-button,
+.world-clocks-button {
+  margin: 2px 0;
+  padding: 12px;
+  border-radius: 14px;
 }
 
-/* Let App Grid folder dialog size to available viewport height instead of fixed 720px,
-   while preserving GNOME's .app-folder-dialog and .app-folder styling from _app-grid.scss. */
+/* Floating AppFolderDialog toplevel sits cleanly above DWM miniature workspace
+   thumbnails with per-pixel transparent rounded corners (matching upstream). */
+window#winomeAppFolderWindow {
+  background-color: transparent;
+  box-shadow: none;
+  font: 11pt "Cantarell";
+}
 .app-folder-dialog {
   min-width: 0;
   min-height: 0;
@@ -864,7 +1101,13 @@ window#winomeModalDialogWindow {
 }
 .app-folder-dialog .folder-name-container .folder-name-label {
   font-weight: 800;
-  font-size: 1.818em;
+  font-size: 1.65em;
+}
+.app-folder-dialog .icon-button {
+  border-radius: 999px;
+  padding: 8px;
+  min-width: 20px;
+  min-height: 20px;
 }
 .app-folder-dialog .overview-tile {
   border-radius: 24px;
@@ -896,6 +1139,121 @@ window#winomeModalDialogWindow {
 .overview-tile.app-folder:checked:hover,
 .overview-tile.app-folder.checked:hover {
   background-color: #515158;
+}
+
+/* Dedicated GNOME Search Results View (#searchResults / SearchResultsView). */
+#searchResults,
+#searchResultsContent {
+  background-color: transparent;
+}
+.grid-search-result,
+.list-search-result,
+.search-provider-icon {
+  background-image: none;
+  border-image: none;
+  border-style: none;
+  outline: none;
+  box-shadow: none;
+}
+.grid-search-result:focus:not(:focus-visible),
+.list-search-result:focus:not(:focus-visible),
+.search-provider-icon:focus:not(:focus-visible) {
+  outline-style: none;
+  outline-width: 0;
+  box-shadow: none;
+}
+.overview-tile.selected,
+.grid-search-result.selected,
+.grid-search-result:checked {
+  color: #fafafb;
+  background-color: rgba(250, 250, 251, 0.14);
+}
+.overview-tile.selected:hover,
+.grid-search-result.selected:hover,
+.grid-search-result:checked:hover {
+  background-color: rgba(250, 250, 251, 0.20);
+}
+.search-section-content {
+  background-color: #38383b;
+  color: #fafafb;
+  border-radius: 24px;
+  padding: 12px 16px;
+  margin: 0 12px;
+  box-shadow: inset 0 0 0 1px rgba(250, 250, 251, 0.06);
+}
+.list-search-result {
+  padding: 8px 12px;
+  border-radius: 13px;
+  background-color: transparent;
+  color: #fafafb;
+}
+.list-search-result:hover {
+  background-color: rgba(250, 250, 251, 0.08);
+}
+.list-search-result:active {
+  background-color: rgba(250, 250, 251, 0.16);
+}
+.list-search-result.selected,
+.list-search-result:checked {
+  color: #fafafb;
+  background-color: rgba(250, 250, 251, 0.13);
+}
+.list-search-result.selected:hover,
+.list-search-result:checked:hover {
+  background-color: rgba(250, 250, 251, 0.18);
+}
+.list-search-result-title {
+  font-weight: 600;
+  color: #fafafb;
+}
+.list-search-result-description {
+  color: #afafb1;
+  font-size: 0.92em;
+}
+.search-provider-icon {
+  padding: 8px 10px;
+  border-radius: 13px;
+  background-color: transparent;
+  color: #fafafb;
+}
+.search-provider-icon:hover {
+  background-color: rgba(250, 250, 251, 0.08);
+  color: #fafafb;
+}
+.search-provider-icon:active {
+  background-color: rgba(250, 250, 251, 0.16);
+  color: #fafafb;
+}
+.search-provider-icon:disabled,
+.search-provider-icon:disabled label,
+.search-provider-icon:disabled image {
+  background-color: transparent;
+  color: #fafafb;
+  opacity: 1.0;
+}
+.list-search-provider-details {
+  font-weight: 700;
+  color: #fafafb;
+}
+/* Upstream _search-results.scss: circular .system-action-icon tiles inside GridSearchResults. */
+.system-action-icon {
+  background-color: rgba(250, 250, 251, 0.10);
+  color: #fafafb;
+  border-radius: 999px;
+  min-width: 72px;
+  min-height: 72px;
+}
+.grid-search-result:hover .system-action-icon,
+.grid-search-result.selected .system-action-icon {
+  background-color: rgba(250, 250, 251, 0.16);
+}
+.search-statusbox {
+  padding: 24px;
+}
+.search-statustext {
+  font-size: 1.5em;
+  font-weight: 700;
+  color: rgba(250, 250, 251, 0.55);
 }
 """
 

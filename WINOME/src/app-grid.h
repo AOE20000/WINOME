@@ -48,5 +48,12 @@ void app_grid_set_transition_opacity (GtkWidget *grid, bool frozen,
 bool app_grid_launch_first (GtkWidget *grid);
 void app_grid_close_menu (GtkWidget *grid);
 bool app_grid_close_open_folder (GtkWidget *grid);
+void app_grid_set_folder_toggled_cb (GtkWidget *grid,
+                                     void (*on_folder_toggled) (bool open, void *),
+                                     void *user_data);
+void app_grid_set_host_bounds (GtkWidget *grid, int mon_x_px, int mon_y_px,
+                               int mon_w_px, int mon_h_px, int panel_h_px,
+                               int dash_top_px);
+void *app_grid_get_folder_hwnd (GtkWidget *grid);
 
 }  // namespace winome

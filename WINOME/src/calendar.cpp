@@ -136,8 +136,10 @@ typedef struct {
 
   GtkWidget *grid;
   GtkWidget *month_label;
+  GtkWidget *today_btn;
   GtkWidget *day_header_label;
   GtkWidget *date_header_label;
+  GtkWidget *events_title_label;
   GtkWidget *dnd_switch;
   GtkWidget *utc_time_label;
 
@@ -171,16 +173,104 @@ month_name (int month)
   return is_zh () ? zh[month] : en[month];
 }
 
+static bool
+is_selected_date_today (const CalendarData *data)
+{
+  if (data == nullptr)
+    return true;
+  GDateTime *now = g_date_time_new_now_local ();
+  if (now == nullptr)
+    return true;
+  bool eq = (g_date_time_get_year (now) == data->selected_year &&
+             g_date_time_get_month (now) == data->selected_month + 1 &&
+             g_date_time_get_day_of_month (now) == data->selected_day);
+  g_date_time_unref (now);
+  return eq;
+}
+
+static void
+update_today_button_reactive (CalendarData *data)
+{
+  if (data == nullptr || data->today_btn == nullptr)
+    return;
+  // Upstream dateMenu.js TodayButton: non-reactive when Today is already
+  // selected so hovering does not flash an inactive button highlight.
+  const bool on_today = is_selected_date_today (data);
+  gtk_widget_set_can_target (data->today_btn, on_today ? FALSE : TRUE);
+  if (on_today)
+    gtk_widget_add_css_class (data->today_btn, "today-selected");
+  else
+    gtk_widget_remove_css_class (data->today_btn, "today-selected");
+}
+
+static void
+update_events_heading (CalendarData *data)
+{
+  if (data == nullptr || data->events_title_label == nullptr)
+    return;
+  GDateTime *now = g_date_time_new_now_local ();
+  GDateTime *sel = g_date_time_new_local (
+      data->selected_year, data->selected_month + 1, data->selected_day,
+      0, 0, 0.0);
+  if (now == nullptr || sel == nullptr) {
+    if (now != nullptr) g_date_time_unref (now);
+    if (sel != nullptr) g_date_time_unref (sel);
+    return;
+  }
+  GDateTime *today0 = g_date_time_new_local (
+      g_date_time_get_year (now), g_date_time_get_month (now),
+      g_date_time_get_day_of_month (now), 0, 0, 0.0);
+  GTimeSpan diff_days =
+      g_date_time_difference (sel, today0) / G_TIME_SPAN_DAY;
+  gchar buf[64];
+  if (diff_days == 0) {
+    snprintf (buf, sizeof (buf), "%s", is_zh () ? "今天" : "Today");
+  } else if (diff_days == -1) {
+    snprintf (buf, sizeof (buf), "%s", is_zh () ? "昨天" : "Yesterday");
+  } else if (diff_days == 1) {
+    snprintf (buf, sizeof (buf), "%s", is_zh () ? "明天" : "Tomorrow");
+  } else if (data->selected_year == g_date_time_get_year (now)) {
+    if (is_zh ())
+      snprintf (buf, sizeof (buf), "%d月%d日", data->selected_month + 1,
+                data->selected_day);
+    else
+      snprintf (buf, sizeof (buf), "%s %d", month_name (data->selected_month),
+                data->selected_day);
+  } else {
+    if (is_zh ())
+      snprintf (buf, sizeof (buf), "%d年%d月%d日", data->selected_year,
+                data->selected_month + 1, data->selected_day);
+    else
+      snprintf (buf, sizeof (buf), "%s %d, %d",
+                month_name (data->selected_month), data->selected_day,
+                data->selected_year);
+  }
+  gtk_label_set_text (GTK_LABEL (data->events_title_label), buf);
+  g_date_time_unref (today0);
+  g_date_time_unref (sel);
+  g_date_time_unref (now);
+}
+
 static void
 update_month_label (CalendarData *data)
 {
+  GDateTime *now = g_date_time_new_now_local ();
+  int cur_year = now != nullptr ? g_date_time_get_year (now) : data->selected_year;
+  if (now != nullptr)
+    g_date_time_unref (now);
+
+  // Upstream calendar.js: show only the month name in the current year;
+  // include the year only when viewing a different year.
   gchar text[64];
-  if (is_zh ())
+  if (data->selected_year == cur_year) {
+    snprintf (text, sizeof (text), "%s", month_name (data->selected_month));
+  } else if (is_zh ()) {
     snprintf (text, sizeof (text), "%d年%s", data->selected_year,
               month_name (data->selected_month));
-  else
+  } else {
     snprintf (text, sizeof (text), "%s %d", month_name (data->selected_month),
               data->selected_year);
+  }
   gtk_label_set_text (GTK_LABEL (data->month_label), text);
 }
 
@@ -539,7 +629,9 @@ rebuild_message_list (CalendarData *data, bool force = false)
   if (data->placeholder != nullptr)
     gtk_widget_set_visible (data->placeholder, has_content ? FALSE : TRUE);
   if (data->clear_btn != nullptr) {
-    gtk_widget_set_visible (data->clear_btn, has_content ? TRUE : FALSE);
+    // Upstream GNOME message-list-controls: keep Clear button visible and
+    // insensitive when there are no notifications so controls stay balanced.
+    gtk_widget_set_visible (data->clear_btn, TRUE);
     gtk_widget_set_sensitive (data->clear_btn, !notifs.empty () ? TRUE : FALSE);
   }
 }
@@ -607,17 +699,19 @@ calendar_rebuild (CalendarData *data)
       gtk_widget_add_css_class (button, "calendar-day");
       gtk_widget_set_halign (button, GTK_ALIGN_CENTER);
       gtk_widget_set_valign (button, GTK_ALIGN_CENTER);
-      if (col == 0 || col == 6)
+      const bool is_today = (y == now_y && m == now_m && d == now_d);
+      const bool is_weekend = (col == 0 || col == 6);
+      if (is_weekend)
         gtk_widget_add_css_class (button, "calendar-weekend");
-      if (m == data->selected_month + 1)
-        gtk_widget_add_css_class (button, "calendar-weekday");
       else
+        gtk_widget_add_css_class (button, "calendar-weekday");
+      if (m != data->selected_month + 1)
         gtk_widget_add_css_class (button, "calendar-other-month");
-      if (y == now_y && m == now_m && d == now_d)
+      if (is_today)
         gtk_widget_add_css_class (button, "calendar-today");
 
       if (y == data->selected_year && m == data->selected_month + 1 &&
-          d == data->selected_day) {
+          d == data->selected_day && !is_today) {
         gtk_widget_add_css_class (button, "selected");
         gtk_widget_set_state_flags (button, GTK_STATE_FLAG_SELECTED, FALSE);
       } else {
@@ -642,6 +736,9 @@ calendar_rebuild (CalendarData *data)
   g_date_time_unref (iter);
   g_date_time_unref (first);
   g_date_time_unref (now);
+
+  update_today_button_reactive (data);
+  update_events_heading (data);
 }
 
 GtkWidget *
@@ -660,6 +757,7 @@ winome_calendar_new (void)
 
   data->grid = gtk_grid_new ();
   gtk_widget_add_css_class (data->grid, "calendar-grid");
+  gtk_grid_set_column_homogeneous (GTK_GRID (data->grid), TRUE);
   gtk_box_append (GTK_BOX (box), data->grid);
 
   // Month header row: < back | label | forward >
@@ -669,7 +767,7 @@ winome_calendar_new (void)
   g_object_set_data (G_OBJECT (top_box), "row", GINT_TO_POINTER (0));
 
   GtkWidget *back = create_icon_button (
-      "pan-start-symbolic", -1,
+      "pan-start-symbolic", 16,
       "calendar-change-month-back", "pager-button", "icon-button", "flat");
   g_signal_connect (back, "clicked", G_CALLBACK (on_prev_month), data);
   gtk_box_append (GTK_BOX (top_box), back);
@@ -681,7 +779,7 @@ winome_calendar_new (void)
   gtk_box_append (GTK_BOX (top_box), data->month_label);
 
   GtkWidget *forward = create_icon_button (
-      "pan-end-symbolic", -1,
+      "pan-end-symbolic", 16,
       "calendar-change-month-forward", "pager-button", "icon-button", "flat");
   g_signal_connect (forward, "clicked", G_CALLBACK (on_next_month), data);
   gtk_box_append (GTK_BOX (top_box), forward);
@@ -690,6 +788,7 @@ winome_calendar_new (void)
   for (int col = 0; col < 7; col++) {
     GtkWidget *heading = gtk_label_new (weekday_abbrev (col));
     gtk_widget_add_css_class (heading, "calendar-day-heading");
+    gtk_widget_set_halign (heading, GTK_ALIGN_CENTER);
     gtk_grid_attach (GTK_GRID (data->grid), heading, col, 1, 1, 1);
     g_object_set_data (G_OBJECT (heading), "row", GINT_TO_POINTER (1));
   }
@@ -697,7 +796,7 @@ winome_calendar_new (void)
   update_month_label (data);
   calendar_rebuild (data);
 
-  GtkWidget *root = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
+  GtkWidget *root = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
   gtk_widget_set_name (root, "calendarArea");
 
   // --- Left column: notifications / message list & DND controls ---
@@ -760,7 +859,7 @@ winome_calendar_new (void)
   gtk_widget_add_css_class (clear_btn, "message-list-clear-button");
   gtk_widget_add_css_class (clear_btn, "button");
   gtk_widget_set_focus_on_click (clear_btn, FALSE);
-  gtk_widget_set_visible (clear_btn, FALSE);
+  gtk_widget_set_visible (clear_btn, TRUE);
   gtk_widget_set_sensitive (clear_btn, FALSE);
   g_signal_connect (clear_btn, "clicked",
                     G_CALLBACK (on_clear_notifs_clicked), NULL);
@@ -780,6 +879,7 @@ winome_calendar_new (void)
   gtk_widget_set_focus_on_click (today_btn, FALSE);
   g_signal_connect (today_btn, "clicked",
                     G_CALLBACK (on_today_button_clicked), data);
+  data->today_btn = today_btn;
 
   GtkWidget *today_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
   data->day_header_label = gtk_label_new ("");
@@ -811,6 +911,7 @@ winome_calendar_new (void)
   GtkWidget *events_title = gtk_label_new (is_zh () ? "今天" : "Today");
   gtk_widget_add_css_class (events_title, "events-title");
   gtk_widget_set_halign (events_title, GTK_ALIGN_START);
+  data->events_title_label = events_title;
   gtk_box_append (GTK_BOX (events_box), events_title);
 
   GtkWidget *events_list = gtk_box_new (GTK_ORIENTATION_VERTICAL,
@@ -871,9 +972,31 @@ winome_calendar_new (void)
   g_signal_connect (root, "destroy", G_CALLBACK (on_calendar_destroy), NULL);
 
   rebuild_message_list (data, true);
+  update_today_button_reactive (data);
+  update_events_heading (data);
   winome_calendar_refresh (root);
 
   return root;
+}
+
+void
+winome_calendar_reset_to_today (GtkWidget *calendar)
+{
+  if (calendar == nullptr)
+    return;
+  CalendarData *data = static_cast<CalendarData *> (
+      g_object_get_data (G_OBJECT (calendar), "calendar-data"));
+  if (data == nullptr)
+    return;
+  GDateTime *now = g_date_time_new_now_local ();
+  if (now == nullptr)
+    return;
+  data->selected_year = g_date_time_get_year (now);
+  data->selected_month = g_date_time_get_month (now) - 1;
+  data->selected_day = g_date_time_get_day_of_month (now);
+  g_date_time_unref (now);
+  update_month_label (data);
+  calendar_rebuild (data);
 }
 
 void

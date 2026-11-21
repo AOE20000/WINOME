@@ -539,6 +539,103 @@ extract_hbitmap_raw (HBITMAP bmp, RawDecodedIcon *out)
     has_rgb_gt_a = true;
   }
 
+  // Detect Windows 10/11 Start Menu solid-color tile plates returned by
+  // IShellItemImageFactory::GetImage (a large 90-degree opaque colored square
+  // with a small 32x32..64x64 icon centered inside it) and crop/round the
+  // excess plate margin so the icon renders at full GNOME scale.
+  if (w >= 64 && h == w) {
+    const uint8_t b0 = buf[0];
+    const uint8_t g0 = buf[1];
+    const uint8_t r0 = buf[2];
+    const uint8_t a0 = buf[3];
+    auto matches_plate = [&] (int px, int py, int tol = 4) -> bool {
+      const uint8_t *p = buf + ((size_t)py * (size_t)w + (size_t)px) * 4;
+      return p[3] >= 248 && std::abs ((int)p[0] - (int)b0) <= tol &&
+             std::abs ((int)p[1] - (int)g0) <= tol &&
+             std::abs ((int)p[2] - (int)r0) <= tol;
+    };
+    if (a0 >= 248 && matches_plate (w - 1, 0) && matches_plate (0, h - 1) &&
+        matches_plate (w - 1, h - 1)) {
+      int border = std::max (w / 7, 6);
+      int border_total = 0;
+      int border_match = 0;
+      int min_x = w, min_y = h, max_x = -1, max_y = -1;
+      for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+          bool in_border =
+              (x < border || x >= w - border || y < border || y >= h - border);
+          bool is_plate = matches_plate (x, y, 6);
+          if (in_border) {
+            ++border_total;
+            if (is_plate)
+              ++border_match;
+          } else if (!is_plate) {
+            min_x = std::min (min_x, x);
+            min_y = std::min (min_y, y);
+            max_x = std::max (max_x, x);
+            max_y = std::max (max_y, y);
+          }
+        }
+      }
+      int glyph_w = (max_x >= min_x) ? (max_x - min_x + 1) : 0;
+      int glyph_h = (max_y >= min_y) ? (max_y - min_y + 1) : 0;
+      int glyph_span = std::max (glyph_w, glyph_h);
+      if (border_total > 0 && border_match * 100 >= border_total * 97 &&
+          glyph_span >= 16 && glyph_span <= (w * 72) / 100) {
+        int pad = std::max (glyph_span / 5, 6);
+        int crop_side = std::clamp (glyph_span + 2 * pad, w / 2, w);
+        int cx = (min_x + max_x) / 2;
+        int cy = (min_y + max_y) / 2;
+        int x0 = std::clamp (cx - crop_side / 2, 0, w - crop_side);
+        int y0 = std::clamp (cy - crop_side / 2, 0, h - crop_side);
+        size_t crop_bytes = (size_t)crop_side * (size_t)crop_side * 4;
+        auto *cropped = static_cast<uint8_t *> (g_malloc (crop_bytes));
+        const float radius = crop_side * 0.22f;
+        const float r_inner = std::max (radius - 1.0f, 1.0f);
+        for (int cy_i = 0; cy_i < crop_side; ++cy_i) {
+          for (int cx_i = 0; cx_i < crop_side; ++cx_i) {
+            const uint8_t *src_p =
+                buf + ((size_t)(y0 + cy_i) * (size_t)w + (size_t)(x0 + cx_i)) * 4;
+            uint8_t *dst_p =
+                cropped + ((size_t)cy_i * (size_t)crop_side + (size_t)cx_i) * 4;
+            float dx = 0.0f;
+            if (cx_i < radius)
+              dx = radius - (cx_i + 0.5f);
+            else if (cx_i >= crop_side - radius)
+              dx = (cx_i + 0.5f) - (crop_side - radius);
+            float dy = 0.0f;
+            if (cy_i < radius)
+              dy = radius - (cy_i + 0.5f);
+            else if (cy_i >= crop_side - radius)
+              dy = (cy_i + 0.5f) - (crop_side - radius);
+            float dist = std::sqrt (dx * dx + dy * dy);
+            float cov = 1.0f;
+            if (dist >= radius)
+              cov = 0.0f;
+            else if (dist > r_inner)
+              cov = (radius - dist) / (radius - r_inner);
+            if (has_rgb_gt_a) {
+              dst_p[0] = src_p[0];
+              dst_p[1] = src_p[1];
+              dst_p[2] = src_p[2];
+              dst_p[3] = static_cast<uint8_t> (src_p[3] * cov + 0.5f);
+            } else {
+              dst_p[0] = static_cast<uint8_t> (src_p[0] * cov + 0.5f);
+              dst_p[1] = static_cast<uint8_t> (src_p[1] * cov + 0.5f);
+              dst_p[2] = static_cast<uint8_t> (src_p[2] * cov + 0.5f);
+              dst_p[3] = static_cast<uint8_t> (src_p[3] * cov + 0.5f);
+            }
+          }
+        }
+        g_free (buf);
+        buf = cropped;
+        w = crop_side;
+        h = crop_side;
+        byte_len = crop_bytes;
+      }
+    }
+  }
+
   out->width = w;
   out->height = h;
   out->unpremultiplied = has_rgb_gt_a;
@@ -2315,20 +2412,48 @@ app_icon_decode_entry_raw (const AppEntry &entry, int size)
     return raw;
 
   bool ok = false;
-  if (!entry.launch_path.empty ())
+  auto try_extract_pe_icon = [&] (const std::wstring &pe_path, int idx,
+                                  int min_accept_px) -> bool {
+    if (pe_path.empty () || pe_path.rfind (L"shell:", 0) == 0)
+      return false;
+    HICON hi = nullptr;
+    UINT icon_id = 0;
+    UINT extracted = PrivateExtractIconsW (pe_path.c_str (), idx, size, size,
+                                           &hi, &icon_id, 1, 0);
+    if (extracted > 0 && extracted != 0xFFFFFFFFu && hi != nullptr) {
+      RawDecodedIcon candidate;
+      bool dec = extract_hicon_raw (hi, &candidate);
+      DestroyIcon (hi);
+      if (dec && candidate.width >= min_accept_px &&
+          candidate.height >= min_accept_px) {
+        app_icon_raw_clear (raw);
+        raw.width = candidate.width;
+        raw.height = candidate.height;
+        raw.unpremultiplied = candidate.unpremultiplied;
+        raw.bytes = candidate.bytes;
+        candidate.bytes = nullptr;
+        return true;
+      }
+      app_icon_raw_clear (candidate);
+    }
+    return false;
+  };
+
+  // Prefer extracting the true high-res unplated .ico/.exe icon resource first
+  // for desktop shortcuts so Explorer's .lnk handler doesn't wrap a solid
+  // Start Menu tile plate around desktop apps (e.g. Blender, PowerShell).
+  if (!entry.is_uwp) {
+    if (!entry.icon_path.empty ())
+      ok = try_extract_pe_icon (entry.icon_path, entry.icon_index, 48);
+    if (!ok && !entry.target_exe.empty ())
+      ok = try_extract_pe_icon (entry.target_exe, 0, 48);
+  }
+  if (!ok && !entry.launch_path.empty ())
     ok = load_shell_image_raw_for_path (entry.launch_path, size, &raw);
   if (!ok && !entry.target_exe.empty ())
     ok = load_shell_image_raw_for_path (entry.target_exe, size, &raw);
   if (!ok && !entry.icon_path.empty ()) {
-    HICON hi = nullptr;
-    UINT icon_id = 0;
-    UINT extracted = PrivateExtractIconsW (
-        entry.icon_path.c_str (), entry.icon_index, size, size, &hi, &icon_id,
-        1, 0);
-    if (extracted > 0 && extracted != 0xFFFFFFFFu && hi != nullptr) {
-      ok = extract_hicon_raw (hi, &raw);
-      DestroyIcon (hi);
-    }
+    ok = try_extract_pe_icon (entry.icon_path, entry.icon_index, 16);
     if (!ok) {
       HICON fallback = nullptr;
       if (ExtractIconExW (entry.icon_path.c_str (), entry.icon_index, &fallback,

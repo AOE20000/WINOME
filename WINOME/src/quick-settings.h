@@ -28,6 +28,7 @@ GtkWidget *winome_quick_settings_new (void);
 // Create the calendar/date popover widget (opens when the clock is clicked).
 GtkWidget *winome_calendar_new (void);
 void winome_calendar_refresh (GtkWidget *calendar);
+void winome_calendar_reset_to_today (GtkWidget *calendar);
 
 // Refresh battery percentage and volume state in the quick settings.
 void winome_quick_settings_refresh (GtkWidget *quick_settings);

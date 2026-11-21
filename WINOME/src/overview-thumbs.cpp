@@ -23,15 +23,15 @@ namespace winome {
 namespace {
 
 // upstream MAX_THUMBNAIL_SCALE (also enforced by the caller's box_h).
-constexpr double kMaxThumbnailScale = 0.05;
-constexpr double kSpacingFallback = 6.0;    // .workspace-thumbnails spacing
+constexpr double kMaxThumbnailScale = 0.08;
+constexpr double kSpacingFallback = 12.0;   // .workspace-thumbnails spacing
 constexpr double kPaddingFallback = 6.0;    // .workspace-thumbnails padding
-constexpr double kThumbRadiusFallback = 4.0;
+constexpr double kThumbRadiusFallback = 6.0;
 // .workspace-thumbnail-indicator: border shorthand values are not directly
 // queryable through the St engine; the accent color matches the fixed
 // -st-accent-color default used elsewhere in WINOME.
 constexpr double kIndicatorWidthFallback = 3.0;
-constexpr double kIndicatorRadiusFallback = 8.0;
+constexpr double kIndicatorRadiusFallback = 9.0;
 
 struct ThumbRect {
   double x, y, w, h;
@@ -100,16 +100,16 @@ resolve_theme (WinomeThumbs *self)
   StEngine::Node box (*engine, nullptr, "", "workspace-thumbnails", "");
   double v = 0;
   if (box.lookup_length ("spacing", &v) && v > 0)
-    self->spacing = v;
+    self->spacing = std::max (v, 10.0);
   if (box.lookup_length ("padding", &v) && v >= 0)
-    self->padding = v;
+    self->padding = std::max (v, 6.0);
 
   StEngine::Node thumb (*engine, &box, "", "workspace-thumbnail", "");
   std::string color;
   if (thumb.lookup_color ("background-color", &color))
     gdk_rgba_parse (&self->pill_color, color.c_str ());
   if (thumb.lookup_length ("border-radius", &v) && v > 0)
-    self->thumb_radius = v;
+    self->thumb_radius = std::max (v, 5.0);
 }
 
 // --- snapshot ------------------------------------------------------------------
@@ -123,8 +123,8 @@ winome_thumbs_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
   if (self->pills.empty ())
     return;
 
-  // .workspace-thumbnail pills: the wallpaper drawn cover-style inside a 4px
-  // rounded clip.
+  // .workspace-thumbnail pills: the wallpaper drawn cover-style inside a
+  // rounded clip with a subtle 1px border for crisp definition.
   for (int i = 0; i < (int)self->pills.size (); ++i) {
     const ThumbRect &pill = self->pills[i];
     graphene_rect_t rect;
@@ -155,6 +155,12 @@ winome_thumbs_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
       gtk_snapshot_append_color (snapshot, &self->pill_color, &rect);
 
     gtk_snapshot_pop (snapshot);
+
+    float b_widths[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    GdkRGBA b_col = {1.0f, 1.0f, 1.0f,
+                     (i == self->hover_index) ? 0.22f : 0.10f};
+    GdkRGBA b_cols[4] = {b_col, b_col, b_col, b_col};
+    gtk_snapshot_append_border (snapshot, &clip, b_widths, b_cols);
   }
 
   // Drop-target outline highlight during drag.
