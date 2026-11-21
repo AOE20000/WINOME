@@ -34,10 +34,13 @@ class NativeTaskbar {
   static void suspend_keeper_ms(DWORD ms);
   static void set_primary_cloaked(bool cloaked);
   static bool is_tray_overflow_open();
+  // Immediately re-suppresses the native taskbar after Explorer restarts
+  // (e.g. TaskbarCreated broadcast).
+  static void on_explorer_restarted();
 
  private:
   static std::vector<HWND> find_taskbars(HWND* out_primary = nullptr);
-  static void set_visibility(HWND hwnd, bool visible, int restore_state);
+  static bool set_visibility(HWND hwnd, bool visible, int restore_state);
   static void keeper_loop();
 
   // Set to true while we are suppressing the taskbar. Guarded by the state

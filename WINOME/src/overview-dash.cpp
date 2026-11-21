@@ -22,6 +22,7 @@
 #include "virtual-desktop.h"
 
 #include <gdk/gdk.h>
+#include <gdk/win32/gdkwin32.h>
 #include <dwmapi.h>
 
 #include <shellapi.h>
@@ -703,6 +704,25 @@ make_dash_sep (void)
   return sep;
 }
 
+static void
+promote_dash_popover_hwnd_topmost (GtkWidget *popover)
+{
+  if (popover == nullptr || !gtk_widget_get_visible (popover))
+    return;
+  GdkSurface *surf = gtk_native_get_surface (GTK_NATIVE (popover));
+  if (surf == nullptr)
+    return;
+  HWND hwnd = static_cast<HWND> (gdk_win32_surface_get_handle (surf));
+  if (hwnd != nullptr && IsWindow (hwnd)) {
+    LONG_PTR ex = GetWindowLongPtrW (hwnd, GWL_EXSTYLE);
+    if ((ex & WS_EX_TOPMOST) == 0)
+      SetWindowLongPtrW (hwnd, GWL_EXSTYLE, ex | WS_EX_TOPMOST);
+    SetWindowPos (hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                      SWP_NOOWNERZORDER);
+  }
+}
+
 void
 show_dash_context_menu (WinomeDash *self, int index)
 {
@@ -826,6 +846,7 @@ show_dash_context_menu (WinomeDash *self, int index)
   gtk_popover_set_child (GTK_POPOVER (popover), box);
   g_signal_connect (
       popover, "closed", G_CALLBACK (+[] (GtkPopover *p, gpointer d) {
+        g_print ("[menu] dash closed\n");
         auto *dash = WINOME_DASH (d);
         if (dash->active_menu == GTK_WIDGET (p))
           dash->active_menu = nullptr;
@@ -833,8 +854,25 @@ show_dash_context_menu (WinomeDash *self, int index)
           gtk_widget_unparent (GTK_WIDGET (p));
       }),
       self);
+  g_signal_connect (
+      popover, "map", G_CALLBACK (+[] (GtkWidget *p, gpointer G_GNUC_UNUSED) {
+        promote_dash_popover_hwnd_topmost (p);
+        g_object_ref (p);
+        g_idle_add_full (
+            G_PRIORITY_HIGH_IDLE,
+            [] (gpointer data) -> gboolean {
+              GtkWidget *pop = GTK_WIDGET (data);
+              promote_dash_popover_hwnd_topmost (pop);
+              g_object_unref (pop);
+              return G_SOURCE_REMOVE;
+            },
+            p, nullptr);
+      }),
+      nullptr);
   self->active_menu = popover;
+  g_print ("[menu] dash open index=%d id=%s\n", index, app.id.c_str ());
   gtk_popover_popup (GTK_POPOVER (popover));
+  promote_dash_popover_hwnd_topmost (popover);
 }
 
 void
@@ -893,8 +931,10 @@ on_dash_click (GtkGestureClick *gesture, int n_press, double x, double y,
     return;
 
   if (button == GDK_BUTTON_SECONDARY) {
-    if (index < (int)self->apps.size ())
+    if (index < (int)self->apps.size ()) {
+      gtk_gesture_set_state (GTK_GESTURE (gesture), GTK_EVENT_SEQUENCE_CLAIMED);
       show_dash_context_menu (self, index);
+    }
     return;
   }
 
@@ -1098,11 +1138,23 @@ winome_dash_finalize (GObject *object)
 }
 
 static void
+winome_dash_size_allocate (GtkWidget *widget, int width, int height,
+                           int baseline)
+{
+  GTK_WIDGET_CLASS (winome_dash_parent_class)
+      ->size_allocate (widget, width, height, baseline);
+  WinomeDash *self = WINOME_DASH (widget);
+  if (self->active_menu != nullptr)
+    gtk_popover_present (GTK_POPOVER (self->active_menu));
+}
+
+static void
 winome_dash_class_init (WinomeDashClass *klass)
 {
   GtkWidgetClass *widget_class = GTK_WIDGET_CLASS (klass);
   widget_class->snapshot = winome_dash_snapshot;
   widget_class->measure = winome_dash_measure;
+  widget_class->size_allocate = winome_dash_size_allocate;
 
   GObjectClass *object_class = G_OBJECT_CLASS (klass);
   object_class->dispose = winome_dash_dispose;

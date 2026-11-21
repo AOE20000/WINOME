@@ -344,6 +344,9 @@ void apply_primary_panel_geometry_and_workarea(HWND primary_hwnd,
                 want_work.left, want_work.top, want_work.right, want_work.bottom,
                 current.left, current.top, current.right, current.bottom,
                 canonical_h);
+        // Perform one trailing verify in case Explorer overwrites the workarea
+        // shortly after Shell_TrayWnd / popup deactivation without rebroadcasting.
+        schedule_workarea_retry(220);
       } else {
         g_print("[workarea] SPI_SETWORKAREA failed gle=%lu\n", GetLastError());
       }
@@ -358,8 +361,10 @@ void apply_primary_panel_geometry_and_workarea(HWND primary_hwnd,
       }
       schedule_workarea_retry(g_workarea_guard.remaining_defer_ms(now_ms));
       break;
-    case WorkareaAssertAction::SkipHidden:
     case WorkareaAssertAction::SkipUnchanged:
+      cancel_workarea_retry();
+      break;
+    case WorkareaAssertAction::SkipHidden:
     case WorkareaAssertAction::SkipInvalidMonitor:
       break;
   }
@@ -485,6 +490,10 @@ void CALLBACK fg_win_event_proc(HWINEVENTHOOK hook G_GNUC_UNUSED,
       schedule_drag_trailing_eval();
       return;
     }
+  } else {
+    // Repair workarea before evaluating maximized/fullscreen bounds on focus
+    // changes (e.g. closing an Explorer tray popup or restoring a window).
+    reassert_primary_workarea_and_styles();
   }
   evaluate_fullscreen_state();
 }

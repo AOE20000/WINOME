@@ -482,14 +482,29 @@ void wide_to_utf8(const wchar_t *src, char *dst, int dst_size) {
   WideCharToMultiByte(CP_UTF8, 0, src, -1, dst, dst_size, nullptr, nullptr);
 }
 
+bool s_brightness_ever_available = false;
+
+void update_brightness_capability(bool ok, const char* fail_detail) {
+  if (ok) {
+    s_brightness_ever_available = true;
+    capability_set(SubsystemId::Brightness, CapabilityState::Active);
+    return;
+  }
+  if (!s_brightness_ever_available) {
+    capability_set(SubsystemId::Brightness, CapabilityState::Active,
+                   "No controllable display brightness hardware (desktop/no DDC/CI)");
+  } else {
+    capability_set(SubsystemId::Brightness, CapabilityState::Degraded,
+                   fail_detail != nullptr ? fail_detail : "Display brightness failure");
+  }
+}
+
 } // namespace
 
 bool has_brightness_control() {
   double value = 0.0;
-  bool ok = get_lcd_brightness(&value) || get_dxva2_brightness(&value);
-  capability_set(SubsystemId::Brightness,
-                 ok ? CapabilityState::Active : CapabilityState::Degraded,
-                 ok ? std::string{} : "No LCD IOCTL or DDC/CI display brightness device");
+  const bool ok = get_lcd_brightness(&value) || get_dxva2_brightness(&value);
+  update_brightness_capability(ok, "Display brightness unavailable");
   return ok;
 }
 
@@ -497,13 +512,12 @@ bool get_brightness(double* out) {
   double value = s_cached_brightness;
   if (get_lcd_brightness(&value) || get_dxva2_brightness(&value)) {
     s_cached_brightness = value;
-    capability_set(SubsystemId::Brightness, CapabilityState::Active);
+    update_brightness_capability(true, nullptr);
     if (out != nullptr)
       *out = value;
     return true;
   }
-  capability_set(SubsystemId::Brightness, CapabilityState::Degraded,
-                 "Display brightness read failed");
+  update_brightness_capability(false, "Display brightness read failed");
   return false;
 }
 
@@ -511,9 +525,7 @@ bool set_brightness(double fraction) {
   double clamped = std::clamp(fraction, 0.0, 1.0);
   s_cached_brightness = clamped;
   bool ok = set_lcd_brightness(clamped) || set_dxva2_brightness(clamped);
-  capability_set(SubsystemId::Brightness,
-                 ok ? CapabilityState::Active : CapabilityState::Degraded,
-                 ok ? std::string{} : "Display brightness write failed");
+  update_brightness_capability(ok, "Display brightness write failed");
   return ok;
 }
 

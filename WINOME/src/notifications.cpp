@@ -395,6 +395,20 @@ bool media_equals(const WinomeMediaInfo& a, const WinomeMediaInfo& b) {
          a.album == b.album && a.app_id == b.app_id;
 }
 
+bool sys_notifs_equal(const std::vector<WinomeSystemNotification>& a,
+                      const std::vector<WinomeSystemNotification>& b) {
+  if (a.size() != b.size())
+    return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i].id != b[i].id || a[i].timestamp_unix != b[i].timestamp_unix ||
+        a[i].app_name != b[i].app_name || a[i].title != b[i].title ||
+        a[i].body != b[i].body) {
+      return false;
+    }
+  }
+  return true;
+}
+
 gboolean apply_poll_on_main(gpointer user_data) {
   auto* data = static_cast<PollApplyData*>(user_data);
   if (!g_running.load())
@@ -484,10 +498,10 @@ gboolean apply_poll_on_main(gpointer user_data) {
     show_banner_main(newly_arrived.front());
 
   // Adapt background WinRT polling cadence: 2s when active media or OS toast
-  // access is permitted, relaxing to 6s when idle & toast access is denied.
+  // access is permitted, relaxing to 12s when idle & toast access is denied.
   g_toast_allowed_last.store(data->toast_allowed, std::memory_order_release);
   g_media_active_last.store(data->media.active, std::memory_order_release);
-  const int want_sec = (data->toast_allowed || data->media.active) ? 2 : 6;
+  const int want_sec = (data->toast_allowed || data->media.active) ? 2 : 12;
   if (g_poll_timer_id != 0 && want_sec != g_poll_interval_sec) {
     g_source_remove(g_poll_timer_id);
     g_poll_interval_sec = want_sec;
@@ -499,6 +513,12 @@ gboolean apply_poll_on_main(gpointer user_data) {
 }
 
 void notif_worker_main() {
+  bool has_last_poll = false;
+  WinomeMediaInfo last_media{};
+  bool last_toast_allowed = false;
+  bool last_got_notifs = false;
+  std::vector<WinomeSystemNotification> last_notifs;
+
   for (;;) {
     bool do_poll = false;
     bool do_clear = false;
@@ -539,9 +559,29 @@ void notif_worker_main() {
       payload->got_notifs =
           winrt_get_notifications(&payload->sys_notifs, &allowed);
       payload->toast_allowed = allowed;
-      g_idle_add_full(
-          G_PRIORITY_DEFAULT_IDLE, apply_poll_on_main, payload,
-          +[](gpointer ud) { delete static_cast<PollApplyData*>(ud); });
+
+      const bool unchanged =
+          has_last_poll &&
+          media_equals(last_media, payload->media) &&
+          last_toast_allowed == payload->toast_allowed &&
+          last_got_notifs == payload->got_notifs &&
+          (!payload->got_notifs ||
+           sys_notifs_equal(last_notifs, payload->sys_notifs));
+      if (unchanged) {
+        delete payload;
+      } else {
+        has_last_poll = true;
+        last_media = payload->media;
+        last_toast_allowed = payload->toast_allowed;
+        last_got_notifs = payload->got_notifs;
+        if (payload->got_notifs)
+          last_notifs = payload->sys_notifs;
+        else
+          last_notifs.clear();
+        g_idle_add_full(
+            G_PRIORITY_DEFAULT_IDLE, apply_poll_on_main, payload,
+            +[](gpointer ud) { delete static_cast<PollApplyData*>(ud); });
+      }
     }
   }
 }

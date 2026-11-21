@@ -155,95 +155,23 @@ winome_thumbs_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
       gtk_snapshot_append_color (snapshot, &self->pill_color, &rect);
 
     gtk_snapshot_pop (snapshot);
-
-    // Subtle close badge ('x') at top-right corner when hovering an extra pill.
-    if (self->can_manage && self->pills.size () > 1 && i == self->hover_index) {
-      double br = 6.5;
-      double bx = pill.x + pill.w - br - 3.0;
-      double by = pill.y + br + 3.0;
-      graphene_rect_t badge;
-      graphene_rect_init (&badge, (float)(bx - br), (float)(by - br),
-                          (float)(2 * br), (float)(2 * br));
-      GskRoundedRect circle;
-      gsk_rounded_rect_init_from_rect (&circle, &badge, (float)br);
-      gtk_snapshot_push_rounded_clip (snapshot, &circle);
-      GdkRGBA badge_bg = self->hover_close
-                             ? (GdkRGBA){0.85f, 0.22f, 0.22f, 0.95f}
-                             : (GdkRGBA){0.12f, 0.12f, 0.14f, 0.85f};
-      gtk_snapshot_append_color (snapshot, &badge_bg, &badge);
-      gtk_snapshot_pop (snapshot);
-
-      cairo_t *cr = gtk_snapshot_append_cairo (snapshot, &badge);
-      cairo_set_source_rgba (cr, 1.0, 1.0, 1.0, 0.95);
-      cairo_set_line_width (cr, 1.5);
-      cairo_set_line_cap (cr, CAIRO_LINE_CAP_ROUND);
-      double arm = 2.6;
-      cairo_move_to (cr, bx - arm, by - arm);
-      cairo_line_to (cr, bx + arm, by + arm);
-      cairo_move_to (cr, bx + arm, by - arm);
-      cairo_line_to (cr, bx - arm, by + arm);
-      cairo_stroke (cr);
-      cairo_destroy (cr);
-    }
-  }
-
-  // Optional '+' New Desktop pill.
-  if (self->has_add_pill) {
-    const ThumbRect &ap = self->add_pill;
-    graphene_rect_t rect;
-    graphene_rect_init (&rect, (float)ap.x, (float)ap.y, (float)ap.w,
-                        (float)ap.h);
-    GskRoundedRect clip;
-    gsk_rounded_rect_init_from_rect (&clip, &rect,
-                                     (float)self->thumb_radius);
-    gtk_snapshot_push_rounded_clip (snapshot, &clip);
-    bool hot = (self->hover_index == (int)self->pills.size () ||
-                self->drop_target == (int)self->pills.size ());
-    GdkRGBA bg = hot ? (GdkRGBA){0.35f, 0.35f, 0.39f, 0.92f}
-                     : (GdkRGBA){0.22f, 0.22f, 0.25f, 0.82f};
-    gtk_snapshot_append_color (snapshot, &bg, &rect);
-    gtk_snapshot_pop (snapshot);
-
-    cairo_t *cr = gtk_snapshot_append_cairo (snapshot, &rect);
-    cairo_set_source_rgba (cr, 0.96, 0.96, 0.98, 0.92);
-    cairo_set_line_width (cr, 2.0);
-    cairo_set_line_cap (cr, CAIRO_LINE_CAP_ROUND);
-    double cx = ap.x + ap.w / 2.0;
-    double cy = ap.y + ap.h / 2.0;
-    double arm = std::min (ap.w, ap.h) * 0.22;
-    cairo_move_to (cr, cx - arm, cy);
-    cairo_line_to (cr, cx + arm, cy);
-    cairo_move_to (cr, cx, cy - arm);
-    cairo_line_to (cr, cx, cy + arm);
-    cairo_stroke (cr);
-    cairo_destroy (cr);
   }
 
   // Drop-target outline highlight during drag.
   if (self->drop_target >= 0 &&
-      self->drop_target <= (int)self->pills.size ()) {
-    ThumbRect tr{};
-    bool ok = false;
-    if (self->drop_target < (int)self->pills.size ()) {
-      tr = self->pills[self->drop_target];
-      ok = true;
-    } else if (self->has_add_pill) {
-      tr = self->add_pill;
-      ok = true;
-    }
-    if (ok) {
-      double bw = self->indicator_width;
-      graphene_rect_t rect;
-      graphene_rect_init (&rect, (float)(tr.x - bw), (float)(tr.y - bw),
-                          (float)(tr.w + 2 * bw), (float)(tr.h + 2 * bw));
-      GskRoundedRect outline;
-      gsk_rounded_rect_init_from_rect (&outline, &rect,
-                                       (float)self->indicator_radius);
-      float widths[4] = {(float)bw, (float)bw, (float)bw, (float)bw};
-      GdkRGBA hi = {0.48f, 0.72f, 0.98f, 1.0f};
-      GdkRGBA colors[4] = {hi, hi, hi, hi};
-      gtk_snapshot_append_border (snapshot, &outline, widths, colors);
-    }
+      self->drop_target < (int)self->pills.size ()) {
+    const ThumbRect &tr = self->pills[self->drop_target];
+    double bw = self->indicator_width;
+    graphene_rect_t rect;
+    graphene_rect_init (&rect, (float)(tr.x - bw), (float)(tr.y - bw),
+                        (float)(tr.w + 2 * bw), (float)(tr.h + 2 * bw));
+    GskRoundedRect outline;
+    gsk_rounded_rect_init_from_rect (&outline, &rect,
+                                     (float)self->indicator_radius);
+    float widths[4] = {(float)bw, (float)bw, (float)bw, (float)bw};
+    GdkRGBA hi = {0.48f, 0.72f, 0.98f, 1.0f};
+    GdkRGBA colors[4] = {hi, hi, hi, hi};
+    gtk_snapshot_append_border (snapshot, &outline, widths, colors);
   }
 
   // .workspace-thumbnail-indicator: 3px accent frame allocated AROUND the
@@ -312,30 +240,15 @@ winome_thumbs_measure (GtkWidget *widget, GtkOrientation orientation,
 
 // --- hover & clicks -----------------------------------------------------------
 
-static bool
-point_in_close_badge (WinomeThumbs *self, int index, double x, double y)
-{
-  if (!self->can_manage || self->pills.size () <= 1 || index < 0 ||
-      index >= (int)self->pills.size ()) {
-    return false;
-  }
-  const ThumbRect &pill = self->pills[index];
-  double br = 8.0; // generous click target around the 6.5px visual badge
-  double bx = pill.x + pill.w - 9.5;
-  double by = pill.y + 9.5;
-  return x >= bx - br && x <= bx + br && y >= by - br && y <= by + br;
-}
-
 static void
 winome_thumbs_motion (GtkEventControllerMotion *motion G_GNUC_UNUSED, double x,
                       double y, gpointer user_data)
 {
   WinomeThumbs *self = WINOME_THUMBS (user_data);
   int hit = overview_thumbs_drop_target_at (GTK_WIDGET (self), x, y);
-  bool over_close = point_in_close_badge (self, hit, x, y);
-  if (hit != self->hover_index || over_close != self->hover_close) {
+  if (hit != self->hover_index || self->hover_close) {
     self->hover_index = hit;
-    self->hover_close = over_close;
+    self->hover_close = false;
     gtk_widget_queue_draw (GTK_WIDGET (self));
   }
 }
@@ -365,21 +278,7 @@ winome_thumbs_clicked (GtkGestureClick *gesture, int n_press, double x,
   if (hit < 0)
     return;
 
-  if (self->has_add_pill && hit == (int)self->pills.size ()) {
-    if (button == GDK_BUTTON_PRIMARY && self->add_cb != nullptr)
-      self->add_cb (self->manage_data);
-    return;
-  }
-
   if (hit < (int)self->pills.size ()) {
-    if ((button == GDK_BUTTON_MIDDLE ||
-         (button == GDK_BUTTON_PRIMARY &&
-          point_in_close_badge (self, hit, x, y))) &&
-        self->can_manage && self->pills.size () > 1 &&
-        self->remove_cb != nullptr) {
-      self->remove_cb (hit, self->manage_data);
-      return;
-    }
     if (button == GDK_BUTTON_PRIMARY && self->click_cb != nullptr)
       self->click_cb (hit, self->click_data);
   }
@@ -598,17 +497,25 @@ int
 overview_thumbs_drop_target_at (GtkWidget *thumbs, double x, double y)
 {
   WinomeThumbs *self = WINOME_THUMBS (thumbs);
+  if (self->pills.empty ())
+    return -1;
+
+  const double v_top = self->pills[0].y - self->padding - 6.0;
+  const double v_bot =
+      self->pills[0].y + self->pills[0].h + self->padding + 6.0;
+  if (y < v_top || y > v_bot)
+    return -1;
+
   for (int i = 0; i < (int)self->pills.size (); ++i) {
     const ThumbRect &pill = self->pills[i];
-    if (x >= pill.x && x <= pill.x + pill.w && y >= pill.y &&
-        y <= pill.y + pill.h) {
+    const double left =
+        pill.x - (i == 0 ? self->padding + 10.0 : self->spacing * 0.5);
+    const double right =
+        pill.x + pill.w +
+        (i + 1 == (int)self->pills.size () ? self->padding + 10.0
+                                           : self->spacing * 0.5);
+    if (x >= left && x <= right)
       return i;
-    }
-  }
-  if (self->has_add_pill) {
-    const ThumbRect &ap = self->add_pill;
-    if (x >= ap.x && x <= ap.x + ap.w && y >= ap.y && y <= ap.y + ap.h)
-      return (int)self->pills.size ();
   }
   return -1;
 }

@@ -71,25 +71,31 @@ UCRT_PREFIX="/ucrt64"
 
 BUNDLE_NAME="WINOME-portable"
 BUNDLE_DIR="$OUT_DIR/$BUNDLE_NAME"
+STAGE_DIR="$OUT_DIR/.${BUNDLE_NAME}-staging"
 ZIP_PATH="$OUT_DIR/WINOME-win64-portable.zip"
 
-info "Staging bundle in $BUNDLE_DIR..."
-rm -rf "$BUNDLE_DIR"
-mkdir -p "$BUNDLE_DIR"
+cleanup_stage() {
+  rm -rf "$STAGE_DIR" 2>/dev/null || true
+}
+trap cleanup_stage EXIT
+
+info "Staging bundle via temporary directory $STAGE_DIR (preserving $BUNDLE_DIR in-place)..."
+rm -rf "$STAGE_DIR"
+mkdir -p "$STAGE_DIR" "$BUNDLE_DIR"
 
 # 1. Main executable, winome-ctl.exe, and GLib/GTK Windows helper binaries
-cp -f "$EXE_SRC" "$BUNDLE_DIR/winome.exe"
-cp -f "$CTL_SRC" "$BUNDLE_DIR/winome-ctl.exe"
+cp -f "$EXE_SRC" "$STAGE_DIR/winome.exe"
+cp -f "$CTL_SRC" "$STAGE_DIR/winome-ctl.exe"
 for helper in gdbus.exe gspawn-win64-helper.exe gspawn-win64-helper-console.exe; do
   if [ -f "$UCRT_PREFIX/bin/$helper" ]; then
-    cp -f "$UCRT_PREFIX/bin/$helper" "$BUNDLE_DIR/$helper"
+    cp -f "$UCRT_PREFIX/bin/$helper" "$STAGE_DIR/$helper"
   fi
 done
 
 # 2. GdkPixbuf loaders (DLLs only, normalized relative loaders.cache)
 PIXBUF_REL="lib/gdk-pixbuf-2.0/2.10.0"
 PIXBUF_SRC="$UCRT_PREFIX/$PIXBUF_REL"
-PIXBUF_DST="$BUNDLE_DIR/$PIXBUF_REL"
+PIXBUF_DST="$STAGE_DIR/$PIXBUF_REL"
 [ -d "$PIXBUF_SRC/loaders" ] || fail "Missing gdk-pixbuf loaders: $PIXBUF_SRC/loaders"
 
 mkdir -p "$PIXBUF_DST/loaders"
@@ -113,7 +119,7 @@ fi
 
 # 3. Transitive /ucrt64/bin/*.dll closure across winome.exe, helpers, and loaders
 info "Resolving and copying transitive UCRT64 DLL dependencies..."
-DLL_COUNT="$(python3 - "$(cygpath -m "$BUNDLE_DIR")" "$(cygpath -m "$UCRT_PREFIX/bin")" << 'PYEOF'
+DLL_COUNT="$(python3 - "$(cygpath -m "$STAGE_DIR")" "$(cygpath -m "$UCRT_PREFIX/bin")" << 'PYEOF'
 import os
 import re
 import shutil
@@ -162,7 +168,7 @@ DLL_COUNT="${DLL_COUNT//$'\r'/}"
 ok "Copied $DLL_COUNT UCRT64 runtime DLLs and $LOADER_COUNT gdk-pixbuf loaders"
 
 # 4. GLib schemas (compile cleanly inside staging dir)
-SCHEMAS_DST="$BUNDLE_DIR/share/glib-2.0/schemas"
+SCHEMAS_DST="$STAGE_DIR/share/glib-2.0/schemas"
 mkdir -p "$SCHEMAS_DST"
 if [ -d "$UCRT_PREFIX/share/glib-2.0/schemas" ]; then
   cp -f "$UCRT_PREFIX/share/glib-2.0/schemas/"*.xml "$SCHEMAS_DST/" 2>/dev/null || true
@@ -176,8 +182,8 @@ fi
 
 # 5. Icon themes (Adwaita symbolic + scalable + hicolor index)
 ADWAITA_SRC="$UCRT_PREFIX/share/icons/Adwaita"
-ADWAITA_DST="$BUNDLE_DIR/share/icons/Adwaita"
-mkdir -p "$ADWAITA_DST" "$BUNDLE_DIR/share/icons/hicolor"
+ADWAITA_DST="$STAGE_DIR/share/icons/Adwaita"
+mkdir -p "$ADWAITA_DST" "$STAGE_DIR/share/icons/hicolor"
 
 for f in index.theme icon-theme.cache; do
   [ -f "$ADWAITA_SRC/$f" ] && cp -f "$ADWAITA_SRC/$f" "$ADWAITA_DST/"
@@ -186,28 +192,28 @@ for sub in symbolic scalable; do
   [ -d "$ADWAITA_SRC/$sub" ] && cp -r "$ADWAITA_SRC/$sub" "$ADWAITA_DST/"
 done
 if [ -f "$UCRT_PREFIX/share/icons/hicolor/index.theme" ]; then
-  cp -f "$UCRT_PREFIX/share/icons/hicolor/index.theme" "$BUNDLE_DIR/share/icons/hicolor/"
+  cp -f "$UCRT_PREFIX/share/icons/hicolor/index.theme" "$STAGE_DIR/share/icons/hicolor/"
 fi
 
 # 6. Fontconfig configuration
 if [ -d "$UCRT_PREFIX/etc/fonts" ]; then
-  mkdir -p "$BUNDLE_DIR/etc"
-  cp -r "$UCRT_PREFIX/etc/fonts" "$BUNDLE_DIR/etc/"
+  mkdir -p "$STAGE_DIR/etc"
+  cp -r "$UCRT_PREFIX/etc/fonts" "$STAGE_DIR/etc/"
 fi
 
 # 7. License notices & sample out-of-process stdio JSON plugin
-[ -f "$ROOT/LICENSE" ] && cp -f "$ROOT/LICENSE" "$BUNDLE_DIR/LICENSE"
-[ -f "$PROJ/THIRD-PARTY-NOTICES" ] && cp -f "$PROJ/THIRD-PARTY-NOTICES" "$BUNDLE_DIR/THIRD-PARTY-NOTICES"
+[ -f "$ROOT/LICENSE" ] && cp -f "$ROOT/LICENSE" "$STAGE_DIR/LICENSE"
+[ -f "$PROJ/THIRD-PARTY-NOTICES" ] && cp -f "$PROJ/THIRD-PARTY-NOTICES" "$STAGE_DIR/THIRD-PARTY-NOTICES"
 if [ -d "$PROJ/examples/plugins" ]; then
-  mkdir -p "$BUNDLE_DIR/examples"
-  cp -r "$PROJ/examples/plugins" "$BUNDLE_DIR/examples/"
+  mkdir -p "$STAGE_DIR/examples"
+  cp -r "$PROJ/examples/plugins" "$STAGE_DIR/examples/"
 fi
 
 # 8. Helper scripts and portable usage note (CRLF line endings for cmd.exe/Notepad)
-printf '@echo off\r\n"%%~dp0winome.exe" --restore\r\n' > "$BUNDLE_DIR/restore-taskbar.bat"
-printf '@echo off\r\n"%%~dp0winome.exe" --settings\r\n' > "$BUNDLE_DIR/open-settings.bat"
+printf '@echo off\r\n"%%~dp0winome.exe" --restore\r\n' > "$STAGE_DIR/restore-taskbar.bat"
+printf '@echo off\r\n"%%~dp0winome.exe" --settings\r\n' > "$STAGE_DIR/open-settings.bat"
 
-python3 - "$(cygpath -m "$BUNDLE_DIR/README.txt")" << 'PYEOF'
+python3 - "$(cygpath -m "$STAGE_DIR/README.txt")" << 'PYEOF'
 import pathlib, sys
 
 text = (
@@ -234,20 +240,61 @@ text = (
 pathlib.Path(sys.argv[1]).write_bytes(text.encode("utf-8"))
 PYEOF
 
-# 9. Verify critical bundle files before archiving
+# 9. Verify critical bundle files in staging dir BEFORE syncing to BUNDLE_DIR
+for req in \
+  "$STAGE_DIR/winome.exe" \
+  "$STAGE_DIR/winome-ctl.exe" \
+  "$STAGE_DIR/libgtk-4-1.dll" \
+  "$STAGE_DIR/libglib-2.0-0.dll" \
+  "$STAGE_DIR/libcairo-2.dll" \
+  "$STAGE_DIR/libstdc++-6.dll" \
+  "$STAGE_DIR/libgcc_s_seh-1.dll" \
+  "$STAGE_DIR/$PIXBUF_REL/loaders.cache" \
+  "$STAGE_DIR/$PIXBUF_REL/loaders/pixbufloader_svg.dll" \
+  "$SCHEMAS_DST/gschemas.compiled" \
+  "$ADWAITA_DST/index.theme" \
+  "$STAGE_DIR/etc/fonts/fonts.conf" \
+  "$STAGE_DIR/restore-taskbar.bat"
+do
+  [ -f "$req" ] || fail "Missing required staged artifact: $req"
+done
+
+# Sync staged files into BUNDLE_DIR in-place without deleting BUNDLE_DIR itself
+# (avoids EBUSY when Windows Explorer or a terminal has BUNDLE_DIR open).
+cp -rf "$STAGE_DIR"/. "$BUNDLE_DIR"/
+
+# Also populate runtime DLLs + assets next to build-release/src/winome.exe and
+# build/src/winome.exe so running Release/Debug binaries directly from Explorer
+# never fails with missing libcairo-2.dll / libstdc++-6.dll / libgcc_s_seh-1.dll.
+for build_src_dir in "$PROJ/build-release/src" "$PROJ/build/src" "$PROJ/build-debug/src"; do
+  if [ -d "$build_src_dir" ]; then
+    cp -lf "$STAGE_DIR/"*.dll "$build_src_dir/" 2>/dev/null || cp -f "$STAGE_DIR/"*.dll "$build_src_dir/"
+    for sub_asset in lib share etc; do
+      if [ -d "$STAGE_DIR/$sub_asset" ]; then
+        cp -rf "$STAGE_DIR/$sub_asset" "$build_src_dir/"
+      fi
+    done
+  fi
+done
+rm -rf "$STAGE_DIR"
+
+# Final check on BUNDLE_DIR
 for req in \
   "$BUNDLE_DIR/winome.exe" \
   "$BUNDLE_DIR/winome-ctl.exe" \
   "$BUNDLE_DIR/libgtk-4-1.dll" \
   "$BUNDLE_DIR/libglib-2.0-0.dll" \
+  "$BUNDLE_DIR/libcairo-2.dll" \
+  "$BUNDLE_DIR/libstdc++-6.dll" \
+  "$BUNDLE_DIR/libgcc_s_seh-1.dll" \
   "$BUNDLE_DIR/$PIXBUF_REL/loaders.cache" \
   "$BUNDLE_DIR/$PIXBUF_REL/loaders/pixbufloader_svg.dll" \
-  "$SCHEMAS_DST/gschemas.compiled" \
-  "$ADWAITA_DST/index.theme" \
+  "$BUNDLE_DIR/share/glib-2.0/schemas/gschemas.compiled" \
+  "$BUNDLE_DIR/share/icons/Adwaita/index.theme" \
   "$BUNDLE_DIR/etc/fonts/fonts.conf" \
   "$BUNDLE_DIR/restore-taskbar.bat"
 do
-  [ -f "$req" ] || fail "Missing required staged artifact: $req"
+  [ -f "$req" ] || fail "Missing required final artifact in $BUNDLE_DIR: $req"
 done
 
 BUNDLE_SIZE="$(du -sh "$BUNDLE_DIR" | cut -f1)"

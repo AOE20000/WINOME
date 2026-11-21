@@ -31,6 +31,11 @@ struct DebugStore {
   bool handlers_installed = false;
   std::string pending_stdout;
   std::string pending_stderr;
+  LogRepeatFolder folder;
+  FILE* last_stream = nullptr;
+  std::wstring log_file_path;
+  uint64_t max_log_bytes = 5ULL * 1024 * 1024;
+  uint64_t bytes_since_rotate_check = 0;
 };
 
 DebugStore& dstore() {
@@ -81,8 +86,101 @@ void push_line_locked(DebugStore& s, const char* explicit_tag, std::string line)
     s.logs.pop_front();
 }
 
-void flush_partial_locked(DebugStore& s, std::string* pending, const char* chunk,
-                          const char* default_tag) {
+std::string make_timestamp_prefix() {
+  SYSTEMTIME st{};
+  GetLocalTime(&st);
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "[%04u-%02u-%02u %02u:%02u:%02u.%03u] ",
+                st.wYear, st.wMonth, st.wDay,
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+  return buf;
+}
+
+void write_lines_to_stream_locked(DebugStore& s, FILE* stream,
+                                  const std::vector<std::string>& lines) {
+  if (stream == nullptr || lines.empty())
+    return;
+  for (const std::string& l : lines) {
+    std::fputs(l.c_str(), stream);
+    std::fputc('\n', stream);
+    s.bytes_since_rotate_check += l.size() + 1;
+  }
+  std::fflush(stream);
+}
+
+void maybe_rotate_log_locked(DebugStore& s) {
+  if (s.log_file_path.empty() || s.max_log_bytes == 0 ||
+      s.bytes_since_rotate_check < 65536) {
+    return;
+  }
+  s.bytes_since_rotate_check = 0;
+
+  WIN32_FILE_ATTRIBUTE_DATA fad{};
+  if (!GetFileAttributesExW(s.log_file_path.c_str(), GetFileExInfoStandard, &fad))
+    return;
+  const ULONGLONG size = (static_cast<ULONGLONG>(fad.nFileSizeHigh) << 32) |
+                         fad.nFileSizeLow;
+  if (size <= s.max_log_bytes)
+    return;
+
+  std::vector<std::string> tail;
+  s.folder.flush(make_timestamp_prefix(), &tail);
+  write_lines_to_stream_locked(s, s.last_stream ? s.last_stream : stdout, tail);
+
+  std::fflush(stdout);
+  std::fflush(stderr);
+  FILE* dummy_out = nullptr;
+  FILE* dummy_err = nullptr;
+  _wfreopen_s(&dummy_out, L"NUL", L"w", stdout);
+  _wfreopen_s(&dummy_err, L"NUL", L"w", stderr);
+
+  std::wstring prev_path = s.log_file_path + L".prev";
+  constexpr wchar_t kLogSuffix[] = L"winome.log";
+  const size_t suffix_len = sizeof(kLogSuffix) / sizeof(wchar_t) - 1;
+  if (s.log_file_path.size() >= suffix_len &&
+      s.log_file_path.compare(s.log_file_path.size() - suffix_len, suffix_len,
+                              kLogSuffix) == 0) {
+    prev_path = s.log_file_path.substr(0, s.log_file_path.size() - suffix_len) +
+                L"winome.prev.log";
+  }
+  MoveFileExW(s.log_file_path.c_str(), prev_path.c_str(),
+              MOVEFILE_REPLACE_EXISTING);
+
+  FILE* new_out = nullptr;
+  FILE* new_err = nullptr;
+  _wfreopen_s(&new_out, s.log_file_path.c_str(), L"a", stdout);
+  _wfreopen_s(&new_err, s.log_file_path.c_str(), L"a", stderr);
+
+  const std::string note = make_timestamp_prefix() + "[log] rotated log file (> max bytes)\n";
+  std::fputs(note.c_str(), stdout);
+  std::fflush(stdout);
+}
+
+void emit_completed_line_locked(DebugStore& s, FILE* stream, const char* default_tag,
+                                std::string line) {
+  while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+    line.pop_back();
+  if (line.empty())
+    return;
+
+  // Flush any folded repeat summary when output switches streams so ordering stays clear.
+  if (s.last_stream != nullptr && s.last_stream != stream) {
+    std::vector<std::string> flushed;
+    s.folder.flush(make_timestamp_prefix(), &flushed);
+    write_lines_to_stream_locked(s, s.last_stream, flushed);
+  }
+  s.last_stream = stream;
+
+  std::vector<std::string> out_lines;
+  s.folder.push(line, make_timestamp_prefix(), &out_lines);
+  write_lines_to_stream_locked(s, stream, out_lines);
+  maybe_rotate_log_locked(s);
+
+  push_line_locked(s, default_tag, std::move(line));
+}
+
+void flush_partial_locked(DebugStore& s, std::string* pending, FILE* stream,
+                          const char* chunk, const char* default_tag) {
   if (chunk == nullptr)
     return;
   pending->append(chunk);
@@ -91,35 +189,31 @@ void flush_partial_locked(DebugStore& s, std::string* pending, const char* chunk
     size_t nl = pending->find('\n', pos);
     if (nl == std::string::npos)
       break;
-    std::string line = pending->substr(pos, nl - pos);
-    push_line_locked(s, default_tag, std::move(line));
+    emit_completed_line_locked(s, stream, default_tag,
+                               pending->substr(pos, nl - pos));
     pos = nl + 1;
   }
   if (pos > 0)
     pending->erase(0, pos);
   if (pending->size() > 4096) {
-    push_line_locked(s, default_tag, *pending);
+    emit_completed_line_locked(s, stream, default_tag, *pending);
     pending->clear();
   }
 }
 
 void glib_print_tee(const gchar* text) {
   if (text != nullptr) {
-    std::fputs(text, stdout);
-    std::fflush(stdout);
     auto& s = dstore();
     std::lock_guard<std::mutex> lock(s.mu);
-    flush_partial_locked(s, &s.pending_stdout, text, nullptr);
+    flush_partial_locked(s, &s.pending_stdout, stdout, text, nullptr);
   }
 }
 
 void glib_printerr_tee(const gchar* text) {
   if (text != nullptr) {
-    std::fputs(text, stderr);
-    std::fflush(stderr);
     auto& s = dstore();
     std::lock_guard<std::mutex> lock(s.mu);
-    flush_partial_locked(s, &s.pending_stderr, text, nullptr);
+    flush_partial_locked(s, &s.pending_stderr, stderr, text, nullptr);
   }
 }
 
@@ -208,6 +302,76 @@ void debug_install_log_capture() {
   s.handlers_installed = true;
   g_set_print_handler(glib_print_tee);
   g_set_printerr_handler(glib_printerr_tee);
+}
+
+void debug_configure_log_rotation(const std::wstring& log_path,
+                                  uint64_t max_bytes) {
+  auto& s = dstore();
+  std::lock_guard<std::mutex> lock(s.mu);
+  s.log_file_path = log_path;
+  s.max_log_bytes = max_bytes;
+  s.bytes_since_rotate_check = 0;
+}
+
+void debug_flush_log_repeats() {
+  auto& s = dstore();
+  std::lock_guard<std::mutex> lock(s.mu);
+  if (!s.pending_stdout.empty()) {
+    emit_completed_line_locked(s, stdout, nullptr, s.pending_stdout);
+    s.pending_stdout.clear();
+  }
+  if (!s.pending_stderr.empty()) {
+    emit_completed_line_locked(s, stderr, nullptr, s.pending_stderr);
+    s.pending_stderr.clear();
+  }
+  std::vector<std::string> flushed;
+  s.folder.flush(make_timestamp_prefix(), &flushed);
+  write_lines_to_stream_locked(s, s.last_stream ? s.last_stream : stdout,
+                               flushed);
+}
+
+bool LogRepeatFolder::has_existing_timestamp(const std::string& line) {
+  if (line.rfind("** (", 0) == 0 || line.rfind("(", 0) == 0)
+    return true;
+  // Matches "[YYYY-MM-DD " prefix written by make_timestamp_prefix().
+  return line.size() >= 13 && line[0] == '[' &&
+         std::isdigit(static_cast<unsigned char>(line[1])) &&
+         line[5] == '-' && line[8] == '-' && line[11] == ' ';
+}
+
+void LogRepeatFolder::push(const std::string& raw_line,
+                           const std::string& timestamp_prefix,
+                           std::vector<std::string>* out_lines) {
+  if (out_lines == nullptr || raw_line.empty())
+    return;
+  if (!last_line_.empty() && raw_line == last_line_) {
+    ++repeat_count_;
+    if (repeat_count_ >= kMaxFoldStreak) {
+      out_lines->push_back(timestamp_prefix + "[log] previous line repeated " +
+                           std::to_string(repeat_count_) + " times");
+      repeat_count_ = 0;
+    }
+    return;
+  }
+
+  flush(timestamp_prefix, out_lines);
+  last_line_ = raw_line;
+  if (has_existing_timestamp(raw_line))
+    out_lines->push_back(raw_line);
+  else
+    out_lines->push_back(timestamp_prefix + raw_line);
+}
+
+void LogRepeatFolder::flush(const std::string& timestamp_prefix,
+                            std::vector<std::string>* out_lines) {
+  if (out_lines == nullptr)
+    return;
+  if (repeat_count_ > 0) {
+    out_lines->push_back(timestamp_prefix + "[log] previous line repeated " +
+                         std::to_string(repeat_count_) + " times");
+    repeat_count_ = 0;
+  }
+  last_line_.clear();
 }
 
 void debug_append_log(const char* tag, const std::string& text) {

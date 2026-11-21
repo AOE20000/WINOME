@@ -31,6 +31,20 @@ struct VtableProfile {
   bool can_manage_desktops = false;
 };
 
+// Tracks exponential backoff and self-healing recovery after transient
+// Explorer/COM failures so a momentary restart does not permanently disable
+// virtual desktops for the rest of the session.
+struct VdReconnectPolicy {
+  bool ever_succeeded = false;
+  uint32_t consecutive_failures = 0;
+  uint64_t backoff_until_ms = 0;
+
+  bool can_attempt (uint64_t now_ms) const;
+  void record_success ();
+  uint64_t record_failure (uint64_t now_ms);
+  void reset_backoff ();
+};
+
 // Pure helper mapping an OS build number to safe IVirtualDesktopManagerInternal
 // vtable slot indices (22621/23H2 vs 26100+ 24H2). Unrecognized builds return
 // can_manage_desktops = false so create/remove are safely disabled.
@@ -111,6 +125,8 @@ void remove_change_listener (DesktopChangedCallback cb, void *user_data);
 // Safe to call from any thread (e.g. WH_KEYBOARD_LL): schedules an immediate
 // desktop-state check and notifies listeners if anything changed.
 void notify_change_hint_async (void);
+// Requests an immediate non-blocking COM snapshot probe for the background worker.
+void probe_now_async (void);
 
 }  // namespace vd
 }  // namespace winome

@@ -849,24 +849,53 @@ window#winomeModalDialogWindow {
   border-left-width: 0;
 }
 
-/* Let App Grid folder dialog size to available viewport height instead of fixed 720px. */
+/* Let App Grid folder dialog size to available viewport height instead of fixed 720px,
+   while preserving GNOME's .app-folder-dialog and .app-folder styling from _app-grid.scss. */
 .app-folder-dialog {
   min-width: 0;
   min-height: 0;
-  border-radius: 32px;
+  border-radius: 56px;
+  background-color: #38383b;
+  color: #fafafb;
+  box-shadow: inset 0 0 0 1px rgba(250, 250, 251, 0.1);
+}
+.app-folder-dialog .folder-name-container {
+  padding: 24px 36px 0 36px;
+}
+.app-folder-dialog .folder-name-container .folder-name-label {
+  font-weight: 800;
+  font-size: 1.818em;
+}
+.app-folder-dialog .overview-tile {
+  border-radius: 24px;
+  padding: 12px;
 }
 #winome-folder-scrim {
-  background-color: rgba(0, 0, 0, 0.35);
-  border-radius: 16px;
+  background-color: transparent;
 }
 .overview-tile.app-folder {
-  background-color: rgba(250, 250, 251, 0.08);
+  color: #fafafb;
+  background-color: #353539;
 }
 .overview-tile.app-folder:hover {
-  background-color: rgba(250, 250, 251, 0.14);
+  color: #fafafb;
+  background-color: #3e3e43;
 }
 .overview-tile.app-folder:active {
-  background-color: rgba(250, 250, 251, 0.20);
+  color: #fafafb;
+  background-color: #4b4b50;
+}
+.overview-tile.app-folder:active:hover {
+  background-color: #54545a;
+}
+.overview-tile.app-folder:checked,
+.overview-tile.app-folder.checked {
+  color: #fafafb;
+  background-color: #48484e;
+}
+.overview-tile.app-folder:checked:hover,
+.overview-tile.app-folder.checked:hover {
+  background-color: #515158;
 }
 """
 

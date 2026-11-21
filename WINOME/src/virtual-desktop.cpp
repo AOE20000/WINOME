@@ -29,6 +29,7 @@
 #include <objbase.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -41,7 +42,41 @@
 namespace winome {
 namespace vd {
 
+bool
+VdReconnectPolicy::can_attempt (uint64_t now_ms) const
+{
+  return now_ms >= backoff_until_ms;
+}
+
+void
+VdReconnectPolicy::record_success ()
+{
+  ever_succeeded = true;
+  consecutive_failures = 0;
+  backoff_until_ms = 0;
+}
+
+uint64_t
+VdReconnectPolicy::record_failure (uint64_t now_ms)
+{
+  static constexpr uint64_t kStepsMs[] = {2000, 5000, 15000, 30000};
+  ++consecutive_failures;
+  const size_t idx = std::min<size_t> (consecutive_failures - 1, 3);
+  const uint64_t delay = kStepsMs[idx];
+  backoff_until_ms = now_ms + delay;
+  return delay;
+}
+
+void
+VdReconnectPolicy::reset_backoff ()
+{
+  consecutive_failures = 0;
+  backoff_until_ms = 0;
+}
+
 namespace {
+
+std::atomic<bool> g_reconnect_reset_requested{false};
 
 // --- GUIDs (upstream interfaces.rs) -----------------------------------------
 
@@ -162,12 +197,12 @@ struct ComState {
   void *manager = nullptr;         // IVirtualDesktopManager
   void *pinned_apps = nullptr;     // IVirtualDesktopPinnedApps
   void *view_collection = nullptr; // IApplicationViewCollection
-  bool disabled = false;
-  bool pin_disabled = false;  // pin services unreachable; pin only, not the
-                              // rest of the module
+  VdReconnectPolicy reconnect;
+  bool pin_disabled = false;       // pin services unreachable; pin only, not the
+                                   // rest of the module
 
   void
-  release ()
+  release (bool drop_provider = false)
   {
     if (internal != nullptr) {
       vrelease (internal);
@@ -185,29 +220,48 @@ struct ComState {
       vrelease (pinned_apps);
       pinned_apps = nullptr;
     }
-    // provider deliberately leaked at process exit: releasing it after
-    // combase's TLS teardown crashes (upstream hit this too).
+    // Only drop provider when actively reconnecting (never at process exit,
+    // where releasing after combase TLS teardown can crash).
+    if (drop_provider && provider != nullptr) {
+      vrelease (provider);
+      provider = nullptr;
+    }
   }
 
   bool
   ensure ()
   {
+    if (g_reconnect_reset_requested.exchange (false, std::memory_order_acq_rel)) {
+      release (true);
+      reconnect.reset_backoff ();
+      pin_disabled = false;
+    }
+
     if (internal != nullptr && manager != nullptr)
       return true;
-    if (disabled)
+
+    const uint64_t now_ms = GetTickCount64 ();
+    if (!reconnect.can_attempt (now_ms))
       return false;
+
+    auto fail_with_backoff = [&] (const char *detail) -> bool {
+      release (true);
+      const uint64_t wait_ms = reconnect.record_failure (now_ms);
+      char msg[160] {};
+      std::snprintf (msg, sizeof (msg), "%s (retry in %llus)", detail,
+                     static_cast<unsigned long long> (wait_ms / 1000));
+      capability_set (SubsystemId::VirtualDesktop, CapabilityState::Degraded,
+                      msg);
+      return false;
+    };
 
     if (provider == nullptr) {
       void *obj = nullptr;
       HRESULT hr = CoCreateInstance (kCLSID_ImmersiveShell, nullptr,
                                      CLSCTX_LOCAL_SERVER,
                                      kIID_IServiceProvider, &obj);
-      if (FAILED (hr) || obj == nullptr) {
-        disabled = true;
-        capability_set (SubsystemId::VirtualDesktop, CapabilityState::Degraded,
-                        "ImmersiveShell unavailable (single-workspace fallback)");
-        return false;
-      }
+      if (FAILED (hr) || obj == nullptr)
+        return fail_with_backoff ("ImmersiveShell unavailable");
       provider = obj;
     }
 
@@ -216,12 +270,8 @@ struct ComState {
       HRESULT hr = vcall<HRESULT> (provider, kSlotQueryService,
                                    &kCLSID_VirtualDesktopManagerInternal,
                                    &kIID_IVirtualDesktopManagerInternal, &obj);
-      if (FAILED (hr) || obj == nullptr) {
-        disabled = true;  // build without this interface; never retry
-        capability_set (SubsystemId::VirtualDesktop, CapabilityState::Degraded,
-                        "IVirtualDesktopManagerInternal unsupported");
-        return false;
-      }
+      if (FAILED (hr) || obj == nullptr)
+        return fail_with_backoff ("IVirtualDesktopManagerInternal unavailable");
       internal = obj;
     }
 
@@ -230,15 +280,12 @@ struct ComState {
       HRESULT hr = vcall<HRESULT> (provider, kSlotQueryService,
                                    &kIID_IVirtualDesktopManager,
                                    &kIID_IVirtualDesktopManager, &obj);
-      if (FAILED (hr) || obj == nullptr) {
-        disabled = true;
-        capability_set (SubsystemId::VirtualDesktop, CapabilityState::Degraded,
-                        "IVirtualDesktopManager unsupported");
-        return false;
-      }
+      if (FAILED (hr) || obj == nullptr)
+        return fail_with_backoff ("IVirtualDesktopManager unavailable");
       manager = obj;
     }
 
+    reconnect.record_success ();
     const uint32_t build = windows_build_number ();
     const VtableProfile prof = vtable_slots_for_build (build);
     char detail_buf[128] {};
@@ -275,7 +322,7 @@ struct ComState {
       HRESULT hr = vcall<HRESULT> (internal, kSlotGetDesktops, &arr);
       if (FAILED (hr) || arr == nullptr) {
         if (recoverable (hr) && attempt == 0) {
-          release ();
+          release (true);
           if (!ensure ())
             return out;
           continue;
@@ -318,7 +365,7 @@ struct ComState {
   {
     if (view_collection != nullptr)
       return true;
-    if (disabled || provider == nullptr)
+    if (provider == nullptr)
       return false;
 
     void *obj = nullptr;
@@ -339,7 +386,7 @@ struct ComState {
   {
     if (pinned_apps != nullptr && ensure_view_collection ())
       return true;
-    if (pin_disabled || disabled || provider == nullptr)
+    if (pin_disabled || provider == nullptr)
       return false;
 
     if (pinned_apps == nullptr) {
@@ -385,7 +432,7 @@ struct ComState {
                                    &view);
       if (FAILED (hr) || view == nullptr) {
         if (recoverable (hr) && attempt == 0) {
-          release ();
+          release (true);
           if (!ensure () || !ensure_pin_services ())
             return false;
           continue;
@@ -411,7 +458,7 @@ struct ComState {
                                    &view);
       if (FAILED (hr) || view == nullptr) {
         if (recoverable (hr) && attempt == 0) {
-          release ();
+          release (true);
           if (!ensure () || !ensure_view_collection ())
             return false;
           continue;
@@ -424,7 +471,7 @@ struct ComState {
       if (FAILED (hr) || arr == nullptr) {
         vrelease (view);
         if (recoverable (hr) && attempt == 0) {
-          release ();
+          release (true);
           if (!ensure () || !ensure_view_collection ())
             return false;
           continue;
@@ -708,6 +755,8 @@ run_on_worker (const std::shared_ptr<Job> &job, bool wait_for_result = true)
 
 // --- Centralized event-driven virtual desktop observer -----------------------
 
+std::atomic<uint64_t> g_mutation_seq{0};
+
 struct ListenerEntry {
   DesktopChangedCallback cb = nullptr;
   void *user_data = nullptr;
@@ -718,6 +767,7 @@ struct ObserverState {
   std::condition_variable cv;
   std::vector<ListenerEntry> listeners;
   DesktopSnapshot snapshot{1, 0, false};
+  uint64_t snapshot_seq = 0;
   std::thread worker;
   bool worker_started = false;
   bool worker_stop = false;
@@ -761,6 +811,8 @@ obs_deliver_main (gpointer user_data)
     s.main_notify_queued = false;
     if (s.listeners.empty () || !s.snapshot.valid)
       return G_SOURCE_REMOVE;
+    if (s.snapshot_seq != g_mutation_seq.load (std::memory_order_acquire))
+      return G_SOURCE_REMOVE;
     copy = s.listeners;
     snap = s.snapshot;
   }
@@ -786,9 +838,21 @@ obs_worker_main (void)
         continue;
     }
 
+    const uint64_t seq_before =
+        g_mutation_seq.load (std::memory_order_acquire);
+
     auto job = std::make_shared<Job> ();
     job->op = Job::Op::Snapshot;
     run_on_worker (job);
+
+    if (g_mutation_seq.load (std::memory_order_acquire) != seq_before) {
+      // A newer desktop switch/create/remove occurred while this snapshot was
+      // queued or executing; discard stale intermediate state and re-probe.
+      std::lock_guard<std::mutex> lock (s.mu);
+      if (!s.worker_stop)
+        s.probe_requested = true;
+      continue;
+    }
 
     DesktopSnapshot fresh;
     if (job->ok && !job->out_desktops.empty ()) {
@@ -800,11 +864,13 @@ obs_worker_main (void)
     bool should_schedule = false;
     {
       std::lock_guard<std::mutex> lock (s.mu);
-      if (!s.worker_stop && fresh.valid) {
+      if (!s.worker_stop && fresh.valid &&
+          g_mutation_seq.load (std::memory_order_acquire) == seq_before) {
         bool changed = !s.snapshot.valid ||
                        s.snapshot.count != fresh.count ||
                        s.snapshot.active_index != fresh.active_index;
         s.snapshot = fresh;
+        s.snapshot_seq = seq_before;
         if (changed && !s.listeners.empty () && !s.main_notify_queued) {
           s.main_notify_queued = true;
           should_schedule = true;
@@ -965,12 +1031,24 @@ window_on_current (HWND hwnd)
 bool
 switch_to (int index)
 {
+  g_mutation_seq.fetch_add (1, std::memory_order_acq_rel);
   auto job = std::make_shared<Job> ();
   job->op = Job::Op::SwitchTo;
   job->in_index = index;
   run_on_worker (job);
-  if (job->ok)
+  const uint64_t seq_after =
+      g_mutation_seq.fetch_add (1, std::memory_order_acq_rel) + 1;
+  if (job->ok) {
+    {
+      ObserverState &s = obs_state ();
+      std::lock_guard<std::mutex> lock (s.mu);
+      if (s.snapshot.valid && index >= 0 && index < s.snapshot.count) {
+        s.snapshot.active_index = index;
+        s.snapshot_seq = seq_after;
+      }
+    }
     obs_schedule_hint_async ();
+  }
   return job->ok;
 }
 
@@ -1000,12 +1078,16 @@ pin_window_async (HWND hwnd)
 void
 reset_circuit_breaker (void)
 {
-  std::lock_guard<std::mutex> lock (g_queue_mu);
-  g_worker_stuck = false;
-  g_queue.clear ();
+  {
+    std::lock_guard<std::mutex> lock (g_queue_mu);
+    g_worker_stuck = false;
+    g_queue.clear ();
+  }
+  g_reconnect_reset_requested.store (true, std::memory_order_release);
   winome::capability_set (winome::SubsystemId::VirtualDesktop,
                           winome::CapabilityState::Active,
                           "manual recovery");
+  obs_schedule_hint_async ();
 }
 
 VtableProfile
@@ -1079,9 +1161,11 @@ move_window_to_desktop (HWND hwnd, int target_index)
 bool
 create_desktop (void)
 {
+  g_mutation_seq.fetch_add (1, std::memory_order_acq_rel);
   auto job = std::make_shared<Job> ();
   job->op = Job::Op::CreateDesktop;
   run_on_worker (job);
+  g_mutation_seq.fetch_add (1, std::memory_order_acq_rel);
   if (job->ok)
     obs_schedule_hint_async ();
   return job->ok;
@@ -1092,10 +1176,12 @@ remove_desktop (int index)
 {
   if (index < 0)
     return false;
+  g_mutation_seq.fetch_add (1, std::memory_order_acq_rel);
   auto job = std::make_shared<Job> ();
   job->op = Job::Op::RemoveDesktop;
   job->in_index = index;
   run_on_worker (job);
+  g_mutation_seq.fetch_add (1, std::memory_order_acq_rel);
   if (job->ok)
     obs_schedule_hint_async ();
   return job->ok;
@@ -1148,9 +1234,10 @@ add_change_listener (DesktopChangedCallback cb, void *user_data)
       // early Explorer initialization.
       if (s.init_delay_id == 0)
         s.init_delay_id = g_timeout_add (1500, obs_init_delay_cb, nullptr);
-      // Single shared low-frequency backstop for Win+Tab Task View mutations.
+      // Low-frequency 15s backstop for Win+Tab Task View mutations; normal
+      // switches arrive immediately via EVENT_SYSTEM_DESKTOPSWITCH.
       if (s.fallback_timer_id == 0)
-        s.fallback_timer_id = g_timeout_add (1500, obs_fallback_tick_cb, nullptr);
+        s.fallback_timer_id = g_timeout_add (15000, obs_fallback_tick_cb, nullptr);
     }
   }
 
@@ -1207,6 +1294,12 @@ void
 notify_change_hint_async (void)
 {
   obs_schedule_hint_async ();
+}
+
+void
+probe_now_async (void)
+{
+  obs_request_probe_now ();
 }
 
 bool

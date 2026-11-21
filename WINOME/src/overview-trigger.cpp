@@ -274,6 +274,8 @@ handle_unfocused_esc_idle (gpointer user_data G_GNUC_UNUSED)
         search_entry = c;
       else if (g_strcmp0 (tname, "WinomeAppGrid") == 0)
         app_grid = c;
+      else if (g_strcmp0 (tname, "WinomeAppGridClip") == 0)
+        app_grid = gtk_widget_get_first_child (c);
       else if (g_strcmp0 (tname, "WinomeDash") == 0)
         dash = c;
     }

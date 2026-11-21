@@ -55,12 +55,13 @@ enum class WorkareaAssertAction {
 };
 
 // Rate-limits and loop-protects SPI_SETWORKAREA re-assertions so external OS
-// workarea updates or window-edge drags never trigger an oscillation storm.
+// workarea updates or window-edge drags never trigger an oscillation storm,
+// while recovering quickly without multi-second unreserved gaps.
 struct WorkareaAssertGuard {
-  static constexpr int64_t kMinApplyIntervalMs = 500;
-  static constexpr int64_t kBurstWindowMs = 5000;
-  static constexpr int kMaxBurstApplies = 4;
-  static constexpr int64_t kBackoffDurationMs = 5000;
+  static constexpr int64_t kMinApplyIntervalMs = 120;
+  static constexpr int64_t kBurstWindowMs = 3000;
+  static constexpr int kMaxBurstApplies = 8;
+  static constexpr int64_t kBackoffDurationMs = 1000;
 
   int64_t last_apply_ms = -1;
   int64_t burst_window_start_ms = -1;

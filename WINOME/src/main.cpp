@@ -73,6 +73,7 @@ setup_log_file (void)
   // Append keeps previous sessions' logs up to kMaxLogBytes.
   _wfreopen (log_path.c_str (), L"a", stdout);
   _wfreopen (log_path.c_str (), L"a", stderr);
+  winome::debug_configure_log_rotation (log_path, 5ULL * 1024 * 1024);
 }
 
 // Primary monitor bounds captured when the panel is positioned; restored in
@@ -499,15 +500,18 @@ pin_show_event_proc (HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG idObject,
 // what is actually painting the windows. "GskGLRenderer" means GPU (OpenGL
 // on the hardware ICD); "GskCairoRenderer" means software. This MSYS2 GTK
 // build ships only these two (d3d11 is not compiled in).
-static void
-log_gsk_renderer (GtkWidget *widget)
+static gboolean
+idle_log_gsk_probe (gpointer data)
 {
+  GtkWidget *widget = GTK_WIDGET (data);
+  if (widget == nullptr || !gtk_widget_get_realized (widget))
+    return G_SOURCE_REMOVE;
   GdkSurface *surface = gtk_native_get_surface (GTK_NATIVE (widget));
   if (surface == nullptr)
-    return;
+    return G_SOURCE_REMOVE;
   GskRenderer *renderer = gsk_renderer_new_for_surface (surface);
   if (renderer == nullptr)
-    return;
+    return G_SOURCE_REMOVE;
 
   const char *type = G_OBJECT_TYPE_NAME (renderer);
   const char *want = g_getenv ("GSK_RENDERER");
@@ -540,6 +544,15 @@ log_gsk_renderer (GtkWidget *widget)
   }
 
   g_object_unref (renderer);
+  return G_SOURCE_REMOVE;
+}
+
+static void
+log_gsk_renderer (GtkWidget *widget)
+{
+  if (widget != nullptr)
+    g_idle_add_full (G_PRIORITY_LOW, idle_log_gsk_probe,
+                     g_object_ref (widget), g_object_unref);
 }
 
 static GtkApplication *g_gtk_app = nullptr;
@@ -642,6 +655,8 @@ constexpr UINT WINOME_CMD_QUIT = WM_APP + 103;
 constexpr UINT WINOME_CMD_OPEN_SETTINGS = WM_APP + 104;
 
 static HWND g_control_hwnd = nullptr;
+static UINT g_msg_taskbar_created = 0;
+static guint g_deferred_plugins_idle = 0;
 static bool g_open_overview_on_start = false;
 static bool g_open_settings_on_start = false;
 
@@ -674,9 +689,24 @@ idle_quit_app (gpointer G_GNUC_UNUSED data)
   return G_SOURCE_REMOVE;
 }
 
+static gboolean
+idle_on_explorer_restarted (gpointer G_GNUC_UNUSED data)
+{
+  g_print ("[shell] TaskbarCreated received; re-suppressing taskbar & recovering VD\n");
+  winome::NativeTaskbar::on_explorer_restarted ();
+  winome::reassert_panel_workarea_now ();
+  winome::vd::reset_circuit_breaker ();
+  g_timeout_add (1000, pin_shell_windows, nullptr);
+  return G_SOURCE_REMOVE;
+}
+
 static LRESULT CALLBACK
 control_wnd_proc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+  if (g_msg_taskbar_created != 0 && msg == g_msg_taskbar_created) {
+    g_idle_add (idle_on_explorer_restarted, nullptr);
+    return 0;
+  }
   switch (msg) {
   case WINOME_CMD_SHOW_OVERVIEW:
     g_idle_add (idle_open_overview, nullptr);
@@ -721,6 +751,7 @@ create_control_window (void)
   // Use a hidden top-level WS_POPUP (not HWND_MESSAGE) so both FindWindowW
   // IPC and broadcast session-end messages (WM_QUERYENDSESSION/WM_ENDSESSION)
   // reach the window reliably.
+  g_msg_taskbar_created = RegisterWindowMessageW (L"TaskbarCreated");
   g_control_hwnd = CreateWindowExW (0, kControlWindowClass, L"WINOME Control",
                                     WS_POPUP, 0, 0, 0, 0,
                                     nullptr, nullptr, inst, nullptr);
@@ -893,6 +924,7 @@ on_activate (GtkApplication      *app,
   create_control_window ();
 
   const gint64 panel_t0 = g_get_monotonic_time ();
+  const gint64 act_t0 = panel_t0;
   GtkWidget *panel = winome_shell_panel_new ();
 
   gtk_window_set_application (GTK_WINDOW (panel), app);
@@ -900,8 +932,9 @@ on_activate (GtkApplication      *app,
   gtk_widget_set_visible (panel, TRUE);
 
   position_panel (panel);
-  winome::perf_record_phase_ms (
-      "panel", (g_get_monotonic_time () - panel_t0) / 1000.0);
+  const double panel_and_ov_ms = (g_get_monotonic_time () - panel_t0) / 1000.0;
+  const double ov_ms = winome::perf_get_startup_timings ().overview_init_ms;
+  winome::perf_record_phase_ms ("panel", std::max (0.0, panel_and_ov_ms - ov_ms));
 
   // Workspace-switch OSD (workspaceSwitcherPopup.js) + event-driven VD sync.
   winome::ws_osd_init ();
@@ -916,7 +949,10 @@ on_activate (GtkApplication      *app,
   winome::start_volume_monitor ();
 
   // Opt-in DWM window unification (dark titlebars / Win11 rounded corners).
+  const gint64 theme_t0 = g_get_monotonic_time ();
   winome::window_theming_init ();
+  winome::perf_record_phase_ms (
+      "theming", (g_get_monotonic_time () - theme_t0) / 1000.0);
 
   // Bidirectional Named Pipe IPC server (\\.\pipe\WINOME_Shell_IPC).
   const gint64 ipc_t0 = g_get_monotonic_time ();
@@ -1082,7 +1118,7 @@ on_activate (GtkApplication      *app,
             plugin_id ? plugin_id : "", slot ? slot : "", active != FALSE);
       });
 
-  winome::PluginHostCallbacks plugin_cbs {};
+  static winome::PluginHostCallbacks plugin_cbs {};
   plugin_cbs.topbar_upsert = +[] (const winome::PluginTopBarSpec &spec) {
     winome_shell_panel_plugin_upsert (
         spec.key.c_str (), spec.plugin_id.c_str (), spec.slot.c_str (),
@@ -1108,8 +1144,6 @@ on_activate (GtkApplication      *app,
     winome::notify_shell (title, body, app_name);
   };
   plugin_cbs.plugins_changed = winome::refresh_looking_glass_plugins;
-  winome::plugin_host_init (plugin_cbs);
-  winome::vd::add_change_listener (on_vd_changed_for_plugins, nullptr);
 
   winome::ipc_server_start (g_main_ipc_cbs);
   winome::perf_record_phase_ms (
@@ -1133,18 +1167,33 @@ on_activate (GtkApplication      *app,
     g_idle_add (idle_open_settings, nullptr);
   }
 
-  g_idle_add (
-      +[] (gpointer) -> gboolean {
+  winome::perf_record_phase_ms (
+      "activate", (g_get_monotonic_time () - act_t0) / 1000.0);
+
+  g_deferred_plugins_idle = g_idle_add (
+      +[] (gpointer data) -> gboolean {
+        g_deferred_plugins_idle = 0;
+        const auto *cbs =
+            static_cast<const winome::PluginHostCallbacks *> (data);
+        const gint64 plug_t0 = g_get_monotonic_time ();
+        winome::plugin_host_init (*cbs);
+        winome::vd::add_change_listener (on_vd_changed_for_plugins, nullptr);
+        winome::perf_record_phase_ms (
+            "plugins", (g_get_monotonic_time () - plug_t0) / 1000.0);
         winome::perf_finish_startup ();
         return G_SOURCE_REMOVE;
       },
-      nullptr);
+      &plugin_cbs);
 }
 
 static void
 on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
              gpointer G_GNUC_UNUSED user_data)
 {
+  if (g_deferred_plugins_idle != 0) {
+    g_source_remove (g_deferred_plugins_idle);
+    g_deferred_plugins_idle = 0;
+  }
   winome::vd::remove_change_listener (on_vd_changed_for_plugins, nullptr);
   winome::plugin_host_shutdown ();
   winome::ipc_server_stop ();
@@ -1186,6 +1235,7 @@ on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
   winome::NativeTaskbar::restore ();
   clear_recovery_file ();
   clear_crash_state_file ();
+  winome::debug_flush_log_repeats ();
 }
 
 static bool
@@ -1385,9 +1435,12 @@ main (int argc, char **argv)
   winome::debug_install_log_capture ();
 
   // Recover taskbar and work area if a prior session terminated abnormally.
+  const gint64 rec_t0 = g_get_monotonic_time ();
   if (has_recovery_file ())
     apply_and_clear_recovery (true);
   clear_crash_state_file ();
+  winome::perf_record_phase_ms (
+      "recovery", (g_get_monotonic_time () - rec_t0) / 1000.0);
 
   SetUnhandledExceptionFilter (unhandled_exception_filter);
   SetConsoleCtrlHandler (console_ctrl_handler, TRUE);

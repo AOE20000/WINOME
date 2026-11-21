@@ -412,7 +412,9 @@ update_clock (gpointer data)
   const char *fmt_12 = cfg.clock_show_seconds ? "%l:%M:%S %p" : "%l:%M %p";
   text = g_date_time_format (now, is_24h_clock () ? fmt_24 : fmt_12);
 
-  gtk_label_set_text (clock, text);
+  const char *cur = gtk_label_get_text (clock);
+  if (text != nullptr && g_strcmp0 (cur, text) != 0)
+    gtk_label_set_text (clock, text);
 
   g_free (text);
   g_date_time_unref (now);
@@ -1298,6 +1300,58 @@ update_messages_indicator (PanelStatus *st)
     gtk_widget_set_visible (st->messages_indicator_pad, show ? TRUE : FALSE);
 }
 
+static void reschedule_clock_timer (PanelStatus *st);
+
+static gboolean
+on_clock_second_tick (gpointer data)
+{
+  auto *st = static_cast<PanelStatus *> (data);
+  if (st == nullptr || st->clock_label == nullptr)
+    return G_SOURCE_REMOVE;
+  update_clock (st->clock_label);
+  if (!winome::get_config ().clock_show_seconds) {
+    st->clock_timer_id = 0;
+    reschedule_clock_timer (st);
+    return G_SOURCE_REMOVE;
+  }
+  return G_SOURCE_CONTINUE;
+}
+
+static gboolean
+on_clock_minute_tick (gpointer data)
+{
+  auto *st = static_cast<PanelStatus *> (data);
+  if (st == nullptr || st->clock_label == nullptr)
+    return G_SOURCE_REMOVE;
+  st->clock_timer_id = 0;
+  reschedule_clock_timer (st);
+  return G_SOURCE_REMOVE;
+}
+
+static void
+reschedule_clock_timer (PanelStatus *st)
+{
+  if (st == nullptr || st->clock_label == nullptr)
+    return;
+  if (st->clock_timer_id != 0) {
+    g_source_remove (st->clock_timer_id);
+    st->clock_timer_id = 0;
+  }
+  update_clock (st->clock_label);
+  if (winome::get_config ().clock_show_seconds) {
+    st->clock_timer_id = g_timeout_add_seconds (1, on_clock_second_tick, st);
+  } else {
+    GDateTime *now = g_date_time_new_now_local ();
+    int sec = now != nullptr ? g_date_time_get_second (now) : 0;
+    if (now != nullptr)
+      g_date_time_unref (now);
+    const guint delay_s =
+        static_cast<guint> (std::clamp (60 - sec, 1, 60));
+    st->clock_timer_id =
+        g_timeout_add_seconds (delay_s, on_clock_minute_tick, st);
+  }
+}
+
 static GtkWidget *
 create_clock_button (PanelStatus *st, bool with_popover)
 {
@@ -1354,8 +1408,7 @@ create_clock_button (PanelStatus *st, bool with_popover)
   st->messages_indicator_pad = indicator_pad;
   st->messages_indicator = indicator;
   st->clock_label = clock_label;
-  st->clock_timer_id = g_timeout_add_seconds (1, update_clock, clock_label);
-  update_clock (clock_label);
+  reschedule_clock_timer (st);
   update_messages_indicator (st);
 
   if (with_popover) {
@@ -1588,6 +1641,7 @@ on_tray_item_clicked (GtkButton *button, gpointer G_GNUC_UNUSED data)
       g_object_get_data (G_OBJECT (button), "tray-payload"));
   if (payload == nullptr)
     return;
+  g_print ("[tray] click id=%llu\n", static_cast<unsigned long long> (payload->id));
   winome_shell_panel_close_popovers_immediate ();
   AllowSetForegroundWindow (ASFW_ANY);
   POINT pt{};
@@ -1596,17 +1650,19 @@ on_tray_item_clicked (GtkButton *button, gpointer G_GNUC_UNUSED data)
 }
 
 static void
-on_tray_item_right_click (GtkGestureClick *gesture G_GNUC_UNUSED,
+on_tray_item_right_click (GtkGestureClick *gesture,
                           int n_press G_GNUC_UNUSED,
                           double x G_GNUC_UNUSED,
                           double y G_GNUC_UNUSED,
                           gpointer user_data)
 {
+  gtk_gesture_set_state (GTK_GESTURE (gesture), GTK_EVENT_SEQUENCE_CLAIMED);
   GtkWidget *button = GTK_WIDGET (user_data);
   TrayRowPayload *payload = static_cast<TrayRowPayload *> (
       g_object_get_data (G_OBJECT (button), "tray-payload"));
   if (payload == nullptr)
     return;
+  g_print ("[tray] rclick id=%llu\n", static_cast<unsigned long long> (payload->id));
   winome_shell_panel_close_popovers_immediate ();
   AllowSetForegroundWindow (ASFW_ANY);
   POINT pt{};
@@ -1671,7 +1727,7 @@ rebuild_tray_views (PanelStatus *st)
       GtkGesture *right_click = gtk_gesture_click_new ();
       gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (right_click),
                                      GDK_BUTTON_SECONDARY);
-      g_signal_connect (right_click, "pressed",
+      g_signal_connect (right_click, "released",
                         G_CALLBACK (on_tray_item_right_click), row_btn);
       gtk_widget_add_controller (row_btn, GTK_EVENT_CONTROLLER (right_click));
 
@@ -1956,6 +2012,8 @@ winome_shell_panel_popover_just_closed (void)
 static void
 on_panel_config_changed (void *data)
 {
+  auto *st = static_cast<PanelStatus *> (data);
+  reschedule_clock_timer (st);
   refresh_status (data);
 }
 
@@ -2191,9 +2249,9 @@ build_shell_panel (bool primary)
 
   if (primary) {
     refresh_status (status);
-    // Slow fallback poll for battery percentage / Bluetooth; volume and WLAN
-    // push instant callbacks via WASAPI and WlanRegisterNotification.
-    status->status_timer_id = g_timeout_add_seconds (5, refresh_status, status);
+    // Slow fallback poll for battery percentage / Bluetooth; volume, clock,
+    // WLAN, notifications, and VD push event callbacks.
+    status->status_timer_id = g_timeout_add_seconds (10, refresh_status, status);
     winome::systray_add_listener (on_systray_changed, status);
     winome::add_volume_listener (on_panel_status_event, status);
     winome_wifi_add_listener (on_panel_status_event, status);

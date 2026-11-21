@@ -60,10 +60,19 @@ void perf_record_phase_ms(const char* phase, double elapsed_ms) {
     s.startup.fontmap_ms = elapsed_ms;
   } else if (std::strcmp(phase, "panel") == 0) {
     s.startup.panel_ms = elapsed_ms;
-  } else if (std::strcmp(phase, "overview") == 0) {
+  } else if (std::strcmp(phase, "overview") == 0 ||
+             std::strcmp(phase, "overview_init") == 0) {
     s.startup.overview_init_ms = elapsed_ms;
   } else if (std::strcmp(phase, "ipc") == 0) {
     s.startup.ipc_ms = elapsed_ms;
+  } else if (std::strcmp(phase, "recovery") == 0) {
+    s.startup.recovery_ms = elapsed_ms;
+  } else if (std::strcmp(phase, "theming") == 0) {
+    s.startup.theming_ms = elapsed_ms;
+  } else if (std::strcmp(phase, "plugins") == 0) {
+    s.startup.plugins_ms = elapsed_ms;
+  } else if (std::strcmp(phase, "activate") == 0) {
+    s.startup.gtk_activate_ms = elapsed_ms;
   }
 }
 
@@ -91,11 +100,13 @@ void perf_finish_startup() {
 
   ProcessTelemetry mem = perf_sample_process_telemetry();
   g_print(
-      "[perf] startup total=%.1fms (fontmap=%.1fms[%d/%d], panel=%.1fms, "
-      "overview=%.1fms, ipc=%.1fms) | mem private=%.1fMB ws=%.1fMB gdi=%u user=%u\n",
-      copy.total_startup_ms, copy.fontmap_ms, copy.fonts_loaded_files,
-      copy.fonts_family_count, copy.panel_ms, copy.overview_init_ms,
-      copy.ipc_ms,
+      "[perf] startup total=%.1fms (recovery=%.1fms, fontmap=%.1fms[%d/%d], "
+      "panel=%.1fms, overview=%.1fms, theming=%.1fms, plugins=%.1fms, "
+      "ipc=%.1fms, activate=%.1fms) | mem private=%.1fMB ws=%.1fMB gdi=%u user=%u\n",
+      copy.total_startup_ms, copy.recovery_ms, copy.fontmap_ms,
+      copy.fonts_loaded_files, copy.fonts_family_count, copy.panel_ms,
+      copy.overview_init_ms, copy.theming_ms, copy.plugins_ms, copy.ipc_ms,
+      copy.gtk_activate_ms,
       static_cast<double>(mem.private_bytes) / (1024.0 * 1024.0),
       static_cast<double>(mem.working_set_bytes) / (1024.0 * 1024.0),
       mem.gdi_objects, mem.user_objects);

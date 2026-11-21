@@ -43,8 +43,36 @@ struct InspectedWindowInfo {
 };
 
 // Installs GLib g_print / g_printerr capture handlers that tee output into
-// the in-memory ring buffer while preserving stdout/stderr log output.
+// the in-memory ring buffer while adding timestamps and duplicate folding on
+// disk output.
 void debug_install_log_capture();
+
+// Configures automatic size rotation for stdout/stderr log files under @log_path.
+void debug_configure_log_rotation(const std::wstring& log_path,
+                                  uint64_t max_bytes = 5ULL * 1024 * 1024);
+
+// Flushes any folded duplicate repeat summary before process exit.
+void debug_flush_log_repeats();
+
+// Formats a single log line with an optional wall-clock timestamp prefix and
+// folds consecutive identical lines cleanly (used by file logger & unit tests).
+class LogRepeatFolder {
+ public:
+  static constexpr size_t kMaxFoldStreak = 50;
+
+  // Appends formatted output lines ready to write into the log file.
+  void push(const std::string& raw_line,
+            const std::string& timestamp_prefix,
+            std::vector<std::string>* out_lines);
+  void flush(const std::string& timestamp_prefix,
+             std::vector<std::string>* out_lines);
+
+  static bool has_existing_timestamp(const std::string& line);
+
+ private:
+  std::string last_line_;
+  size_t repeat_count_ = 0;
+};
 
 // Appends a message to the live ring buffer (auto-extracts "[tag]" prefix if
 // tag is null/empty).

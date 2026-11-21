@@ -90,8 +90,8 @@ namespace {
 
 // --- theme constants (compiled gnome-shell-dark.css; StEngine-resolved) ----
 
-constexpr int kSearchMarginTop = 12;     // .search-entry margin-top
-constexpr int kSearchMarginBottom = 6;   // .search-entry margin-bottom
+// .search-entry carries CSS margin-top: 12px / margin-bottom: 6px directly
+// in gtk_widget_get_preferred_size(), matching ControlsManagerLayout startY.
 constexpr double kWorkspaceRadiusFallback = 30.0;
 constexpr int kCloseButtonSize = 32;     // .window-close width/height
 constexpr int kCloseIconSize = 16;       // .window-close StIcon (medium)
@@ -149,7 +149,7 @@ window_picker_spacing ()
   return kWindowPickerSpacing;
 }
 
-// overviewControls.js ratios.
+// overviewControls.js & workspacesView.js constants.
 constexpr double kVerticalSpacingRatio = 0.02;
 constexpr double kThumbnailsAdjustTop = 0.6;
 constexpr double kThumbnailsAdjustBottom = 0.4;  // THUMBNAILS_SPACING_ADJ_
@@ -157,6 +157,14 @@ constexpr double kThumbnailsAdjustBottom = 0.4;  // THUMBNAILS_SPACING_ADJ_
 constexpr double kMaxThumbnailScale = 0.05;      // MAX_THUMBNAIL_SCALE
 constexpr double kDashMaxHeightRatio = 0.16;
 constexpr double kSmallWorkspaceRatio = 0.15;    // SMALL_WORKSPACE_RATIO
+constexpr int kWorkspaceMinSpacing = 24;         // WORKSPACE_MIN_SPACING
+constexpr int kWorkspaceMaxSpacing = 80;         // WORKSPACE_MAX_SPACING
+constexpr double kWorkspaceInactiveScale = 0.94; // WORKSPACE_INACTIVE_SCALE
+constexpr int kWindowDndSize = 256;              // WINDOW_DND_SIZE
+constexpr BYTE kDraggingWindowOpacity = 215;
+constexpr guint kDragScaleMs = 250;              // SCALE_ANIMATION_TIME
+constexpr guint kDragSnapBackMs = 250;           // SNAP_BACK_ANIMATION_TIME
+constexpr guint kRelayoutMs = 200;               // workspace.js layout transition
 
 // Overview.ANIMATION_TIME: opening EASE_OUT_SINE, closing EASE_OUT_QUAD.
 constexpr guint kOpenMs = 250;
@@ -173,7 +181,8 @@ int g_panel_height = 0;   // physical px; clicks above it are panel's
 GtkWidget *g_root = nullptr;      // GtkFixed named "overviewGroup"
 GtkWidget *g_search = nullptr;    // GtkEntry.search-entry
 GtkWidget *g_ws_bg = nullptr;     // workspace-background widget
-GtkWidget *g_app_grid = nullptr;  // paginated App Grid overlay
+GtkWidget *g_app_grid_clip = nullptr;  // clipped ControlsManager box for App Grid
+GtkWidget *g_app_grid = nullptr;       // paginated App Grid overlay
 GtkWidget *g_dash = nullptr;      // overview dash
 GtkWidget *g_thumbs = nullptr;    // .workspace-thumbnails row
 GtkWidget *g_caption = nullptr;   // .window-caption hover pill
@@ -184,7 +193,7 @@ enum class ControlsState {
   WINDOW_PICKER = 1,
   APP_GRID = 2,
 };
-constexpr double kGridSlideOffsetPx = 36.0;
+constexpr double kGridSlideOffsetPx = 48.0;
 ControlsState g_target_state = ControlsState::HIDDEN;
 ControlsState g_pending_show_state = ControlsState::WINDOW_PICKER;
 std::atomic<bool> g_atomic_can_shift_app_grid{false};
@@ -198,15 +207,29 @@ double g_thumbs_cur_opacity = 0.0;
 double g_grid_cur_opacity = 0.0;
 double g_grid_cur_slide_y = kGridSlideOffsetPx;
 
-// Drag-to-desktop state for window previews.
+// Drag-to-desktop state for window previews (dnd.js _Draggable).
 int g_drag_slot = -1;
 HWND g_drag_hwnd = nullptr;
 RECT g_drag_orig_rect{};
 int g_drag_start_px = 0;
 int g_drag_start_py = 0;
+int g_drag_offset_x = 0;
+int g_drag_offset_y = 0;
+int g_drag_cur_px = 0;
+int g_drag_cur_py = 0;
+double g_drag_target_scale = 0.55;
+gint64 g_drag_scale_start_us = 0;
+guint g_drag_tick_source = 0;
+int g_drag_snapback_slot = -1;
+RECT g_drag_snapback_from{};
+BYTE g_drag_snapback_from_op = 215;
+gint64 g_drag_snapback_start_us = 0;
+guint g_drag_snapback_source = 0;
+int g_drag_drop_ws_peek = -1;
 bool g_drag_active = false;
 bool g_drag_just_ended = false;
 bool g_drag_thumbs_revealed = false;
+guint g_dyn_ws_startup_timer = 0;
 std::string g_search_query;       // lowercased UTF-8 live search filter
 
 // Virtual desktops (virtual-desktop.cpp), refreshed on every placement and
@@ -222,16 +245,37 @@ guint g_close_rebuild_timer = 0;
 // Stage 2 animation frame telemetry, redundant-layout guard, & idle trim.
 FrameTimeTracker g_anim_tracker (20000);
 int g_grid_last_moved_y = INT_MIN;
+int g_last_mini_opacity = -1;
+double g_ws_bg_last_radius = -1.0;
+bool g_ws_bg_settled_shadow_drawn = false;
 guint g_idle_trim_timer = 0;
+guint g_prewarm_timer = 0;
+
+struct WallpaperCacheKey {
+  std::wstring path;
+  FILETIME mtime{};
+  uint64_t size = 0;
+  int target_w = 0;
+  int target_h = 0;
+  bool valid = false;
+};
+WallpaperCacheKey g_wallpaper_cache;
+
 void on_overview_desktop_changed (int count, int active_index, void *user_data);
 
 // Workspace-background geometry (physical px, overview client space) and the
 // animated corner radius (logical px).
 RECT g_bg_full = {0, 0, 0, 0};    // HIDDEN state: the whole work area
-RECT g_bg_picker = {0, 0, 0, 0};  // WINDOW_PICKER: aspect workspace box
-RECT g_bg_grid = {0, 0, 0, 0};    // APP_GRID: 15% workspace bar
+RECT g_bg_picker = {0, 0, 0, 0};  // WINDOW_PICKER: active aspect workspace box
+RECT g_bg_grid = {0, 0, 0, 0};    // APP_GRID: 15% workspace bar reference box
 RECT g_bg_final = {0, 0, 0, 0};   // active workspace box (used by ws switch)
-RECT g_bg_cur = {0, 0, 0, 0};     // live animated rect
+RECT g_bg_cur = {0, 0, 0, 0};     // live animated rect of active workspace
+std::vector<RECT> g_ws_full_boxes;
+std::vector<RECT> g_ws_picker_boxes;
+std::vector<RECT> g_ws_grid_boxes;
+std::vector<RECT> g_ws_cur_boxes;
+std::vector<RECT> g_ws_anim_from_boxes;
+std::vector<RECT> g_ws_anim_to_boxes;
 double g_bg_radius_target = kWorkspaceRadiusFallback;
 double g_radius_picker = kWorkspaceRadiusFallback;
 double g_radius_grid = 12.0;
@@ -258,21 +302,24 @@ RECT g_caption_want = {0, 0, 0, 0};
 
 // One preview slot.
 struct SlotEntry {
-  RECT start;         // real window rect (client space) for HIDDEN endpoint
-  RECT picker_rect;   // WINDOW_PICKER slot rect (client space)
-  RECT grid_rect;     // APP_GRID 15% top bar slot rect (client space)
-  RECT rect;          // active settled target rect (hover/drag/hit-test)
-  RECT anim_from;     // live snapshot at transition start
-  RECT anim_to;       // target rect for active transition
-  RECT current;       // animated rect currently set on the thumbnail
-  HWND target;
-  HTHUMBNAIL thumb;
+  RECT start{};                 // real window rect (client space) for HIDDEN endpoint
+  RECT canonical_picker_rect{}; // slot rect inside centered g_bg_picker
+  RECT picker_rect{};           // WINDOW_PICKER slot rect (client space, on its desktop)
+  RECT grid_rect{};             // APP_GRID 15% top bar slot rect (client space)
+  RECT rect{};                  // active settled target rect (hover/drag/hit-test)
+  RECT anim_from{};             // live snapshot at transition start
+  RECT anim_to{};               // target rect for active transition
+  RECT current{};               // animated rect currently set on the thumbnail
+  HWND target = nullptr;
+  HTHUMBNAIL thumb = nullptr;
+  int desktop_index = 0;
   int z_order = 0;    // 0 = frontmost desktop window from EnumWindows
   bool minimized = false;
   BYTE anim_from_opacity = 255;
   BYTE anim_to_opacity = 255;
   BYTE current_opacity = 255;
   double current_scale = 1.0;
+  bool thumb_applied = false;
 };
 std::vector<SlotEntry> g_slots;
 
@@ -282,13 +329,15 @@ int g_hover_index = -1;
 // clones): one DWM thumbnail per (desktop, window) pair, laid out at the
 // window's porthole position scaled into the pill.
 struct MiniSlot {
-  HTHUMBNAIL thumb;
-  RECT rect;
+  HTHUMBNAIL thumb = nullptr;
+  RECT rect{};
 };
 std::vector<MiniSlot> g_mini_slots;
 
 // Layout (physical px, overview client space).
 int g_monitor_w = 0, g_monitor_h = 0;
+int g_placed_scale = 0;
+int g_placed_search_h = 0;
 int g_dash_top = 0;             // top of the dash band (click exclusion)
 RECT g_search_rect = {0, 0, 0, 0}; // physical; clicks here belong to the entry
 RECT g_thumbs_rect = {0, 0, 0, 0}; // physical; clicks here belong to the thumbs row
@@ -320,11 +369,14 @@ Animation g_anim;
 // indicator rides the same eased value). `g_leaving` keeps the previous
 // desktop's DWM thumbnails alive for the outgoing slide.
 constexpr guint kSwitchMs = 250;  // WORKSPACE_SWITCH_TIME
+constexpr guint kWorkspaceScrollTimeoutMs = 150; // windowManager.js SCROLL_TIMEOUT_TIME
 std::vector<SlotEntry> g_leaving;
 guint g_switch_source = 0;
 gint64 g_switch_start_us = 0;
-int g_switch_from = -1, g_switch_to = -1;
+double g_switch_from = -1.0, g_switch_to = -1.0, g_switch_cur_pos = 0.0;
 int g_switch_width = 0;  // slide distance: workspace box width
+gint64 g_last_ws_scroll_us = 0;
+gint64 g_last_internal_switch_us = 0;
 
 // --- hover chrome animation ---------------------------------------------------
 
@@ -357,7 +409,8 @@ static void set_hover (int index, bool immediate = false);
 static void hover_layout_chrome (void);
 static void schedule_hover_idle_hide (void);
 static void cancel_hover_idle (void);
-static void apply_thumb_rect (SlotEntry &e, const RECT &rect, BYTE opacity);
+static void apply_thumb_rect (SlotEntry &e, const RECT &rect, BYTE opacity,
+                              bool force = false);
 static void create_previews (bool at_start_rects, LONG x_offset = 0);
 static void destroy_mini_previews (void);
 static void set_mini_opacity (BYTE opacity);
@@ -470,12 +523,16 @@ hover_display_rect (void)
 int
 slot_at_cursor (void)
 {
-  if (g_overview_hwnd == nullptr)
+  if (g_overview_hwnd == nullptr || g_drag_slot >= 0 || g_drag_active ||
+      g_drag_snapback_source != 0)
     return -1;
   POINT pt;
   if (!GetCursorPos (&pt) || !ScreenToClient (g_overview_hwnd, &pt))
     return -1;
+  const int active_ws = std::max (g_desktop_active, 0);
   for (int i = 0; i < (int)g_slots.size (); ++i) {
+    if (g_slots[i].desktop_index != active_ws)
+      continue;
     const RECT r = slot_display_rect (i);
     if (pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom)
       return i;
@@ -739,45 +796,77 @@ G_DEFINE_TYPE (WinomeWorkspaceBg, winome_workspace_bg, GTK_TYPE_WIDGET)
 static void
 winome_workspace_bg_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
 {
-  // Chain up first so the CSS layer paints .workspace-background's own
-  // background and the 0 4px 16px 4px box-shadow; then draw the wallpaper
-  // clipped to the animated rounded rect on top.
-  GTK_WIDGET_CLASS (winome_workspace_bg_parent_class)
-      ->snapshot (widget, snapshot);
-
   int w = gtk_widget_get_width (widget);
   int h = gtk_widget_get_height (widget);
   if (w <= 0 || h <= 0)
     return;
 
-  graphene_rect_t rect;
-  graphene_rect_init (&rect, 0, 0, w, h);
-  GskRoundedRect clip;
-  gsk_rounded_rect_init_from_rect (&clip, &rect, (float)g_bg_radius);
-  gtk_snapshot_push_rounded_clip (snapshot, &clip);
+  int scale = std::max (gtk_widget_get_scale_factor (widget), 1);
+  const bool settled = (g_anim.source == 0 && g_switch_source == 0);
+  g_ws_bg_settled_shadow_drawn = settled;
 
-  if (g_wallpaper != nullptr) {
-    // MetaBackgroundContent draws the wallpaper cover-style (aspect
-    // preserving, overflow cropped), like the desktop itself. The workspace
-    // box keeps the workarea aspect, so this is a uniform scale of the
-    // covered monitor image.
-    double tw = gdk_texture_get_width (g_wallpaper);
-    double th = gdk_texture_get_height (g_wallpaper);
-    if (tw > 0 && th > 0) {
-      double s = std::max (w / tw, h / th);
-      double dw = tw * s, dh = th * s;
-      graphene_rect_t tex_rect;
-      graphene_rect_init (&tex_rect, (w - dw) / 2.0, (h - dh) / 2.0, dw, dh);
-      gtk_snapshot_append_texture (snapshot, g_wallpaper, &tex_rect);
+  const RECT single_fallback[1] = {g_bg_cur};
+  const RECT *boxes =
+      !g_ws_cur_boxes.empty () ? g_ws_cur_boxes.data () : single_fallback;
+  const int box_count =
+      !g_ws_cur_boxes.empty () ? static_cast<int> (g_ws_cur_boxes.size ()) : 1;
+
+  for (int d = 0; d < box_count; ++d) {
+    const RECT &b = boxes[d];
+    if (b.right <= g_bg_full.left || b.left >= g_bg_full.right)
+      continue;
+    float rx = static_cast<float> (b.left - g_bg_full.left) / scale;
+    float ry = static_cast<float> (b.top - g_bg_full.top) / scale;
+    float rw = static_cast<float> (b.right - b.left) / scale;
+    float rh = static_cast<float> (b.bottom - b.top) / scale;
+    if (rw <= 0.0f || rh <= 0.0f)
+      continue;
+
+    graphene_rect_t rect;
+    graphene_rect_init (&rect, rx, ry, rw, rh);
+    GskRoundedRect clip;
+    gsk_rounded_rect_init_from_rect (&clip, &rect, (float)g_bg_radius);
+
+    // Render the soft outset drop-shadow only when animations have settled:
+    // re-blurring Gaussian shadow FBOs on every frame of a 250ms resize
+    // causes frame drops on integrated GPUs.
+    if (settled && g_bg_radius > 0.5) {
+      const GdkRGBA shadow_rgba = {0.0f, 0.0f, 0.0f, 0.2f};
+      gtk_snapshot_append_outset_shadow (snapshot, &clip, &shadow_rgba,
+                                         0.0f, 4.0f, 4.0f, 16.0f);
     }
-  } else {
-    // No wallpaper file: paint the desktop solid color.
-    DWORD c = GetSysColor (COLOR_DESKTOP);
-    GdkRGBA color = {((c >> 0) & 0xff) / 255.0f, ((c >> 8) & 0xff) / 255.0f,
-                     ((c >> 16) & 0xff) / 255.0f, 1.0f};
-    gtk_snapshot_append_color (snapshot, &color, &rect);
+
+    gtk_snapshot_push_rounded_clip (snapshot, &clip);
+
+    if (g_wallpaper != nullptr) {
+      double tw = gdk_texture_get_width (g_wallpaper);
+      double th = gdk_texture_get_height (g_wallpaper);
+      if (tw > 0 && th > 0) {
+        double s = std::max (static_cast<double> (rw) / tw,
+                             static_cast<double> (rh) / th);
+        double dw = tw * s, dh = th * s;
+        graphene_rect_t tex_rect;
+        graphene_rect_init (&tex_rect,
+                            rx + static_cast<float> ((rw - dw) / 2.0),
+                            ry + static_cast<float> ((rh - dh) / 2.0),
+                            static_cast<float> (dw), static_cast<float> (dh));
+        gtk_snapshot_append_texture (snapshot, g_wallpaper, &tex_rect);
+      }
+    } else {
+      DWORD c = GetSysColor (COLOR_DESKTOP);
+      GdkRGBA color = {((c >> 0) & 0xff) / 255.0f, ((c >> 8) & 0xff) / 255.0f,
+                       ((c >> 16) & 0xff) / 255.0f, 1.0f};
+      gtk_snapshot_append_color (snapshot, &color, &rect);
+    }
+    gtk_snapshot_pop (snapshot);
+
+    if (g_drag_active && d == g_drag_drop_ws_peek && d != g_desktop_active) {
+      float widths[4] = {3.0f, 3.0f, 3.0f, 3.0f};
+      GdkRGBA hi = {0.208f, 0.518f, 0.894f, 0.95f};
+      GdkRGBA colors[4] = {hi, hi, hi, hi};
+      gtk_snapshot_append_border (snapshot, &clip, widths, colors);
+    }
   }
-  gtk_snapshot_pop (snapshot);
 }
 
 static void
@@ -792,15 +881,158 @@ winome_workspace_bg_init (WinomeWorkspaceBg *self)
   (void)self;
 }
 
+// --- clipped App Grid ControlsManager container ------------------------------
+
+typedef struct {
+  GtkWidget parent_instance;
+  GtkWidget *child;
+  int target_w;
+  int target_h;
+  float slide_y;
+} WinomeAppGridClip;
+
+typedef struct {
+  GtkWidgetClass parent_class;
+} WinomeAppGridClipClass;
+
+#define WINOME_APP_GRID_CLIP(obj) \
+  (G_TYPE_CHECK_INSTANCE_CAST ((obj), winome_app_grid_clip_get_type (), \
+                               WinomeAppGridClip))
+
+G_DEFINE_TYPE (WinomeAppGridClip, winome_app_grid_clip, GTK_TYPE_WIDGET)
+
+static void
+winome_app_grid_clip_measure (GtkWidget *widget, GtkOrientation orientation,
+                              int for_size, int *minimum, int *natural,
+                              int *minimum_baseline, int *natural_baseline)
+{
+  (void)for_size;
+  WinomeAppGridClip *self = WINOME_APP_GRID_CLIP (widget);
+  int sz = (orientation == GTK_ORIENTATION_HORIZONTAL) ? self->target_w
+                                                       : self->target_h;
+  if (sz > 0) {
+    *minimum = sz;
+    *natural = sz;
+  } else if (self->child != nullptr && gtk_widget_should_layout (self->child)) {
+    gtk_widget_measure (self->child, orientation, for_size, minimum, natural,
+                        nullptr, nullptr);
+  } else {
+    *minimum = 0;
+    *natural = 0;
+  }
+  *minimum_baseline = -1;
+  *natural_baseline = -1;
+}
+
+static void
+winome_app_grid_clip_size_allocate (GtkWidget *widget, int width, int height,
+                                    int baseline)
+{
+  WinomeAppGridClip *self = WINOME_APP_GRID_CLIP (widget);
+  if (self->child == nullptr || !gtk_widget_should_layout (self->child))
+    return;
+  GskTransform *xf = nullptr;
+  if (std::abs (self->slide_y) > 0.5f) {
+    graphene_point_t pt = GRAPHENE_POINT_INIT (0.0f, self->slide_y);
+    xf = gsk_transform_translate (nullptr, &pt);
+  }
+  gtk_widget_allocate (self->child, width, height, baseline, xf);
+}
+
+static void
+winome_app_grid_clip_dispose (GObject *object)
+{
+  WinomeAppGridClip *self = WINOME_APP_GRID_CLIP (object);
+  g_clear_pointer (&self->child, gtk_widget_unparent);
+  G_OBJECT_CLASS (winome_app_grid_clip_parent_class)->dispose (object);
+}
+
+static void
+winome_app_grid_clip_class_init (WinomeAppGridClipClass *klass)
+{
+  G_OBJECT_CLASS (klass)->dispose = winome_app_grid_clip_dispose;
+  GtkWidgetClass *wclass = GTK_WIDGET_CLASS (klass);
+  wclass->measure = winome_app_grid_clip_measure;
+  wclass->size_allocate = winome_app_grid_clip_size_allocate;
+}
+
+static void
+winome_app_grid_clip_init (WinomeAppGridClip *self)
+{
+  self->child = nullptr;
+  self->target_w = 0;
+  self->target_h = 0;
+  self->slide_y = 0.0f;
+  gtk_widget_set_overflow (GTK_WIDGET (self), GTK_OVERFLOW_HIDDEN);
+}
+
+static GtkWidget *
+app_grid_clip_new (GtkWidget *child)
+{
+  auto *clip = static_cast<WinomeAppGridClip *> (
+      g_object_new (winome_app_grid_clip_get_type (), nullptr));
+  clip->child = child;
+  if (child != nullptr)
+    gtk_widget_set_parent (child, GTK_WIDGET (clip));
+  return GTK_WIDGET (clip);
+}
+
+static void
+app_grid_clip_set_bounds (GtkWidget *clip_widget, int w, int h)
+{
+  if (clip_widget == nullptr)
+    return;
+  WinomeAppGridClip *self = WINOME_APP_GRID_CLIP (clip_widget);
+  if (self->target_w == w && self->target_h == h)
+    return;
+  self->target_w = w;
+  self->target_h = h;
+  gtk_widget_set_size_request (clip_widget, w, h);
+  gtk_widget_queue_resize (clip_widget);
+}
+
+static void
+app_grid_clip_set_slide (GtkWidget *clip_widget, float slide_y)
+{
+  if (clip_widget == nullptr)
+    return;
+  WinomeAppGridClip *self = WINOME_APP_GRID_CLIP (clip_widget);
+  self->slide_y = slide_y;
+  gtk_widget_queue_allocate (clip_widget);
+}
+
 // --- wallpaper ----------------------------------------------------------------
 
 void
-load_wallpaper (void)
+load_wallpaper (bool force = false)
 {
   wchar_t path[MAX_PATH] = L"";
   SystemParametersInfoW (SPI_GETDESKWALLPAPER, MAX_PATH, path, 0);
 
+  int target_w = g_monitor_w > 0 ? g_monitor_w : GetSystemMetrics (SM_CXSCREEN);
+  int target_h = g_monitor_h > 0 ? g_monitor_h : GetSystemMetrics (SM_CYSCREEN);
+  target_w = std::max (target_w, 1280);
+  target_h = std::max (target_h, 720);
+
   if (path[0] != L'\0') {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    FILETIME mtime{};
+    uint64_t file_size = 0;
+    if (GetFileAttributesExW (path, GetFileExInfoStandard, &fad)) {
+      mtime = fad.ftLastWriteTime;
+      file_size = (static_cast<uint64_t> (fad.nFileSizeHigh) << 32) |
+                  fad.nFileSizeLow;
+    }
+    if (!force && g_wallpaper != nullptr && g_wallpaper_cache.valid &&
+        g_wallpaper_cache.path == path &&
+        g_wallpaper_cache.mtime.dwLowDateTime == mtime.dwLowDateTime &&
+        g_wallpaper_cache.mtime.dwHighDateTime == mtime.dwHighDateTime &&
+        g_wallpaper_cache.size == file_size &&
+        g_wallpaper_cache.target_w == target_w &&
+        g_wallpaper_cache.target_h == target_h) {
+      return;
+    }
+
     char utf8[MAX_PATH * 3];
     int n = WideCharToMultiByte (CP_UTF8, 0, path, -1, utf8, sizeof (utf8),
                                  nullptr, nullptr);
@@ -808,11 +1040,6 @@ load_wallpaper (void)
       // Bound uncompressed wallpaper memory to monitor cover resolution so
       // 4K/8K desktop wallpapers do not bloat RSS when overview only fills
       // one display.
-      int target_w = g_monitor_w > 0 ? g_monitor_w : GetSystemMetrics (SM_CXSCREEN);
-      int target_h = g_monitor_h > 0 ? g_monitor_h : GetSystemMetrics (SM_CYSCREEN);
-      target_w = std::max (target_w, 1280);
-      target_h = std::max (target_h, 720);
-
       GdkTexture *texture = nullptr;
       int img_w = 0, img_h = 0;
       if (gdk_pixbuf_get_file_info (utf8, &img_w, &img_h) != nullptr &&
@@ -877,10 +1104,12 @@ load_wallpaper (void)
       if (texture != nullptr) {
         g_clear_object (&g_wallpaper);
         g_wallpaper = texture;
+        g_wallpaper_cache = {path, mtime, file_size, target_w, target_h, true};
         return;
       }
     }
   }
+  g_wallpaper_cache = WallpaperCacheKey{};
   g_clear_object (&g_wallpaper);
 }
 
@@ -1069,6 +1298,12 @@ make_chrome_toplevel (ChromeSurfaceHooks *hooks)
 }
 
 static void
+attach_chrome_hover_motion (GtkWidget *widget);
+static gboolean
+on_overview_scroll (GtkEventControllerScroll *ctrl, double dx, double dy,
+                    gpointer user_data);
+
+static void
 attach_chrome_hover_motion (GtkWidget *widget)
 {
   GtkEventController *motion = gtk_event_controller_motion_new ();
@@ -1095,6 +1330,11 @@ attach_chrome_hover_motion (GtkWidget *widget)
                     }),
                     nullptr);
   gtk_widget_add_controller (widget, motion);
+
+  GtkEventController *scroll = gtk_event_controller_scroll_new (
+      GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
+  g_signal_connect (scroll, "scroll", G_CALLBACK (on_overview_scroll), nullptr);
+  gtk_widget_add_controller (widget, scroll);
 }
 
 static bool
@@ -1529,7 +1769,8 @@ hover_anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
     double e = ease_out_quad (t);
     double s = anim.from + (anim.to - anim.from) * e;
     double final_s = (t < 1.0) ? s : anim.to;
-    if (anim.index >= 0 && anim.index < (int)g_slots.size ()) {
+    if (anim.index >= 0 && anim.index < (int)g_slots.size () &&
+        anim.index != g_drag_slot && anim.index != g_drag_snapback_slot) {
       SlotEntry &slot = g_slots[anim.index];
       slot.current_scale = final_s;
       apply_thumb_rect (slot, scale_rect_around_center (slot.rect, final_s),
@@ -1630,6 +1871,11 @@ hover_idle_hide_cb (gpointer user_data)
 {
   (void)user_data;
 
+  if (g_drag_slot >= 0 || g_drag_active || g_drag_snapback_source != 0) {
+    g_hover_idle_source = 0;
+    return G_SOURCE_REMOVE;
+  }
+
   if (cursor_over_chrome_window ())
     return G_SOURCE_CONTINUE;
 
@@ -1683,8 +1929,14 @@ set_hover (int index, bool immediate)
       gtk_widget_remove_tick_callback (g_window, g_scale_anim_source);
       g_scale_anim_source = 0;
     }
-    // Snap any scaled preview back to its slot rect.
-    for (SlotEntry &s : g_slots) {
+    // Snap any scaled preview back to its slot rect (skipping any actively
+    // dragged or snapping-back slot).
+    for (int i = 0; i < (int)g_slots.size (); ++i) {
+      SlotEntry &s = g_slots[i];
+      if (i == g_drag_slot || i == g_drag_snapback_slot) {
+        s.current_scale = 1.0;
+        continue;
+      }
       if (s.current_scale != 1.0) {
         apply_thumb_rect (s, s.rect, 255);
         s.current_scale = 1.0;
@@ -1698,6 +1950,9 @@ set_hover (int index, bool immediate)
     overlay_hide_all ();
     return;
   }
+
+  if (g_drag_slot >= 0 || g_drag_active || g_drag_snapback_source != 0)
+    return;
 
   if (index == g_hover_index) {
     if (index >= 0) {
@@ -1735,7 +1990,8 @@ set_hover (int index, bool immediate)
   }
 
   const SlotEntry &slot = g_slots[index];
-  if (!IsWindow (slot.target)) {
+  if (!IsWindow (slot.target) ||
+      slot.desktop_index != std::max (g_desktop_active, 0)) {
     if (previous >= 0)
       schedule_hover_idle_hide ();
     return;
@@ -1767,6 +2023,8 @@ on_root_motion (GtkEventControllerMotion *motion, double x, double y,
   (void)user_data;
   if (g_window == nullptr)
     return;
+  if (g_drag_slot >= 0 || g_drag_active || g_drag_snapback_source != 0)
+    return;
   if (g_app_grid_mode) {
     set_hover (-1, true);
     return;
@@ -1775,8 +2033,11 @@ on_root_motion (GtkEventControllerMotion *motion, double x, double y,
   int scale = gtk_widget_get_scale_factor (g_window);
   int px = (int)(x * scale);
   int py = (int)(y * scale);
+  const int active_ws = std::max (g_desktop_active, 0);
 
   for (int i = 0; i < (int)g_slots.size (); ++i) {
+    if (g_slots[i].desktop_index != active_ws)
+      continue;
     const RECT r = slot_display_rect (i);
     if (px >= r.left && px < r.right && py >= r.top && py < r.bottom) {
       set_hover (i);
@@ -1791,6 +2052,8 @@ on_root_motion_leave (GtkEventControllerMotion *motion, gpointer user_data)
 {
   (void)motion;
   (void)user_data;
+  if (g_drag_slot >= 0 || g_drag_active || g_drag_snapback_source != 0)
+    return;
   // Keep the hover alive while the pointer is over the chrome windows (they
   // took the input; we would otherwise see a spurious leave).
   if (cursor_over_chrome_window ())
@@ -1814,20 +2077,29 @@ destroy_previews (void)
 }
 
 void
-apply_thumb_rect (SlotEntry &e, const RECT &rect, BYTE opacity)
+apply_thumb_rect (SlotEntry &e, const RECT &rect, BYTE opacity, bool force)
 {
   if (e.thumb == nullptr)
     return;
+  if (!force && e.thumb_applied && EqualRect (&e.current, &rect) &&
+      e.current_opacity == opacity) {
+    return;
+  }
+  const bool on_screen =
+      (g_monitor_w <= 0 ||
+       (rect.right > 0 && rect.left < g_monitor_w && rect.bottom > 0 &&
+        rect.top < g_monitor_h));
   DWM_THUMBNAIL_PROPERTIES props = {};
   props.dwFlags = DWM_TNP_VISIBLE | DWM_TNP_RECTDESTINATION |
                   DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
-  props.fVisible = TRUE;
+  props.fVisible = (on_screen && opacity > 0) ? TRUE : FALSE;
   props.opacity = opacity;
   props.rcDestination = rect;
   props.fSourceClientAreaOnly = FALSE;
   DwmUpdateThumbnailProperties (e.thumb, &props);
   e.current = rect;
   e.current_opacity = opacity;
+  e.thumb_applied = true;
 }
 
 void
@@ -1837,11 +2109,12 @@ promote_slot_thumb_to_top (SlotEntry &e)
     return;
   DwmUnregisterThumbnail (e.thumb);
   e.thumb = nullptr;
+  e.thumb_applied = false;
   HTHUMBNAIL thumb = nullptr;
   if (SUCCEEDED (DwmRegisterThumbnail (g_overview_hwnd, e.target, &thumb)) &&
       thumb != nullptr) {
     e.thumb = thumb;
-    apply_thumb_rect (e, e.current, e.current_opacity);
+    apply_thumb_rect (e, e.current, e.current_opacity, true);
   }
 }
 
@@ -1865,16 +2138,21 @@ create_previews (bool at_start_rects, LONG x_offset)
 
   for (size_t idx : order) {
     SlotEntry &e = g_slots[idx];
-    HTHUMBNAIL thumb = nullptr;
-    if (SUCCEEDED (DwmRegisterThumbnail (g_overview_hwnd, e.target, &thumb)) &&
-        thumb != nullptr) {
-      e.thumb = thumb;
+    if (e.thumb == nullptr) {
+      HTHUMBNAIL thumb = nullptr;
+      if (SUCCEEDED (DwmRegisterThumbnail (g_overview_hwnd, e.target, &thumb)) &&
+          thumb != nullptr) {
+        e.thumb = thumb;
+      }
+    }
+    if (e.thumb != nullptr) {
+      e.thumb_applied = false;
       if (at_start_rects)
-        apply_thumb_rect (e, e.start, e.minimized ? 0 : 255);
+        apply_thumb_rect (e, e.start, e.minimized ? 0 : 255, true);
       else
-        apply_thumb_rect (e, translate_rect_x (e.rect, x_offset), 255);
+        apply_thumb_rect (e, translate_rect_x (e.rect, x_offset), 255, true);
     } else {
-      e.thumb = nullptr;
+      e.thumb_applied = false;
     }
   }
 }
@@ -1888,11 +2166,15 @@ destroy_mini_previews (void)
     if (m.thumb != nullptr)
       DwmUnregisterThumbnail (m.thumb);
   g_mini_slots.clear ();
+  g_last_mini_opacity = -1;
 }
 
 void
 set_mini_opacity (BYTE opacity)
 {
+  if (g_last_mini_opacity == static_cast<int> (opacity))
+    return;
+  g_last_mini_opacity = static_cast<int> (opacity);
   for (MiniSlot &m : g_mini_slots) {
     if (m.thumb == nullptr)
       continue;
@@ -1915,24 +2197,32 @@ set_mini_opacity (BYTE opacity)
 // open animation.
 void
 create_mini_previews (HMONITOR monitor, const RECT &monitor_rect,
-                      int thumbs_x, int thumbs_y, BYTE initial_opacity)
+                      int thumbs_x, int thumbs_y, BYTE initial_opacity,
+                      const std::vector<OvWindowInfo> *pre_all = nullptr,
+                      const std::vector<int> *pre_desktops = nullptr)
 {
   destroy_mini_previews ();
   if (g_overview_hwnd == nullptr || g_desktops.empty () ||
       overview_thumbs_get_height (g_thumbs) <= 0)
     return;
 
-  // Every alt-tab window on the monitor, cloaked ones included; bucketed
-  // by desktop afterwards.
-  std::vector<OvWindowInfo> all;
-  EnumContext ctx{monitor, monitor_rect, &all, false, true,
-                  winome::get_config ().overview_window_blacklist};
-  EnumWindows (collect_windows, reinterpret_cast<LPARAM> (&ctx));
-
-  // Pre-resolve each window's desktop once.
-  std::vector<int> window_desktop (all.size (), -1);
-  for (size_t i = 0; i < all.size (); ++i)
-    window_desktop[i] = vd::window_desktop_index (all[i].hwnd);
+  std::vector<OvWindowInfo> local_all;
+  std::vector<int> local_desktops;
+  const std::vector<OvWindowInfo> *all_ptr = pre_all;
+  const std::vector<int> *desk_ptr = pre_desktops;
+  if (all_ptr == nullptr || desk_ptr == nullptr ||
+      all_ptr->size () != desk_ptr->size ()) {
+    EnumContext ctx{monitor, monitor_rect, &local_all, false, true,
+                    winome::get_config ().overview_window_blacklist};
+    EnumWindows (collect_windows, reinterpret_cast<LPARAM> (&ctx));
+    local_desktops.assign (local_all.size (), -1);
+    for (size_t i = 0; i < local_all.size (); ++i)
+      local_desktops[i] = vd::window_desktop_index (local_all[i].hwnd);
+    all_ptr = &local_all;
+    desk_ptr = &local_desktops;
+  }
+  const std::vector<OvWindowInfo> &all = *all_ptr;
+  const std::vector<int> &window_desktop = *desk_ptr;
 
   int scale = gtk_widget_get_scale_factor (g_window);
   int panel = g_panel_height;
@@ -1950,7 +2240,8 @@ create_mini_previews (HMONITOR monitor, const RECT &monitor_rect,
 
     // Register back-to-front so frontmost windows render on top inside pills.
     for (size_t i = all.size (); i-- > 0;) {
-      if (window_desktop[i] != d)
+      if (window_desktop[i] != d &&
+          !(window_desktop[i] < 0 && d == g_desktop_active))
         continue;
 
       // Clip the window rect to the porthole (the workarea) before scaling.
@@ -1986,7 +2277,148 @@ create_mini_previews (HMONITOR monitor, const RECT &monitor_rect,
   set_mini_opacity (initial_opacity);
 }
 
+// Synchronize Windows virtual desktops with GNOME Shell's dynamic workspace
+// rules (windowManager.js WorkspaceTracker._checkWorkspaces):
+// - Minimum 2 workspaces at all times (1 workspace -> 2 workspaces on startup).
+// - Always 1 trailing empty workspace at the end (if last workspace has a
+//   window, append a new empty workspace).
+// - Any empty intermediate or extra trailing workspace is removed.
+static bool g_in_dynamic_ws_sync = false;
+
+static bool
+sync_dynamic_workspaces (HMONITOR monitor, const RECT &monitor_rect,
+                         std::vector<OvWindowInfo> *out_all = nullptr,
+                         std::vector<int> *out_window_desktop = nullptr)
+{
+  std::vector<OvWindowInfo> all;
+  EnumContext ctx{monitor, monitor_rect, &all, false, true,
+                  winome::get_config ().overview_window_blacklist};
+  EnumWindows (collect_windows, reinterpret_cast<LPARAM> (&ctx));
+
+  std::vector<vd::DesktopInfo> ds = vd::desktops ();
+  std::vector<int> win_desk (all.size (), -1);
+  if (!ds.empty ()) {
+    for (size_t i = 0; i < all.size (); ++i)
+      win_desk[i] = vd::window_desktop_index (all[i].hwnd);
+  }
+
+  const bool can_manage =
+      !ds.empty () &&
+      vd::vtable_slots_for_build (vd::windows_build_number ())
+          .can_manage_desktops;
+  bool changed = false;
+
+  if (can_manage) {
+    std::vector<int> counts (ds.size (), 0);
+    for (size_t i = 0; i < all.size (); ++i) {
+      int d = win_desk[i];
+      if (d >= 0 && d < static_cast<int> (counts.size ()))
+        ++counts[static_cast<size_t> (d)];
+    }
+
+    DynamicWorkspacePlan plan = compute_dynamic_workspace_plan (counts);
+    g_in_dynamic_ws_sync = true;
+    for (int a = 0; a < plan.append_count; ++a) {
+      if (vd::create_desktop ())
+        changed = true;
+    }
+    for (int rm_idx : plan.remove_indices) {
+      if (vd::remove_desktop (rm_idx))
+        changed = true;
+    }
+    g_in_dynamic_ws_sync = false;
+
+    if (changed && !plan.remove_indices.empty ()) {
+      // Removing an intermediate desktop shifts higher desktop indices down.
+      for (size_t i = 0; i < all.size (); ++i)
+        win_desk[i] = vd::window_desktop_index (all[i].hwnd);
+    }
+  }
+
+  if (out_all != nullptr)
+    *out_all = std::move (all);
+  if (out_window_desktop != nullptr)
+    *out_window_desktop = std::move (win_desk);
+  return changed;
+}
+
 // --- layout ----------------------------------------------------------------------
+
+static int
+picker_workspace_spacing (const RECT &base_picker, int mw, int scale)
+{
+  int pw = base_picker.right - base_picker.left;
+  int avail_space = (mw - pw) / 2;
+  int raw = avail_space - static_cast<int> (pw * 0.4);
+  return std::clamp (raw, kWorkspaceMinSpacing * scale,
+                     kWorkspaceMaxSpacing * scale);
+}
+
+// workspacesView.js _getFirstFitSingleWorkspaceBox + _updateWorkspacesState:
+// Inactive workspaces scale by WORKSPACE_INACTIVE_SCALE (0.94) and sit at a
+// visual edge spacing of [24..80]*scale from the active workspace so the left
+// and right adjacent workspaces peek into the overview.
+static RECT
+picker_box_for_desktop (int d, double scroll_pos, const RECT &base_picker,
+                        int mw, int scale)
+{
+  double pw = static_cast<double> (base_picker.right - base_picker.left);
+  double ph = static_cast<double> (base_picker.bottom - base_picker.top);
+  double base_cx = (base_picker.left + base_picker.right) * 0.5;
+  double base_cy = (base_picker.top + base_picker.bottom) * 0.5;
+  int gap = picker_workspace_spacing (base_picker, mw, scale);
+  double dist = static_cast<double> (d) - scroll_pos;
+  double s_prog = 1.0 - std::clamp (std::abs (dist), 0.0, 1.0);
+  double ws_scale =
+      kWorkspaceInactiveScale + (1.0 - kWorkspaceInactiveScale) * s_prog;
+  double step = 0.5 * (1.0 + kWorkspaceInactiveScale) * pw + gap;
+  double cx = base_cx + dist * step;
+  double w = pw * ws_scale;
+  double h = ph * ws_scale;
+  RECT out;
+  out.left = static_cast<LONG> (std::lround (cx - w * 0.5));
+  out.top = static_cast<LONG> (std::lround (base_cy - h * 0.5));
+  out.right = static_cast<LONG> (std::lround (cx + w * 0.5));
+  out.bottom = static_cast<LONG> (std::lround (base_cy + h * 0.5));
+  return out;
+}
+
+// workspacesView.js _getFirstFitAllWorkspaceBox (FitMode.ALL in APP_GRID):
+// All workspaces line up horizontally inside the 15% top workspace bar.
+static RECT
+grid_box_for_desktop (int d, int count, const RECT &base_grid, int mw,
+                      int scale)
+{
+  int n = std::max (count, 1);
+  int base_w = base_grid.right - base_grid.left;
+  int base_h = base_grid.bottom - base_grid.top;
+  if (n <= 1)
+    return base_grid;
+  int gap = kWorkspaceMinSpacing * scale;
+  int max_total_w = std::max (mw - 2 * gap, n * 64);
+  int avail_for_boxes = std::max (max_total_w - (n - 1) * gap, n * 48);
+  int ws_w = std::min (base_w, avail_for_boxes / n);
+  double aspect =
+      base_h > 0 ? static_cast<double> (base_w) / base_h : 1.7777778;
+  int ws_h = std::min (
+      base_h, std::max (static_cast<int> (ws_w / aspect + 0.5), 48));
+  ws_w = std::max (static_cast<int> (ws_h * aspect + 0.5), 48);
+  int total_w = n * ws_w + (n - 1) * gap;
+  int start_x = (mw - total_w) / 2;
+  int top_y = base_grid.top + (base_h - ws_h) / 2;
+  int left_x = start_x + d * (ws_w + gap);
+  return RECT{left_x, top_y, left_x + ws_w, top_y + ws_h};
+}
+
+static RECT
+full_box_for_desktop (int d, int active_idx, const RECT &full_rect,
+                      const RECT &base_picker, int mw, int scale)
+{
+  int gap = picker_workspace_spacing (base_picker, mw, scale);
+  int stride = (full_rect.right - full_rect.left) + gap;
+  return translate_rect_x (full_rect,
+                           static_cast<LONG> ((d - active_idx) * stride));
+}
 
 struct PlacedGeometry {
   int search_x, search_y;      // logical
@@ -2034,9 +2466,21 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
   int thumb_adjust = (int)(spacing * kThumbnailsAdjustTop + 0.5);
   int thumb_adjust_bottom = (int)(spacing * kThumbnailsAdjustBottom + 0.5);
 
-  // Search entry.
-  GtkRequisition search_nat;
-  gtk_widget_get_preferred_size (g_search, nullptr, &search_nat);
+  // Search entry: must be visible (and realized alongside g_window) before
+  // measuring; an unmapped/hidden GtkEntry reports preferred height 0 on the
+  // very first overview open, pushing ws_box_picker upward across the bar.
+  if (g_search != nullptr && !gtk_widget_get_visible (g_search))
+    gtk_widget_set_visible (g_search, TRUE);
+  if (g_search != nullptr && gtk_widget_get_realized (g_window) &&
+      !gtk_widget_get_realized (g_search)) {
+    gtk_widget_realize (g_search);
+  }
+  GtkRequisition search_nat{};
+  if (g_search != nullptr)
+    gtk_widget_get_preferred_size (g_search, nullptr, &search_nat);
+  static int s_last_valid_search_h = 0;
+  if (search_nat.height > 0)
+    s_last_valid_search_h = search_nat.height;
   int search_w = search_nat.width;
   StEngine *engine = StEngine::get ();
   if (engine != nullptr) {
@@ -2045,9 +2489,14 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
     if (node.lookup_length ("width", &v) && v > 0)
       search_w = (int)(v + 0.5);
   }
-  int search_h = search_nat.height;
-  int search_total =
-      (kSearchMarginTop + kSearchMarginBottom) * scale + search_h * scale;
+  if (search_w <= 0)
+    search_w = 352;
+  int search_h = search_nat.height > 0
+                     ? search_nat.height
+                     : (s_last_valid_search_h > 0 ? s_last_valid_search_h : 56);
+  g_placed_scale = scale;
+  g_placed_search_h = search_h;
+  int search_total = search_h * scale;
 
   // Workspace thumbnails (ThumbnailsBox, shown in WINDOW_PICKER for >1
   // desktop or during drag; cross-faded cleanly during state shifts).
@@ -2112,7 +2561,7 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
   out->search_w = search_w;
   out->search_h = search_h;
   out->search_x = (mw / scale - search_w) / 2;
-  out->search_y = (panel_height + kSearchMarginTop * scale) / scale;
+  out->search_y = panel_height / scale;
   out->dash_x = (mw - dash_w) / 2 / scale;
   out->dash_y = (panel_height + wa_h - dash_h) / scale;
   out->thumbs_h = thumbs_h;
@@ -2129,6 +2578,22 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
   g_bg_picker = ws_box_picker;
   g_bg_grid = ws_box_grid;
   g_bg_final = g_app_grid_mode ? ws_box_grid : ws_box_picker;
+
+  const int ws_count = std::max (static_cast<int> (g_desktops.size ()), 1);
+  const int active_ws = std::clamp (g_desktop_active, 0, ws_count - 1);
+  g_ws_full_boxes.resize (static_cast<size_t> (ws_count));
+  g_ws_picker_boxes.resize (static_cast<size_t> (ws_count));
+  g_ws_grid_boxes.resize (static_cast<size_t> (ws_count));
+  for (int d = 0; d < ws_count; ++d) {
+    g_ws_full_boxes[static_cast<size_t> (d)] =
+        full_box_for_desktop (d, active_ws, g_bg_full, ws_box_picker, mw,
+                              scale);
+    g_ws_picker_boxes[static_cast<size_t> (d)] =
+        picker_box_for_desktop (d, static_cast<double> (active_ws),
+                                ws_box_picker, mw, scale);
+    g_ws_grid_boxes[static_cast<size_t> (d)] =
+        grid_box_for_desktop (d, ws_count, ws_box_grid, mw, scale);
+  }
 
   // .workspace-background border-radius (proportionally scaled in APP_GRID).
   double base_radius = kWorkspaceRadiusFallback;
@@ -2151,18 +2616,102 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
   return true;
 }
 
+static void
+apply_ws_boxes (const std::vector<RECT> &boxes)
+{
+  const bool settled = (g_anim.source == 0 && g_switch_source == 0);
+  const int active_ws =
+      !boxes.empty ()
+          ? std::clamp (g_desktop_active, 0, static_cast<int> (boxes.size ()) - 1)
+          : 0;
+  const RECT active_rect =
+      !boxes.empty () ? boxes[static_cast<size_t> (active_ws)] : g_bg_cur;
+  bool same = (boxes.size () == g_ws_cur_boxes.size ()) &&
+              EqualRect (&g_bg_cur, &active_rect) &&
+              g_ws_bg_last_radius == g_bg_radius &&
+              g_ws_bg_settled_shadow_drawn == settled;
+  if (same) {
+    for (size_t i = 0; i < boxes.size (); ++i) {
+      if (!EqualRect (&boxes[i], &g_ws_cur_boxes[i])) {
+        same = false;
+        break;
+      }
+    }
+  }
+  if (same)
+    return;
+  g_ws_cur_boxes = boxes;
+  g_bg_cur = active_rect;
+  g_ws_bg_last_radius = g_bg_radius;
+  if (g_ws_bg != nullptr)
+    gtk_widget_queue_draw (g_ws_bg);
+}
+
 void
 apply_bg_rect (const RECT &rect)
 {
-  g_bg_cur = rect;
-  if (g_ws_bg == nullptr || g_window == nullptr)
+  const bool settled = (g_anim.source == 0 && g_switch_source == 0);
+  if (g_ws_cur_boxes.size () <= 1 && EqualRect (&g_bg_cur, &rect) &&
+      g_ws_bg_last_radius == g_bg_radius &&
+      g_ws_bg_settled_shadow_drawn == settled) {
     return;
-  int scale = gtk_widget_get_scale_factor (g_window);
-  gtk_widget_set_size_request (g_ws_bg, (rect.right - rect.left) / scale,
-                               (rect.bottom - rect.top) / scale);
-  gtk_fixed_move (GTK_FIXED (g_root), g_ws_bg, rect.left / scale,
-                  rect.top / scale);
-  gtk_widget_queue_draw (g_ws_bg);
+  }
+  g_bg_cur = rect;
+  if (g_ws_cur_boxes.size () <= 1) {
+    g_ws_cur_boxes.assign (1, rect);
+  } else {
+    const int active_ws = std::clamp (
+        g_desktop_active, 0, static_cast<int> (g_ws_cur_boxes.size ()) - 1);
+    g_ws_cur_boxes[static_cast<size_t> (active_ws)] = rect;
+  }
+  g_ws_bg_last_radius = g_bg_radius;
+  if (g_ws_bg != nullptr)
+    gtk_widget_queue_draw (g_ws_bg);
+}
+
+static void
+apply_app_grid_slide (double slide_y)
+{
+  if (g_app_grid == nullptr)
+    return;
+  const int snapped = static_cast<int> (std::lround (slide_y));
+  if (snapped == g_grid_last_moved_y)
+    return;
+  g_grid_last_moved_y = snapped;
+  if (g_app_grid_clip != nullptr) {
+    app_grid_clip_set_slide (
+        g_app_grid_clip, snapped == 0 ? 0.0f : static_cast<float> (slide_y));
+  } else if (g_root != nullptr) {
+    if (snapped == 0) {
+      gtk_fixed_set_child_transform (GTK_FIXED (g_root), g_app_grid, nullptr);
+    } else {
+      graphene_point_t pt =
+          GRAPHENE_POINT_INIT (0.0f, static_cast<float> (slide_y));
+      GskTransform *xf = gsk_transform_translate (nullptr, &pt);
+      gtk_fixed_set_child_transform (GTK_FIXED (g_root), g_app_grid, xf);
+      gsk_transform_unref (xf);
+    }
+  }
+}
+
+static void
+ensure_app_grid_synced (void)
+{
+  if (g_app_grid == nullptr || g_grid_w <= 0 || g_grid_h <= 0)
+    return;
+  app_grid_clip_set_bounds (g_app_grid_clip, g_grid_w, g_grid_h);
+  gtk_widget_set_size_request (g_app_grid, g_grid_w, g_grid_h);
+  app_grid_set_query (g_app_grid, g_search_query);
+  app_grid_rebuild (g_app_grid, g_grid_w, g_grid_h);
+}
+
+static void
+sync_app_grid_visible (bool visible)
+{
+  if (g_app_grid_clip != nullptr)
+    gtk_widget_set_visible (g_app_grid_clip, visible ? TRUE : FALSE);
+  if (g_app_grid != nullptr)
+    gtk_widget_set_visible (g_app_grid, visible ? TRUE : FALSE);
 }
 
 void
@@ -2171,16 +2720,39 @@ position_widgets (const PlacedGeometry &geo, bool opening, LONG switch_off_x = 0
   gtk_widget_set_size_request (g_search, geo.search_w, geo.search_h);
   gtk_fixed_move (GTK_FIXED (g_root), g_search, geo.search_x, geo.search_y);
 
+  // Keep g_ws_bg fixed to the full workarea allocation and paint/clip g_bg_cur
+  // directly inside winome_workspace_bg_snapshot so 250ms animations do zero
+  // GtkFixed re-layout or size_request churn.
+  int scale = std::max (gtk_widget_get_scale_factor (g_window), 1);
+  if (g_ws_bg != nullptr) {
+    const int full_w = std::max (
+        static_cast<int> (g_bg_full.right - g_bg_full.left) / scale, 1);
+    const int full_h = std::max (
+        static_cast<int> (g_bg_full.bottom - g_bg_full.top) / scale, 1);
+    gtk_widget_set_size_request (g_ws_bg, full_w, full_h);
+    gtk_fixed_move (GTK_FIXED (g_root), g_ws_bg,
+                    static_cast<int> (g_bg_full.left) / scale,
+                    static_cast<int> (g_bg_full.top) / scale);
+  }
+
   // The background starts at the full work area (radius 0) when opening —
   // the open animation shrinks it into the target box — and sits at the
   // settled (or slide-in start) box on relayout.
   if (opening) {
-    apply_bg_rect (g_bg_full);
     g_bg_radius = 0.0;
+    apply_ws_boxes (g_ws_full_boxes);
   } else {
-    const RECT &target_bg = g_app_grid_mode ? g_bg_grid : g_bg_picker;
-    apply_bg_rect (translate_rect_x (target_bg, switch_off_x));
+    const std::vector<RECT> &target_boxes =
+        g_app_grid_mode ? g_ws_grid_boxes : g_ws_picker_boxes;
     g_bg_radius = g_app_grid_mode ? g_radius_grid : g_radius_picker;
+    if (switch_off_x == 0) {
+      apply_ws_boxes (target_boxes);
+    } else {
+      std::vector<RECT> shifted = target_boxes;
+      for (RECT &r : shifted)
+        r = translate_rect_x (r, switch_off_x);
+      apply_ws_boxes (shifted);
+    }
   }
 
   gtk_fixed_move (GTK_FIXED (g_root), g_dash, geo.dash_x, geo.dash_y);
@@ -2191,7 +2763,6 @@ position_widgets (const PlacedGeometry &geo, bool opening, LONG switch_off_x = 0
                              : (!g_app_grid_mode && geo.thumbs_h > 0);
   gtk_widget_set_visible (g_thumbs, show_thumbs);
 
-  int scale = gtk_widget_get_scale_factor (g_window);
   g_search_rect.left = geo.search_x * scale;
   g_search_rect.top = geo.search_y * scale;
   g_search_rect.right = (geo.search_x + geo.search_w) * scale;
@@ -2211,7 +2782,7 @@ position_widgets (const PlacedGeometry &geo, bool opening, LONG switch_off_x = 0
   gtk_widget_set_visible (g_ws_bg, TRUE);
   gtk_widget_set_visible (g_dash, TRUE);
   if (!opening)
-    gtk_widget_set_visible (g_app_grid, g_app_grid_mode);
+    sync_app_grid_visible (g_app_grid_mode);
 }
 
 // --- z-order ----------------------------------------------------------------------
@@ -2219,6 +2790,97 @@ position_widgets (const PlacedGeometry &geo, bool opening, LONG switch_off_x = 0
 static void dump_zorder (const char *tag);
 static void restack_locked (void);
 static void switch_finish (bool restore_hover = true);
+
+static bool
+is_popup_menu_window (HWND h)
+{
+  if (h == nullptr || !IsWindow (h) || !IsWindowVisible (h) || is_cloaked (h))
+    return false;
+  if (h == g_panel_hwnd || h == g_overview_hwnd || h == g_chrome_hwnd ||
+      h == g_icon_hwnd || h == g_caption_hwnd)
+    return false;
+  RECT r{};
+  if (!GetWindowRect (h, &r) || r.right <= r.left || r.bottom <= r.top)
+    return false;
+
+  wchar_t cls[128] = L"";
+  GetClassNameW (h, cls, 128);
+  if (wcscmp (cls, L"#32768") == 0 ||
+      wcsstr (cls, L"Xaml_WindowedPopupClass") != nullptr ||
+      wcsstr (cls, L"PopupHost") != nullptr) {
+    return true;
+  }
+
+  DWORD pid = 0;
+  GetWindowThreadProcessId (h, &pid);
+  if (pid == GetCurrentProcessId ()) {
+    return g_overview_hwnd != nullptr &&
+           GetWindow (h, GW_OWNER) == g_overview_hwnd;
+  }
+
+  if (wcscmp (cls, L"Shell_TrayWnd") == 0 ||
+      wcscmp (cls, L"Shell_SecondaryTrayWnd") == 0) {
+    return false;
+  }
+
+  LONG_PTR ex = GetWindowLongPtrW (h, GWL_EXSTYLE);
+  LONG_PTR style = GetWindowLongPtrW (h, GWL_STYLE);
+  if ((ex & WS_EX_TOPMOST) != 0 && (style & WS_POPUP) != 0 &&
+      (style & (WS_CAPTION | WS_THICKFRAME)) == 0) {
+    HMONITOR mon = MonitorFromRect (&r, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof (mi);
+    if (GetMonitorInfoW (mon, &mi)) {
+      int mw = mi.rcMonitor.right - mi.rcMonitor.left;
+      int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+      int ww = r.right - r.left;
+      int wh = r.bottom - r.top;
+      if (ww < (mw * 85) / 100 || wh < (mh * 85) / 100)
+        return true;
+    }
+  }
+  return false;
+}
+
+static HWND
+find_owned_overview_popup_hwnd (void)
+{
+  if (g_overview_hwnd == nullptr || !IsWindow (g_overview_hwnd))
+    return nullptr;
+  const DWORD self_pid = GetCurrentProcessId ();
+  HWND w = GetTopWindow (nullptr);
+  for (int i = 0; w != nullptr && i < 40; ++i, w = GetWindow (w, GW_HWNDNEXT)) {
+    if (w == g_panel_hwnd || w == g_overview_hwnd || w == g_chrome_hwnd ||
+        w == g_icon_hwnd || w == g_caption_hwnd)
+      continue;
+    if (!IsWindowVisible (w) || is_cloaked (w))
+      continue;
+    DWORD pid = 0;
+    GetWindowThreadProcessId (w, &pid);
+    if (pid != self_pid)
+      continue;
+    if (GetWindow (w, GW_OWNER) != g_overview_hwnd)
+      continue;
+    RECT r{};
+    if (!GetWindowRect (w, &r) || r.right <= r.left || r.bottom <= r.top)
+      continue;
+    return w;
+  }
+  return nullptr;
+}
+
+static HWND
+find_lowest_popup_menu_above_panel (void)
+{
+  if (g_panel_hwnd == nullptr || !IsWindow (g_panel_hwnd))
+    return nullptr;
+  for (HWND prev = GetWindow (g_panel_hwnd, GW_HWNDPREV); prev != nullptr;
+       prev = GetWindow (prev, GW_HWNDPREV)) {
+    if (is_popup_menu_window (prev))
+      return prev;
+  }
+  return nullptr;
+}
 
 static LRESULT CALLBACK
 overview_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -2362,7 +3024,13 @@ place_overview_locked (bool opening, int switch_dir)
 
   load_wallpaper ();
 
-  // Virtual desktops (single-desktop systems keep the classic layout).
+  // Synchronize dynamic workspaces (GNOME WorkspaceTracker._checkWorkspaces)
+  // and enumerate all desktops' eligible windows in a single pass.
+  std::vector<OvWindowInfo> all_windows;
+  std::vector<int> window_desktop;
+  sync_dynamic_workspaces (monitor, mi.rcMonitor, &all_windows,
+                           &window_desktop);
+
   g_desktops = vd::desktops ();
   g_desktop_active = g_desktops.empty () ? -1 : vd::current_index ();
   if (g_desktop_active < 0)
@@ -2373,6 +3041,8 @@ place_overview_locked (bool opening, int switch_dir)
     reset_drag_state ();
   g_print ("[ov] desktops=%zu active=%d\n", g_desktops.size (),
            g_desktop_active);
+
+  const std::vector<RECT> prev_ws_cur_boxes = g_ws_cur_boxes;
 
   // Geometry (ControlsManagerLayout + WorkspacesView workspace box).
   PlacedGeometry geo;
@@ -2401,18 +3071,19 @@ place_overview_locked (bool opening, int switch_dir)
   g_grid_x = (w / scale - g_grid_w) / 2;
   g_grid_y = (int)geo.app_grid_box.top / scale;
   if (g_app_grid != nullptr) {
-    app_grid_set_query (g_app_grid, g_search_query);
-    app_grid_rebuild (g_app_grid, g_grid_w, g_grid_h);
-    gtk_widget_set_size_request (g_app_grid, g_grid_w, g_grid_h);
+    if (g_app_grid_clip != nullptr) {
+      gtk_fixed_move (GTK_FIXED (g_root), g_app_grid_clip, g_grid_x, g_grid_y);
+      app_grid_clip_set_bounds (g_app_grid_clip, g_grid_w, g_grid_h);
+    } else {
+      gtk_fixed_move (GTK_FIXED (g_root), g_app_grid, g_grid_x, g_grid_y);
+    }
+    const bool need_grid_now =
+        !opening || g_app_grid_mode ||
+        g_pending_show_state == ControlsState::APP_GRID ||
+        !g_search_query.empty ();
+    if (need_grid_now)
+      ensure_app_grid_synced ();
   }
-
-  // Enumerate alt-tab eligible windows ONCE and compute BOTH WINDOW_PICKER
-  // and APP_GRID (15% top bar) slot rectangles so transitions between them
-  // require zero window re-enumeration or DWM thumbnail teardown.
-  std::vector<OvWindowInfo> windows;
-  EnumContext ctx{monitor, mi.rcMonitor, &windows, !g_desktops.empty (),
-                  false, winome::get_config ().overview_window_blacklist};
-  EnumWindows (collect_windows, reinterpret_cast<LPARAM> (&ctx));
 
   RECT workarea = {0, panel_height, w, h};
   double chrome_oversize =
@@ -2423,12 +3094,27 @@ place_overview_locked (bool opening, int switch_dir)
   double small_gap =
       (window_picker_spacing () * kSmallWorkspaceRatio + 4.0) * scale;
 
-  std::vector<OvSlot> picker_slots;
-  overview_compute_slots (windows, mi.rcMonitor, workarea, geo.ws_box_picker,
-                          spacing, spacing, &picker_slots);
-  std::vector<OvSlot> grid_slots;
-  overview_compute_slots (windows, mi.rcMonitor, workarea, geo.ws_box_grid,
-                          small_gap, small_gap, &grid_slots);
+  // Preserve existing live DWM thumbnail handles across in-place relayouts
+  // (e.g. after dropping a window onto another workspace or closing a window)
+  // so remaining windows animate smoothly without a DWM re-register flash.
+  struct SavedThumb {
+    HWND target = nullptr;
+    HTHUMBNAIL thumb = nullptr;
+    RECT current{};
+    BYTE opacity = 255;
+  };
+  std::vector<SavedThumb> saved_thumbs;
+  if (!opening && switch_dir == 0) {
+    saved_thumbs.reserve (g_slots.size ());
+    for (SlotEntry &old_s : g_slots) {
+      if (old_s.thumb != nullptr && old_s.target != nullptr) {
+        saved_thumbs.push_back (SavedThumb{old_s.target, old_s.thumb,
+                                           old_s.current,
+                                           old_s.current_opacity});
+        old_s.thumb = nullptr;
+      }
+    }
+  }
 
   set_hover (-1, true);
   destroy_previews ();
@@ -2437,59 +3123,119 @@ place_overview_locked (bool opening, int switch_dir)
     g_anim.source = 0;
   }
 
-  g_slots.reserve (picker_slots.size ());
-  for (const OvSlot &s : picker_slots) {
-    SlotEntry e;
-    e.target = s.window.hwnd;
-    e.start = s.window.rect;
-    e.z_order = (int)windows.size ();
-    for (size_t wi = 0; wi < windows.size (); ++wi) {
-      if (windows[wi].hwnd == e.target) {
-        e.z_order = (int)wi;
-        break;
-      }
+  const int ws_count = std::max (static_cast<int> (g_desktops.size ()), 1);
+  const int active_ws = std::clamp (g_desktop_active, 0, ws_count - 1);
+  bool need_relayout_anim = false;
+
+  for (int d = 0; d < ws_count; ++d) {
+    std::vector<OvWindowInfo> desk_windows;
+    for (size_t i = 0; i < all_windows.size (); ++i) {
+      int wd = (i < window_desktop.size ()) ? window_desktop[i] : -1;
+      if (g_desktops.empty () || wd == d || (wd < 0 && d == active_ws))
+        desk_windows.push_back (all_windows[i]);
     }
-    e.minimized = IsIconic (s.window.hwnd) != FALSE;
-    int sw = (int)((s.window.rect.right - s.window.rect.left) * s.scale);
-    int sh = (int)((s.window.rect.bottom - s.window.rect.top) * s.scale);
-    e.picker_rect.left = (int)s.x;
-    e.picker_rect.top = (int)s.y;
-    e.picker_rect.right = e.picker_rect.left + sw;
-    e.picker_rect.bottom = e.picker_rect.top + sh;
-    if (e.picker_rect.right <= e.picker_rect.left ||
-        e.picker_rect.bottom <= e.picker_rect.top)
+    if (desk_windows.empty ())
       continue;
 
-    bool found_grid = false;
-    for (const OvSlot &gs : grid_slots) {
-      if (gs.window.hwnd == e.target) {
-        int gsw = (int)((gs.window.rect.right - gs.window.rect.left) * gs.scale);
-        int gsh = (int)((gs.window.rect.bottom - gs.window.rect.top) * gs.scale);
-        e.grid_rect.left = (int)gs.x;
-        e.grid_rect.top = (int)gs.y;
-        e.grid_rect.right = std::max (e.grid_rect.left + 1, e.grid_rect.left + gsw);
-        e.grid_rect.bottom = std::max (e.grid_rect.top + 1, e.grid_rect.top + gsh);
-        found_grid = true;
-        break;
-      }
-    }
-    if (!found_grid) {
-      e.grid_rect = remap_rect_between_boxes (e.picker_rect, geo.ws_box_picker,
-                                              geo.ws_box_grid);
-    }
+    const RECT &ws_picker_d = g_ws_picker_boxes[static_cast<size_t> (d)];
+    const RECT &ws_grid_d = g_ws_grid_boxes[static_cast<size_t> (d)];
+    const RECT &ws_full_d = g_ws_full_boxes[static_cast<size_t> (d)];
 
-    if (e.minimized) {
-      e.start.left = geo.ws_box_picker.left;
-      e.start.top = geo.ws_box_picker.top;
-      e.start.right = e.start.left + 1;
-      e.start.bottom = e.start.top + 1;
+    std::vector<OvSlot> picker_slots;
+    overview_compute_slots (desk_windows, mi.rcMonitor, workarea,
+                            geo.ws_box_picker, spacing, spacing, &picker_slots);
+    std::vector<OvSlot> grid_slots;
+    overview_compute_slots (desk_windows, mi.rcMonitor, workarea, ws_grid_d,
+                            small_gap, small_gap, &grid_slots);
+
+    for (const OvSlot &s : picker_slots) {
+      SlotEntry e{};
+      e.target = s.window.hwnd;
+      e.thumb = nullptr;
+      e.desktop_index = d;
+      e.start = (d == active_ws)
+                    ? s.window.rect
+                    : remap_rect_between_boxes (s.window.rect, g_bg_full,
+                                                ws_full_d);
+      e.z_order = static_cast<int> (all_windows.size ());
+      for (size_t wi = 0; wi < all_windows.size (); ++wi) {
+        if (all_windows[wi].hwnd == e.target) {
+          e.z_order = static_cast<int> (wi);
+          break;
+        }
+      }
+      e.minimized = (d == active_ws) && (IsIconic (s.window.hwnd) != FALSE);
+      int sw = (int)((s.window.rect.right - s.window.rect.left) * s.scale);
+      int sh = (int)((s.window.rect.bottom - s.window.rect.top) * s.scale);
+      e.canonical_picker_rect.left = (int)s.x;
+      e.canonical_picker_rect.top = (int)s.y;
+      e.canonical_picker_rect.right = e.canonical_picker_rect.left + sw;
+      e.canonical_picker_rect.bottom = e.canonical_picker_rect.top + sh;
+      if (e.canonical_picker_rect.right <= e.canonical_picker_rect.left ||
+          e.canonical_picker_rect.bottom <= e.canonical_picker_rect.top)
+        continue;
+
+      e.picker_rect =
+          (d == active_ws)
+              ? e.canonical_picker_rect
+              : remap_rect_between_boxes (e.canonical_picker_rect,
+                                          geo.ws_box_picker, ws_picker_d);
+
+      bool found_grid = false;
+      for (const OvSlot &gs : grid_slots) {
+        if (gs.window.hwnd == e.target) {
+          int gsw =
+              (int)((gs.window.rect.right - gs.window.rect.left) * gs.scale);
+          int gsh =
+              (int)((gs.window.rect.bottom - gs.window.rect.top) * gs.scale);
+          e.grid_rect.left = (int)gs.x;
+          e.grid_rect.top = (int)gs.y;
+          e.grid_rect.right =
+              std::max (e.grid_rect.left + 1, e.grid_rect.left + gsw);
+          e.grid_rect.bottom =
+              std::max (e.grid_rect.top + 1, e.grid_rect.top + gsh);
+          found_grid = true;
+          break;
+        }
+      }
+      if (!found_grid) {
+        e.grid_rect = remap_rect_between_boxes (e.canonical_picker_rect,
+                                                geo.ws_box_picker, ws_grid_d);
+      }
+
+      if (e.minimized) {
+        e.start.left = ws_picker_d.left;
+        e.start.top = ws_picker_d.top;
+        e.start.right = e.start.left + 1;
+        e.start.bottom = e.start.top + 1;
+      }
+      e.rect = g_app_grid_mode ? e.grid_rect : e.picker_rect;
+      e.anim_from = opening ? e.start : e.rect;
+      e.anim_to = e.rect;
+      e.current = opening ? e.start : e.rect;
+      e.current_opacity = opening ? (e.minimized ? 0 : 255) : 255;
+
+      for (SavedThumb &st : saved_thumbs) {
+        if (st.thumb != nullptr && st.target == e.target) {
+          e.thumb = st.thumb;
+          st.thumb = nullptr;
+          e.anim_from = st.current;
+          e.current = st.current;
+          e.anim_from_opacity = st.opacity;
+          e.current_opacity = st.opacity;
+          if (!EqualRect (&st.current, &e.rect))
+            need_relayout_anim = true;
+          break;
+        }
+      }
+
+      g_slots.push_back (e);
     }
-    e.rect = g_app_grid_mode ? e.grid_rect : e.picker_rect;
-    e.anim_from = opening ? e.start : e.rect;
-    e.anim_to = e.rect;
-    e.current = opening ? e.start : e.rect;
-    e.current_opacity = opening ? (e.minimized ? 0 : 255) : 255;
-    g_slots.push_back (e);
+  }
+
+  for (SavedThumb &st : saved_thumbs) {
+    if (st.thumb != nullptr)
+      DwmUnregisterThumbnail (st.thumb);
   }
 
   // Settle focus and Win32 z-order BEFORE registering DWM thumbnails so that
@@ -2501,22 +3247,24 @@ place_overview_locked (bool opening, int switch_dir)
 
   // Register DWM thumbnails once (in back-to-front desktop Z-order): start at
   // real desktop rects when opening, slide-in start offset when switching
-  // desktops, or settled rects otherwise.
+  // desktops, or current/settled rects otherwise.
   create_previews (opening, switch_off_x);
 
   // Mini window previews inside the workspace thumbnail pills.
   create_mini_previews (monitor, mi.rcMonitor, geo.thumbs_x, geo.thumbs_y,
-                        (opening || g_app_grid_mode) ? 0 : 255);
+                        (opening || g_app_grid_mode) ? 0 : 255, &all_windows,
+                        &window_desktop);
 
   g_placed = true;
-  g_print ("[ov] placed %dx%d slots=%zu ws=%ldx%ld dash=%d\n", w, h,
-           g_slots.size (), (long)(g_ws_box.right - g_ws_box.left),
-           (long)(g_ws_box.bottom - g_ws_box.top),
-           overview_dash_get_width (g_dash));
+  g_print ("[ov] placed %dx%d slots=%zu ws=%ldx%ld grid=%dx%d@(%d,%d) dash=%d\n",
+           w, h, g_slots.size (), (long)(g_ws_box.right - g_ws_box.left),
+           (long)(g_ws_box.bottom - g_ws_box.top), g_grid_w, g_grid_h, g_grid_x,
+           g_grid_y, overview_dash_get_width (g_dash));
 
   if (opening) {
     ControlsState desired = g_pending_show_state;
     g_bg_cur = g_bg_full;
+    g_ws_cur_boxes = g_ws_full_boxes;
     g_bg_radius = 0.0;
     g_thumbs_cur_opacity = 0.0;
     g_grid_cur_opacity = 0.0;
@@ -2525,20 +3273,14 @@ place_overview_locked (bool opening, int switch_dir)
       gtk_widget_set_opacity (g_thumbs, 0.0);
     if (g_app_grid != nullptr) {
       gtk_widget_set_opacity (g_app_grid, 0.0);
-      gtk_fixed_move (GTK_FIXED (g_root), g_app_grid, g_grid_x,
-                      g_grid_y + (int)kGridSlideOffsetPx);
-      gtk_widget_set_visible (g_app_grid, desired == ControlsState::APP_GRID);
+      apply_app_grid_slide (kGridSlideOffsetPx);
+      sync_app_grid_visible (desired == ControlsState::APP_GRID);
     }
     start_state_transition (desired, kOpenMs);
   } else {
     g_ws_box = g_app_grid_mode ? g_bg_grid : g_bg_picker;
     g_bg_radius_target = g_app_grid_mode ? g_radius_grid : g_radius_picker;
     g_bg_radius = g_bg_radius_target;
-    apply_bg_rect (translate_rect_x (g_ws_box, switch_off_x));
-    for (SlotEntry &s : g_slots) {
-      s.rect = g_app_grid_mode ? s.grid_rect : s.picker_rect;
-      apply_thumb_rect (s, translate_rect_x (s.rect, switch_off_x), 255);
-    }
     g_thumbs_cur_opacity = (!g_app_grid_mode && g_thumbs_has_pills) ? 1.0 : 0.0;
     if (g_thumbs != nullptr) {
       gtk_widget_set_visible (g_thumbs,
@@ -2547,14 +3289,46 @@ place_overview_locked (bool opening, int switch_dir)
     }
     set_mini_opacity (g_app_grid_mode ? 0 : 255);
     if (g_app_grid != nullptr) {
-      gtk_fixed_move (GTK_FIXED (g_root), g_app_grid, g_grid_x, g_grid_y);
+      apply_app_grid_slide (g_app_grid_mode ? 0.0 : kGridSlideOffsetPx);
       gtk_widget_set_opacity (g_app_grid, g_app_grid_mode ? 1.0 : 0.0);
-      gtk_widget_set_visible (g_app_grid, g_app_grid_mode);
+      sync_app_grid_visible (g_app_grid_mode);
     }
     g_grid_cur_opacity = g_app_grid_mode ? 1.0 : 0.0;
     g_grid_cur_slide_y = g_app_grid_mode ? 0.0 : kGridSlideOffsetPx;
-    if (!g_app_grid_mode && switch_dir == 0)
-      set_hover (slot_at_cursor ());
+
+    if (switch_dir == 0 && need_relayout_anim) {
+      if (!prev_ws_cur_boxes.empty ()) {
+        g_ws_cur_boxes = prev_ws_cur_boxes;
+        const std::vector<RECT> &tgt_boxes =
+            g_app_grid_mode ? g_ws_grid_boxes : g_ws_picker_boxes;
+        if (g_ws_cur_boxes.size () < tgt_boxes.size ()) {
+          for (size_t di = g_ws_cur_boxes.size (); di < tgt_boxes.size (); ++di)
+            g_ws_cur_boxes.push_back (tgt_boxes[di]);
+        } else if (g_ws_cur_boxes.size () > tgt_boxes.size ()) {
+          g_ws_cur_boxes.resize (tgt_boxes.size ());
+        }
+      }
+      for (SlotEntry &s : g_slots)
+        apply_thumb_rect (s, s.current, s.current_opacity, true);
+      start_state_transition (g_target_state, kRelayoutMs);
+    } else {
+      const std::vector<RECT> &target_boxes =
+          g_app_grid_mode ? g_ws_grid_boxes : g_ws_picker_boxes;
+      if (switch_off_x == 0) {
+        apply_ws_boxes (target_boxes);
+      } else {
+        std::vector<RECT> shifted = target_boxes;
+        for (RECT &r : shifted)
+          r = translate_rect_x (r, switch_off_x);
+        apply_ws_boxes (shifted);
+      }
+      for (SlotEntry &s : g_slots) {
+        s.rect = g_app_grid_mode ? s.grid_rect : s.picker_rect;
+        apply_thumb_rect (s, translate_rect_x (s.rect, switch_off_x), 255);
+      }
+      if (!g_app_grid_mode && switch_dir == 0)
+        set_hover (slot_at_cursor ());
+    }
   }
   dump_zorder ("placed");
 }
@@ -2640,9 +3414,14 @@ zorder_drifted (void)
 
   HWND chain[6];
   int n = 0;
-  HWND popover = static_cast<HWND> (winome_shell_panel_top_popover_hwnd ());
-  if (popover != nullptr)
-    chain[n++] = popover;
+  HWND panel_popover =
+      static_cast<HWND> (winome_shell_panel_top_popover_hwnd ());
+  HWND ov_popup = is_visible_hwnd (g_overview_hwnd)
+                      ? find_owned_overview_popup_hwnd ()
+                      : nullptr;
+  HWND top_popover = (panel_popover != nullptr) ? panel_popover : ov_popup;
+  if (top_popover != nullptr)
+    chain[n++] = top_popover;
   chain[n++] = g_panel_hwnd;
   if (is_visible_hwnd (g_chrome_hwnd))
     chain[n++] = g_chrome_hwnd;
@@ -2663,11 +3442,14 @@ zorder_drifted (void)
   for (int i = 1; i < n; ++i)
     if (GetWindow (chain[i], GW_HWNDPREV) != chain[i - 1])
       return true;
-  // Without a popover the panel must sit above all visible topmost windows;
-  // ignore invisible/cloaked/zero-sized OS helper windows (Default IME, etc.).
+  // Without a popover the panel must sit above all visible topmost windows,
+  // EXCEPT active native/tray right-click popup menus (which must float above
+  // the panel until dismissed); ignore invisible/cloaked/zero-sized OS helpers.
   if (chain[0] == g_panel_hwnd) {
     for (HWND prev = GetWindow (g_panel_hwnd, GW_HWNDPREV); prev != nullptr;
          prev = GetWindow (prev, GW_HWNDPREV)) {
+      if (is_popup_menu_window (prev))
+        continue;
       if (IsWindowVisible (prev) && !is_cloaked (prev)) {
         RECT r{};
         if (GetWindowRect (prev, &r) && r.right > r.left && r.bottom > r.top)
@@ -2688,12 +3470,30 @@ restack_locked (void)
   if (!zorder_drifted ())
     return;
 
-  HWND popover = static_cast<HWND> (winome_shell_panel_top_popover_hwnd ());
+  HWND panel_popover =
+      static_cast<HWND> (winome_shell_panel_top_popover_hwnd ());
+  HWND ov_popup = is_visible_hwnd (g_overview_hwnd)
+                      ? find_owned_overview_popup_hwnd ()
+                      : nullptr;
+  HWND top_popover = (panel_popover != nullptr) ? panel_popover : ov_popup;
 
-  if (popover == nullptr)
+  if (panel_popover == nullptr && ov_popup != nullptr) {
+    ensure_hwnd_topmost (ov_popup);
+    SetWindowPos (ov_popup, HWND_TOPMOST, 0, 0, 0, 0,
+                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                      SWP_NOOWNERZORDER);
+  }
+
+  HWND foreign_popup =
+      (top_popover == nullptr) ? find_lowest_popup_menu_above_panel () : nullptr;
+  HWND panel_anchor = (top_popover != nullptr)
+                          ? top_popover
+                          : (foreign_popup != nullptr ? foreign_popup
+                                                      : HWND_TOPMOST);
+
+  if (top_popover == nullptr && foreign_popup == nullptr)
     ensure_hwnd_topmost (g_panel_hwnd);
-  if (!SetWindowPos (g_panel_hwnd, popover != nullptr ? popover : HWND_TOPMOST,
-                     0, 0, 0, 0,
+  if (!SetWindowPos (g_panel_hwnd, panel_anchor, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
                          SWP_NOOWNERZORDER))
     g_print ("[restack] panel failed gle=%lu\n", GetLastError ());
@@ -2752,7 +3552,8 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
   if (t > 1.0)
     t = 1.0;
 
-  double e = (anim.to_state == ControlsState::HIDDEN)
+  double e = (anim.to_state == ControlsState::HIDDEN ||
+              anim.from_state == anim.to_state)
                  ? ease_out_quad (t)
                  : ((anim.from_state == ControlsState::HIDDEN &&
                      anim.to_state == ControlsState::WINDOW_PICKER)
@@ -2760,8 +3561,17 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
                         : ease_out_cubic (t));
 
   RECT bg = lerp_rect (anim.bg_from, anim.bg_to, e);
-  apply_bg_rect (bg);
   g_bg_radius = anim.radius_from + (anim.radius_to - anim.radius_from) * e;
+  if (!g_ws_anim_to_boxes.empty () &&
+      g_ws_anim_from_boxes.size () == g_ws_anim_to_boxes.size ()) {
+    std::vector<RECT> cur_boxes (g_ws_anim_to_boxes.size ());
+    for (size_t i = 0; i < g_ws_anim_to_boxes.size (); ++i)
+      cur_boxes[i] =
+          lerp_rect (g_ws_anim_from_boxes[i], g_ws_anim_to_boxes[i], e);
+    apply_ws_boxes (cur_boxes);
+  } else {
+    apply_bg_rect (bg);
+  }
 
   g_thumbs_cur_opacity =
       anim.thumbs_from + (anim.thumbs_to - anim.thumbs_from) * e;
@@ -2776,12 +3586,9 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
   g_grid_cur_slide_y =
       anim.grid_slide_from + (anim.grid_slide_to - anim.grid_slide_from) * e;
   if (g_app_grid != nullptr && gtk_widget_get_visible (g_app_grid)) {
-    gtk_widget_set_opacity (g_app_grid, std::clamp (g_grid_cur_opacity, 0.0, 1.0));
-    int target_move_y = g_grid_y + (int)(g_grid_cur_slide_y + 0.5);
-    if (target_move_y != g_grid_last_moved_y) {
-      g_grid_last_moved_y = target_move_y;
-      gtk_fixed_move (GTK_FIXED (g_root), g_app_grid, g_grid_x, target_move_y);
-    }
+    app_grid_set_transition_opacity (
+        g_app_grid, true, std::clamp (g_grid_cur_opacity, 0.0, 1.0));
+    apply_app_grid_slide (g_grid_cur_slide_y);
   }
 
   for (SlotEntry &s : g_slots) {
@@ -2805,6 +3612,11 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
       finish_hide ();
       return G_SOURCE_REMOVE;
     }
+    // Re-draw settled workspace boxes once anim.source == 0 to paint drop-shadows.
+    if (!g_ws_anim_to_boxes.empty ())
+      apply_ws_boxes (g_ws_anim_to_boxes);
+    else
+      apply_bg_rect (bg);
     if (anim.to_state == ControlsState::APP_GRID) {
       if (g_thumbs != nullptr && gtk_widget_get_visible (g_thumbs)) {
         gtk_widget_set_opacity (g_thumbs, 0.0);
@@ -2812,9 +3624,8 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
       }
       set_mini_opacity (0);
       if (g_app_grid != nullptr) {
-        gtk_widget_set_opacity (g_app_grid, 1.0);
-        g_grid_last_moved_y = g_grid_y;
-        gtk_fixed_move (GTK_FIXED (g_root), g_app_grid, g_grid_x, g_grid_y);
+        app_grid_set_transition_opacity (g_app_grid, false, 1.0);
+        apply_app_grid_slide (0.0);
       }
       g_grid_cur_opacity = 1.0;
       g_grid_cur_slide_y = 0.0;
@@ -2823,8 +3634,8 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
     }
     // Settled on WINDOW_PICKER.
     if (g_app_grid != nullptr && gtk_widget_get_visible (g_app_grid)) {
-      gtk_widget_set_opacity (g_app_grid, 0.0);
-      gtk_widget_set_visible (g_app_grid, FALSE);
+      app_grid_set_transition_opacity (g_app_grid, false, 0.0);
+      sync_app_grid_visible (false);
     }
     g_grid_cur_opacity = 0.0;
     g_grid_cur_slide_y = kGridSlideOffsetPx;
@@ -2868,7 +3679,7 @@ switch_finish (bool restore_hover)
     return;
   const RECT &target_bg = g_app_grid_mode ? g_bg_grid : g_bg_picker;
   g_bg_final = target_bg;
-  apply_bg_rect (target_bg);
+  apply_ws_boxes (g_app_grid_mode ? g_ws_grid_boxes : g_ws_picker_boxes);
   overview_thumbs_set_indicator_value (g_thumbs, -1.0);
   for (SlotEntry &s : g_slots)
     apply_thumb_rect (s, s.rect, 255);
@@ -2891,26 +3702,37 @@ switch_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
     t = 1.0;
   double e = ease_out_cubic (t);
 
-  // The strip slides towards the target: the new desktop slides in from the
-  // direction of its index, the previous one slides out the other way, the
-  // workspace background box travels along, and the thumbnail indicator
-  // rides the same eased value.
-  int dir = (g_switch_to > g_switch_from) ? 1 : -1;
-  int width = g_switch_width > 0 ? g_switch_width
-                                  : (g_ws_box.right - g_ws_box.left);
-  LONG in_off = (LONG)(dir * (1.0 - e) * width);
-  LONG out_off = (LONG)(-dir * e * width);
+  // WorkspacesView._scrollToActive + _updateWorkspacesState:
+  // Continuous scroll adjustment position slides the entire horizontal
+  // workspace strip while smoothly interpolating each workspace's scale
+  // between WORKSPACE_INACTIVE_SCALE (0.94) and 1.0.
+  const double scroll_pos = g_switch_from + (g_switch_to - g_switch_from) * e;
+  g_switch_cur_pos = scroll_pos;
+  const int ws_count = std::max (static_cast<int> (g_desktops.size ()), 1);
+  const int scale =
+      g_window != nullptr ? std::max (gtk_widget_get_scale_factor (g_window), 1)
+                          : 1;
 
-  const RECT &target_bg = g_app_grid_mode ? g_bg_grid : g_bg_picker;
-  g_bg_final = target_bg;
-
-  for (SlotEntry &s : g_slots)
-    apply_thumb_rect (s, translate_rect_x (s.rect, in_off), 255);
-  for (SlotEntry &l : g_leaving)
-    apply_thumb_rect (l, translate_rect_x (l.rect, out_off), 255);
-  apply_bg_rect (translate_rect_x (target_bg, in_off));
-  overview_thumbs_set_indicator_value (
-      g_thumbs, g_switch_from + (g_switch_to - g_switch_from) * e);
+  if (!g_app_grid_mode) {
+    std::vector<RECT> cur_boxes (static_cast<size_t> (ws_count));
+    for (int d = 0; d < ws_count; ++d) {
+      cur_boxes[static_cast<size_t> (d)] = picker_box_for_desktop (
+          d, scroll_pos, g_bg_picker, g_monitor_w, scale);
+    }
+    apply_ws_boxes (cur_boxes);
+    for (SlotEntry &s : g_slots) {
+      int d = std::clamp (s.desktop_index, 0, ws_count - 1);
+      RECT r = remap_rect_between_boxes (
+          s.canonical_picker_rect, g_bg_picker,
+          cur_boxes[static_cast<size_t> (d)]);
+      apply_thumb_rect (s, r, 255);
+    }
+  } else {
+    apply_ws_boxes (g_ws_grid_boxes);
+    for (SlotEntry &s : g_slots)
+      apply_thumb_rect (s, s.grid_rect, 255);
+  }
+  overview_thumbs_set_indicator_value (g_thumbs, scroll_pos);
 
   if (t >= 1.0) {
     switch_finish (true);
@@ -2919,10 +3741,9 @@ switch_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
   return G_SOURCE_CONTINUE;
 }
 
-// Animated workspace switch (WorkspacesView._scrollToActive: the previews of
-// the previous desktop slide out while the new desktop's slide in, 250ms
-// EASE_OUT_CUBIC). Falls back to the plain relayout when the relayout did
-// not land on @to.
+// Animated workspace switch (WorkspacesView._scrollToActive: 250ms
+// EASE_OUT_CUBIC on the scroll adjustment; zero DWM thumbnail teardown or
+// EnumWindows re-enumeration when desktop count is unchanged).
 static void
 switch_workspace_animated (int to)
 {
@@ -2946,46 +3767,65 @@ switch_workspace_animated (int to)
   if (fresh.empty () || to >= (int)fresh.size ())
     return;
 
-  // Finish a previous in-flight switch instantly (rapid pill clicks).
-  switch_finish (false);
+  const bool was_switching = (g_switch_source != 0);
+  const double from_pos =
+      was_switching ? g_switch_cur_pos
+                    : static_cast<double> (std::max (g_desktop_active, 0));
+  switch_cancel ();
 
-  int from = g_desktop_active;
-  int dir = (to > from) ? 1 : -1;
-
-  // Suppress hover/chrome and clear any active drag before rebuilding slots.
   set_hover (-1, true);
   reset_drag_state ();
 
-  // Hand the current previews (with their live DWM thumbnails) to the
-  // outgoing group; they keep rendering while sliding out.
-  for (SlotEntry &e : g_slots)
-    g_leaving.push_back (std::move (e));
-  g_slots.clear ();
-
-  // Rebuild directly at the t=0 slide-in start offset without probing hover,
-  // so neither a final-position frame nor hover chrome flashes before settle.
-  place_overview_locked (false, dir);
-  if (to != g_desktop_active) {
-    for (SlotEntry &l : g_leaving)
-      if (l.thumb != nullptr)
-        DwmUnregisterThumbnail (l.thumb);
-    g_leaving.clear ();
-    apply_bg_rect (g_app_grid_mode ? g_bg_grid : g_bg_picker);
-    for (SlotEntry &s : g_slots)
-      apply_thumb_rect (s, s.rect, 255);
-    if (!g_app_grid_mode && g_target_state == ControlsState::WINDOW_PICKER)
-      set_hover (slot_at_cursor ());
+  if (fresh.size () != g_desktops.size ()) {
+    place_overview_locked (false, 0);
     return;
   }
 
-  g_switch_from = from;
-  g_switch_to = to;
+  g_desktop_active = to;
+  const int ws_count = std::max (static_cast<int> (g_desktops.size ()), 1);
+  const int scale = std::max (gtk_widget_get_scale_factor (g_window), 1);
+  g_ws_picker_boxes.resize (static_cast<size_t> (ws_count));
+  g_ws_full_boxes.resize (static_cast<size_t> (ws_count));
+  for (int d = 0; d < ws_count; ++d) {
+    g_ws_picker_boxes[static_cast<size_t> (d)] =
+        picker_box_for_desktop (d, static_cast<double> (to), g_bg_picker,
+                                g_monitor_w, scale);
+    g_ws_full_boxes[static_cast<size_t> (d)] =
+        full_box_for_desktop (d, to, g_bg_full, g_bg_picker, g_monitor_w,
+                              scale);
+  }
+  for (SlotEntry &s : g_slots) {
+    int d = std::clamp (s.desktop_index, 0, ws_count - 1);
+    const RECT &ws_picker_d = g_ws_picker_boxes[static_cast<size_t> (d)];
+    s.picker_rect = (d == to)
+                        ? s.canonical_picker_rect
+                        : remap_rect_between_boxes (
+                              s.canonical_picker_rect, g_bg_picker, ws_picker_d);
+    s.rect = g_app_grid_mode ? s.grid_rect : s.picker_rect;
+  }
+
+  if (g_thumbs != nullptr && g_thumbs_has_pills) {
+    int wa_h = std::max (g_monitor_h - g_panel_height, 1);
+    int box_h = (int)(wa_h * kMaxThumbnailScale) / scale;
+    bool can_manage =
+        vd::vtable_slots_for_build (vd::windows_build_number ())
+            .can_manage_desktops;
+    overview_thumbs_repopulate (
+        g_thumbs, (int)g_desktops.size (), g_desktop_active, box_h,
+        (double)g_monitor_w / scale, (double)g_monitor_w, (double)wa_h,
+        g_wallpaper, can_manage, false);
+  }
+
+  g_switch_from = from_pos;
+  g_switch_to = static_cast<double> (to);
+  g_switch_cur_pos = from_pos;
   g_switch_width = g_ws_box.right - g_ws_box.left;
   g_switch_start_us = g_get_monotonic_time ();
-  overview_thumbs_set_indicator_value (g_thumbs, static_cast<double> (from));
+  g_last_internal_switch_us = g_switch_start_us;
+  overview_thumbs_set_indicator_value (g_thumbs, from_pos);
   g_switch_source =
       gtk_widget_add_tick_callback (g_window, switch_tick, nullptr, nullptr);
-  g_print ("[ov] workspace switch %d -> %d (animated)\n", from, to);
+  g_print ("[ov] workspace switch %.2f -> %d (animated)\n", from_pos, to);
 }
 
 void
@@ -3018,13 +3858,12 @@ start_state_transition (ControlsState to_state, guint duration_ms)
   g_anim.from_state = prev_target;
   g_anim.to_state = to_state;
   g_anim.duration_ms = std::max (duration_ms, 1u);
-  g_anim.start_us = g_get_monotonic_time ();
-  g_anim_tracker.reset ();
   g_grid_last_moved_y = INT_MIN;
 
   // Snapshot live visual state so mid-flight interruptions are completely
   // seamless with zero jump.
   g_anim.bg_from = g_bg_cur;
+  g_ws_anim_from_boxes = g_ws_cur_boxes;
   g_anim.radius_from = g_bg_radius;
   g_anim.thumbs_from = g_thumbs_cur_opacity;
   g_anim.grid_opacity_from = g_grid_cur_opacity;
@@ -3032,6 +3871,7 @@ start_state_transition (ControlsState to_state, guint duration_ms)
 
   if (to_state == ControlsState::WINDOW_PICKER) {
     g_anim.bg_to = g_bg_picker;
+    g_ws_anim_to_boxes = g_ws_picker_boxes;
     g_bg_final = g_bg_picker;
     g_anim.radius_to = g_radius_picker;
     g_bg_radius_target = g_radius_picker;
@@ -3041,6 +3881,10 @@ start_state_transition (ControlsState to_state, guint duration_ms)
       gtk_widget_set_visible (g_thumbs, TRUE);
     g_anim.grid_opacity_to = 0.0;
     g_anim.grid_slide_to = kGridSlideOffsetPx;
+    if (g_app_grid != nullptr && gtk_widget_get_visible (g_app_grid)) {
+      app_grid_set_transition_opacity (
+          g_app_grid, true, std::clamp (g_grid_cur_opacity, 0.0, 1.0));
+    }
     for (SlotEntry &s : g_slots) {
       s.anim_from = s.current;
       s.anim_from_opacity = s.current_opacity;
@@ -3050,6 +3894,7 @@ start_state_transition (ControlsState to_state, guint duration_ms)
     }
   } else if (to_state == ControlsState::APP_GRID) {
     g_anim.bg_to = g_bg_grid;
+    g_ws_anim_to_boxes = g_ws_grid_boxes;
     g_bg_final = g_bg_grid;
     g_anim.radius_to = g_radius_grid;
     g_bg_radius_target = g_radius_grid;
@@ -3058,6 +3903,7 @@ start_state_transition (ControlsState to_state, guint duration_ms)
     g_anim.grid_opacity_to = 1.0;
     g_anim.grid_slide_to = 0.0;
     if (g_app_grid != nullptr) {
+      ensure_app_grid_synced ();
       if (prev_target != ControlsState::APP_GRID && !gtk_widget_get_visible (g_app_grid)) {
         app_grid_reset_page (g_app_grid);
         g_grid_cur_opacity = 0.0;
@@ -3065,11 +3911,10 @@ start_state_transition (ControlsState to_state, guint duration_ms)
         g_anim.grid_opacity_from = 0.0;
         g_anim.grid_slide_from = kGridSlideOffsetPx;
       }
-      gtk_widget_set_opacity (g_app_grid,
-                              std::clamp (g_grid_cur_opacity, 0.0, 1.0));
-      gtk_fixed_move (GTK_FIXED (g_root), g_app_grid, g_grid_x,
-                      g_grid_y + (int)(g_grid_cur_slide_y + 0.5));
-      gtk_widget_set_visible (g_app_grid, TRUE);
+      app_grid_set_transition_opacity (
+          g_app_grid, true, std::clamp (g_grid_cur_opacity, 0.0, 1.0));
+      apply_app_grid_slide (g_grid_cur_slide_y);
+      sync_app_grid_visible (true);
     }
     for (SlotEntry &s : g_slots) {
       s.anim_from = s.current;
@@ -3082,11 +3927,16 @@ start_state_transition (ControlsState to_state, guint duration_ms)
     g_pending_desktop_sync = false;
     g_pending_desktop_target = -1;
     g_anim.bg_to = g_bg_full;
+    g_ws_anim_to_boxes = g_ws_full_boxes;
     g_anim.radius_to = 0.0;
     g_bg_radius_target = 0.0;
     g_anim.thumbs_to = 0.0;
     g_anim.grid_opacity_to = 0.0;
     g_anim.grid_slide_to = kGridSlideOffsetPx;
+    if (g_app_grid != nullptr && gtk_widget_get_visible (g_app_grid)) {
+      app_grid_set_transition_opacity (
+          g_app_grid, true, std::clamp (g_grid_cur_opacity, 0.0, 1.0));
+    }
     for (SlotEntry &s : g_slots) {
       s.anim_from = s.current;
       s.anim_from_opacity = s.current_opacity;
@@ -3095,7 +3945,12 @@ start_state_transition (ControlsState to_state, guint duration_ms)
     }
   }
 
+  if (g_ws_anim_from_boxes.size () != g_ws_anim_to_boxes.size ())
+    g_ws_anim_from_boxes = g_ws_anim_to_boxes;
+
   restack_locked ();
+  g_anim.start_us = g_get_monotonic_time ();
+  g_anim_tracker.reset ();
   g_anim.source =
       gtk_widget_add_tick_callback (g_window, anim_tick, nullptr, nullptr);
 }
@@ -3106,7 +3961,7 @@ overview_idle_trim_cb (gpointer user_data)
   (void)user_data;
   g_idle_trim_timer = 0;
   if (g_window == nullptr || !gtk_widget_get_visible (g_window))
-    app_icon_cache_trim (256);
+    app_icon_cache_trim (64);
   return G_SOURCE_REMOVE;
 }
 
@@ -3136,13 +3991,8 @@ finish_hide (void)
   g_pending_desktop_target = -1;
   g_atomic_can_shift_app_grid.store (false, std::memory_order_release);
   g_pending_shift_app_grid.store (false, std::memory_order_release);
-  g_drag_active = false;
-  g_drag_slot = -1;
-  g_drag_hwnd = nullptr;
+  reset_drag_state ();
   g_drag_just_ended = false;
-  g_drag_thumbs_revealed = false;
-  if (g_thumbs != nullptr)
-    overview_thumbs_set_drop_target (g_thumbs, -1);
   if (g_dash != nullptr) {
     overview_dash_close_menu (g_dash);
     overview_dash_set_apps_active (g_dash, false);
@@ -3151,8 +4001,9 @@ finish_hide (void)
     app_grid_close_open_folder (g_app_grid);
     app_grid_close_menu (g_app_grid);
     app_grid_reset_page (g_app_grid);
-    gtk_widget_set_opacity (g_app_grid, 1.0);
-    gtk_widget_set_visible (g_app_grid, FALSE);
+    apply_app_grid_slide (0.0);
+    app_grid_set_transition_opacity (g_app_grid, false, 1.0);
+    sync_app_grid_visible (false);
   }
   g_grid_cur_opacity = 0.0;
   g_grid_cur_slide_y = kGridSlideOffsetPx;
@@ -3172,7 +4023,10 @@ finish_hide (void)
   // the wallpaper-covered work area — GNOME's t=0 — instead of a bare
   // #222226 flash while the placement idle is still pending.
   g_bg_cur = g_bg_full;
+  g_ws_cur_boxes.assign (1, g_bg_full);
   g_bg_radius = 0.0;
+  g_ws_bg_last_radius = -1.0;
+  g_ws_bg_settled_shadow_drawn = false;
   g_thumbs_cur_opacity = 0.0;
   if (g_thumbs != nullptr)
     gtk_widget_set_opacity (g_thumbs, 1.0);
@@ -3204,6 +4058,8 @@ cancel_delayed_rebuild (void)
 static gboolean
 delayed_rebuild_cb (gpointer user_data G_GNUC_UNUSED)
 {
+  if (g_drag_slot >= 0 || g_drag_active)
+    return G_SOURCE_CONTINUE;
   g_close_rebuild_timer = 0;
   if (g_window != nullptr && gtk_widget_get_visible (g_window) && g_placed &&
       g_target_state != ControlsState::HIDDEN && overview_active ()) {
@@ -3223,107 +4079,161 @@ schedule_delayed_rebuild (guint delay_ms)
 static void
 reset_drag_state (void)
 {
-  bool was_revealed = g_drag_thumbs_revealed;
+  if (g_drag_tick_source != 0 && g_window != nullptr) {
+    gtk_widget_remove_tick_callback (g_window, g_drag_tick_source);
+    g_drag_tick_source = 0;
+  }
+  if (g_drag_snapback_source != 0 && g_window != nullptr) {
+    gtk_widget_remove_tick_callback (g_window, g_drag_snapback_source);
+    g_drag_snapback_source = 0;
+  }
+  if (g_drag_snapback_slot >= 0 &&
+      g_drag_snapback_slot < static_cast<int> (g_slots.size ())) {
+    SlotEntry &s = g_slots[static_cast<size_t> (g_drag_snapback_slot)];
+    apply_thumb_rect (s, s.rect, 255);
+  }
+  g_drag_snapback_slot = -1;
   g_drag_slot = -1;
   g_drag_hwnd = nullptr;
   g_drag_active = false;
   g_drag_thumbs_revealed = false;
-  if (was_revealed) {
-    if (g_thumbs != nullptr && g_root != nullptr && g_ws_bg != nullptr &&
-        gtk_widget_get_parent (g_thumbs) == g_root &&
-        gtk_widget_get_parent (g_ws_bg) == g_root) {
-      gtk_widget_insert_before (g_thumbs, g_root, g_ws_bg);
-    }
-    g_thumbs_rect = {0, 0, 0, 0};
-    g_thumbs_has_pills = g_desktops.size () > 1;
+  if (g_drag_drop_ws_peek != -1) {
+    g_drag_drop_ws_peek = -1;
+    if (g_ws_bg != nullptr)
+      gtk_widget_queue_draw (g_ws_bg);
   }
   if (g_thumbs != nullptr)
     overview_thumbs_set_drop_target (g_thumbs, -1);
 }
 
-static void
-reveal_drag_thumbs_single_desktop (int scale)
+static bool
+update_dragged_slot_transform (gint64 now_us)
 {
-  if (g_thumbs == nullptr || g_desktops.size () != 1)
-    return;
-  bool can_manage =
-      vd::vtable_slots_for_build (vd::windows_build_number ())
-          .can_manage_desktops;
-  if (!can_manage)
-    return;
-
-  int mw = g_monitor_w;
-  int wa_h = std::max (g_monitor_h - g_panel_height, 1);
-  if (mw <= 0 || scale <= 0)
-    return;
-
-  int spacing = (int)(wa_h * kVerticalSpacingRatio + 0.5);
-  int thumb_adjust = (int)(spacing * kThumbnailsAdjustTop + 0.5);
-  int thumb_adjust_bottom = (int)(spacing * kThumbnailsAdjustBottom + 0.5);
-  GtkRequisition search_nat{};
-  gtk_widget_get_preferred_size (g_search, nullptr, &search_nat);
-  int search_total =
-      (kSearchMarginTop + kSearchMarginBottom + search_nat.height) * scale;
-  int box_h = (int)(wa_h * kMaxThumbnailScale) / scale;
-  overview_thumbs_repopulate (g_thumbs, 1, 0, box_h, (double)mw / scale,
-                              (double)mw, (double)wa_h, g_wallpaper, true,
-                              true);
-  int thumbs_w = overview_thumbs_get_width (g_thumbs);
-  int thumbs_h = overview_thumbs_get_height (g_thumbs) * scale;
-  if (thumbs_h <= 0)
-    return;
-
-  int thumbs_x = (mw / scale - thumbs_w) / 2;
-  int thumbs_y = (g_panel_height + search_total + thumb_adjust) / scale;
-  if (g_root != nullptr && g_ws_bg != nullptr &&
-      gtk_widget_get_parent (g_thumbs) == g_root &&
-      gtk_widget_get_parent (g_ws_bg) == g_root) {
-    gtk_widget_insert_after (g_thumbs, g_root, g_ws_bg);
+  if (!g_drag_active || g_drag_slot < 0 ||
+      g_drag_slot >= static_cast<int> (g_slots.size ()) ||
+      g_window == nullptr) {
+    return false;
   }
-  gtk_fixed_move (GTK_FIXED (g_root), g_thumbs, thumbs_x, thumbs_y);
-  g_thumbs_cur_opacity = 1.0;
-  gtk_widget_set_opacity (g_thumbs, 1.0);
-  gtk_widget_set_visible (g_thumbs, TRUE);
-  g_thumbs_has_pills = true;
-  g_thumbs_rect.left = thumbs_x * scale;
-  g_thumbs_rect.top = thumbs_y * scale;
-  g_thumbs_rect.right = (thumbs_x + thumbs_w) * scale;
-  g_thumbs_rect.bottom = (thumbs_y * scale) + thumbs_h;
-  g_drag_thumbs_revealed = true;
+  const int scale = std::max (gtk_widget_get_scale_factor (g_window), 1);
+  double t = (now_us - g_drag_scale_start_us) / 1000.0 /
+             static_cast<double> (kDragScaleMs);
+  t = std::clamp (t, 0.0, 1.0);
+  const double e = ease_out_quad (t);
+  const double cur_scale = 1.0 + (g_drag_target_scale - 1.0) * e;
+  const BYTE cur_op = static_cast<BYTE> (std::clamp (
+      static_cast<int> (
+          std::lround (255.0 + (kDraggingWindowOpacity - 255.0) * e)),
+      64, 255));
 
-  // Shrink and shift g_ws_bg and non-dragged DWM thumbnails below the revealed
-  // thumbnails row so neither g_ws_bg nor top-row slots obscure the pills.
-  RECT old_box = g_bg_picker;
-  int new_top = g_panel_height + search_total + thumb_adjust + thumbs_h +
-                thumb_adjust_bottom;
-  int avail_bottom = g_dash_top - spacing;
-  int picker_ws_h = std::max (avail_bottom - new_top, 72);
-  double wa_aspect = (double)mw / (double)wa_h;
-  int picker_ws_w = std::min ((int)(picker_ws_h * wa_aspect + 0.5), mw);
-  int picker_ws_x = (mw - picker_ws_w) / 2;
-  RECT new_box = {picker_ws_x, new_top, picker_ws_x + picker_ws_w,
-                  new_top + picker_ws_h};
-  g_bg_picker = new_box;
-  g_bg_final = new_box;
-  g_ws_box = new_box;
-  apply_bg_rect (new_box);
+  const int orig_w = g_drag_orig_rect.right - g_drag_orig_rect.left;
+  const int orig_h = g_drag_orig_rect.bottom - g_drag_orig_rect.top;
+  const int dw =
+      std::max (static_cast<int> (std::lround (orig_w * cur_scale)), 48 * scale);
+  const int dh =
+      std::max (static_cast<int> (std::lround (orig_h * cur_scale)), 36 * scale);
+  // dnd.js _updateActorPosition: scale around the grab point so the preview
+  // never teleports to the cursor center at t=0.
+  const int left =
+      g_drag_cur_px + static_cast<int> (std::lround (g_drag_offset_x * cur_scale));
+  const int top =
+      g_drag_cur_py + static_cast<int> (std::lround (g_drag_offset_y * cur_scale));
+  RECT moved{left, top, left + dw, top + dh};
+  apply_thumb_rect (g_slots[static_cast<size_t> (g_drag_slot)], moved, cur_op);
+  return t < 1.0;
+}
 
-  for (int i = 0; i < (int)g_slots.size (); ++i) {
-    g_slots[i].picker_rect =
-        remap_rect_between_boxes (g_slots[i].picker_rect, old_box, new_box);
-    g_slots[i].rect = g_slots[i].picker_rect;
-    if (i != g_drag_slot)
-      apply_thumb_rect (g_slots[i], g_slots[i].rect, 255);
+static gboolean
+drag_scale_tick (GtkWidget *widget G_GNUC_UNUSED, GdkFrameClock *clock,
+                 gpointer user_data G_GNUC_UNUSED)
+{
+  if (!g_drag_active || g_drag_slot < 0) {
+    g_drag_tick_source = 0;
+    return G_SOURCE_REMOVE;
+  }
+  const gint64 now = gdk_frame_clock_get_frame_time (clock);
+  if (!update_dragged_slot_transform (now)) {
+    g_drag_tick_source = 0;
+    return G_SOURCE_REMOVE;
+  }
+  return G_SOURCE_CONTINUE;
+}
+
+static gboolean
+drag_snapback_tick (GtkWidget *widget G_GNUC_UNUSED, GdkFrameClock *clock,
+                    gpointer user_data G_GNUC_UNUSED)
+{
+  if (g_drag_snapback_slot < 0 ||
+      g_drag_snapback_slot >= static_cast<int> (g_slots.size ())) {
+    g_drag_snapback_slot = -1;
+    g_drag_snapback_source = 0;
+    return G_SOURCE_REMOVE;
+  }
+  const gint64 now = gdk_frame_clock_get_frame_time (clock);
+  double t = (now - g_drag_snapback_start_us) / 1000.0 /
+             static_cast<double> (kDragSnapBackMs);
+  t = std::clamp (t, 0.0, 1.0);
+  const double e = ease_out_quad (t);
+  SlotEntry &s = g_slots[static_cast<size_t> (g_drag_snapback_slot)];
+  RECT cur = lerp_rect (g_drag_snapback_from, s.rect, e);
+  BYTE op = static_cast<BYTE> (std::clamp (
+      static_cast<int> (std::lround (
+          g_drag_snapback_from_op + (255.0 - g_drag_snapback_from_op) * e)),
+      0, 255));
+  apply_thumb_rect (s, cur, op);
+  if (t >= 1.0) {
+    apply_thumb_rect (s, s.rect, 255);
+    g_drag_snapback_slot = -1;
+    g_drag_snapback_source = 0;
+    if (!g_app_grid_mode && g_target_state == ControlsState::WINDOW_PICKER)
+      set_hover (slot_at_cursor ());
+    return G_SOURCE_REMOVE;
+  }
+  return G_SOURCE_CONTINUE;
+}
+
+static int
+resolve_drag_drop_workspace (int px, int py, int scale, int *out_thumb_pill,
+                             int *out_peek_ws)
+{
+  if (out_thumb_pill != nullptr)
+    *out_thumb_pill = -1;
+  if (out_peek_ws != nullptr)
+    *out_peek_ws = -1;
+
+  // 1. ThumbnailsBox pills at the top (workspaceThumbnail.js handleDragOver).
+  if (g_thumbs != nullptr && g_thumbs_rect.right > g_thumbs_rect.left) {
+    const int pad = 8 * scale;
+    if (px >= g_thumbs_rect.left - pad && px <= g_thumbs_rect.right + pad &&
+        py >= g_thumbs_rect.top - pad && py <= g_thumbs_rect.bottom + pad) {
+      double lx = static_cast<double> (px - g_thumbs_rect.left) / scale;
+      double ly = static_cast<double> (py - g_thumbs_rect.top) / scale;
+      int pill = overview_thumbs_drop_target_at (g_thumbs, lx, ly);
+      if (pill >= 0) {
+        if (out_thumb_pill != nullptr)
+          *out_thumb_pill = pill;
+        return pill;
+      }
+    }
   }
 
-  if (g_panel_hwnd != nullptr) {
-    HMONITOR monitor =
-        MonitorFromWindow (g_panel_hwnd, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof (mi);
-    if (GetMonitorInfoW (monitor, &mi))
-      create_mini_previews (monitor, mi.rcMonitor, thumbs_x, thumbs_y, 255);
+  // 2. Peeking adjacent workspaces on the left/right edges
+  //    (workspace.js Workspace.handleDragOver / acceptDrop).
+  const int active_ws = std::max (g_desktop_active, 0);
+  for (int d = 0; d < static_cast<int> (g_ws_cur_boxes.size ()); ++d) {
+    if (d == active_ws)
+      continue;
+    const RECT &b = g_ws_cur_boxes[static_cast<size_t> (d)];
+    if (b.right <= 0 || b.left >= g_monitor_w)
+      continue;
+    if (px >= b.left && px < b.right && py >= b.top && py < b.bottom) {
+      if (out_peek_ws != nullptr)
+        *out_peek_ws = d;
+      if (out_thumb_pill != nullptr)
+        *out_thumb_pill = d;
+      return d;
+    }
   }
+  return -1;
 }
 
 void
@@ -3339,9 +4249,9 @@ on_drag_begin (GtkGestureDrag *drag, double x, double y,
   }
 
   if (g_switch_source != 0)
-    switch_finish (true);
+    switch_finish (false);
 
-  int scale = gtk_widget_get_scale_factor (g_window);
+  int scale = std::max (gtk_widget_get_scale_factor (g_window), 1);
   int px = (int)(x * scale);
   int py = (int)(y * scale);
   if ((g_panel_height > 0 && py < g_panel_height) || py >= g_dash_top ||
@@ -3354,14 +4264,31 @@ on_drag_begin (GtkGestureDrag *drag, double x, double y,
     return;
   }
 
+  const int active_ws = std::max (g_desktop_active, 0);
   for (int i = 0; i < (int)g_slots.size (); ++i) {
+    if (g_slots[i].desktop_index != active_ws)
+      continue;
     const RECT r = slot_display_rect (i);
     if (px >= r.left && px < r.right && py >= r.top && py < r.bottom) {
+      set_hover (-1, true);
       g_drag_slot = i;
       g_drag_hwnd = g_slots[i].target;
       g_drag_orig_rect = g_slots[i].rect;
       g_drag_start_px = px;
       g_drag_start_py = py;
+      g_drag_cur_px = px;
+      g_drag_cur_py = py;
+      g_drag_offset_x = g_drag_orig_rect.left - px;
+      g_drag_offset_y = g_drag_orig_rect.top - py;
+      const int orig_w = g_drag_orig_rect.right - g_drag_orig_rect.left;
+      const int orig_h = g_drag_orig_rect.bottom - g_drag_orig_rect.top;
+      const int max_dim = std::max (orig_w, orig_h);
+      g_drag_target_scale =
+          max_dim > 0
+              ? std::clamp (static_cast<double> (kWindowDndSize * scale) /
+                                max_dim,
+                            0.38, 0.82)
+              : 0.65;
       return;
     }
   }
@@ -3376,38 +4303,35 @@ on_drag_update (GtkGestureDrag *drag G_GNUC_UNUSED, double dx, double dy,
       g_window == nullptr)
     return;
 
+  int scale = std::max (gtk_widget_get_scale_factor (g_window), 1);
+  g_drag_cur_px = g_drag_start_px + (int)(dx * scale);
+  g_drag_cur_py = g_drag_start_py + (int)(dy * scale);
+
   if (!g_drag_active) {
-    if (dx * dx + dy * dy < 64.0)
+    if (dx * dx + dy * dy < 36.0)
       return;
     g_drag_active = true;
     set_hover (-1, true);
     promote_slot_thumb_to_top (g_slots[g_drag_slot]);
-
-    int scale = gtk_widget_get_scale_factor (g_window);
-    if (!g_drag_thumbs_revealed)
-      reveal_drag_thumbs_single_desktop (scale);
+    g_drag_scale_start_us = g_get_monotonic_time ();
+    if (g_drag_tick_source == 0) {
+      g_drag_tick_source = gtk_widget_add_tick_callback (
+          g_window, drag_scale_tick, nullptr, nullptr);
+    }
   }
 
-  int scale = gtk_widget_get_scale_factor (g_window);
-  int orig_w = g_drag_orig_rect.right - g_drag_orig_rect.left;
-  int orig_h = g_drag_orig_rect.bottom - g_drag_orig_rect.top;
-  int dw = std::max ((int)(orig_w * 0.55), 80 * scale);
-  int dh = std::max ((int)(orig_h * 0.55), 60 * scale);
-  int cur_px = g_drag_start_px + (int)(dx * scale);
-  int cur_py = g_drag_start_py + (int)(dy * scale);
-  RECT moved{cur_px - dw / 2, cur_py - dh / 2, cur_px + dw / 2,
-             cur_py + dh / 2};
-  apply_thumb_rect (g_slots[g_drag_slot], moved, 215);
+  update_dragged_slot_transform (g_get_monotonic_time ());
 
-  if (g_thumbs != nullptr && g_thumbs_rect.right > g_thumbs_rect.left &&
-      cur_px >= g_thumbs_rect.left && cur_px < g_thumbs_rect.right &&
-      cur_py >= g_thumbs_rect.top && cur_py < g_thumbs_rect.bottom) {
-    double lx = (double)(cur_px - g_thumbs_rect.left) / scale;
-    double ly = (double)(cur_py - g_thumbs_rect.top) / scale;
-    overview_thumbs_set_drop_target (
-        g_thumbs, overview_thumbs_drop_target_at (g_thumbs, lx, ly));
-  } else if (g_thumbs != nullptr) {
-    overview_thumbs_set_drop_target (g_thumbs, -1);
+  int thumb_pill = -1;
+  int peek_ws = -1;
+  resolve_drag_drop_workspace (g_drag_cur_px, g_drag_cur_py, scale, &thumb_pill,
+                               &peek_ws);
+  if (g_thumbs != nullptr)
+    overview_thumbs_set_drop_target (g_thumbs, thumb_pill);
+  if (g_drag_drop_ws_peek != peek_ws) {
+    g_drag_drop_ws_peek = peek_ws;
+    if (g_ws_bg != nullptr)
+      gtk_widget_queue_draw (g_ws_bg);
   }
 }
 
@@ -3418,43 +4342,72 @@ on_drag_end (GtkGestureDrag *drag G_GNUC_UNUSED, double dx, double dy,
   if (g_drag_slot < 0)
     return;
 
-  bool was_drag = g_drag_active;
-  HWND target_hwnd = g_drag_hwnd;
-  int scale = g_window != nullptr ? gtk_widget_get_scale_factor (g_window) : 1;
-  int end_px = g_drag_start_px + (int)(dx * scale);
-  int end_py = g_drag_start_py + (int)(dy * scale);
+  if (g_drag_tick_source != 0 && g_window != nullptr) {
+    gtk_widget_remove_tick_callback (g_window, g_drag_tick_source);
+    g_drag_tick_source = 0;
+  }
+
+  const int dragged_slot = g_drag_slot;
+  const bool was_drag = g_drag_active;
+  const HWND target_hwnd = g_drag_hwnd;
+  const int scale =
+      g_window != nullptr ? std::max (gtk_widget_get_scale_factor (g_window), 1)
+                          : 1;
+  const int end_px = g_drag_start_px + (int)(dx * scale);
+  const int end_py = g_drag_start_py + (int)(dy * scale);
 
   g_drag_active = false;
   g_drag_slot = -1;
   g_drag_hwnd = nullptr;
+
+  if (g_drag_drop_ws_peek != -1) {
+    g_drag_drop_ws_peek = -1;
+    if (g_ws_bg != nullptr)
+      gtk_widget_queue_draw (g_ws_bg);
+  }
+  if (g_thumbs != nullptr)
+    overview_thumbs_set_drop_target (g_thumbs, -1);
 
   if (!was_drag)
     return;
 
   g_drag_just_ended = true;
 
-  int tgt = -1;
-  if (g_thumbs != nullptr && g_thumbs_rect.right > g_thumbs_rect.left &&
-      end_px >= g_thumbs_rect.left && end_px < g_thumbs_rect.right &&
-      end_py >= g_thumbs_rect.top && end_py < g_thumbs_rect.bottom) {
-    double lx = (double)(end_px - g_thumbs_rect.left) / scale;
-    double ly = (double)(end_py - g_thumbs_rect.top) / scale;
-    tgt = overview_thumbs_drop_target_at (g_thumbs, lx, ly);
-  }
-  if (g_thumbs != nullptr)
-    overview_thumbs_set_drop_target (g_thumbs, -1);
+  int thumb_pill = -1;
+  int peek_ws = -1;
+  const int tgt = resolve_drag_drop_workspace (end_px, end_py, scale,
+                                               &thumb_pill, &peek_ws);
 
+  bool moved = false;
   if (tgt >= 0 && target_hwnd != nullptr && IsWindow (target_hwnd)) {
     if (tgt < (int)g_desktops.size () && tgt != g_desktop_active) {
-      vd::move_window_to_desktop (target_hwnd, tgt);
+      moved = vd::move_window_to_desktop (target_hwnd, tgt);
     } else if (tgt == (int)g_desktops.size () && vd::create_desktop ()) {
       int n = vd::count ();
       if (n > 0)
-        vd::move_window_to_desktop (target_hwnd, n - 1);
+        moved = vd::move_window_to_desktop (target_hwnd, n - 1);
     }
   }
-  reset_drag_state ();
-  rebuild_now ();
+
+  if (moved) {
+    reset_drag_state ();
+    rebuild_now ();
+    return;
+  }
+
+  // dnd.js _cancelDrag: smoothly animate the dragged preview back to its slot
+  // over SNAP_BACK_ANIMATION_TIME (250ms EASE_OUT_QUAD) instead of rebuilding.
+  if (dragged_slot >= 0 &&
+      dragged_slot < static_cast<int> (g_slots.size ()) &&
+      g_window != nullptr) {
+    g_drag_snapback_slot = dragged_slot;
+    g_drag_snapback_from = g_slots[static_cast<size_t> (dragged_slot)].current;
+    g_drag_snapback_from_op =
+        g_slots[static_cast<size_t> (dragged_slot)].current_opacity;
+    g_drag_snapback_start_us = g_get_monotonic_time ();
+    g_drag_snapback_source = gtk_widget_add_tick_callback (
+        g_window, drag_snapback_tick, nullptr, nullptr);
+  }
 }
 
 // --- clicks --------------------------------------------------------------------------
@@ -3547,8 +4500,21 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
     return;
   }
 
+  const int active_ws = std::max (g_desktop_active, 0);
+
   if (g_app_grid_mode) {
     POINT pt = {px, py};
+    for (int d = 0; d < static_cast<int> (g_ws_cur_boxes.size ()); ++d) {
+      const RECT &b = g_ws_cur_boxes[static_cast<size_t> (d)];
+      if (pt.x >= b.left && pt.x < b.right && pt.y >= b.top && pt.y < b.bottom) {
+        if (d != active_ws && vd::switch_to (d))
+          switch_workspace_animated (d);
+        g_print ("[ov] click (%d,%d) small workspace %d -> window picker\n", px,
+                 py, d);
+        overview_toggle_app_grid ();
+        return;
+      }
+    }
     if (pt.x >= g_ws_box.left && pt.x < g_ws_box.right &&
         pt.y >= g_ws_box.top && pt.y < g_ws_box.bottom) {
       g_print ("[ov] click (%d,%d) small workspace -> window picker\n", px,
@@ -3562,8 +4528,43 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
 
   POINT pt = {px, py};
 
+  // Clicking on an inactive peeking workspace (or a window preview inside an
+  // inactive peeking workspace) switches to that workspace while keeping the
+  // overview open (workspace.js _init clickGesture + _onCloneSelected).
+  for (int d = 0; d < static_cast<int> (g_ws_cur_boxes.size ()); ++d) {
+    if (d == active_ws)
+      continue;
+    const RECT &b = g_ws_cur_boxes[static_cast<size_t> (d)];
+    if (b.right <= 0 || b.left >= g_monitor_w)
+      continue;
+    if (pt.x >= b.left && pt.x < b.right && pt.y >= b.top && pt.y < b.bottom) {
+      if (button == GDK_BUTTON_PRIMARY) {
+        g_print ("[ov] click (%d,%d) peeking workspace %d -> switch\n", px, py,
+                 d);
+        if (vd::switch_to (d))
+          switch_workspace_animated (d);
+      } else if (button == GDK_BUTTON_MIDDLE) {
+        for (const SlotEntry &e : g_slots) {
+          if (e.desktop_index != d)
+            continue;
+          if (pt.x >= e.rect.left && pt.x < e.rect.right &&
+              pt.y >= e.rect.top && pt.y < e.rect.bottom) {
+            if (IsWindow (e.target)) {
+              PostMessageW (e.target, WM_CLOSE, 0, 0);
+              schedule_delayed_rebuild (140);
+            }
+            break;
+          }
+        }
+      }
+      return;
+    }
+  }
+
   if (button == GDK_BUTTON_MIDDLE) {
     for (const SlotEntry &e : g_slots) {
+      if (e.desktop_index != active_ws)
+        continue;
       if (pt.x >= e.rect.left && pt.x < e.rect.right && pt.y >= e.rect.top &&
           pt.y < e.rect.bottom) {
         if (IsWindow (e.target)) {
@@ -3576,8 +4577,11 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
     return;
   }
 
-  // Inside a preview slot: restore/focus that window and close.
+  // Inside a preview slot on the active workspace: restore/focus that window
+  // and close.
   for (int i = 0; i < (int)g_slots.size (); ++i) {
+    if (g_slots[i].desktop_index != active_ws)
+      continue;
     const RECT r = slot_display_rect (i);
     if (pt.x >= r.left && pt.x < r.right && pt.y >= r.top &&
         pt.y < r.bottom) {
@@ -3632,8 +4636,22 @@ on_overview_surface_layout (GdkSurface *surface G_GNUC_UNUSED,
                             int height G_GNUC_UNUSED,
                             gpointer user_data G_GNUC_UNUSED)
 {
-  if (g_window != nullptr && gtk_widget_get_visible (g_window))
-    restack_locked ();
+  if (g_window == nullptr || !gtk_widget_get_visible (g_window))
+    return;
+  restack_locked ();
+  if (g_placed && g_target_state != ControlsState::HIDDEN &&
+      g_anim.source == 0 && g_switch_source == 0) {
+    int scale = std::max (gtk_widget_get_scale_factor (g_window), 1);
+    int cur_search_h = g_placed_search_h;
+    if (g_search != nullptr && gtk_widget_get_visible (g_search)) {
+      GtkRequisition nat{};
+      gtk_widget_get_preferred_size (g_search, nullptr, &nat);
+      if (nat.height > 0)
+        cur_search_h = nat.height;
+    }
+    if (scale != g_placed_scale || cur_search_h != g_placed_search_h)
+      overview_reposition ();
+  }
 }
 
 void
@@ -3680,11 +4698,65 @@ on_thumb_clicked (int index, void *user_data)
            g_desktop_active);
   if (index < 0 || index == g_desktop_active)
     return;
+  g_last_ws_scroll_us = g_get_monotonic_time ();
   if (vd::switch_to (index)) {
     switch_workspace_animated (index);
   } else {
     g_print ("[ov] desktop switch failed\n");
   }
+}
+
+// WorkspacesDisplay._onScrollEvent + WindowManager.handleWorkspaceScroll:
+// Scroll wheel anywhere on the Overview workspace area switches to the
+// previous/next workspace (throttled by SCROLL_TIMEOUT_TIME = 150ms).
+static gboolean
+on_overview_scroll (GtkEventControllerScroll *ctrl G_GNUC_UNUSED, double dx,
+                    double dy, gpointer user_data G_GNUC_UNUSED)
+{
+  if (g_window == nullptr || !gtk_widget_get_visible (g_window) ||
+      !g_placed || g_target_state == ControlsState::HIDDEN ||
+      !overview_active ()) {
+    return GDK_EVENT_PROPAGATE;
+  }
+  if (g_drag_active || g_drag_slot >= 0 || g_drag_snapback_source != 0)
+    return GDK_EVENT_PROPAGATE;
+
+  // In APP_GRID mode, let the app grid's own scroll controller handle wheel
+  // scrolling when the pointer is over the app grid area; scrolling above the
+  // app grid (e.g. over the top miniature workspaces row) switches workspaces.
+  if (g_app_grid_mode || g_target_state == ControlsState::APP_GRID) {
+    if (g_overview_hwnd != nullptr) {
+      int scale = std::max (gtk_widget_get_scale_factor (g_window), 1);
+      POINT pt{};
+      if (GetCursorPos (&pt) && ScreenToClient (g_overview_hwnd, &pt)) {
+        if (pt.y >= g_grid_y * scale)
+          return GDK_EVENT_PROPAGATE;
+      }
+    }
+  }
+
+  if (g_desktops.size () <= 1 || g_desktop_active < 0)
+    return GDK_EVENT_PROPAGATE;
+
+  double delta = (std::fabs (dy) >= std::fabs (dx)) ? dy : dx;
+  if (std::fabs (delta) < 1e-4)
+    return GDK_EVENT_PROPAGATE;
+
+  const gint64 now_us = g_get_monotonic_time ();
+  if (now_us - g_last_ws_scroll_us <
+      static_cast<gint64> (kWorkspaceScrollTimeoutMs) * 1000) {
+    return GDK_EVENT_STOP;
+  }
+
+  const int step = (delta > 0.0) ? 1 : -1;
+  const int target = g_desktop_active + step;
+  if (target < 0 || target >= static_cast<int> (g_desktops.size ()))
+    return GDK_EVENT_STOP;
+
+  g_last_ws_scroll_us = now_us;
+  if (vd::switch_to (target))
+    switch_workspace_animated (target);
+  return GDK_EVENT_STOP;
 }
 
 void
@@ -3755,6 +4827,41 @@ on_app_grid_pins_changed (void *user_data G_GNUC_UNUSED)
   }
 }
 
+gboolean
+dynamic_workspaces_startup_cb (gpointer user_data)
+{
+  (void)user_data;
+  g_dyn_ws_startup_timer = 0;
+  if (g_window == nullptr)
+    return G_SOURCE_REMOVE;
+  if (gtk_widget_get_visible (g_window) && g_placed &&
+      g_target_state != ControlsState::HIDDEN && overview_active ()) {
+    return G_SOURCE_REMOVE;
+  }
+  HMONITOR mon = (g_panel_hwnd != nullptr)
+                     ? MonitorFromWindow (g_panel_hwnd, MONITOR_DEFAULTTOPRIMARY)
+                     : MonitorFromPoint (POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+  MONITORINFO mi{};
+  mi.cbSize = sizeof (mi);
+  if (!GetMonitorInfoW (mon, &mi)) {
+    mi.rcMonitor = RECT{0, 0, GetSystemMetrics (SM_CXSCREEN),
+                        GetSystemMetrics (SM_CYSCREEN)};
+  }
+  sync_dynamic_workspaces (mon, mi.rcMonitor);
+  return G_SOURCE_REMOVE;
+}
+
+void
+schedule_dynamic_workspaces_check (guint delay_ms = 250)
+{
+  if (g_window == nullptr)
+    return;
+  if (g_dyn_ws_startup_timer != 0)
+    g_source_remove (g_dyn_ws_startup_timer);
+  g_dyn_ws_startup_timer =
+      g_timeout_add (delay_ms, dynamic_workspaces_startup_cb, nullptr);
+}
+
 // Relayout when the active desktop changed outside the overview (event-driven
 // via centralized VD observer).
 void
@@ -3764,6 +4871,8 @@ on_overview_desktop_changed (int count, int active_index, void *user_data)
   if (g_window == nullptr || !gtk_widget_get_visible (g_window) ||
       !g_placed || g_target_state == ControlsState::HIDDEN ||
       !overview_active ()) {
+    if (g_window != nullptr && !g_in_dynamic_ws_sync)
+      schedule_dynamic_workspaces_check (250);
     return;
   }
   const bool count_changed = (count != (int)g_desktops.size ());
@@ -3771,6 +4880,16 @@ on_overview_desktop_changed (int count, int active_index, void *user_data)
       (active_index >= 0 && active_index != g_desktop_active);
   if (!count_changed && !active_changed)
     return;
+
+  // Ignore delayed Explorer EVENT_SYSTEM_DESKTOPSWITCH echoes from an earlier
+  // step of an internal Overview workspace switch sequence (e.g. scrolling
+  // 0 -> 1 -> 2 when Explorer's 0 -> 1 notification arrives after we already
+  // switched to 2).
+  if (!count_changed && active_changed &&
+      (g_switch_source != 0 ||
+       (g_get_monotonic_time () - g_last_internal_switch_us < 1000000))) {
+    return;
+  }
 
   if (g_anim.source != 0) {
     g_pending_desktop_sync = true;
@@ -3835,8 +4954,29 @@ on_app_index_ready (void *user_data G_GNUC_UNUSED)
   int mw = mi.rcMonitor.right - mi.rcMonitor.left;
   int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
   int scale = std::max (gtk_widget_get_scale_factor (g_window), 1);
+
+  if (g_wallpaper == nullptr)
+    load_wallpaper ();
+
   int est_w = std::max (std::min (mw / scale - 48, 1320), 400);
-  int est_h = std::max ((int)(mh / scale * 0.62), 260);
+  int est_h = std::max ((int)(mh / scale * 0.58), 260);
+  if (!overview_active () && !gtk_widget_get_visible (g_window)) {
+    int panel_h = winome_shell_panel_height ();
+    RECT pr{};
+    if (IsWindowVisible (g_panel_hwnd) && GetWindowRect (g_panel_hwnd, &pr) &&
+        pr.bottom > pr.top) {
+      panel_h = pr.bottom - pr.top;
+    }
+    PlacedGeometry geo{};
+    if (compute_geometry (monitor, mi.rcMonitor, panel_h, &geo)) {
+      est_h = std::max (
+          static_cast<int> (geo.app_grid_box.bottom - geo.app_grid_box.top) /
+              scale,
+          260);
+    }
+  }
+  app_grid_clip_set_bounds (g_app_grid_clip, est_w, est_h);
+  gtk_widget_set_size_request (g_app_grid, est_w, est_h);
   app_grid_prewarm (g_app_grid, est_w, est_h);
 }
 
@@ -3877,6 +5017,7 @@ shift_app_grid_idle (gpointer user_data)
   if (g_target_state == ControlsState::HIDDEN)
     return G_SOURCE_REMOVE;
   if (g_target_state == ControlsState::WINDOW_PICKER) {
+    ensure_app_grid_synced ();
     if (g_app_grid != nullptr)
       app_grid_refresh_running (g_app_grid);
     start_state_transition (ControlsState::APP_GRID, kOpenMs);
@@ -4027,6 +5168,25 @@ on_overview_key_pressed (GtkEventControllerKey *controller,
   return GDK_EVENT_PROPAGATE;
 }
 
+gboolean
+overview_prewarm_idle_cb (gpointer user_data)
+{
+  (void)user_data;
+  g_prewarm_timer = 0;
+  if (g_window == nullptr)
+    return G_SOURCE_REMOVE;
+  if (g_wallpaper == nullptr)
+    load_wallpaper ();
+  if (!gtk_widget_get_visible (g_window) && !gtk_widget_get_realized (g_window))
+    gtk_widget_realize (g_window);
+  GtkWidget *chrome_wins[] = {g_chrome_window, g_icon_window, g_caption_window};
+  for (GtkWidget *cw : chrome_wins) {
+    if (cw != nullptr && !gtk_widget_get_realized (cw))
+      gtk_widget_realize (cw);
+  }
+  return G_SOURCE_REMOVE;
+}
+
 }  // namespace
 
 void
@@ -4099,7 +5259,6 @@ overview_init (HWND panel_hwnd)
   g_signal_connect (g_search, "activate", G_CALLBACK (on_search_activate),
                     nullptr);
   gtk_fixed_put (GTK_FIXED (g_root), g_search, 0, 0);
-  gtk_widget_set_visible (g_search, FALSE);
 
   // Z-ORDER mirrors ControlsManager.add_child():
   // [searchEntryBin, appDisplay, dash, searchController, thumbnailsBox,
@@ -4115,14 +5274,14 @@ overview_init (HWND panel_hwnd)
 
   g_app_grid = app_grid_new (on_app_grid_launch_done,
                              on_app_grid_pins_changed, nullptr);
-  gtk_fixed_put (GTK_FIXED (g_root), g_app_grid, 0, 0);
-  gtk_widget_set_visible (g_app_grid, FALSE);
+  g_app_grid_clip = app_grid_clip_new (g_app_grid);
+  gtk_fixed_put (GTK_FIXED (g_root), g_app_grid_clip, 0, 0);
+  sync_app_grid_visible (false);
 
   g_dash = overview_dash_new (g_root);
   overview_dash_set_show_apps_cb (g_dash, on_dash_show_apps_clicked, nullptr);
   overview_dash_set_changed_cb (g_dash, on_dash_changed, nullptr);
   gtk_fixed_put (GTK_FIXED (g_root), g_dash, 0, 0);
-  gtk_widget_set_visible (g_dash, FALSE);
 
   // .workspace-thumbnails — one wallpaper pill per virtual desktop, above
   // the dash and below the workspace background (the thumbnailsBox position
@@ -4135,13 +5294,12 @@ overview_init (HWND panel_hwnd)
   gtk_fixed_put (GTK_FIXED (g_root), g_thumbs, 0, 0);
   gtk_widget_set_visible (g_thumbs, FALSE);
 
-  // .workspace-background — wallpaper in an animated rounded clip (+ CSS
-  // shadow), on the workarea-aspect workspace box.
+  // Wallpaper in an animated rounded clip (shadow painted directly by
+  // winome_workspace_bg_snapshot when settled; avoid per-frame CSS blur FBO).
   g_ws_bg = (GtkWidget *)g_object_new (winome_workspace_bg_get_type (),
                                        nullptr);
-  gtk_widget_add_css_class (g_ws_bg, "workspace-background");
+  gtk_widget_set_can_target (g_ws_bg, FALSE);
   gtk_fixed_put (GTK_FIXED (g_root), g_ws_bg, 0, 0);
-  gtk_widget_set_visible (g_ws_bg, FALSE);
 
   // Chrome windows (above the DWM thumbnails).
   chrome_init ();
@@ -4189,6 +5347,12 @@ overview_init (HWND panel_hwnd)
                     nullptr);
   gtk_widget_add_controller (g_window, keys);
 
+  GtkEventController *ws_scroll = gtk_event_controller_scroll_new (
+      GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
+  g_signal_connect (ws_scroll, "scroll", G_CALLBACK (on_overview_scroll),
+                    nullptr);
+  gtk_widget_add_controller (g_window, ws_scroll);
+
   vd::add_change_listener (on_overview_desktop_changed, nullptr);
   g_signal_connect (
       g_window, "close-request",
@@ -4218,6 +5382,22 @@ overview_init (HWND panel_hwnd)
           g_source_remove (g_idle_trim_timer);
           g_idle_trim_timer = 0;
         }
+        if (g_prewarm_timer != 0) {
+          g_source_remove (g_prewarm_timer);
+          g_prewarm_timer = 0;
+        }
+        if (g_dyn_ws_startup_timer != 0) {
+          g_source_remove (g_dyn_ws_startup_timer);
+          g_dyn_ws_startup_timer = 0;
+        }
+        if (g_drag_tick_source != 0) {
+          gtk_widget_remove_tick_callback (w, g_drag_tick_source);
+          g_drag_tick_source = 0;
+        }
+        if (g_drag_snapback_source != 0) {
+          gtk_widget_remove_tick_callback (w, g_drag_snapback_source);
+          g_drag_snapback_source = 0;
+        }
         if (g_scale_anim_source != 0) {
           gtk_widget_remove_tick_callback (w, g_scale_anim_source);
           g_scale_anim_source = 0;
@@ -4231,6 +5411,7 @@ overview_init (HWND panel_hwnd)
         destroy_previews ();
         destroy_mini_previews ();
         vd::remove_change_listener (on_overview_desktop_changed, nullptr);
+        g_wallpaper_cache = WallpaperCacheKey{};
         g_clear_object (&g_wallpaper);
 
         chrome_cancel_apply (&g_chrome_hooks);
@@ -4264,6 +5445,7 @@ overview_init (HWND panel_hwnd)
         g_root = nullptr;
         g_search = nullptr;
         g_ws_bg = nullptr;
+        g_app_grid_clip = nullptr;
         g_app_grid = nullptr;
         g_dash = nullptr;
         g_thumbs = nullptr;
@@ -4281,6 +5463,13 @@ overview_init (HWND panel_hwnd)
         g_drag_hwnd = nullptr;
         g_drag_just_ended = false;
         g_drag_thumbs_revealed = false;
+        g_drag_drop_ws_peek = -1;
+        g_ws_full_boxes.clear ();
+        g_ws_picker_boxes.clear ();
+        g_ws_grid_boxes.clear ();
+        g_ws_cur_boxes.clear ();
+        g_ws_anim_from_boxes.clear ();
+        g_ws_anim_to_boxes.clear ();
         g_hover_index = -1;
         g_last_hovered_slot = -1;
         g_overlay_opacity = 0.0;
@@ -4291,6 +5480,11 @@ overview_init (HWND panel_hwnd)
           close_overview ("destroy");
       }),
       nullptr);
+
+  if (g_prewarm_timer != 0)
+    g_source_remove (g_prewarm_timer);
+  g_prewarm_timer = g_timeout_add (350, overview_prewarm_idle_cb, nullptr);
+  schedule_dynamic_workspaces_check (1600);
 }
 
 void
@@ -4299,6 +5493,10 @@ overview_show (void)
   if (g_window == nullptr || g_panel_hwnd == nullptr)
     return;
 
+  if (g_prewarm_timer != 0) {
+    g_source_remove (g_prewarm_timer);
+    g_prewarm_timer = 0;
+  }
   cancel_delayed_rebuild ();
 
   if (g_search != nullptr) {
@@ -4339,8 +5537,10 @@ overview_show (void)
     }
   } else if (g_placed && g_target_state == ControlsState::HIDDEN) {
     // Closing animation was mid-flight; reverse seamlessly back to picker or grid.
-    if (g_pending_show_state == ControlsState::APP_GRID && g_app_grid != nullptr)
+    if (g_pending_show_state == ControlsState::APP_GRID && g_app_grid != nullptr) {
+      ensure_app_grid_synced ();
       app_grid_refresh_running (g_app_grid);
+    }
     start_state_transition (g_pending_show_state, kOpenMs);
     if (winome_shell_panel_top_popover_hwnd () == nullptr)
       focus_overview_window (false);
@@ -4413,7 +5613,7 @@ overview_hide_async (void)
 void
 overview_invalidate_wallpaper (void)
 {
-  load_wallpaper ();
+  load_wallpaper (true);
   if (g_window != nullptr && gtk_widget_get_visible (g_window))
     gtk_widget_queue_draw (g_window);
 }
@@ -4459,8 +5659,11 @@ overview_toggle_app_grid (void)
   ControlsState next = (g_target_state == ControlsState::APP_GRID)
                            ? ControlsState::WINDOW_PICKER
                            : ControlsState::APP_GRID;
-  if (next == ControlsState::APP_GRID && g_app_grid != nullptr)
-    app_grid_refresh_running (g_app_grid);
+  if (next == ControlsState::APP_GRID) {
+    ensure_app_grid_synced ();
+    if (g_app_grid != nullptr)
+      app_grid_refresh_running (g_app_grid);
+  }
   start_state_transition (next, kOpenMs);
   restack_locked ();
 }

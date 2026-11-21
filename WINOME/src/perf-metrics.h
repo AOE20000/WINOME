@@ -20,6 +20,10 @@ struct StartupTimings {
   double panel_ms = 0.0;
   double overview_init_ms = 0.0;
   double ipc_ms = 0.0;
+  double recovery_ms = 0.0;
+  double theming_ms = 0.0;
+  double plugins_ms = 0.0;
+  double gtk_activate_ms = 0.0;
   double total_startup_ms = 0.0;
   int fonts_loaded_files = 0;
   int fonts_family_count = 0;

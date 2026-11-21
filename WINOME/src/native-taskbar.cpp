@@ -17,7 +17,7 @@ namespace {
 
 constexpr wchar_t kPrimaryTaskbarClass[] = L"Shell_TrayWnd";
 constexpr wchar_t kSecondaryTaskbarClass[] = L"Shell_SecondaryTrayWnd";
-constexpr DWORD kRehideIntervalMs = 500;
+constexpr DWORD kRehideIntervalMs = 1500;
 constexpr int kClassBuffer = 256;
 
 // EnumWindows callback: collects every top-level window whose class is one of
@@ -66,28 +66,42 @@ std::vector<HWND> NativeTaskbar::find_taskbars(HWND* out_primary) {
   return found;
 }
 
-void NativeTaskbar::set_visibility(HWND hwnd, bool visible, int restore_state) {
+bool NativeTaskbar::set_visibility(HWND hwnd, bool visible, int restore_state) {
+  if (hwnd == nullptr || !IsWindow(hwnd))
+    return false;
   APPBARDATA abd{};
   abd.cbSize = sizeof(APPBARDATA);
   abd.hWnd = hwnd;
+  bool changed = false;
   if (visible) {
     // Always restore as visible non-autohide unless caller preserves an
     // explicit state; crash recovery defaults to ABS_ALWAYSONTOP so user
     // immediately sees the taskbar.
     abd.lParam = (restore_state >= 0) ? restore_state : ABS_ALWAYSONTOP;
-  } else {
-    abd.lParam = ABS_AUTOHIDE;
-  }
-  SHAppBarMessage(ABM_SETSTATE, &abd);
-  ShowWindowAsync(hwnd, visible ? SW_SHOWNORMAL : SW_HIDE);
-  if (visible) {
+    SHAppBarMessage(ABM_SETSTATE, &abd);
+    ShowWindowAsync(hwnd, SW_SHOWNORMAL);
     // Ensure taskbar is never left DWM-cloaked on restore or emergency exit.
     BOOL uncloak = FALSE;
     DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &uncloak, sizeof(uncloak));
     SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
                      SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS);
+    changed = true;
+  } else {
+    // Only send ABM_SETSTATE when not already ABS_AUTOHIDE so Explorer is not
+    // poked into repeatedly recalculating SPI_SETWORKAREA to (0,0,W,H).
+    const UINT_PTR cur_state = SHAppBarMessage(ABM_GETSTATE, &abd);
+    if ((cur_state & ABS_AUTOHIDE) == 0) {
+      abd.lParam = ABS_AUTOHIDE;
+      SHAppBarMessage(ABM_SETSTATE, &abd);
+      changed = true;
+    }
+    if (IsWindowVisible(hwnd)) {
+      ShowWindowAsync(hwnd, SW_HIDE);
+      changed = true;
+    }
   }
+  return changed;
 }
 
 void NativeTaskbar::suspend_keeper_ms(DWORD ms) {
@@ -129,26 +143,45 @@ bool NativeTaskbar::is_tray_overflow_open() {
 }
 
 void NativeTaskbar::keeper_loop() {
-  // Park on the stop event, waking periodically to re-assert the hidden
-  // state only if Explorer made a taskbar visible again.
+  // Park on the stop event, waking at 1500ms to re-hide taskbars without
+  // running a full EnumWindows sweep on single-monitor setups every tick.
   bool first_pass = true;
+  uint32_t tick_count = 0;
   for (;;) {
     const uint64_t now = GetTickCount64();
     const bool suspended =
         now < suspend_until_tick_.load(std::memory_order_acquire) ||
         is_tray_overflow_open();
     if (!suspended) {
-      for (HWND hwnd : find_taskbars()) {
-        if (first_pass || IsWindowVisible(hwnd))
-          set_visibility(hwnd, false, ABS_ALWAYSONTOP);
+      const bool check_secondary =
+          first_pass ||
+          (GetSystemMetrics(SM_CMONITORS) > 1 && (tick_count % 4 == 0));
+      if (check_secondary) {
+        for (HWND hwnd : find_taskbars()) {
+          if (first_pass || IsWindowVisible(hwnd))
+            set_visibility(hwnd, false, ABS_ALWAYSONTOP);
+        }
+      } else {
+        HWND primary = FindWindowW(kPrimaryTaskbarClass, nullptr);
+        if (primary != nullptr && IsWindowVisible(primary))
+          set_visibility(primary, false, ABS_ALWAYSONTOP);
       }
       if (primary_cloaked_.exchange(false, std::memory_order_acq_rel))
         set_primary_cloaked(false);
     }
     first_pass = false;
+    ++tick_count;
     if (WaitForSingleObject(stop_event_, kRehideIntervalMs) == WAIT_OBJECT_0)
       break;
   }
+}
+
+void NativeTaskbar::on_explorer_restarted() {
+  if (!hidden_.load(std::memory_order_acquire))
+    return;
+  suspend_keeper_ms(0);
+  for (HWND hwnd : find_taskbars())
+    set_visibility(hwnd, false, ABS_ALWAYSONTOP);
 }
 
 void NativeTaskbar::hide() {

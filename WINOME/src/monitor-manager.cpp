@@ -49,6 +49,7 @@ struct MonitorManagerState {
   HMODULE wts_dll = nullptr;
   BOOL(WINAPI* wts_unreg)(HWND) = nullptr;
   guint display_debounce_id = 0;
+  guint workarea_idle_id = 0;
   bool initialized = false;
 };
 
@@ -175,6 +176,7 @@ gboolean idle_handle_theme_change(gpointer G_GNUC_UNUSED data) {
 }
 
 gboolean idle_handle_workarea_change(gpointer G_GNUC_UNUSED data) {
+  g_mm.workarea_idle_id = 0;
   if (g_mm.cbs.on_workarea_changed != nullptr)
     g_mm.cbs.on_workarea_changed();
   return G_SOURCE_REMOVE;
@@ -212,7 +214,8 @@ LRESULT CALLBACK watcher_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
       if (is_wallpaper) {
         g_idle_add(idle_handle_wallpaper_change, nullptr);
       } else if (wParam == SPI_SETWORKAREA) {
-        g_idle_add(idle_handle_workarea_change, nullptr);
+        if (g_mm.workarea_idle_id == 0)
+          g_mm.workarea_idle_id = g_idle_add(idle_handle_workarea_change, nullptr);
       } else if (area != nullptr &&
                  (_wcsicmp(area, L"ImmersiveColorSet") == 0 ||
                   _wcsicmp(area, L"Environment") == 0)) {
@@ -287,8 +290,12 @@ void monitor_manager_sync() {
   const MonitorDescriptor& primary = monitors.front();
   if (g_mm.primary_panel != nullptr && IsWindow(g_mm.primary_panel)) {
     position_panel_hwnd(g_mm.primary_panel, primary.monitor_rect, panel_h, true);
-    RECT work = compute_panel_work_area(primary.monitor_rect, panel_h);
-    SystemParametersInfoW(SPI_SETWORKAREA, 0, &work, 0);
+    if (g_mm.cbs.on_workarea_changed != nullptr) {
+      g_mm.cbs.on_workarea_changed();
+    } else {
+      RECT work = compute_panel_work_area(primary.monitor_rect, panel_h);
+      SystemParametersInfoW(SPI_SETWORKAREA, 0, &work, 0);
+    }
   }
   if (g_mm.cbs.on_display_changed != nullptr)
     g_mm.cbs.on_display_changed(primary.monitor_rect);
@@ -415,6 +422,10 @@ void monitor_manager_shutdown() {
   if (g_mm.display_debounce_id != 0) {
     g_source_remove(g_mm.display_debounce_id);
     g_mm.display_debounce_id = 0;
+  }
+  if (g_mm.workarea_idle_id != 0) {
+    g_source_remove(g_mm.workarea_idle_id);
+    g_mm.workarea_idle_id = 0;
   }
 
   destroy_all_secondary_panels();

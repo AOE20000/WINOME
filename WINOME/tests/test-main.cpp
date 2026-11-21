@@ -26,6 +26,7 @@
 #include "run-dialog.h"
 #include "shell-ipc.h"
 #include "st-engine.h"
+#include "system-status.h"
 #include "systray.h"
 #include "virtual-desktop.h"
 #include "wifi-networks.h"
@@ -604,11 +605,11 @@ void test_app_grid_and_running_window_matching() {
         d_xl.page_size == 24);
 
   auto d_md = winome::compute_app_grid_dimensions(1320, 670);
-  CHECK(d_md.cols == 6 && d_md.rows == 4 && d_md.icon_size == 72 &&
+  CHECK(d_md.cols == 6 && d_md.rows == 4 && d_md.icon_size == 80 &&
         d_md.page_size == 24);
 
   auto d_mid = winome::compute_app_grid_dimensions(1000, 560);
-  CHECK(d_mid.cols == 5 && d_mid.rows == 3 && d_mid.icon_size == 80 &&
+  CHECK(d_mid.cols == 5 && d_mid.rows == 3 && d_mid.icon_size == 96 &&
         d_mid.page_size == 15);
 
   auto d_port = winome::compute_app_grid_dimensions(500, 760);
@@ -621,8 +622,15 @@ void test_app_grid_and_running_window_matching() {
     CHECK(grid != nullptr);
     if (grid != nullptr) {
       g_object_ref_sink(grid);
+      CHECK(gtk_widget_get_halign(grid) == GTK_ALIGN_FILL);
+      CHECK(gtk_widget_get_valign(grid) == GTK_ALIGN_FILL);
+      CHECK(gtk_widget_get_overflow(grid) == GTK_OVERFLOW_HIDDEN);
       winome::app_grid_set_query(grid, "");
       winome::app_grid_rebuild(grid, 1320, 670);
+      winome::app_grid_set_transition_opacity(grid, true, 0.35);
+      CHECK(std::abs(gtk_widget_get_opacity(grid) - 0.35) < 0.02);
+      winome::app_grid_set_transition_opacity(grid, false, 1.0);
+      CHECK(std::abs(gtk_widget_get_opacity(grid) - 1.0) < 0.02);
       winome::app_grid_last_page(grid);
       winome::app_grid_first_page(grid);
       winome::app_grid_next_page(grid);
@@ -660,6 +668,25 @@ void test_app_grid_pagination() {
     winome::app_grid_rebuild(grid, 1000, 560);
     // Repeated unchanged rebuild must hit structure cache cleanly.
     winome::app_grid_rebuild(grid, 1000, 560);
+    // Guard against GTK4 "min height > natural height" and horizontal/vertical
+    // box overflow beyond the 1320x620 App Grid budget.
+    winome::app_grid_rebuild(grid, 1320, 620);
+    {
+      int min_w = 0, nat_w = 0, mw_b = -1, nw_b = -1;
+      gtk_widget_measure(grid, GTK_ORIENTATION_HORIZONTAL, -1,
+                         &min_w, &nat_w, &mw_b, &nw_b);
+      CHECK(nat_w >= min_w);
+      CHECK(min_w <= 1320);
+      CHECK(nat_w <= 1320);
+    }
+    for (const char* q : {"", "a", "nonexistent_zzzz"}) {
+      winome::app_grid_set_query(grid, q);
+      int min_h = 0, nat_h = 0, min_b = -1, nat_b = -1;
+      gtk_widget_measure(grid, GTK_ORIENTATION_VERTICAL, 1320,
+                         &min_h, &nat_h, &min_b, &nat_b);
+      CHECK(nat_h >= min_h);
+    }
+    winome::app_grid_set_query(grid, "");
     winome::app_grid_next_page(grid);
     winome::app_grid_prev_page(grid);
     winome::app_grid_reset_page(grid);
@@ -684,10 +711,45 @@ void test_dash_favorites_and_thumbs_summary() {
   CHECK(!t_idle.visible);
 
   auto t_drag = winome::compute_thumbs_summary(1, true, true);
-  CHECK(t_drag.visible && t_drag.desktop_pills == 1 && t_drag.has_add_pill);
+  CHECK(t_drag.visible && t_drag.desktop_pills == 1 && !t_drag.has_add_pill);
 
   auto t_multi = winome::compute_thumbs_summary(2, true, false);
-  CHECK(t_multi.visible && t_multi.desktop_pills == 2 && t_multi.has_add_pill);
+  CHECK(t_multi.visible && t_multi.desktop_pills == 2 && !t_multi.has_add_pill);
+
+  // GNOME dynamic workspaces (windowManager.js WorkspaceTracker._checkWorkspaces):
+  // 1) Startup with 1 workspace -> 2 workspaces ([W1, Empty W2])
+  auto dw_one_empty = winome::compute_dynamic_workspace_plan({0});
+  CHECK(dw_one_empty.append_count == 1 && dw_one_empty.remove_indices.empty() &&
+        dw_one_empty.final_count == 2);
+
+  auto dw_one_full = winome::compute_dynamic_workspace_plan({3});
+  CHECK(dw_one_full.append_count == 1 && dw_one_full.remove_indices.empty() &&
+        dw_one_full.final_count == 2);
+
+  // 2) Workspace 2 has window -> create Workspace 3 ([W1, W2, Empty W3])
+  auto dw_two_full = winome::compute_dynamic_workspace_plan({3, 1});
+  CHECK(dw_two_full.append_count == 1 && dw_two_full.remove_indices.empty() &&
+        dw_two_full.final_count == 3);
+
+  // 3) Workspace 2 has no windows & Workspace 3 has no windows -> Workspace 3 disappears ([W1, Empty W2])
+  auto dw_w2_empty_w3_empty = winome::compute_dynamic_workspace_plan({3, 0, 0});
+  CHECK(dw_w2_empty_w3_empty.append_count == 0 &&
+        dw_w2_empty_w3_empty.remove_indices.size() == 1 &&
+        dw_w2_empty_w3_empty.remove_indices[0] == 2 &&
+        dw_w2_empty_w3_empty.final_count == 2);
+
+  // 4) Workspace 2 has no windows, but Workspace 3 has windows -> Workspace 2 disappears ([W1, W2(old W3), Empty W3])
+  auto dw_w2_empty_w3_full = winome::compute_dynamic_workspace_plan({3, 0, 2});
+  CHECK(dw_w2_empty_w3_full.append_count == 1 &&
+        dw_w2_empty_w3_full.remove_indices.size() == 1 &&
+        dw_w2_empty_w3_full.remove_indices[0] == 1 &&
+        dw_w2_empty_w3_full.final_count == 3);
+
+  auto dw_w2_empty_w3_full_w4_empty = winome::compute_dynamic_workspace_plan({3, 0, 2, 0});
+  CHECK(dw_w2_empty_w3_full_w4_empty.append_count == 0 &&
+        dw_w2_empty_w3_full_w4_empty.remove_indices.size() == 1 &&
+        dw_w2_empty_w3_full_w4_empty.remove_indices[0] == 1 &&
+        dw_w2_empty_w3_full_w4_empty.final_count == 3);
 }
 
 void test_st_engine_theme_metrics() {
@@ -755,6 +817,19 @@ void test_perf_metrics_and_isolated_fontmap() {
   winome::capability_record_failure(winome::SubsystemId::SysTray, "fail-2", 2);
   CHECK(winome::capability_get(winome::SubsystemId::SysTray).state ==
         winome::CapabilityState::Tripped);
+
+  // Verify overview_init phase spelling and expanded startup breakdowns.
+  winome::perf_record_phase_ms("overview_init", 42.5);
+  winome::perf_record_phase_ms("theming", 3.25);
+  winome::perf_record_phase_ms("plugins", 18.0);
+  winome::perf_record_phase_ms("recovery", 1.5);
+  winome::perf_record_phase_ms("activate", 95.0);
+  const auto st = winome::perf_get_startup_timings();
+  CHECK(st.overview_init_ms >= 42.4 && st.overview_init_ms <= 42.6);
+  CHECK(st.theming_ms >= 3.2 && st.theming_ms <= 3.3);
+  CHECK(st.plugins_ms >= 17.9 && st.plugins_ms <= 18.1);
+  CHECK(st.recovery_ms >= 1.4 && st.recovery_ms <= 1.6);
+  CHECK(st.gtk_activate_ms >= 94.9 && st.gtk_activate_ms <= 95.1);
 
   auto mem = winome::perf_sample_process_telemetry();
   CHECK(mem.private_bytes > 0);
@@ -1119,6 +1194,39 @@ void test_debug_runtime_ipc_sddl_and_ctl() {
   CHECK(winome::debug_latest_log_seq() == base_seq + 3);
   CHECK(winome::debug_extract_log_tag("[vd] hello") == "vd");
   CHECK(winome::debug_extract_log_tag("plain message") == "misc");
+
+  // Verify timestamp prefixing and consecutive duplicate folding in LogRepeatFolder.
+  {
+    winome::LogRepeatFolder folder;
+    std::vector<std::string> out;
+    const std::string ts = "[2026-11-21 23:15:00.000] ";
+    CHECK(!winome::LogRepeatFolder::has_existing_timestamp("[workarea] applied"));
+    CHECK(winome::LogRepeatFolder::has_existing_timestamp(ts + "[workarea] applied"));
+    CHECK(winome::LogRepeatFolder::has_existing_timestamp(
+        "(winome.exe:123): Gtk-WARNING **: 02:49:56.424: msg"));
+
+    folder.push("[workarea] applied", ts, &out);
+    folder.push("[workarea] applied", ts, &out);
+    folder.push("[workarea] applied", ts, &out);
+    CHECK(out.size() == 1);
+    CHECK(out[0] == ts + "[workarea] applied");
+
+    folder.push("[ov] hide", ts, &out);
+    CHECK(out.size() == 3);
+    CHECK(out[1] == ts + "[log] previous line repeated 2 times");
+    CHECK(out[2] == ts + "[ov] hide");
+
+    folder.flush(ts, &out);
+    CHECK(out.size() == 3);
+
+    // Reaching kMaxFoldStreak emits a rolling summary automatically.
+    folder.push("spam", ts, &out);
+    for (size_t i = 0; i < winome::LogRepeatFolder::kMaxFoldStreak; ++i)
+      folder.push("spam", ts, &out);
+    CHECK(out.back() ==
+          ts + "[log] previous line repeated " +
+              std::to_string(winome::LogRepeatFolder::kMaxFoldStreak) + " times");
+  }
 
   const auto vd_logs = winome::debug_get_logs_since(base_seq, "vd", 10);
   CHECK(vd_logs.size() == 1);
@@ -1525,6 +1633,29 @@ void test_vd_async_and_breaker_recovery() {
     }
   }
   CHECK(found_active);
+
+  // VdReconnectPolicy: exponential backoff on transient Explorer COM failures,
+  // clean reset on recovery / TaskbarCreated.
+  winome::vd::VdReconnectPolicy policy;
+  CHECK(policy.can_attempt(1000));
+  CHECK(policy.record_failure(1000) == 2000);
+  CHECK(!policy.can_attempt(2999));
+  CHECK(policy.can_attempt(3000));
+  CHECK(policy.record_failure(3000) == 5000);
+  CHECK(policy.record_failure(8000) == 15000);
+  CHECK(policy.record_failure(23000) == 30000);
+  CHECK(policy.record_failure(53000) == 30000);
+  policy.record_success();
+  CHECK(policy.ever_succeeded && policy.consecutive_failures == 0);
+  CHECK(policy.can_attempt(0));
+  CHECK(policy.record_failure(60000) == 2000);
+  policy.reset_backoff();
+  CHECK(policy.can_attempt(60001));
+
+  // Brightness hardware absence should not report Degraded on desktop monitors.
+  (void)winome::has_brightness_control();
+  CHECK(winome::capability_get(winome::SubsystemId::Brightness).state ==
+        winome::CapabilityState::Active);
 }
 
 void test_start_menu_pinned_layout_and_folder_sync() {
@@ -2012,23 +2143,22 @@ void test_workarea_clamp_guard_and_fullscreen_hysteresis() {
   CHECK(guard.evaluate(1300, want, reset, false, false, false) ==
         winome::WorkareaAssertAction::SkipInvalidMonitor);
 
-  // Burst protection: applies at >=500ms intervals up to 4 times in 5s, then backs off.
+  // Burst protection: applies at >=120ms intervals up to 8 times in 3s, then backs off 1s.
   CHECK(guard.evaluate(2000, want, reset, true, false, false) ==
         winome::WorkareaAssertAction::Apply);
-  CHECK(guard.evaluate(2100, want, reset, true, false, false) ==
+  CHECK(guard.evaluate(2050, want, reset, true, false, false) ==
         winome::WorkareaAssertAction::DeferCooldown);
-  CHECK(guard.evaluate(2600, want, reset, true, false, false) ==
-        winome::WorkareaAssertAction::Apply);
-  CHECK(guard.evaluate(3200, want, reset, true, false, false) ==
-        winome::WorkareaAssertAction::Apply);
-  CHECK(guard.evaluate(3800, want, reset, true, false, false) ==
-        winome::WorkareaAssertAction::Apply);
-  CHECK(guard.evaluate(4400, want, reset, true, false, false) ==
+  for (int k = 1; k < winome::WorkareaAssertGuard::kMaxBurstApplies; ++k) {
+    CHECK(guard.evaluate(2000 + k * 150, want, reset, true, false, false) ==
+          winome::WorkareaAssertAction::Apply);
+  }
+  CHECK(guard.evaluate(2000 + winome::WorkareaAssertGuard::kMaxBurstApplies * 150,
+                       want, reset, true, false, false) ==
         winome::WorkareaAssertAction::DeferBackoff);
-  // Once backoff expires and workarea stays matching long enough, burst counter clears.
-  CHECK(guard.evaluate(9500, want, want, true, false, false) ==
+  // Once 1s backoff expires and workarea stays matching across the window, burst counter clears.
+  CHECK(guard.evaluate(6500, want, want, true, false, false) ==
         winome::WorkareaAssertAction::SkipUnchanged);
-  CHECK(guard.evaluate(10100, want, reset, true, false, false) ==
+  CHECK(guard.evaluate(6700, want, reset, true, false, false) ==
         winome::WorkareaAssertAction::Apply);
 
   // Fullscreen bounds check: rejects near-edge undersized windows & unreserved zoomed windows.

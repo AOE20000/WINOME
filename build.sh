@@ -133,6 +133,17 @@ do_build() {
   local exe="$dir/src/winome.exe"
   if [ -f "$exe" ]; then
     ok "构建成功: $DIR/src/winome.exe ($(du -h "$exe" | cut -f1))，用时 $((SECONDS - t0))s"
+    if [ "$key" = "release" ] && [ -f "$PROJ/package.sh" ]; then
+      info "同步更新便携版目录 WINOME/dist/WINOME-portable 与运行时 DLL..."
+      "$PROJ/package.sh" --no-build --skip-zip
+    elif [ -d "$PROJ/dist/WINOME-portable" ]; then
+      cp -lf "$PROJ/dist/WINOME-portable/"*.dll "$dir/src/" 2>/dev/null || cp -f "$PROJ/dist/WINOME-portable/"*.dll "$dir/src/" 2>/dev/null || true
+      for sub_asset in lib share etc; do
+        if [ -d "$PROJ/dist/WINOME-portable/$sub_asset" ] && [ ! -d "$dir/src/$sub_asset" ]; then
+          cp -rf "$PROJ/dist/WINOME-portable/$sub_asset" "$dir/src/"
+        fi
+      done
+    fi
   else
     fail "构建完成但未找到产物"
     exit 1
