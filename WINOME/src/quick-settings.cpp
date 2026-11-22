@@ -31,6 +31,8 @@
 #include <math.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -50,6 +52,7 @@ tr (const char *en, const char *zh)
 #define QUICK_HEADER_ICON_SIZE 24
 
 static GtkWidget *find_quick_settings_root (GtkWidget *widget);
+static GtkWidget *quick_settings_open_drawer_child (GtkWidget *quick_settings);
 static gboolean quick_settings_is_menu_open_for (GtkWidget *quick_settings,
                                                  GtkWidget *anchor);
 static void quick_settings_toggle_inline_menu (GtkWidget *quick_settings,
@@ -299,16 +302,19 @@ build_quick_menu_header (const char *icon_name, const char *title,
   gtk_label_set_xalign (GTK_LABEL (title_label), 0.0);
   gtk_box_append (GTK_BOX (text_col), title_label);
 
-  if (subtitle != NULL && subtitle[0] != '\0') {
-    subtitle_label = gtk_label_new (subtitle);
-    gtk_widget_add_css_class (subtitle_label, "subtitle");
-    gtk_label_set_ellipsize (GTK_LABEL (subtitle_label), PANGO_ELLIPSIZE_END);
-    gtk_label_set_xalign (GTK_LABEL (subtitle_label), 0.0);
-    gtk_box_append (GTK_BOX (text_col), subtitle_label);
-  }
+  subtitle_label = gtk_label_new (subtitle != NULL ? subtitle : "");
+  gtk_widget_add_css_class (subtitle_label, "subtitle");
+  gtk_label_set_ellipsize (GTK_LABEL (subtitle_label), PANGO_ELLIPSIZE_END);
+  gtk_label_set_xalign (GTK_LABEL (subtitle_label), 0.0);
+  gtk_widget_set_visible (subtitle_label,
+                          (subtitle != NULL && subtitle[0] != '\0') ? TRUE : FALSE);
+  gtk_box_append (GTK_BOX (text_col), subtitle_label);
 
   gtk_box_append (GTK_BOX (row), text_col);
   gtk_box_append (GTK_BOX (header), row);
+
+  g_object_set_data (G_OBJECT (header), "header-icon", icon);
+  g_object_set_data (G_OBJECT (header), "header-subtitle", subtitle_label);
 
   return header;
 }
@@ -973,20 +979,144 @@ on_settings_clicked (GtkButton *button G_GNUC_UNUSED,
   winome::open_settings_window ();
 }
 
+static const char *
+dark_mode_subtitle (bool apps_dark, bool sys_dark)
+{
+  if (apps_dark && sys_dark)
+    return tr ("Dark", "深色");
+  if (!apps_dark && !sys_dark)
+    return tr ("Light", "浅色");
+  if (!apps_dark && sys_dark)
+    return tr ("Light Apps · Dark System", "浅色应用 · 深色系统");
+  return tr ("Dark Apps · Light System", "深色应用 · 浅色系统");
+}
+
 static void
-on_dark_mode_toggled (GtkToggleButton *button,
-                      gpointer G_GNUC_UNUSED user_data)
+on_dark_mode_toggled (GtkToggleButton *button, gpointer user_data)
 {
   winome::set_dark_mode (gtk_toggle_button_get_active (button) != FALSE);
+  if (user_data != nullptr)
+    winome_quick_settings_refresh (GTK_WIDGET (user_data));
 }
+
+enum DarkModeMenuAction {
+  DARK_ACTION_APPS_LIGHT = 1,
+  DARK_ACTION_APPS_DARK,
+  DARK_ACTION_SYS_LIGHT,
+  DARK_ACTION_SYS_DARK,
+  DARK_ACTION_OPEN_SETTINGS,
+};
+
+struct DarkModeMenuTarget {
+  DarkModeMenuAction action;
+  GtkWidget *panel;
+};
+
+static void
+on_dark_mode_menu_activate (gpointer user_data)
+{
+  auto *t = static_cast<DarkModeMenuTarget *> (user_data);
+  if (t == nullptr)
+    return;
+  switch (t->action) {
+  case DARK_ACTION_APPS_LIGHT:
+    winome::set_app_dark_mode (false);
+    break;
+  case DARK_ACTION_APPS_DARK:
+    winome::set_app_dark_mode (true);
+    break;
+  case DARK_ACTION_SYS_LIGHT:
+    winome::set_system_dark_mode (false);
+    break;
+  case DARK_ACTION_SYS_DARK:
+    winome::set_system_dark_mode (true);
+    break;
+  case DARK_ACTION_OPEN_SETTINGS:
+    ShellExecuteW (nullptr, L"open", L"ms-settings:colors", nullptr, nullptr,
+                   SW_SHOWNORMAL);
+    return;
+  }
+  if (t->panel != nullptr)
+    winome_quick_settings_refresh (t->panel);
+}
+
+static GtkWidget *
+build_dark_mode_menu (gpointer user_data)
+{
+  GtkWidget *panel = GTK_WIDGET (user_data);
+  bool apps_dark = false;
+  bool sys_dark = false;
+  winome::get_theme_modes (&apps_dark, &sys_dark);
+
+  auto *targets = g_new0 (DarkModeMenuTarget, 5);
+  targets[0] = {DARK_ACTION_APPS_LIGHT, panel};
+  targets[1] = {DARK_ACTION_APPS_DARK, panel};
+  targets[2] = {DARK_ACTION_SYS_LIGHT, panel};
+  targets[3] = {DARK_ACTION_SYS_DARK, panel};
+  targets[4] = {DARK_ACTION_OPEN_SETTINGS, panel};
+
+  WinomeMenuEntry items[7] = {};
+  items[0].label = tr ("Light Apps", "浅色应用主题");
+  items[0].icon_name = "weather-clear-symbolic";
+  items[0].checked = !apps_dark ? TRUE : FALSE;
+  items[0].callback = on_dark_mode_menu_activate;
+  items[0].user_data = &targets[0];
+
+  items[1].label = tr ("Dark Apps", "深色应用主题");
+  items[1].icon_name = "dark-mode-symbolic";
+  items[1].checked = apps_dark ? TRUE : FALSE;
+  items[1].callback = on_dark_mode_menu_activate;
+  items[1].user_data = &targets[1];
+
+  items[2].label = nullptr;  // separator
+
+  items[3].label = tr ("Light System", "浅色系统主题");
+  items[3].icon_name = "weather-clear-symbolic";
+  items[3].checked = !sys_dark ? TRUE : FALSE;
+  items[3].callback = on_dark_mode_menu_activate;
+  items[3].user_data = &targets[2];
+
+  items[4].label = tr ("Dark System", "深色系统主题");
+  items[4].icon_name = "dark-mode-symbolic";
+  items[4].checked = sys_dark ? TRUE : FALSE;
+  items[4].callback = on_dark_mode_menu_activate;
+  items[4].user_data = &targets[3];
+
+  items[5].label = nullptr;  // separator
+
+  items[6].label = tr ("Color Settings", "颜色设置");
+  items[6].icon_name = "preferences-system-symbolic";
+  items[6].checked = FALSE;
+  items[6].callback = on_dark_mode_menu_activate;
+  items[6].user_data = &targets[4];
+
+  GtkWidget *menu = build_quick_menu_full (
+      items, G_N_ELEMENTS (items), "dark-mode-symbolic",
+      tr ("Dark Style", "深色主题"), dark_mode_subtitle (apps_dark, sys_dark),
+      (apps_dark || sys_dark) ? TRUE : FALSE);
+  g_object_set_data_full (G_OBJECT (menu), "dark-mode-targets", targets, g_free);
+  return menu;
+}
+
+static void wifi_menu_refresh_async (struct WifiMenu *m, gboolean trigger_scan);
+static void bluetooth_menu_refresh_async (struct BluetoothMenu *m, bool issue_inquiry);
 
 static void
 on_wlan_toggled (GtkToggleButton *button, gpointer user_data)
 {
   gboolean active = gtk_toggle_button_get_active (button);
   winome_wifi_set_enabled (active);
-  if (user_data != nullptr)
-    winome_quick_settings_refresh (GTK_WIDGET (user_data));
+  if (user_data != nullptr) {
+    GtkWidget *qs = GTK_WIDGET (user_data);
+    winome_quick_settings_refresh (qs);
+    GtkWidget *drawer = quick_settings_open_drawer_child (qs);
+    if (drawer != nullptr) {
+      auto *wm = static_cast<WifiMenu *> (
+          g_object_get_data (G_OBJECT (drawer), "wifi-menu"));
+      if (wm != nullptr)
+        wifi_menu_refresh_async (wm, active);
+    }
+  }
 }
 
 struct BluetoothTaskResult {
@@ -1003,6 +1133,13 @@ idle_bluetooth_task_done (gpointer user_data)
     gtk_widget_set_sensitive (res->button, TRUE);
   if (res->panel != nullptr) {
     winome_quick_settings_refresh (res->panel);
+    GtkWidget *drawer = quick_settings_open_drawer_child (res->panel);
+    if (drawer != nullptr) {
+      auto *bm = static_cast<BluetoothMenu *> (
+          g_object_get_data (G_OBJECT (drawer), "bluetooth-menu"));
+      if (bm != nullptr)
+        bluetooth_menu_refresh_async (bm, true);
+    }
     g_object_unref (res->panel);
   }
   if (res->button != nullptr)
@@ -1012,7 +1149,7 @@ idle_bluetooth_task_done (gpointer user_data)
         tr ("Bluetooth", "蓝牙"),
         tr ("Could not change Bluetooth radio state.",
             "无法切换蓝牙开关状态。"),
-        "bluetooth-disabled-symbolic");
+        "WINOME");
   }
   delete res;
   return G_SOURCE_REMOVE;
@@ -1045,6 +1182,7 @@ static void
 on_dnd_toggled (GtkToggleButton *button, gpointer G_GNUC_UNUSED user_data)
 {
   winome::set_do_not_disturb (gtk_toggle_button_get_active (button) != FALSE);
+  winome::notifications_notify_dnd_changed ();
 }
 
 static void
@@ -1697,6 +1835,15 @@ get_qs_grid (GtkWidget *quick_settings)
   return grid != NULL ? WINOME_QUICK_SETTINGS_GRID (grid) : NULL;
 }
 
+static GtkWidget *
+quick_settings_open_drawer_child (GtkWidget *quick_settings)
+{
+  WinomeQuickSettingsGrid *grid = get_qs_grid (quick_settings);
+  if (grid == NULL || !grid_is_opening_or_open (grid))
+    return NULL;
+  return grid->drawer_child;
+}
+
 static gboolean
 quick_settings_is_menu_open_for (GtkWidget *quick_settings, GtkWidget *anchor)
 {
@@ -2002,8 +2149,16 @@ on_power_mode_activate (gpointer user_data)
     g_object_set_data (G_OBJECT (t->panel), "last-power-mode",
                        GINT_TO_POINTER ((int)t->mode + 1));
   }
-  if (winome_power_set_mode (t->mode))
+  winome_power_set_mode (t->mode);
+  if (t->panel != NULL)
     winome_quick_settings_refresh (t->panel);
+}
+
+static void
+on_power_settings_activate (gpointer G_GNUC_UNUSED user_data)
+{
+  ShellExecuteW (nullptr, L"open", L"ms-settings:powersleep", nullptr, nullptr,
+                 SW_SHOWNORMAL);
 }
 
 static WinomePowerMode
@@ -2037,35 +2192,61 @@ on_power_mode_toggled (GtkToggleButton *button, gpointer user_data)
 
 // Wi-Fi secondary menu: the visible networks with the associated one checked.
 // Clicking a row asks Windows to connect using its stored profile; we do not
-// prompt for credentials, matching GNOME's behaviour for saved networks.
-typedef struct {
-  GtkWidget *panel;              // quick settings root, for refresh
-  GPtrArray *networks;           // WinomeWifiNetwork*, owned
-  GPtrArray *labels;             // char* row labels, owned
-  GPtrArray *rows;               // WifiRowTarget*, owned (one per row)
-} WifiMenu;
+// Live-updating Wi-Fi inline menu state (kept alive while the drawer is open,
+// torn down automatically when the drawer closes/destroys).
+struct WifiMenu;
+
+struct WifiRowTarget {
+  WifiMenu *menu = nullptr;
+  guint index = 0;
+};
+
+struct WifiMenu {
+  GtkWidget *panel = nullptr;            // quick settings root, for refresh
+  GtkWidget *header_icon = nullptr;
+  GtkWidget *header_subtitle = nullptr;
+  GtkWidget *items_box = nullptr;
+  GPtrArray *networks = nullptr;         // WinomeWifiNetwork*, owned
+  GPtrArray *labels = nullptr;           // char* row labels, owned
+  GPtrArray *rows = nullptr;             // WifiRowTarget*, owned
+  std::shared_ptr<std::atomic<bool>> alive;
+  std::shared_ptr<std::atomic<bool>> in_flight;
+  guint scan_timer_id = 0;
+  guint debounce_id = 0;
+  bool listener_registered = false;
+  bool initial_scan_done = false;
+};
+
+static void on_wifi_menu_wlan_event (gpointer user_data);
 
 static void
 wifi_menu_free (gpointer data)
 {
-  WifiMenu *m = static_cast<WifiMenu *>(data);
+  WifiMenu *m = static_cast<WifiMenu *> (data);
   if (m == nullptr)
     return;
-  if (m->rows != NULL)
+  if (m->alive)
+    m->alive->store (false, std::memory_order_release);
+  if (m->scan_timer_id != 0) {
+    g_source_remove (m->scan_timer_id);
+    m->scan_timer_id = 0;
+  }
+  if (m->debounce_id != 0) {
+    g_source_remove (m->debounce_id);
+    m->debounce_id = 0;
+  }
+  if (m->listener_registered) {
+    winome_wifi_remove_listener (on_wifi_menu_wlan_event, m);
+    m->listener_registered = false;
+  }
+  if (m->rows != nullptr)
     g_ptr_array_free (m->rows, TRUE);
-  if (m->labels != NULL)
+  if (m->labels != nullptr)
     g_ptr_array_free (m->labels, TRUE);
-  if (m->networks != NULL)
+  if (m->networks != nullptr)
     g_ptr_array_free (m->networks, TRUE);
-  g_free (m);
+  delete m;
 }
-
-// Row activation: each row gets its own index into the menu's network array so
-// the callback knows which SSID was clicked.
-typedef struct {
-  WifiMenu *menu;
-  guint     index;
-} WifiRowTarget;
 
 // Clicking a row connects; the row target is recycled rather than freed so a
 // menu row can be activated more than once (they are not: the popup is torn
@@ -2363,73 +2544,256 @@ on_wifi_network_activate (gpointer user_data)
   }
 }
 
+static void
+on_wifi_settings_activate (gpointer G_GNUC_UNUSED user_data)
+{
+  ShellExecuteW (nullptr, L"open", L"ms-settings:network-wifi", nullptr,
+                 nullptr, SW_SHOWNORMAL);
+}
+
+static void
+wifi_menu_populate_rows (WifiMenu *m, const WinomeWifiStatus &st,
+                         const WinomeWifiNetwork *list, guint count,
+                         bool scanning)
+{
+  if (m == nullptr || m->items_box == nullptr)
+    return;
+
+  while (GtkWidget *ch = gtk_widget_get_first_child (m->items_box))
+    gtk_box_remove (GTK_BOX (m->items_box), ch);
+
+  if (m->rows != nullptr)
+    g_ptr_array_set_size (m->rows, 0);
+  if (m->labels != nullptr)
+    g_ptr_array_set_size (m->labels, 0);
+  if (m->networks != nullptr)
+    g_ptr_array_set_size (m->networks, 0);
+
+  if (m->header_icon != nullptr) {
+    if (st.enabled && st.connected)
+      gtk_widget_add_css_class (m->header_icon, "active");
+    else
+      gtk_widget_remove_css_class (m->header_icon, "active");
+  }
+  if (m->header_subtitle != nullptr) {
+    const char *sub = !st.enabled
+                          ? tr ("Off", "已关闭")
+                          : (st.ssid[0] != '\0'
+                                 ? st.ssid
+                                 : (scanning ? tr ("Scanning…", "正在扫描…")
+                                             : tr ("Not Connected", "未连接")));
+    gtk_label_set_text (GTK_LABEL (m->header_subtitle), sub);
+    gtk_widget_set_visible (m->header_subtitle, TRUE);
+  }
+
+  if (!st.enabled) {
+    WinomeMenuEntry e{};
+    e.label = tr ("Wi-Fi is Off", "无线网络已关闭");
+    e.icon_name = "network-wireless-offline-symbolic";
+    gtk_box_append (GTK_BOX (m->items_box), make_quick_menu_item (&e));
+  } else if (count == 0 || list == nullptr) {
+    WinomeMenuEntry e{};
+    e.label = scanning ? tr ("Scanning for networks…", "正在扫描无线网络…")
+                       : tr ("No Networks Found", "未发现无线网络");
+    e.icon_name = "network-wireless-acquiring-symbolic";
+    gtk_box_append (GTK_BOX (m->items_box), make_quick_menu_item (&e));
+  } else {
+    for (guint i = 0; i < count; ++i) {
+      WinomeWifiNetwork *net = g_new0 (WinomeWifiNetwork, 1);
+      *net = list[i];
+      g_ptr_array_add (m->networks, net);
+
+      char *lbl = g_strdup_printf ("%s   %d%%", list[i].ssid,
+                                   list[i].signal_quality);
+      g_ptr_array_add (m->labels, lbl);
+
+      WifiRowTarget *row = g_new0 (WifiRowTarget, 1);
+      row->menu = m;
+      row->index = i;
+      g_ptr_array_add (m->rows, row);
+
+      WinomeMenuEntry entry{};
+      entry.label = lbl;
+      entry.icon_name = net->secured ? "network-wireless-encrypted-symbolic"
+                                     : "network-wireless-symbolic";
+      entry.checked = net->connected;
+      entry.callback = on_wifi_network_activate;
+      entry.user_data = row;
+      gtk_box_append (GTK_BOX (m->items_box), make_quick_menu_item (&entry));
+    }
+  }
+
+  WinomeMenuEntry sep{};
+  sep.label = nullptr;
+  gtk_box_append (GTK_BOX (m->items_box), make_quick_menu_item (&sep));
+
+  WinomeMenuEntry settings{};
+  settings.label = tr ("All Networks", "无线网络设置");
+  settings.icon_name = "preferences-system-symbolic";
+  settings.callback = on_wifi_settings_activate;
+  gtk_box_append (GTK_BOX (m->items_box), make_quick_menu_item (&settings));
+
+  gtk_widget_queue_resize (m->items_box);
+}
+
+static void
+wifi_menu_refresh_async (WifiMenu *m, gboolean trigger_scan)
+{
+  if (m == nullptr || !m->alive || !m->alive->load (std::memory_order_acquire))
+    return;
+  bool expected = false;
+  if (!m->in_flight->compare_exchange_strong (expected, true,
+                                              std::memory_order_acq_rel)) {
+    return;
+  }
+
+  auto alive = m->alive;
+  auto in_flight = m->in_flight;
+  std::thread ([m, alive, in_flight, trigger_scan] () {
+    struct WifiRefreshPayload {
+      WifiMenu *menu = nullptr;
+      std::shared_ptr<std::atomic<bool>> alive;
+      std::shared_ptr<std::atomic<bool>> in_flight;
+      WinomeWifiStatus status{};
+      WinomeWifiNetwork *nets = nullptr;
+      guint count = 0;
+      gboolean ok = FALSE;
+      ~WifiRefreshPayload () {
+        if (nets != nullptr)
+          winome_wifi_free_networks (nets);
+      }
+    };
+    auto *payload = new WifiRefreshPayload ();
+    payload->menu = m;
+    payload->alive = alive;
+    payload->in_flight = in_flight;
+    payload->ok = winome_wifi_query_snapshot_threadsafe (
+        &payload->status, &payload->nets, &payload->count, trigger_scan);
+
+    g_idle_add (
+        [] (gpointer ud) -> gboolean {
+          std::unique_ptr<WifiRefreshPayload> p (
+              static_cast<WifiRefreshPayload *> (ud));
+          p->in_flight->store (false, std::memory_order_release);
+          if (!p->alive->load (std::memory_order_acquire) || p->menu == nullptr)
+            return G_SOURCE_REMOVE;
+          p->menu->initial_scan_done = true;
+          if (p->ok) {
+            wifi_menu_populate_rows (p->menu, p->status, p->nets, p->count,
+                                     false);
+            if (p->menu->panel != nullptr)
+              winome_quick_settings_refresh (p->menu->panel);
+          }
+          return G_SOURCE_REMOVE;
+        },
+        payload);
+  }).detach ();
+}
+
+static gboolean
+on_wifi_menu_debounce_cb (gpointer user_data)
+{
+  WifiMenu *m = static_cast<WifiMenu *> (user_data);
+  if (m != nullptr) {
+    m->debounce_id = 0;
+    wifi_menu_refresh_async (m, FALSE);
+  }
+  return G_SOURCE_REMOVE;
+}
+
+static void
+on_wifi_menu_wlan_event (gpointer user_data)
+{
+  WifiMenu *m = static_cast<WifiMenu *> (user_data);
+  if (m == nullptr || !m->alive || !m->alive->load (std::memory_order_acquire))
+    return;
+  if (m->debounce_id != 0)
+    g_source_remove (m->debounce_id);
+  m->debounce_id = g_timeout_add (200, on_wifi_menu_debounce_cb, m);
+}
+
+static gboolean
+on_wifi_menu_periodic_scan (gpointer user_data)
+{
+  WifiMenu *m = static_cast<WifiMenu *> (user_data);
+  if (m == nullptr || !m->alive || !m->alive->load (std::memory_order_acquire))
+    return G_SOURCE_REMOVE;
+  wifi_menu_refresh_async (m, TRUE);
+  return G_SOURCE_CONTINUE;
+}
+
 static GtkWidget *
 build_wifi_menu (gpointer user_data)
 {
   GtkWidget *panel = GTK_WIDGET (user_data);
-  winome_wifi_trigger_scan_async ();
-  WinomeWifiNetwork *list = nullptr;
-  guint count = 0;
-
-  if (!winome_wifi_scan (&list, &count) || list == nullptr)
+  WinomeWifiStatus st = {};
+  if (!winome_wifi_get_status (&st))
     return NULL;
 
-  if (count == 0) {
-    winome_wifi_free_networks (list);
-    return NULL;   // radio on, nothing in range: leave the arrow inert
+  WinomeWifiNetwork *list = nullptr;
+  guint count = 0;
+  if (st.enabled) {
+    winome_wifi_query_snapshot_threadsafe (&st, &list, &count, FALSE);
   }
 
-  WifiMenu *m = g_new0 (WifiMenu, 1);
+  GtkWidget *menu = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_add_css_class (menu, "quick-toggle-menu");
+  gtk_widget_set_hexpand (menu, TRUE);
+
+  const char *init_sub = !st.enabled
+                             ? tr ("Off", "已关闭")
+                             : (st.ssid[0] != '\0'
+                                    ? st.ssid
+                                    : tr ("Scanning…", "正在扫描…"));
+  GtkWidget *header = build_quick_menu_header (
+      "network-wireless-symbolic", tr ("Wi-Fi", "无线网络"), init_sub,
+      (st.enabled && st.connected) ? TRUE : FALSE);
+  if (header != nullptr)
+    gtk_box_append (GTK_BOX (menu), header);
+
+  GtkWidget *scroll = gtk_scrolled_window_new ();
+  gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (scroll),
+                                  GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+  gtk_scrolled_window_set_propagate_natural_width (
+      GTK_SCROLLED_WINDOW (scroll), TRUE);
+  gtk_scrolled_window_set_propagate_natural_height (
+      GTK_SCROLLED_WINDOW (scroll), TRUE);
+  gtk_scrolled_window_set_max_content_height (
+      GTK_SCROLLED_WINDOW (scroll), 280);
+
+  GtkWidget *items_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scroll), items_box);
+  gtk_box_append (GTK_BOX (menu), scroll);
+
+  auto *m = new WifiMenu ();
   m->panel = panel;
+  m->header_icon = header != nullptr
+                       ? GTK_WIDGET (g_object_get_data (G_OBJECT (header),
+                                                        "header-icon"))
+                       : nullptr;
+  m->header_subtitle = header != nullptr
+                           ? GTK_WIDGET (g_object_get_data (G_OBJECT (header),
+                                                            "header-subtitle"))
+                           : nullptr;
+  m->items_box = items_box;
   m->networks = g_ptr_array_new_with_free_func (g_free);
   m->labels = g_ptr_array_new_with_free_func (g_free);
   m->rows = g_ptr_array_new_with_free_func (g_free);
+  m->alive = std::make_shared<std::atomic<bool>> (true);
+  m->in_flight = std::make_shared<std::atomic<bool>> (false);
 
-  for (guint i = 0; i < count; i++) {
-    WinomeWifiNetwork *net = g_new0 (WinomeWifiNetwork, 1);
-    *net = list[i];
-    g_ptr_array_add (m->networks, net);
+  wifi_menu_populate_rows (m, st, list, count, st.enabled && count == 0);
+  if (list != nullptr)
+    winome_wifi_free_networks (list);
 
-    // GNOME renders "SSID   72%" for network rows.
-    g_ptr_array_add (m->labels,
-                     g_strdup_printf ("%s   %d%%", list[i].ssid,
-                                      list[i].signal_quality));
-  }
-  winome_wifi_free_networks (list);
+  // Live refresh while open: event-driven WLAN scan/connection callbacks plus
+  // 4-second periodic hardware scan on a background thread.
+  winome_wifi_add_listener (on_wifi_menu_wlan_event, m);
+  m->listener_registered = true;
+  m->scan_timer_id = g_timeout_add_seconds (4, on_wifi_menu_periodic_scan, m);
+  wifi_menu_refresh_async (m, TRUE);
 
-  WinomeMenuEntry *items = g_new0 (WinomeMenuEntry, count);
-  for (guint i = 0; i < count; i++) {
-    const WinomeWifiNetwork *net =
-        static_cast<const WinomeWifiNetwork *> (g_ptr_array_index (m->networks, i));
-    WifiRowTarget *row = g_new0 (WifiRowTarget, 1);
-
-    row->menu = m;
-    row->index = i;
-    g_ptr_array_add (m->rows, row);
-
-    items[i].label = static_cast<const char *> (g_ptr_array_index (m->labels, i));
-    items[i].icon_name = net->secured ? "network-wireless-encrypted-symbolic"
-                                      : "network-wireless-symbolic";
-    items[i].checked = net->connected;
-    items[i].callback = on_wifi_network_activate;
-    items[i].user_data = row;
-  }
-
-  // Upstream NetworkMenu calls
-  //   menu.setHeader('network-wireless-symbolic', _('Wi-Fi'), subtitle)
-  // where subtitle is "Connected" / "Not Connected" / the wired fallback. The
-  // badge goes blue (.active) once associated.
-  WinomeWifiStatus st;
-  const gboolean associated = winome_wifi_get_status (&st) && st.connected;
-  const char *subtitle = st.ssid[0] != '\0' ? st.ssid
-                                            : tr ("Not Connected", "未连接");
-
-  GtkWidget *menu = build_quick_menu_full (items, count,
-                                           "network-wireless-symbolic",
-                                           tr ("Wi-Fi", "无线网络"),
-                                           subtitle, associated);
   g_object_set_data_full (G_OBJECT (menu), "wifi-menu", m, wifi_menu_free);
-  g_free (items);
   return menu;
 }
 
@@ -2437,7 +2801,7 @@ static GtkWidget *
 build_power_mode_menu (gpointer user_data)
 {
   GtkWidget *panel = GTK_WIDGET (user_data);
-  WinomeMenuEntry items[WINOME_POWER_MODE_COUNT];
+  WinomeMenuEntry items[WINOME_POWER_MODE_COUNT + 2] = {};
   PowerModeTarget *targets = g_new0 (PowerModeTarget, WINOME_POWER_MODE_COUNT);
   WinomePowerMode active = winome_power_get_active ();
   guint n = 0;
@@ -2462,6 +2826,16 @@ build_power_mode_menu (gpointer user_data)
     return NULL;   // no stock plans installed: leave the arrow inert
   }
 
+  items[n].label = nullptr;  // separator
+  n++;
+
+  items[n].label = tr ("Power Settings", "电源设置");
+  items[n].icon_name = "preferences-system-symbolic";
+  items[n].checked = FALSE;
+  items[n].callback = on_power_settings_activate;
+  items[n].user_data = nullptr;
+  n++;
+
   // Header: "Power Mode" with the current plan's glyph in the badge, shown
   // active while a plan is selected. Falls back to Balanced when the scheme
   // cannot be read.
@@ -2478,9 +2852,17 @@ build_power_mode_menu (gpointer user_data)
   return menu;
 }
 
-typedef struct {
-  GPtrArray *labels;
-} BluetoothMenu;
+struct BluetoothMenu {
+  GtkWidget *panel = nullptr;
+  GtkWidget *header_icon = nullptr;
+  GtkWidget *header_subtitle = nullptr;
+  GtkWidget *items_box = nullptr;
+  GPtrArray *labels = nullptr;
+  std::shared_ptr<std::atomic<bool>> alive;
+  std::shared_ptr<std::atomic<bool>> in_flight;
+  guint refresh_timer_id = 0;
+  int tick_count = 0;
+};
 
 static void
 bluetooth_menu_free (gpointer data)
@@ -2488,9 +2870,15 @@ bluetooth_menu_free (gpointer data)
   BluetoothMenu *m = static_cast<BluetoothMenu *> (data);
   if (m == nullptr)
     return;
+  if (m->alive)
+    m->alive->store (false, std::memory_order_release);
+  if (m->refresh_timer_id != 0) {
+    g_source_remove (m->refresh_timer_id);
+    m->refresh_timer_id = 0;
+  }
   if (m->labels != nullptr)
     g_ptr_array_free (m->labels, TRUE);
-  g_free (m);
+  delete m;
 }
 
 static void
@@ -2500,52 +2888,219 @@ on_bluetooth_device_activate (gpointer G_GNUC_UNUSED user_data)
                  SW_SHOWNORMAL);
 }
 
-static GtkWidget *
-build_bluetooth_menu (gpointer G_GNUC_UNUSED user_data)
+static void
+bluetooth_menu_populate_rows (BluetoothMenu *m,
+                              bool bt_enabled,
+                              const char *connected_name,
+                              const winome::BluetoothDevice *devs,
+                              int count,
+                              bool scanning)
 {
-  winome::BluetoothDevice devs[16] = {};
-  int count = winome::get_bluetooth_devices (devs, 16);
-  if (count < 0)
-    count = 0;
+  if (m == nullptr || m->items_box == nullptr)
+    return;
 
-  BluetoothMenu *m = g_new0 (BluetoothMenu, 1);
-  m->labels = g_ptr_array_new_with_free_func (g_free);
+  while (GtkWidget *ch = gtk_widget_get_first_child (m->items_box))
+    gtk_box_remove (GTK_BOX (m->items_box), ch);
+  if (m->labels != nullptr)
+    g_ptr_array_set_size (m->labels, 0);
 
-  int total = count + 1;
-  WinomeMenuEntry *items = g_new0 (WinomeMenuEntry, total);
-  for (int i = 0; i < count; ++i) {
-    char *copy = g_strdup (devs[i].name);
-    g_ptr_array_add (m->labels, copy);
-    items[i].label = copy;
-    items[i].icon_name = "bluetooth-active-symbolic";
-    items[i].checked = devs[i].connected ? TRUE : FALSE;
-    items[i].callback = on_bluetooth_device_activate;
-    items[i].user_data = NULL;
+  if (m->header_icon != nullptr) {
+    if (bt_enabled)
+      gtk_widget_add_css_class (m->header_icon, "active");
+    else
+      gtk_widget_remove_css_class (m->header_icon, "active");
+  }
+  if (m->header_subtitle != nullptr) {
+    const char *sub = (connected_name != nullptr && connected_name[0] != '\0')
+                          ? connected_name
+                          : (bt_enabled
+                                 ? (scanning ? tr ("Searching…", "正在搜索…")
+                                             : tr ("On", "已开启"))
+                                 : tr ("Off", "已关闭"));
+    gtk_label_set_text (GTK_LABEL (m->header_subtitle), sub);
+    gtk_widget_set_visible (m->header_subtitle, TRUE);
   }
 
-  items[count].label = tr ("Bluetooth Settings", "蓝牙设置");
-  items[count].icon_name = "preferences-system-symbolic";
-  items[count].checked = FALSE;
-  items[count].callback = on_bluetooth_device_activate;
-  items[count].user_data = NULL;
+  if (!bt_enabled) {
+    WinomeMenuEntry e{};
+    e.label = tr ("Bluetooth is Off", "蓝牙已关闭");
+    e.icon_name = "bluetooth-disabled-symbolic";
+    gtk_box_append (GTK_BOX (m->items_box), make_quick_menu_item (&e));
+  } else if (count <= 0 || devs == nullptr) {
+    WinomeMenuEntry e{};
+    e.label = scanning ? tr ("Searching for devices…", "正在搜索蓝牙设备…")
+                       : tr ("No Devices Found", "未发现蓝牙设备");
+    e.icon_name = "bluetooth-active-symbolic";
+    gtk_box_append (GTK_BOX (m->items_box), make_quick_menu_item (&e));
+  } else {
+    for (int i = 0; i < count; ++i) {
+      char *lbl = devs[i].paired
+                      ? g_strdup (devs[i].name)
+                      : g_strdup_printf ("%s  (%s)", devs[i].name,
+                                         tr ("Nearby", "附近"));
+      g_ptr_array_add (m->labels, lbl);
 
+      WinomeMenuEntry entry{};
+      entry.label = lbl;
+      entry.icon_name = devs[i].connected ? "bluetooth-active-symbolic"
+                                          : "bluetooth-symbolic";
+      entry.checked = devs[i].connected ? TRUE : FALSE;
+      entry.callback = on_bluetooth_device_activate;
+      gtk_box_append (GTK_BOX (m->items_box), make_quick_menu_item (&entry));
+    }
+  }
+
+  WinomeMenuEntry sep{};
+  sep.label = nullptr;
+  gtk_box_append (GTK_BOX (m->items_box), make_quick_menu_item (&sep));
+
+  WinomeMenuEntry settings{};
+  settings.label = tr ("Bluetooth Settings", "蓝牙设置");
+  settings.icon_name = "preferences-system-symbolic";
+  settings.callback = on_bluetooth_device_activate;
+  gtk_box_append (GTK_BOX (m->items_box), make_quick_menu_item (&settings));
+
+  gtk_widget_queue_resize (m->items_box);
+}
+
+static void
+bluetooth_menu_refresh_async (BluetoothMenu *m, bool issue_inquiry)
+{
+  if (m == nullptr || !m->alive || !m->alive->load (std::memory_order_acquire))
+    return;
+  bool expected = false;
+  if (!m->in_flight->compare_exchange_strong (expected, true,
+                                              std::memory_order_acq_rel)) {
+    return;
+  }
+
+  auto alive = m->alive;
+  auto in_flight = m->in_flight;
+  std::thread ([m, alive, in_flight, issue_inquiry] () {
+    struct BtRefreshPayload {
+      BluetoothMenu *menu = nullptr;
+      std::shared_ptr<std::atomic<bool>> alive;
+      std::shared_ptr<std::atomic<bool>> in_flight;
+      bool present = false;
+      bool enabled = false;
+      char connected_name[249] = "";
+      winome::BluetoothDevice devs[24] = {};
+      int count = 0;
+    };
+    auto *payload = new BtRefreshPayload ();
+    payload->menu = m;
+    payload->alive = alive;
+    payload->in_flight = in_flight;
+    winome::get_bluetooth_status (&payload->present, &payload->enabled,
+                                  payload->connected_name,
+                                  sizeof (payload->connected_name));
+    if (payload->enabled) {
+      payload->count = winome::get_bluetooth_devices_ex (
+          payload->devs, 24, issue_inquiry);
+      if (payload->count < 0)
+        payload->count = 0;
+    }
+
+    g_idle_add (
+        [] (gpointer ud) -> gboolean {
+          std::unique_ptr<BtRefreshPayload> p (
+              static_cast<BtRefreshPayload *> (ud));
+          p->in_flight->store (false, std::memory_order_release);
+          if (!p->alive->load (std::memory_order_acquire) || p->menu == nullptr)
+            return G_SOURCE_REMOVE;
+          bluetooth_menu_populate_rows (p->menu, p->enabled, p->connected_name,
+                                        p->devs, p->count, false);
+          if (p->menu->panel != nullptr)
+            winome_quick_settings_refresh (p->menu->panel);
+          return G_SOURCE_REMOVE;
+        },
+        payload);
+  }).detach ();
+}
+
+static gboolean
+on_bluetooth_menu_periodic_refresh (gpointer user_data)
+{
+  BluetoothMenu *m = static_cast<BluetoothMenu *> (user_data);
+  if (m == nullptr || !m->alive || !m->alive->load (std::memory_order_acquire))
+    return G_SOURCE_REMOVE;
+  ++m->tick_count;
+  // Poll paired/connected state every 3s; issue active inquiry every 9s to
+  // discover newly advertised nearby devices without hogging the BT radio.
+  const bool inquiry = (m->tick_count % 3 == 0);
+  bluetooth_menu_refresh_async (m, inquiry);
+  return G_SOURCE_CONTINUE;
+}
+
+static GtkWidget *
+build_bluetooth_menu (gpointer user_data)
+{
+  GtkWidget *panel = GTK_WIDGET (user_data);
   bool bt_present = false, bt_enabled = false;
   char bt_name[249] = "";
   winome::get_bluetooth_status (&bt_present, &bt_enabled, bt_name,
                                 sizeof (bt_name));
+
+  winome::BluetoothDevice devs[24] = {};
+  int count = bt_enabled ? winome::get_bluetooth_devices (devs, 24) : 0;
+  if (count < 0)
+    count = 0;
+
+  GtkWidget *menu = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_add_css_class (menu, "quick-toggle-menu");
+  gtk_widget_set_hexpand (menu, TRUE);
+
   const char *subtitle = bt_name[0] != '\0'
                              ? bt_name
                              : (bt_enabled ? tr ("On", "已开启")
                                            : tr ("Off", "已关闭"));
+  GtkWidget *header = build_quick_menu_header (
+      "bluetooth-active-symbolic", tr ("Bluetooth", "蓝牙"), subtitle,
+      bt_enabled ? TRUE : FALSE);
+  if (header != nullptr)
+    gtk_box_append (GTK_BOX (menu), header);
 
-  GtkWidget *menu = build_quick_menu_full (items, static_cast<guint> (total),
-                                           "bluetooth-active-symbolic",
-                                           tr ("Bluetooth", "蓝牙"),
-                                           subtitle,
-                                           bt_enabled ? TRUE : FALSE);
+  GtkWidget *scroll = gtk_scrolled_window_new ();
+  gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (scroll),
+                                  GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+  gtk_scrolled_window_set_propagate_natural_width (
+      GTK_SCROLLED_WINDOW (scroll), TRUE);
+  gtk_scrolled_window_set_propagate_natural_height (
+      GTK_SCROLLED_WINDOW (scroll), TRUE);
+  gtk_scrolled_window_set_max_content_height (
+      GTK_SCROLLED_WINDOW (scroll), 280);
+
+  GtkWidget *items_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scroll), items_box);
+  gtk_box_append (GTK_BOX (menu), scroll);
+
+  auto *m = new BluetoothMenu ();
+  m->panel = panel;
+  m->header_icon = header != nullptr
+                       ? GTK_WIDGET (g_object_get_data (G_OBJECT (header),
+                                                        "header-icon"))
+                       : nullptr;
+  m->header_subtitle = header != nullptr
+                           ? GTK_WIDGET (g_object_get_data (G_OBJECT (header),
+                                                            "header-subtitle"))
+                           : nullptr;
+  m->items_box = items_box;
+  m->labels = g_ptr_array_new_with_free_func (g_free);
+  m->alive = std::make_shared<std::atomic<bool>> (true);
+  m->in_flight = std::make_shared<std::atomic<bool>> (false);
+
+  bluetooth_menu_populate_rows (m, bt_enabled, bt_name, devs, count,
+                                bt_enabled && count == 0);
+
+  // Live refresh while open: immediate background inquiry + 3-second periodic
+  // paired/connected status refresh (inquiry every 9s).
+  m->refresh_timer_id =
+      g_timeout_add_seconds (3, on_bluetooth_menu_periodic_refresh, m);
+  if (bt_enabled)
+    bluetooth_menu_refresh_async (m, true);
+
   g_object_set_data_full (G_OBJECT (menu), "bluetooth-menu", m,
                           bluetooth_menu_free);
-  g_free (items);
   return menu;
 }
 
@@ -2677,7 +3232,7 @@ winome_quick_settings_new (void)
                       G_CALLBACK (on_bluetooth_toggled), root);
     winome_quick_settings_grid_attach (grid, bluetooth, 1);
 
-    powermode = make_quick_menu_toggle ("power-profile-balanced-symbolic",
+    powermode = make_quick_menu_toggle (winome_power_mode_icon (active_power),
                                         tr ("Power Mode", "电源模式"),
                                         winome_power_mode_label (active_power),
                                         build_power_mode_menu, root);
@@ -2692,14 +3247,17 @@ winome_quick_settings_new (void)
                       G_CALLBACK (on_night_light_toggled), NULL);
     winome_quick_settings_grid_attach (grid, nightlight, 1);
 
-    darkmode = make_quick_toggle ("dark-mode-symbolic",
-                                  tr ("Dark Style", "深色主题"),
-                                  NULL, NULL, NULL);
-    bool is_dark = false;
-    winome::get_dark_mode (&is_dark);
-    gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (darkmode), is_dark);
-    g_signal_connect (darkmode, "toggled",
-                      G_CALLBACK (on_dark_mode_toggled), NULL);
+    bool apps_dark = false, sys_dark = false;
+    winome::get_theme_modes (&apps_dark, &sys_dark);
+    darkmode = make_quick_menu_toggle ("dark-mode-symbolic",
+                                       tr ("Dark Style", "深色主题"),
+                                       dark_mode_subtitle (apps_dark, sys_dark),
+                                       build_dark_mode_menu, root);
+    gtk_toggle_button_set_active (
+        GTK_TOGGLE_BUTTON (quick_menu_toggle_button (darkmode)),
+        (apps_dark && sys_dark) ? TRUE : FALSE);
+    g_signal_connect (quick_menu_toggle_button (darkmode), "toggled",
+                      G_CALLBACK (on_dark_mode_toggled), root);
     winome_quick_settings_grid_attach (grid, darkmode, 1);
 
     dnd = make_quick_toggle ("notifications-disabled-symbolic",
@@ -3116,13 +3674,18 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
   }
 
   if (darkmode_toggle) {
-    bool is_dark = false;
-    if (winome::get_dark_mode (&is_dark)) {
-      g_signal_handlers_block_by_func (darkmode_toggle,
-          (gpointer) on_dark_mode_toggled, NULL);
-      gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (darkmode_toggle), is_dark);
-      g_signal_handlers_unblock_by_func (darkmode_toggle,
-          (gpointer) on_dark_mode_toggled, NULL);
+    bool apps_dark = false;
+    bool sys_dark = false;
+    if (winome::get_theme_modes (&apps_dark, &sys_dark)) {
+      set_toggle_active_blocked (darkmode_toggle,
+                                 (apps_dark && sys_dark) ? TRUE : FALSE,
+                                 G_CALLBACK (on_dark_mode_toggled), quick_settings);
+      MenuToggleParts *parts = static_cast<MenuToggleParts *> (
+          g_object_get_data (G_OBJECT (darkmode_toggle), "menu-toggle-parts"));
+      if (parts && parts->subtitle_label) {
+        gtk_label_set_text (GTK_LABEL (parts->subtitle_label),
+                            dark_mode_subtitle (apps_dark, sys_dark));
+      }
     }
   }
 

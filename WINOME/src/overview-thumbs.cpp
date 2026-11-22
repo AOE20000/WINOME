@@ -12,9 +12,11 @@
 // the 3px frame lands outside the pill exactly like upstream.
 
 #include "overview-thumbs.h"
+#include "overview-layout.h"
 #include "st-engine.h"
 
 #include <algorithm>
+#include <cmath>
 #include <new>
 #include <vector>
 
@@ -53,6 +55,12 @@ struct WinomeThumbs {
   // Continuous indicator position (workspacesView.js _scrollAdjustment.value
   // while a workspace switch animates): -1 = snap to `active`.
   double indicator_value = -1.0;
+
+  // GPU transform during WINDOW_PICKER <-> APP_GRID (overviewControls.js
+  // _getThumbnailsBoxParams: pivot (0.5, 0.5), scale 1->0.5, ty 0->h/2).
+  double anim_scale = 1.0;
+  double anim_translate_y = 0.0;
+  double panel_top_ratio = 0.0;
 
   GdkTexture *wallpaper = nullptr;
 
@@ -123,6 +131,22 @@ winome_thumbs_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
   if (self->pills.empty ())
     return;
 
+  const bool has_transform =
+      (std::abs (self->anim_scale - 1.0) > 0.002 ||
+       std::abs (self->anim_translate_y) > 0.25);
+  if (has_transform) {
+    const float cx = static_cast<float> (gtk_widget_get_width (widget)) * 0.5f;
+    const float cy = static_cast<float> (gtk_widget_get_height (widget)) * 0.5f;
+    const float sc = static_cast<float> (std::clamp (self->anim_scale, 0.05, 2.0));
+    graphene_point_t p_to =
+        GRAPHENE_POINT_INIT (cx, cy + static_cast<float> (self->anim_translate_y));
+    graphene_point_t p_back = GRAPHENE_POINT_INIT (-cx, -cy);
+    gtk_snapshot_save (snapshot);
+    gtk_snapshot_translate (snapshot, &p_to);
+    gtk_snapshot_scale (snapshot, sc, sc);
+    gtk_snapshot_translate (snapshot, &p_back);
+  }
+
   // .workspace-thumbnail pills: the wallpaper drawn cover-style inside a
   // rounded clip with a subtle 1px border for crisp definition.
   for (int i = 0; i < (int)self->pills.size (); ++i) {
@@ -140,14 +164,13 @@ winome_thumbs_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
       double tw = gdk_texture_get_width (self->wallpaper);
       double th = gdk_texture_get_height (self->wallpaper);
       if (tw > 0 && th > 0 && pill.w > 0 && pill.h > 0) {
-        double s = std::max (pill.w / tw, pill.h / th);
-        double dw = tw * s, dh = th * s;
+        WallpaperDrawRect wr = compute_workarea_wallpaper_draw_rect (
+            pill.x, pill.y, pill.w, pill.h, tw, th, self->panel_top_ratio);
         graphene_rect_t tex_rect;
-        graphene_rect_init (&tex_rect,
-                            (float)(pill.x + (pill.w - dw) / 2.0),
-                            (float)(pill.y + (pill.h - dh) / 2.0),
-                            (float)dw, (float)dh);
-        gtk_snapshot_append_texture (snapshot, self->wallpaper, &tex_rect);
+        graphene_rect_init (&tex_rect, (float)wr.x, (float)wr.y, (float)wr.w,
+                            (float)wr.h);
+        gtk_snapshot_append_scaled_texture (
+            snapshot, self->wallpaper, GSK_SCALING_FILTER_LINEAR, &tex_rect);
         drawn = true;
       }
     }
@@ -212,6 +235,9 @@ winome_thumbs_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
                          self->indicator_color, self->indicator_color};
     gtk_snapshot_append_border (snapshot, &outline, widths, colors);
   }
+
+  if (has_transform)
+    gtk_snapshot_restore (snapshot);
 }
 
 // --- measure ---------------------------------------------------------------------
@@ -327,11 +353,15 @@ winome_thumbs_init (WinomeThumbs *self)
   self->hover_index = -1;
   self->drop_target = -1;
   self->indicator_value = -1.0;
+  self->anim_scale = 1.0;
+  self->anim_translate_y = 0.0;
+  self->panel_top_ratio = 0.0;
   self->spacing = kSpacingFallback;
   self->padding = kPaddingFallback;
   self->thumb_radius = kThumbRadiusFallback;
   self->indicator_width = kIndicatorWidthFallback;
   self->indicator_radius = kIndicatorRadiusFallback;
+  gtk_widget_set_overflow (GTK_WIDGET (self), GTK_OVERFLOW_VISIBLE);
   GtkEventController *motion = gtk_event_controller_motion_new ();
   g_signal_connect (motion, "enter", G_CALLBACK (winome_thumbs_motion), self);
   g_signal_connect (motion, "motion", G_CALLBACK (winome_thumbs_motion), self);
@@ -358,12 +388,17 @@ void
 overview_thumbs_repopulate (GtkWidget *thumbs, int count, int active,
                             double box_h, double avail_w, double porthole_w,
                             double porthole_h, GdkTexture *wallpaper,
-                            bool can_manage, bool force_show)
+                            bool can_manage, bool force_show,
+                            double panel_top_ratio)
 {
   if (thumbs == nullptr)
     return;
   WinomeThumbs *self = WINOME_THUMBS (thumbs);
   resolve_theme (self);
+  self->panel_top_ratio = std::max (panel_top_ratio, 0.0);
+
+  const int old_w = overview_thumbs_get_width (thumbs);
+  const int old_h = overview_thumbs_get_height (thumbs);
 
   self->pills.clear ();
   self->has_add_pill = false;
@@ -422,8 +457,26 @@ overview_thumbs_repopulate (GtkWidget *thumbs, int count, int active,
 
   g_set_object (&self->wallpaper, wallpaper);
 
+  const int new_w = overview_thumbs_get_width (thumbs);
+  const int new_h = overview_thumbs_get_height (thumbs);
+  if (new_w != old_w || new_h != old_h)
+    gtk_widget_queue_resize (thumbs);
   gtk_widget_queue_draw (thumbs);
-  gtk_widget_queue_resize (thumbs);
+}
+
+void
+overview_thumbs_set_wallpaper (GtkWidget *thumbs, GdkTexture *wallpaper)
+{
+  if (thumbs == nullptr)
+    return;
+  WinomeThumbs *self = WINOME_THUMBS (thumbs);
+  if (self->wallpaper == wallpaper)
+    return;
+  g_set_object (&self->wallpaper, wallpaper);
+  if (!self->pills.empty () && gtk_widget_get_visible (thumbs) &&
+      gtk_widget_get_opacity (thumbs) > 0.01) {
+    gtk_widget_queue_draw (thumbs);
+  }
 }
 
 int
@@ -476,7 +529,26 @@ void
 overview_thumbs_set_indicator_value (GtkWidget *thumbs, double value)
 {
   WinomeThumbs *self = WINOME_THUMBS (thumbs);
+  if (std::abs (self->indicator_value - value) < 1e-4)
+    return;
   self->indicator_value = value;
+  gtk_widget_queue_draw (thumbs);
+}
+
+void
+overview_thumbs_set_transform (GtkWidget *thumbs, double scale,
+                               double translate_y)
+{
+  if (thumbs == nullptr)
+    return;
+  WinomeThumbs *self = WINOME_THUMBS (thumbs);
+  const double clamped_scale = std::clamp (scale, 0.05, 2.0);
+  if (std::abs (self->anim_scale - clamped_scale) < 0.002 &&
+      std::abs (self->anim_translate_y - translate_y) < 0.25) {
+    return;
+  }
+  self->anim_scale = clamped_scale;
+  self->anim_translate_y = translate_y;
   gtk_widget_queue_draw (thumbs);
 }
 

@@ -56,8 +56,10 @@
 #include "app-index.h"
 #include "config.h"
 #include "easing.h"
+#include "fullscreen-watcher.h"
 #include "host-utils.h"
 #include "i18n.h"
+#include "live-wallpaper.h"
 #include "perf-metrics.h"
 #include "overview-layout.h"
 #include "overview-dash.h"
@@ -84,7 +86,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace winome {
@@ -192,6 +196,10 @@ GtkWidget *g_dash = nullptr;      // overview dash
 GtkWidget *g_thumbs = nullptr;    // .workspace-thumbnails row
 GtkWidget *g_caption = nullptr;   // .window-caption hover pill
 GdkTexture *g_wallpaper = nullptr;
+GdkTexture *g_wallpaper_thumb = nullptr; // downscaled <=320x180 RGB for g_thumbs
+GdkTexture *g_live_wallpaper = nullptr;
+GdkTexture *g_live_wallpaper_thumb = nullptr;
+bool g_using_live_wallpaper = false;
 bool g_app_grid_mode = false;     // true when state is APP_GRID
 bool g_search_mode = false;       // true when #searchResults is active
 bool g_folder_dialog_open = false;// true when App Grid folder dialog is open
@@ -211,8 +219,11 @@ bool g_placed = false;
 bool g_thumbs_has_pills = false;
 int g_grid_x = 0, g_grid_y = 0, g_grid_w = 0, g_grid_h = 0;
 double g_thumbs_cur_opacity = 0.0;
+double g_thumbs_cur_scale = 1.0;
+double g_thumbs_cur_ty = 0.0;
 double g_grid_cur_opacity = 0.0;
 double g_grid_cur_slide_y = kGridSlideOffsetPx;
+double g_panel_cur_progress = 0.0;
 
 // Drag-to-desktop state for window previews (dnd.js _Draggable).
 int g_drag_slot = -1;
@@ -237,6 +248,7 @@ bool g_drag_active = false;
 bool g_drag_just_ended = false;
 bool g_drag_thumbs_revealed = false;
 guint g_dyn_ws_startup_timer = 0;
+guint g_dash_resync_timer = 0;
 std::string g_search_query;       // trimmed lowercased query for active checks
 std::string g_search_raw_text;    // case-preserving raw search text
 
@@ -262,11 +274,21 @@ guint g_close_rebuild_timer = 0;
 // Stage 2 animation frame telemetry, redundant-layout guard, & idle trim.
 FrameTimeTracker g_anim_tracker (20000);
 int g_grid_last_moved_y = INT_MIN;
-int g_last_mini_opacity = -1;
+BYTE g_mini_target_opacity = 0;
 double g_ws_bg_last_radius = -1.0;
 bool g_ws_bg_settled_shadow_drawn = false;
 guint g_idle_trim_timer = 0;
 guint g_prewarm_timer = 0;
+int g_prewarm_step = 0;
+guint g_settle_hover_timer = 0;
+guint g_post_hide_workarea_timer = 0;
+guint g_app_index_defer_timer = 0;
+std::shared_ptr<std::atomic<bool>> g_overview_alive;
+GdkFrameClock *g_overview_clock = nullptr;
+gulong g_overview_after_paint_id = 0;
+bool g_dwm_frame_pending = false;
+bool g_dwm_pending_has_mini = false;
+BYTE g_dwm_pending_mini_opacity = 0;
 
 struct WallpaperCacheKey {
   std::wstring path;
@@ -291,6 +313,8 @@ std::vector<RECT> g_ws_full_boxes;
 std::vector<RECT> g_ws_picker_boxes;
 std::vector<RECT> g_ws_grid_boxes;
 std::vector<RECT> g_ws_cur_boxes;
+std::vector<RECT> g_ws_hist1_boxes;
+std::vector<RECT> g_ws_hist2_boxes;
 std::vector<RECT> g_ws_anim_from_boxes;
 std::vector<RECT> g_ws_anim_to_boxes;
 double g_bg_radius_target = kWorkspaceRadiusFallback;
@@ -320,7 +344,8 @@ RECT g_caption_want = {0, 0, 0, 0};
 
 // One preview slot.
 struct SlotEntry {
-  RECT start{};                 // real window rect (client space) for HIDDEN endpoint
+  RECT canonical_start{};       // raw real window rect inside g_bg_full
+  RECT start{};                 // HIDDEN endpoint (remapped to its workspace's full box)
   RECT canonical_picker_rect{}; // slot rect inside centered g_bg_picker
   RECT picker_rect{};           // WINDOW_PICKER slot rect (client space, on its desktop)
   RECT grid_rect{};             // APP_GRID 15% top bar slot rect (client space)
@@ -340,6 +365,10 @@ struct SlotEntry {
   BYTE current_opacity = 255;
   double current_scale = 1.0;
   bool thumb_applied = false;
+  bool last_visible = false;
+  RECT pending_rect{};
+  BYTE pending_opacity = 255;
+  bool has_pending_dwm = false;
 };
 std::vector<SlotEntry> g_slots;
 
@@ -347,10 +376,20 @@ int g_hover_index = -1;
 
 // Mini window previews inside the workspace thumbnails (WorkspaceThumbnail
 // clones): one DWM thumbnail per (desktop, window) pair, laid out at the
-// window's porthole position scaled into the pill.
+// window's porthole position scaled into the pill, and dynamically clipped
+// against g_ws_cur_boxes so they never bleed over expanding/shrinking workspace
+// backgrounds in DWM.
 struct MiniSlot {
   HTHUMBNAIL thumb = nullptr;
   RECT rect{};
+  SIZE src_size{0, 0};
+  bool has_src_size = false;
+  RECT last_dest{};
+  RECT last_src{};
+  bool last_visible = false;
+  bool last_has_src = false;
+  BYTE last_opacity = 0;
+  bool props_applied = false;
 };
 std::vector<MiniSlot> g_mini_slots;
 
@@ -365,6 +404,7 @@ RECT g_ws_box = {0, 0, 0, 0};   // physical workspace box (slot layout area)
 
 struct Animation {
   guint source = 0;
+  bool started = false;
   ControlsState from_state = ControlsState::HIDDEN;
   ControlsState to_state = ControlsState::HIDDEN;
   gint64 start_us = 0;
@@ -375,10 +415,16 @@ struct Animation {
   double radius_to = 0.0;
   double thumbs_from = 0.0;
   double thumbs_to = 0.0;
+  double thumbs_scale_from = 1.0;
+  double thumbs_scale_to = 1.0;
+  double thumbs_ty_from = 0.0;
+  double thumbs_ty_to = 0.0;
   double grid_opacity_from = 0.0;
   double grid_opacity_to = 0.0;
   double grid_slide_from = 0.0;
   double grid_slide_to = 0.0;
+  double panel_from = 0.0;
+  double panel_to = 0.0;
 };
 Animation g_anim;
 
@@ -392,6 +438,7 @@ constexpr guint kSwitchMs = 250;  // WORKSPACE_SWITCH_TIME
 constexpr guint kWorkspaceScrollTimeoutMs = 150; // windowManager.js SCROLL_TIMEOUT_TIME
 std::vector<SlotEntry> g_leaving;
 guint g_switch_source = 0;
+bool g_switch_started = false;
 gint64 g_switch_start_us = 0;
 double g_switch_from = -1.0, g_switch_to = -1.0, g_switch_cur_pos = 0.0;
 int g_switch_width = 0;  // slide distance: workspace box width
@@ -420,6 +467,44 @@ guint g_overlay_anim_ms = 0;
 guint g_hover_idle_source = 0;  // WINDOW_OVERLAY_IDLE_HIDE_TIMEOUT
 
 // Forward declarations (defined below in dependency order).
+static GdkTexture *
+active_wallpaper_texture (void)
+{
+  if (g_using_live_wallpaper && g_live_wallpaper != nullptr)
+    return g_live_wallpaper;
+  return g_wallpaper;
+}
+
+static GdkTexture *
+active_wallpaper_thumb_texture (void)
+{
+  if (g_using_live_wallpaper && g_live_wallpaper_thumb != nullptr)
+    return g_live_wallpaper_thumb;
+  if (g_using_live_wallpaper && g_live_wallpaper != nullptr)
+    return g_live_wallpaper;
+  return g_wallpaper_thumb != nullptr ? g_wallpaper_thumb : g_wallpaper;
+}
+
+static void
+on_live_wallpaper_frame (GdkTexture *full_tex, GdkTexture *thumb_tex,
+                         void *user_data G_GNUC_UNUSED)
+{
+  if (full_tex == nullptr || g_window == nullptr ||
+      !gtk_widget_get_visible (g_window) || !g_using_live_wallpaper) {
+    return;
+  }
+  g_set_object (&g_live_wallpaper, full_tex);
+  if (thumb_tex != nullptr)
+    g_set_object (&g_live_wallpaper_thumb, thumb_tex);
+  if (g_ws_bg != nullptr && gtk_widget_get_visible (g_ws_bg) &&
+      !g_search_mode) {
+    gtk_widget_queue_draw (g_ws_bg);
+  }
+  if (g_thumbs != nullptr && g_thumbs_has_pills && thumb_tex != nullptr) {
+    overview_thumbs_set_wallpaper (g_thumbs, thumb_tex);
+  }
+}
+
 static void place_overview_locked (bool opening, int switch_dir = 0);
 static gboolean overview_place_idle (gpointer user_data);
 static gboolean overview_place_opening_idle (gpointer user_data);
@@ -431,8 +516,10 @@ static void schedule_hover_idle_hide (void);
 static void cancel_hover_idle (void);
 static void apply_thumb_rect (SlotEntry &e, const RECT &rect, BYTE opacity,
                               bool force = false);
-static void create_previews (bool at_start_rects, LONG x_offset = 0);
+static void create_previews (bool at_start_rects, LONG x_offset = 0,
+                             bool reorder_existing = false);
 static void destroy_mini_previews (void);
+static void sync_mini_previews_visibility (BYTE opacity);
 static void set_mini_opacity (BYTE opacity);
 static void rebuild_now (void);
 static void reset_drag_state (void);
@@ -440,6 +527,13 @@ static void cancel_delayed_rebuild (void);
 static void schedule_delayed_rebuild (guint delay_ms);
 static void start_state_transition (ControlsState to_state, guint duration_ms);
 static void finish_hide (void);
+static void clear_pending_dwm_frame (void);
+static void cancel_search_fade (void);
+static void cancel_settle_hover (void);
+static void schedule_settle_hover (guint delay_ms);
+static void cancel_post_hide_workarea (void);
+static void schedule_post_hide_workarea (guint delay_ms);
+static void refresh_dash_in_place (void);
 static void restack_locked (void);
 static void focus_overview_window (bool focus_search);
 static void chrome_hide (void);
@@ -688,12 +782,18 @@ is_alt_tab_window (HWND hwnd)
   return true;
 }
 
+DWORD
+window_cloaked_flags (HWND hwnd)
+{
+  DWORD cloaked = 0;
+  DwmGetWindowAttribute (hwnd, DWMWA_CLOAKED, &cloaked, sizeof (cloaked));
+  return cloaked;
+}
+
 bool
 is_cloaked (HWND hwnd)
 {
-  BOOL cloaked = FALSE;
-  DwmGetWindowAttribute (hwnd, DWMWA_CLOAKED, &cloaked, sizeof (cloaked));
-  return cloaked != FALSE;
+  return window_cloaked_flags (hwnd) != 0;
 }
 
 // The visible frame bounds (no invisible DWM resize borders); the restored
@@ -748,11 +848,17 @@ collect_windows (HWND hwnd, LPARAM lparam)
   if (is_overview_default_blacklisted_hwnd (hwnd, ctx->use_blacklist))
     return TRUE;
 
+  const DWORD cloaked = window_cloaked_flags (hwnd);
+  // App-cloaked (DWM_CLOAKED_APP = 0x1, e.g. suspended/pre-launched UWP) and
+  // inherited-cloaked (0x4) windows are never real user windows on any desktop.
+  if ((cloaked & (0x1u | 0x4u)) != 0)
+    return TRUE;
+
   if (ctx->vd_filter) {
-    if (!vd::window_on_current (hwnd))
+    if (!vd::window_on_current (hwnd) || cloaked != 0)
       return TRUE;
   } else if (!ctx->include_cloaked) {
-    if (is_cloaked (hwnd))
+    if (cloaked != 0)
       return TRUE;
   }
 
@@ -801,53 +907,75 @@ winome_workspace_bg_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
       !g_ws_cur_boxes.empty () ? g_ws_cur_boxes.data () : single_fallback;
   const int box_count =
       !g_ws_cur_boxes.empty () ? static_cast<int> (g_ws_cur_boxes.size ()) : 1;
+  const int active_ws =
+      (box_count > 1) ? std::clamp (g_desktop_active, 0, box_count - 1) : 0;
 
-  for (int d = 0; d < box_count; ++d) {
+  auto draw_ws_box = [&] (int d) {
     const RECT &b = boxes[d];
-    if (b.right <= g_bg_full.left || b.left >= g_bg_full.right)
-      continue;
+    if (b.right <= g_bg_full.left || b.left >= g_bg_full.right ||
+        b.bottom <= g_bg_full.top || b.top >= g_bg_full.bottom) {
+      return;
+    }
     float rx = static_cast<float> (b.left - g_bg_full.left) / scale;
     float ry = static_cast<float> (b.top - g_bg_full.top) / scale;
     float rw = static_cast<float> (b.right - b.left) / scale;
     float rh = static_cast<float> (b.bottom - b.top) / scale;
     if (rw <= 0.0f || rh <= 0.0f)
-      continue;
+      return;
 
     graphene_rect_t rect;
     graphene_rect_init (&rect, rx, ry, rw, rh);
+    const bool use_rounded = (g_bg_radius > 0.5);
     GskRoundedRect clip;
-    gsk_rounded_rect_init_from_rect (&clip, &rect, (float)g_bg_radius);
+    if (use_rounded)
+      gsk_rounded_rect_init_from_rect (&clip, &rect, (float)g_bg_radius);
 
     // Render the soft outset drop-shadow only when animations have settled:
     // re-blurring Gaussian shadow FBOs on every frame of a 250ms resize
     // causes frame drops on integrated GPUs.
-    if (settled && g_bg_radius > 0.5) {
+    if (settled && use_rounded) {
       const GdkRGBA shadow_rgba = {0.0f, 0.0f, 0.0f, 0.2f};
       gtk_snapshot_append_outset_shadow (snapshot, &clip, &shadow_rgba,
                                          0.0f, 4.0f, 4.0f, 16.0f);
     }
 
-    gtk_snapshot_push_rounded_clip (snapshot, &clip);
+    // Keep strictly ONE child node inside push_rounded_clip so GTK4's
+    // GskGLRenderer stays on its single-pass rounded-texture shader fast path
+    // instead of allocating a full-screen offscreen FBO on every frame.
+    if (use_rounded)
+      gtk_snapshot_push_rounded_clip (snapshot, &clip);
+    else
+      gtk_snapshot_push_clip (snapshot, &rect);
 
-    if (g_wallpaper != nullptr) {
-      double tw = gdk_texture_get_width (g_wallpaper);
-      double th = gdk_texture_get_height (g_wallpaper);
+    bool painted_tex = false;
+    GdkTexture *wp_tex = active_wallpaper_texture ();
+    if (wp_tex != nullptr) {
+      double tw = gdk_texture_get_width (wp_tex);
+      double th = gdk_texture_get_height (wp_tex);
       if (tw > 0 && th > 0) {
-        double s = std::max (static_cast<double> (rw) / tw,
-                             static_cast<double> (rh) / th);
-        double dw = tw * s, dh = th * s;
+        const double wa_h_px =
+            std::max<double> (g_bg_full.bottom - g_bg_full.top, 1.0);
+        const double panel_ratio =
+            (g_panel_height > 0) ? (static_cast<double> (g_panel_height) / wa_h_px)
+                                 : 0.0;
+        WallpaperDrawRect wr = compute_workarea_wallpaper_draw_rect (
+            rx, ry, rw, rh, tw, th, panel_ratio);
         graphene_rect_t tex_rect;
-        graphene_rect_init (&tex_rect,
-                            rx + static_cast<float> ((rw - dw) / 2.0),
-                            ry + static_cast<float> ((rh - dh) / 2.0),
-                            static_cast<float> (dw), static_cast<float> (dh));
-        gtk_snapshot_append_texture (snapshot, g_wallpaper, &tex_rect);
+        graphene_rect_init (&tex_rect, static_cast<float> (wr.x),
+                            static_cast<float> (wr.y),
+                            static_cast<float> (wr.w),
+                            static_cast<float> (wr.h));
+        gtk_snapshot_append_scaled_texture (
+            snapshot, wp_tex, GSK_SCALING_FILTER_LINEAR, &tex_rect);
+        painted_tex = true;
       }
-    } else {
+    }
+    if (!painted_tex) {
       DWORD c = GetSysColor (COLOR_DESKTOP);
-      GdkRGBA color = {((c >> 0) & 0xff) / 255.0f, ((c >> 8) & 0xff) / 255.0f,
-                       ((c >> 16) & 0xff) / 255.0f, 1.0f};
-      gtk_snapshot_append_color (snapshot, &color, &rect);
+      GdkRGBA desktop_color = {((c >> 0) & 0xff) / 255.0f,
+                               ((c >> 8) & 0xff) / 255.0f,
+                               ((c >> 16) & 0xff) / 255.0f, 1.0f};
+      gtk_snapshot_append_color (snapshot, &desktop_color, &rect);
     }
     gtk_snapshot_pop (snapshot);
 
@@ -855,9 +983,20 @@ winome_workspace_bg_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
       float widths[4] = {3.0f, 3.0f, 3.0f, 3.0f};
       GdkRGBA hi = {0.208f, 0.518f, 0.894f, 0.95f};
       GdkRGBA colors[4] = {hi, hi, hi, hi};
+      if (!use_rounded)
+        gsk_rounded_rect_init_from_rect (&clip, &rect, 0.0f);
       gtk_snapshot_append_border (snapshot, &clip, widths, colors);
     }
+  };
+
+  // Paint inactive workspaces first and the active workspace last so expanding
+  // or shrinking the active workspace never gets overlapped by a neighbor.
+  for (int d = 0; d < box_count; ++d) {
+    if (d != active_ws)
+      draw_ws_box (d);
   }
+  if (active_ws >= 0 && active_ws < box_count)
+    draw_ws_box (active_ws);
 }
 
 static void
@@ -880,6 +1019,15 @@ typedef struct {
   int target_w;
   int target_h;
   float slide_y;
+  float transition_opacity;
+  bool transition_active;
+  GdkTexture *transition_tex;
+  GdkTexture *cached_page0_tex;
+  uint64_t cached_page0_version;
+  int cached_page0_w;
+  int cached_page0_h;
+  int cached_page0_scale;
+  guint capture_idle_source;
 } WinomeAppGridClip;
 
 typedef struct {
@@ -922,18 +1070,87 @@ winome_app_grid_clip_size_allocate (GtkWidget *widget, int width, int height,
   WinomeAppGridClip *self = WINOME_APP_GRID_CLIP (widget);
   if (self->child == nullptr || !gtk_widget_should_layout (self->child))
     return;
-  GskTransform *xf = nullptr;
-  if (std::abs (self->slide_y) > 0.5f) {
-    graphene_point_t pt = GRAPHENE_POINT_INIT (0.0f, self->slide_y);
-    xf = gsk_transform_translate (nullptr, &pt);
+  // Keep child allocation static at (0,0) and apply slide_y purely inside
+  // snapshot so 250ms transitions never trigger recursive layout/allocate passes.
+  gtk_widget_allocate (self->child, width, height, baseline, nullptr);
+}
+
+static void
+winome_app_grid_clip_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
+{
+  WinomeAppGridClip *self = WINOME_APP_GRID_CLIP (widget);
+  const int w = gtk_widget_get_width (widget);
+  const int h = gtk_widget_get_height (widget);
+  if (w <= 0 || h <= 0)
+    return;
+
+  if (!self->transition_active) {
+    if (self->child == nullptr || !gtk_widget_get_visible (self->child))
+      return;
+    if (std::abs (self->slide_y) > 0.5f) {
+      graphene_rect_t clip_rect =
+          GRAPHENE_RECT_INIT (0.0f, 0.0f, (float)w, (float)h);
+      gtk_snapshot_push_clip (snapshot, &clip_rect);
+      graphene_point_t pt = GRAPHENE_POINT_INIT (0.0f, self->slide_y);
+      gtk_snapshot_save (snapshot);
+      gtk_snapshot_translate (snapshot, &pt);
+      gtk_widget_snapshot_child (widget, self->child, snapshot);
+      gtk_snapshot_restore (snapshot);
+      gtk_snapshot_pop (snapshot);
+    } else {
+      gtk_widget_snapshot_child (widget, self->child, snapshot);
+    }
+    return;
   }
-  gtk_widget_allocate (self->child, width, height, baseline, xf);
+
+  const float alpha = std::clamp (self->transition_opacity, 0.0f, 1.0f);
+  if (alpha <= 0.004f)
+    return;
+
+  // Fast path: slide & fade a pre-cached GPU texture quad without touching the
+  // live App Grid widget tree (zero re-entrant gsk_renderer_render_texture
+  // stalls inside snapshot(), zero per-frame layout/FBO overhead).
+  graphene_rect_t clip_rect =
+      GRAPHENE_RECT_INIT (0.0f, 0.0f, (float)w, (float)h);
+  gtk_snapshot_push_clip (snapshot, &clip_rect);
+  if (self->transition_tex != nullptr) {
+    if (alpha < 0.996f)
+      gtk_snapshot_push_opacity (snapshot, alpha);
+    graphene_rect_t dst =
+        GRAPHENE_RECT_INIT (0.0f, self->slide_y, (float)w, (float)h);
+    gtk_snapshot_append_scaled_texture (snapshot, self->transition_tex,
+                                        GSK_SCALING_FILTER_LINEAR, &dst);
+    if (alpha < 0.996f)
+      gtk_snapshot_pop (snapshot);
+  } else if (self->child != nullptr && gtk_widget_get_visible (self->child)) {
+    // Cold fallback (first open before page-0 cache exists, or non-page-0):
+    // slide the live child directly without wrapping it in a full-screen
+    // GskOpacityNode offscreen FBO (which stalls integrated GPUs 100-180ms).
+    graphene_point_t pt = GRAPHENE_POINT_INIT (0.0f, self->slide_y);
+    gtk_snapshot_save (snapshot);
+    gtk_snapshot_translate (snapshot, &pt);
+    gtk_widget_snapshot_child (widget, self->child, snapshot);
+    gtk_snapshot_restore (snapshot);
+  }
+  gtk_snapshot_pop (snapshot);
+}
+
+static void
+app_grid_clip_cancel_capture (WinomeAppGridClip *self)
+{
+  if (self != nullptr && self->capture_idle_source != 0) {
+    g_source_remove (self->capture_idle_source);
+    self->capture_idle_source = 0;
+  }
 }
 
 static void
 winome_app_grid_clip_dispose (GObject *object)
 {
   WinomeAppGridClip *self = WINOME_APP_GRID_CLIP (object);
+  app_grid_clip_cancel_capture (self);
+  g_clear_object (&self->transition_tex);
+  g_clear_object (&self->cached_page0_tex);
   g_clear_pointer (&self->child, gtk_widget_unparent);
   G_OBJECT_CLASS (winome_app_grid_clip_parent_class)->dispose (object);
 }
@@ -945,6 +1162,7 @@ winome_app_grid_clip_class_init (WinomeAppGridClipClass *klass)
   GtkWidgetClass *wclass = GTK_WIDGET_CLASS (klass);
   wclass->measure = winome_app_grid_clip_measure;
   wclass->size_allocate = winome_app_grid_clip_size_allocate;
+  wclass->snapshot = winome_app_grid_clip_snapshot;
 }
 
 static void
@@ -954,6 +1172,15 @@ winome_app_grid_clip_init (WinomeAppGridClip *self)
   self->target_w = 0;
   self->target_h = 0;
   self->slide_y = 0.0f;
+  self->transition_opacity = 1.0f;
+  self->transition_active = false;
+  self->transition_tex = nullptr;
+  self->cached_page0_tex = nullptr;
+  self->cached_page0_version = 0;
+  self->cached_page0_w = 0;
+  self->cached_page0_h = 0;
+  self->cached_page0_scale = 0;
+  self->capture_idle_source = 0;
   gtk_widget_set_overflow (GTK_WIDGET (self), GTK_OVERFLOW_HIDDEN);
 }
 
@@ -978,21 +1205,233 @@ app_grid_clip_set_bounds (GtkWidget *clip_widget, int w, int h)
     return;
   self->target_w = w;
   self->target_h = h;
+  app_grid_clip_cancel_capture (self);
+  g_clear_object (&self->transition_tex);
+  g_clear_object (&self->cached_page0_tex);
+  self->cached_page0_version = 0;
   gtk_widget_set_size_request (clip_widget, w, h);
   gtk_widget_queue_resize (clip_widget);
 }
 
+// Capture page 0 into a persistent GPU texture OUTSIDE snapshot() once the
+// App Grid has settled and laid out cleanly, so every subsequent transition
+// slides & fades a single cached GPU quad with zero capture latency.
+static gboolean
+app_grid_clip_capture_page0_cb (gpointer user_data)
+{
+  WinomeAppGridClip *self = WINOME_APP_GRID_CLIP (user_data);
+  self->capture_idle_source = 0;
+  if (self->child == nullptr || self->transition_active ||
+      g_anim.source != 0 || g_switch_source != 0 ||
+      g_target_state != ControlsState::APP_GRID || g_search_mode ||
+      g_folder_dialog_open) {
+    return G_SOURCE_REMOVE;
+  }
+  GtkWidget *widget = GTK_WIDGET (self);
+  if (!gtk_widget_get_visible (widget) ||
+      !gtk_widget_get_visible (self->child) ||
+      app_grid_current_page (self->child) != 0) {
+    return G_SOURCE_REMOVE;
+  }
+  const int w = gtk_widget_get_width (widget);
+  const int h = gtk_widget_get_height (widget);
+  if (w <= 0 || h <= 0 || gtk_widget_get_width (self->child) <= 0 ||
+      gtk_widget_get_height (self->child) <= 0) {
+    return G_SOURCE_REMOVE;
+  }
+  const int scale = std::clamp (gtk_widget_get_scale_factor (widget), 1, 2);
+  const uint64_t ver = app_grid_visual_version (self->child);
+  if (self->cached_page0_tex != nullptr &&
+      self->cached_page0_w == w && self->cached_page0_h == h &&
+      self->cached_page0_scale == scale &&
+      self->cached_page0_version == ver) {
+    return G_SOURCE_REMOVE;
+  }
+  GtkNative *native = gtk_widget_get_native (widget);
+  GskRenderer *renderer =
+      native != nullptr ? gtk_native_get_renderer (native) : nullptr;
+  if (renderer == nullptr)
+    return G_SOURCE_REMOVE;
+
+  GtkSnapshot *cap = gtk_snapshot_new ();
+  if (scale > 1)
+    gtk_snapshot_scale (cap, (float)scale, (float)scale);
+  gtk_widget_snapshot_child (widget, self->child, cap);
+  GskRenderNode *node = gtk_snapshot_free_to_node (cap);
+  if (node != nullptr) {
+    graphene_rect_t bounds = GRAPHENE_RECT_INIT (
+        0.0f, 0.0f, (float)(w * scale), (float)(h * scale));
+    GdkTexture *tex = gsk_renderer_render_texture (renderer, node, &bounds);
+    gsk_render_node_unref (node);
+    if (tex != nullptr) {
+      g_clear_object (&self->cached_page0_tex);
+      self->cached_page0_tex = tex;
+      self->cached_page0_w = w;
+      self->cached_page0_h = h;
+      self->cached_page0_scale = scale;
+      self->cached_page0_version = ver;
+    }
+  }
+  return G_SOURCE_REMOVE;
+}
+
 static void
-app_grid_clip_set_slide (GtkWidget *clip_widget, float slide_y)
+app_grid_clip_schedule_page0_capture (GtkWidget *clip_widget)
 {
   if (clip_widget == nullptr)
     return;
   WinomeAppGridClip *self = WINOME_APP_GRID_CLIP (clip_widget);
-  self->slide_y = slide_y;
-  gtk_widget_queue_allocate (clip_widget);
+  if (self->child == nullptr || app_grid_current_page (self->child) != 0)
+    return;
+  const int w = gtk_widget_get_width (clip_widget);
+  const int h = gtk_widget_get_height (clip_widget);
+  const int scale =
+      std::clamp (gtk_widget_get_scale_factor (clip_widget), 1, 2);
+  const uint64_t ver = app_grid_visual_version (self->child);
+  if (self->cached_page0_tex != nullptr &&
+      self->cached_page0_w == w && self->cached_page0_h == h &&
+      self->cached_page0_scale == scale &&
+      self->cached_page0_version == ver) {
+    return;
+  }
+  app_grid_clip_cancel_capture (self);
+  self->capture_idle_source = g_timeout_add_full (
+      G_PRIORITY_LOW, 40, app_grid_clip_capture_page0_cb, self, nullptr);
+}
+
+// Begin a transition on WinomeAppGridClip. Returns true when a valid cached
+// page-0 GPU texture was bound (so the caller can keep g_app_grid hidden until
+// t>=1.0 and skip all App Grid widget-tree layout/draw work during animation).
+static bool
+app_grid_clip_begin_transition (GtkWidget *clip_widget, double opacity,
+                                double slide_y)
+{
+  if (clip_widget == nullptr)
+    return false;
+  WinomeAppGridClip *self = WINOME_APP_GRID_CLIP (clip_widget);
+  app_grid_clip_cancel_capture (self);
+  g_clear_object (&self->transition_tex);
+
+  const int scale =
+      std::clamp (gtk_widget_get_scale_factor (clip_widget), 1, 2);
+  const bool can_use_cache =
+      (self->cached_page0_tex != nullptr && self->child != nullptr &&
+       app_grid_current_page (self->child) == 0 &&
+       self->cached_page0_w == self->target_w &&
+       self->cached_page0_h == self->target_h &&
+       self->cached_page0_scale == scale);
+  if (can_use_cache) {
+    self->transition_tex = GDK_TEXTURE (g_object_ref (self->cached_page0_tex));
+  }
+
+  self->transition_active = true;
+  self->transition_opacity =
+      static_cast<float> (std::clamp (opacity, 0.0, 1.0));
+  self->slide_y = static_cast<float> (slide_y);
+  gtk_widget_queue_draw (clip_widget);
+  return self->transition_tex != nullptr;
+}
+
+static void
+app_grid_clip_set_transition (GtkWidget *clip_widget, bool active,
+                              double opacity, double slide_y,
+                              bool invalidate_cache = false)
+{
+  if (clip_widget == nullptr)
+    return;
+  WinomeAppGridClip *self = WINOME_APP_GRID_CLIP (clip_widget);
+  const float alpha = static_cast<float> (std::clamp (opacity, 0.0, 1.0));
+  const float sy = static_cast<float> (slide_y);
+  if (!active) {
+    g_clear_object (&self->transition_tex);
+  } else if (invalidate_cache) {
+    g_clear_object (&self->transition_tex);
+  }
+  const bool changed =
+      (self->transition_active != active) ||
+      (std::abs (self->transition_opacity - alpha) > 0.004f) ||
+      (std::abs (self->slide_y - sy) > 0.25f);
+  self->transition_active = active;
+  self->transition_opacity = alpha;
+  self->slide_y = sy;
+  if (changed)
+    gtk_widget_queue_draw (clip_widget);
 }
 
 // --- wallpaper ----------------------------------------------------------------
+
+// Pack a GdkPixbuf into a tight, opaque 3-channel RGB GdkTexture (compositing
+// any alpha against COLOR_DESKTOP so g_ws_bg never exposes controls beneath it
+// and saves 25% GPU texture bandwidth on integrated GPUs).
+static GdkTexture *
+pixbuf_to_opaque_rgb_texture (GdkPixbuf *pb)
+{
+  if (pb == nullptr)
+    return nullptr;
+  const int n_channels = gdk_pixbuf_get_n_channels (pb);
+  const int bps = gdk_pixbuf_get_bits_per_sample (pb);
+  const int rowstride = gdk_pixbuf_get_rowstride (pb);
+  const int pw = gdk_pixbuf_get_width (pb);
+  const int ph = gdk_pixbuf_get_height (pb);
+  if (pw <= 0 || ph <= 0 || bps != 8 || (n_channels != 3 && n_channels != 4))
+    return nullptr;
+  const gsize src_line_bytes =
+      static_cast<gsize> (pw) * static_cast<gsize> (n_channels);
+  const gsize pix_bytes = gdk_pixbuf_get_byte_length (pb);
+  const gsize required_src =
+      static_cast<gsize> (ph - 1) * static_cast<gsize> (rowstride) +
+      src_line_bytes;
+  if (static_cast<gsize> (rowstride) < src_line_bytes ||
+      pix_bytes < required_src) {
+    return nullptr;
+  }
+  const gsize dst_stride = static_cast<gsize> (pw) * 3u;
+  guint8 *packed = static_cast<guint8 *> (
+      g_try_malloc_n (static_cast<gsize> (ph), dst_stride));
+  if (packed == nullptr)
+    return nullptr;
+
+  const guint8 *src = gdk_pixbuf_read_pixels (pb);
+  if (n_channels == 3) {
+    for (int y = 0; y < ph; ++y) {
+      std::memcpy (packed + static_cast<gsize> (y) * dst_stride,
+                   src + static_cast<gsize> (y) * static_cast<gsize> (rowstride),
+                   dst_stride);
+    }
+  } else {
+    DWORD bg = GetSysColor (COLOR_DESKTOP);
+    const unsigned bg_r = (bg >> 0) & 0xffu;
+    const unsigned bg_g = (bg >> 8) & 0xffu;
+    const unsigned bg_b = (bg >> 16) & 0xffu;
+    for (int y = 0; y < ph; ++y) {
+      const guint8 *srow =
+          src + static_cast<gsize> (y) * static_cast<gsize> (rowstride);
+      guint8 *drow = packed + static_cast<gsize> (y) * dst_stride;
+      for (int x = 0; x < pw; ++x) {
+        const unsigned a = srow[x * 4 + 3];
+        if (a == 255u) {
+          drow[x * 3 + 0] = srow[x * 4 + 0];
+          drow[x * 3 + 1] = srow[x * 4 + 1];
+          drow[x * 3 + 2] = srow[x * 4 + 2];
+        } else {
+          const unsigned inv = 255u - a;
+          drow[x * 3 + 0] =
+              static_cast<guint8> ((srow[x * 4 + 0] * a + bg_r * inv) / 255u);
+          drow[x * 3 + 1] =
+              static_cast<guint8> ((srow[x * 4 + 1] * a + bg_g * inv) / 255u);
+          drow[x * 3 + 2] =
+              static_cast<guint8> ((srow[x * 4 + 2] * a + bg_b * inv) / 255u);
+        }
+      }
+    }
+  }
+  GBytes *bytes =
+      g_bytes_new_take (packed, static_cast<gsize> (ph) * dst_stride);
+  GdkTexture *tex = gdk_memory_texture_new (pw, ph, GDK_MEMORY_R8G8B8, bytes,
+                                            dst_stride);
+  g_bytes_unref (bytes);
+  return tex;
+}
 
 void
 load_wallpaper (bool force = false)
@@ -1028,62 +1467,47 @@ load_wallpaper (bool force = false)
     int n = WideCharToMultiByte (CP_UTF8, 0, path, -1, utf8, sizeof (utf8),
                                  nullptr, nullptr);
     if (n > 0) {
-      // Bound uncompressed wallpaper memory to monitor cover resolution so
-      // 4K/8K desktop wallpapers do not bloat RSS when overview only fills
-      // one display.
+      // Bound uncompressed wallpaper memory to monitor cover resolution and
+      // build a tiny <=320x180 RGB thumbnail texture for g_thumbs so workspace
+      // pills never thrash the GPU texture cache sampling full 1080p/4K images.
       GdkTexture *texture = nullptr;
+      GdkTexture *thumb_tex = nullptr;
       int img_w = 0, img_h = 0;
+      GdkPixbuf *base_pb = nullptr;
       if (gdk_pixbuf_get_file_info (utf8, &img_w, &img_h) != nullptr &&
-          img_w > target_w && img_h > target_h) {
-        double cover = std::max (static_cast<double> (target_w) / img_w,
-                                 static_cast<double> (target_h) / img_h);
-        if (cover < 1.0) {
-          int scaled_w = std::max (1, static_cast<int> (std::ceil (img_w * cover)));
-          int scaled_h = std::max (1, static_cast<int> (std::ceil (img_h * cover)));
-          GdkPixbuf *pb = gdk_pixbuf_new_from_file_at_scale (
-              utf8, scaled_w, scaled_h, FALSE, nullptr);
-          if (pb != nullptr) {
-            const bool has_alpha = gdk_pixbuf_get_has_alpha (pb) != FALSE;
-            const int n_channels = gdk_pixbuf_get_n_channels (pb);
-            const int bps = gdk_pixbuf_get_bits_per_sample (pb);
-            const int rowstride = gdk_pixbuf_get_rowstride (pb);
-            const int pw = gdk_pixbuf_get_width (pb);
-            const int ph = gdk_pixbuf_get_height (pb);
-            if (pw > 0 && ph > 0 && bps == 8 &&
-                (n_channels == 3 || n_channels == 4)) {
-              const gsize tight_stride =
-                  static_cast<gsize> (pw) * static_cast<gsize> (n_channels);
-              const gsize pix_bytes = gdk_pixbuf_get_byte_length (pb);
-              const gsize required_src =
-                  static_cast<gsize> (ph - 1) * static_cast<gsize> (rowstride) +
-                  tight_stride;
-              if (static_cast<gsize> (rowstride) >= tight_stride &&
-                  pix_bytes >= required_src) {
-                guint8 *packed = static_cast<guint8 *> (
-                    g_try_malloc_n (static_cast<gsize> (ph), tight_stride));
-                if (packed != nullptr) {
-                  const guint8 *src = gdk_pixbuf_read_pixels (pb);
-                  for (int y = 0; y < ph; ++y) {
-                    std::memcpy (
-                        packed + static_cast<gsize> (y) * tight_stride,
-                        src + static_cast<gsize> (y) *
-                                  static_cast<gsize> (rowstride),
-                        tight_stride);
-                  }
-                  GBytes *bytes = g_bytes_new_take (
-                      packed, static_cast<gsize> (ph) * tight_stride);
-                  texture = gdk_memory_texture_new (
-                      pw, ph,
-                      (n_channels == 4 && has_alpha) ? GDK_MEMORY_R8G8B8A8
-                                                     : GDK_MEMORY_R8G8B8,
-                      bytes, tight_stride);
-                  g_bytes_unref (bytes);
-                }
-              }
-            }
-            g_object_unref (pb);
+          img_w > 0 && img_h > 0) {
+        if (img_w > target_w || img_h > target_h) {
+          double cover = std::max (static_cast<double> (target_w) / img_w,
+                                   static_cast<double> (target_h) / img_h);
+          int scaled_w =
+              std::max (1, static_cast<int> (std::ceil (img_w * std::min (cover, 1.0))));
+          int scaled_h =
+              std::max (1, static_cast<int> (std::ceil (img_h * std::min (cover, 1.0))));
+          base_pb = gdk_pixbuf_new_from_file_at_scale (utf8, scaled_w, scaled_h,
+                                                       FALSE, nullptr);
+        } else {
+          base_pb = gdk_pixbuf_new_from_file (utf8, nullptr);
+        }
+      }
+
+      if (base_pb != nullptr) {
+        texture = pixbuf_to_opaque_rgb_texture (base_pb);
+        const int bw = gdk_pixbuf_get_width (base_pb);
+        const int bh = gdk_pixbuf_get_height (base_pb);
+        if (bw > 0 && bh > 0) {
+          double ts = std::min ({320.0 / bw, 180.0 / bh, 1.0});
+          int tw = std::max (1, static_cast<int> (std::lround (bw * ts)));
+          int th = std::max (1, static_cast<int> (std::lround (bh * ts)));
+          GdkPixbuf *tpb =
+              (tw < bw || th < bh)
+                  ? gdk_pixbuf_scale_simple (base_pb, tw, th, GDK_INTERP_BILINEAR)
+                  : g_object_ref (base_pb);
+          if (tpb != nullptr) {
+            thumb_tex = pixbuf_to_opaque_rgb_texture (tpb);
+            g_object_unref (tpb);
           }
         }
+        g_object_unref (base_pb);
       }
 
       if (texture == nullptr) {
@@ -1094,14 +1518,227 @@ load_wallpaper (bool force = false)
 
       if (texture != nullptr) {
         g_clear_object (&g_wallpaper);
+        g_clear_object (&g_wallpaper_thumb);
         g_wallpaper = texture;
+        g_wallpaper_thumb = thumb_tex;
         g_wallpaper_cache = {path, mtime, file_size, target_w, target_h, true};
         return;
       }
+      g_clear_object (&thumb_tex);
     }
   }
   g_wallpaper_cache = WallpaperCacheKey{};
   g_clear_object (&g_wallpaper);
+  g_clear_object (&g_wallpaper_thumb);
+}
+
+struct AsyncWallpaperResult {
+  std::shared_ptr<std::atomic<bool>> alive;
+  WallpaperCacheKey key;
+  GBytes *full_bytes = nullptr;
+  int full_w = 0;
+  int full_h = 0;
+  gsize full_stride = 0;
+  GBytes *thumb_bytes = nullptr;
+  int thumb_w = 0;
+  int thumb_h = 0;
+  gsize thumb_stride = 0;
+};
+
+static bool
+pixbuf_to_opaque_rgb_bytes (GdkPixbuf *pb, GBytes **out_bytes, int *out_w,
+                            int *out_h, gsize *out_stride)
+{
+  if (pb == nullptr || out_bytes == nullptr || out_w == nullptr ||
+      out_h == nullptr || out_stride == nullptr)
+    return false;
+  const int n_channels = gdk_pixbuf_get_n_channels (pb);
+  const int bps = gdk_pixbuf_get_bits_per_sample (pb);
+  const int rowstride = gdk_pixbuf_get_rowstride (pb);
+  const int pw = gdk_pixbuf_get_width (pb);
+  const int ph = gdk_pixbuf_get_height (pb);
+  if (pw <= 0 || ph <= 0 || bps != 8 || (n_channels != 3 && n_channels != 4))
+    return false;
+  const gsize src_line_bytes =
+      static_cast<gsize> (pw) * static_cast<gsize> (n_channels);
+  const gsize pix_bytes = gdk_pixbuf_get_byte_length (pb);
+  const gsize required_src =
+      static_cast<gsize> (ph - 1) * static_cast<gsize> (rowstride) +
+      src_line_bytes;
+  if (static_cast<gsize> (rowstride) < src_line_bytes ||
+      pix_bytes < required_src) {
+    return false;
+  }
+  const gsize dst_stride = static_cast<gsize> (pw) * 3u;
+  guint8 *packed = static_cast<guint8 *> (
+      g_try_malloc_n (static_cast<gsize> (ph), dst_stride));
+  if (packed == nullptr)
+    return false;
+
+  const guint8 *src = gdk_pixbuf_read_pixels (pb);
+  if (n_channels == 3) {
+    for (int y = 0; y < ph; ++y) {
+      std::memcpy (packed + static_cast<gsize> (y) * dst_stride,
+                   src + static_cast<gsize> (y) * static_cast<gsize> (rowstride),
+                   dst_stride);
+    }
+  } else {
+    DWORD bg = GetSysColor (COLOR_DESKTOP);
+    const unsigned bg_r = (bg >> 0) & 0xffu;
+    const unsigned bg_g = (bg >> 8) & 0xffu;
+    const unsigned bg_b = (bg >> 16) & 0xffu;
+    for (int y = 0; y < ph; ++y) {
+      const guint8 *srow =
+          src + static_cast<gsize> (y) * static_cast<gsize> (rowstride);
+      guint8 *drow = packed + static_cast<gsize> (y) * dst_stride;
+      for (int x = 0; x < pw; ++x) {
+        const unsigned a = srow[x * 4 + 3];
+        if (a == 255u) {
+          drow[x * 3 + 0] = srow[x * 4 + 0];
+          drow[x * 3 + 1] = srow[x * 4 + 1];
+          drow[x * 3 + 2] = srow[x * 4 + 2];
+        } else {
+          const unsigned inv = 255u - a;
+          drow[x * 3 + 0] =
+              static_cast<guint8> ((srow[x * 4 + 0] * a + bg_r * inv) / 255u);
+          drow[x * 3 + 1] =
+              static_cast<guint8> ((srow[x * 4 + 1] * a + bg_g * inv) / 255u);
+          drow[x * 3 + 2] =
+              static_cast<guint8> ((srow[x * 4 + 2] * a + bg_b * inv) / 255u);
+        }
+      }
+    }
+  }
+  *out_bytes = g_bytes_new_take (packed, static_cast<gsize> (ph) * dst_stride);
+  *out_w = pw;
+  *out_h = ph;
+  *out_stride = dst_stride;
+  return true;
+}
+
+static gboolean
+on_async_wallpaper_ready (gpointer user_data)
+{
+  auto *res = static_cast<AsyncWallpaperResult *> (user_data);
+  const bool alive = res->alive && res->alive->load (std::memory_order_acquire);
+  if (alive && g_window != nullptr && g_wallpaper == nullptr &&
+      res->full_bytes != nullptr && res->full_w > 0 && res->full_h > 0) {
+    GdkTexture *full_tex = gdk_memory_texture_new (
+        res->full_w, res->full_h, GDK_MEMORY_R8G8B8, res->full_bytes,
+        res->full_stride);
+    GdkTexture *thumb_tex = nullptr;
+    if (res->thumb_bytes != nullptr && res->thumb_w > 0 && res->thumb_h > 0) {
+      thumb_tex = gdk_memory_texture_new (
+          res->thumb_w, res->thumb_h, GDK_MEMORY_R8G8B8, res->thumb_bytes,
+          res->thumb_stride);
+    }
+    if (full_tex != nullptr) {
+      g_clear_object (&g_wallpaper);
+      g_clear_object (&g_wallpaper_thumb);
+      g_wallpaper = full_tex;
+      g_wallpaper_thumb = thumb_tex;
+      g_wallpaper_cache = res->key;
+    } else {
+      g_clear_object (&thumb_tex);
+    }
+  }
+  if (res->full_bytes != nullptr)
+    g_bytes_unref (res->full_bytes);
+  if (res->thumb_bytes != nullptr)
+    g_bytes_unref (res->thumb_bytes);
+  delete res;
+  return G_SOURCE_REMOVE;
+}
+
+static void
+start_wallpaper_prewarm_async (void)
+{
+  if (g_wallpaper != nullptr || !g_overview_alive)
+    return;
+  const int target_w =
+      std::max (g_monitor_w > 0 ? g_monitor_w : GetSystemMetrics (SM_CXSCREEN),
+                1280);
+  const int target_h =
+      std::max (g_monitor_h > 0 ? g_monitor_h : GetSystemMetrics (SM_CYSCREEN),
+                720);
+  std::shared_ptr<std::atomic<bool>> alive = g_overview_alive;
+  std::thread ([alive, target_w, target_h] () {
+    if (!alive->load (std::memory_order_acquire))
+      return;
+    wchar_t path[MAX_PATH] = L"";
+    SystemParametersInfoW (SPI_GETDESKWALLPAPER, MAX_PATH, path, 0);
+    if (path[0] == L'\0')
+      return;
+
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    FILETIME mtime{};
+    uint64_t file_size = 0;
+    if (GetFileAttributesExW (path, GetFileExInfoStandard, &fad)) {
+      mtime = fad.ftLastWriteTime;
+      file_size = (static_cast<uint64_t> (fad.nFileSizeHigh) << 32) |
+                  fad.nFileSizeLow;
+    }
+    char utf8[MAX_PATH * 3];
+    int n = WideCharToMultiByte (CP_UTF8, 0, path, -1, utf8, sizeof (utf8),
+                                 nullptr, nullptr);
+    if (n <= 0)
+      return;
+
+    int img_w = 0, img_h = 0;
+    GdkPixbuf *base_pb = nullptr;
+    if (gdk_pixbuf_get_file_info (utf8, &img_w, &img_h) != nullptr &&
+        img_w > 0 && img_h > 0) {
+      if (img_w > target_w || img_h > target_h) {
+        double cover = std::max (static_cast<double> (target_w) / img_w,
+                                 static_cast<double> (target_h) / img_h);
+        int scaled_w = std::max (
+            1, static_cast<int> (std::ceil (img_w * std::min (cover, 1.0))));
+        int scaled_h = std::max (
+            1, static_cast<int> (std::ceil (img_h * std::min (cover, 1.0))));
+        base_pb = gdk_pixbuf_new_from_file_at_scale (utf8, scaled_w, scaled_h,
+                                                     FALSE, nullptr);
+      } else {
+        base_pb = gdk_pixbuf_new_from_file (utf8, nullptr);
+      }
+    }
+    if (base_pb == nullptr)
+      return;
+
+    auto *res = new AsyncWallpaperResult ();
+    res->alive = alive;
+    res->key = {path, mtime, file_size, target_w, target_h, true};
+    bool ok = pixbuf_to_opaque_rgb_bytes (
+        base_pb, &res->full_bytes, &res->full_w, &res->full_h,
+        &res->full_stride);
+    if (ok) {
+      const int bw = gdk_pixbuf_get_width (base_pb);
+      const int bh = gdk_pixbuf_get_height (base_pb);
+      if (bw > 0 && bh > 0) {
+        double ts = std::min ({320.0 / bw, 180.0 / bh, 1.0});
+        int tw = std::max (1, static_cast<int> (std::lround (bw * ts)));
+        int th = std::max (1, static_cast<int> (std::lround (bh * ts)));
+        GdkPixbuf *tpb =
+            (tw < bw || th < bh)
+                ? gdk_pixbuf_scale_simple (base_pb, tw, th, GDK_INTERP_BILINEAR)
+                : g_object_ref (base_pb);
+        if (tpb != nullptr) {
+          pixbuf_to_opaque_rgb_bytes (tpb, &res->thumb_bytes, &res->thumb_w,
+                                      &res->thumb_h, &res->thumb_stride);
+          g_object_unref (tpb);
+        }
+      }
+    }
+    g_object_unref (base_pb);
+    if (!ok || !alive->load (std::memory_order_acquire)) {
+      if (res->full_bytes != nullptr)
+        g_bytes_unref (res->full_bytes);
+      if (res->thumb_bytes != nullptr)
+        g_bytes_unref (res->thumb_bytes);
+      delete res;
+      return;
+    }
+    g_idle_add_full (G_PRIORITY_LOW, on_async_wallpaper_ready, res, nullptr);
+  }).detach ();
 }
 
 // --- chrome windows (close button, app icon, window caption) ----------------
@@ -1773,6 +2410,11 @@ hover_layout_chrome (void)
     overlay_hide_all ();
     return;
   }
+  GtkWidget *chrome_wins[] = {g_chrome_window, g_icon_window, g_caption_window};
+  for (GtkWidget *cw : chrome_wins) {
+    if (cw != nullptr && !gtk_widget_get_realized (cw))
+      gtk_widget_realize (cw);
+  }
 
   const SlotEntry &slot = g_slots[index];
   RECT disp = hover_display_rect ();
@@ -1790,7 +2432,9 @@ hover_anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
 {
   (void)widget;
   (void)user_data;
-  if (g_app_grid_mode || g_search_mode || g_search_fade_cur > 0.005) {
+  if (g_app_grid_mode || g_search_mode || g_search_fade_cur > 0.005 ||
+      g_anim.source != 0 || g_switch_source != 0 ||
+      g_target_state == ControlsState::HIDDEN) {
     g_scale_anims.clear ();
     g_hover_index = -1;
     g_last_hovered_slot = -1;
@@ -2002,8 +2646,11 @@ set_hover (int index, bool immediate)
   }
 
   if (g_drag_slot >= 0 || g_drag_active || g_drag_snapback_source != 0 ||
-      g_app_grid_mode || g_search_mode || g_search_fade_cur > 0.005)
+      g_app_grid_mode || g_search_mode || g_search_fade_cur > 0.005 ||
+      g_anim.source != 0 || g_switch_source != 0 ||
+      g_search_fade_source != 0 || g_target_state == ControlsState::HIDDEN)
     return;
+  cancel_settle_hover ();
 
   if (index == g_hover_index) {
     if (index >= 0) {
@@ -2078,8 +2725,11 @@ on_root_motion (GtkEventControllerMotion *motion, double x, double y,
   if (g_window == nullptr)
     return;
   if (g_drag_slot >= 0 || g_drag_active || g_drag_snapback_source != 0 ||
-      g_app_grid_mode || g_search_mode || g_search_fade_cur > 0.005)
+      g_app_grid_mode || g_search_mode || g_search_fade_cur > 0.005 ||
+      g_anim.source != 0 || g_switch_source != 0 ||
+      g_search_fade_source != 0 || g_target_state == ControlsState::HIDDEN)
     return;
+  cancel_settle_hover ();
   if (g_app_grid_mode || g_search_mode || g_search_fade_cur > 0.005) {
     set_hover (-1, true);
     return;
@@ -2108,8 +2758,11 @@ on_root_motion_leave (GtkEventControllerMotion *motion, gpointer user_data)
   (void)motion;
   (void)user_data;
   if (g_drag_slot >= 0 || g_drag_active || g_drag_snapback_source != 0 ||
-      g_app_grid_mode || g_search_mode || g_search_fade_cur > 0.005)
+      g_app_grid_mode || g_search_mode || g_search_fade_cur > 0.005 ||
+      g_anim.source != 0 || g_switch_source != 0 ||
+      g_search_fade_source != 0 || g_target_state == ControlsState::HIDDEN)
     return;
+  cancel_settle_hover ();
   // Keep the hover alive while the pointer is over the chrome windows (they
   // took the input; we would otherwise see a spurious leave).
   if (cursor_over_chrome_window ())
@@ -2122,6 +2775,7 @@ on_root_motion_leave (GtkEventControllerMotion *motion, gpointer user_data)
 void
 destroy_previews (void)
 {
+  clear_pending_dwm_frame ();
   for (SlotEntry &e : g_slots)
     if (e.thumb != nullptr)
       DwmUnregisterThumbnail (e.thumb);
@@ -2137,24 +2791,35 @@ apply_thumb_rect (SlotEntry &e, const RECT &rect, BYTE opacity, bool force)
 {
   if (e.thumb == nullptr)
     return;
-  if (!force && e.thumb_applied && EqualRect (&e.current, &rect) &&
-      e.current_opacity == opacity) {
-    return;
-  }
   const bool on_screen =
       (g_monitor_w <= 0 ||
        (rect.right > 0 && rect.left < g_monitor_w && rect.bottom > 0 &&
         rect.top < g_monitor_h));
+  const bool now_visible = (on_screen && opacity > 0);
+  if (!force && e.thumb_applied) {
+    if (!now_visible && !e.last_visible) {
+      // Skip redundant synchronous DWM ALPC calls while a slot remains
+      // completely off-screen (e.g. inactive workspaces) or opacity 0.
+      e.current = rect;
+      e.current_opacity = opacity;
+      return;
+    }
+    if (EqualRect (&e.current, &rect) && e.current_opacity == opacity &&
+        e.last_visible == now_visible) {
+      return;
+    }
+  }
   DWM_THUMBNAIL_PROPERTIES props = {};
   props.dwFlags = DWM_TNP_VISIBLE | DWM_TNP_RECTDESTINATION |
                   DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
-  props.fVisible = (on_screen && opacity > 0) ? TRUE : FALSE;
+  props.fVisible = now_visible ? TRUE : FALSE;
   props.opacity = opacity;
   props.rcDestination = rect;
   props.fSourceClientAreaOnly = FALSE;
   DwmUpdateThumbnailProperties (e.thumb, &props);
   e.current = rect;
   e.current_opacity = opacity;
+  e.last_visible = now_visible;
   e.thumb_applied = true;
 }
 
@@ -2175,7 +2840,7 @@ promote_slot_thumb_to_top (SlotEntry &e)
 }
 
 void
-create_previews (bool at_start_rects, LONG x_offset)
+create_previews (bool at_start_rects, LONG x_offset, bool reorder_existing)
 {
   if (g_overview_hwnd == nullptr)
     return;
@@ -2184,16 +2849,33 @@ create_previews (bool at_start_rects, LONG x_offset)
   // registration order (earlier = bottom, later = top). Register in reverse
   // desktop Z-order (backmost window first, frontmost window z_order == 0
   // last) so the active foreground window always renders on top of background
-  // windows during the open/close transitions.
+  // windows during the open/close transitions — and always AFTER g_mini_slots
+  // so workspace thumbnail previews never float above real workspace windows.
+  // Register inactive workspaces' windows first and active workspace windows
+  // last (each group back-to-front by desktop z_order) so neighboring
+  // workspaces never fly on top of active workspace windows during APP_GRID
+  // or close transitions.
+  const int ws_count = std::max (static_cast<int> (g_desktops.size ()), 1);
+  const int active_ws = std::clamp (g_desktop_active, 0, ws_count - 1);
   std::vector<size_t> order (g_slots.size ());
   for (size_t i = 0; i < g_slots.size (); ++i)
     order[i] = i;
-  std::stable_sort (order.begin (), order.end (), [] (size_t a, size_t b) {
-    return g_slots[a].z_order > g_slots[b].z_order;
-  });
+  std::stable_sort (order.begin (), order.end (),
+                    [active_ws] (size_t a, size_t b) {
+                      const bool a_act = (g_slots[a].desktop_index == active_ws);
+                      const bool b_act = (g_slots[b].desktop_index == active_ws);
+                      if (a_act != b_act)
+                        return !a_act && b_act;
+                      return g_slots[a].z_order > g_slots[b].z_order;
+                    });
 
   for (size_t idx : order) {
     SlotEntry &e = g_slots[idx];
+    const bool was_reused = (e.thumb != nullptr);
+    if (reorder_existing && e.thumb != nullptr) {
+      DwmUnregisterThumbnail (e.thumb);
+      e.thumb = nullptr;
+    }
     if (e.thumb == nullptr) {
       HTHUMBNAIL thumb = nullptr;
       if (SUCCEEDED (DwmRegisterThumbnail (g_overview_hwnd, e.target, &thumb)) &&
@@ -2203,7 +2885,9 @@ create_previews (bool at_start_rects, LONG x_offset)
     }
     if (e.thumb != nullptr) {
       e.thumb_applied = false;
-      if (g_search_mode) {
+      if (was_reused && x_offset == 0) {
+        apply_thumb_rect (e, e.current, e.current_opacity, true);
+      } else if (g_search_mode) {
         apply_thumb_rect (e, translate_rect_x (e.rect, x_offset), 0, true);
       } else if (at_start_rects) {
         apply_thumb_rect (e, e.start, e.minimized ? 0 : 255, true);
@@ -2228,27 +2912,182 @@ destroy_mini_previews (void)
     if (m.thumb != nullptr)
       DwmUnregisterThumbnail (m.thumb);
   g_mini_slots.clear ();
-  g_last_mini_opacity = -1;
+  g_mini_target_opacity = 0;
+}
+
+static void
+build_mini_occluder_boxes (std::vector<RECT> *out)
+{
+  out->clear ();
+  if (!g_ws_cur_boxes.empty ())
+    *out = g_ws_cur_boxes;
+  else if (g_bg_cur.right > g_bg_cur.left && g_bg_cur.bottom > g_bg_cur.top)
+    out->push_back (g_bg_cur);
+}
+
+static void
+flush_pending_dwm_frame (void)
+{
+  if (!g_dwm_frame_pending)
+    return;
+  g_dwm_frame_pending = false;
+  for (SlotEntry &s : g_slots) {
+    if (s.has_pending_dwm) {
+      s.has_pending_dwm = false;
+      apply_thumb_rect (s, s.pending_rect, s.pending_opacity);
+    }
+  }
+  if (g_dwm_pending_has_mini) {
+    g_dwm_pending_has_mini = false;
+    set_mini_opacity (g_dwm_pending_mini_opacity);
+  }
+}
+
+static void
+clear_pending_dwm_frame (void)
+{
+  g_dwm_frame_pending = false;
+  g_dwm_pending_has_mini = false;
+  for (SlotEntry &s : g_slots)
+    s.has_pending_dwm = false;
+}
+
+static void
+on_overview_after_paint (GdkFrameClock *clock G_GNUC_UNUSED,
+                         gpointer user_data G_GNUC_UNUSED)
+{
+  flush_pending_dwm_frame ();
+}
+
+static void
+disconnect_after_paint_hook (void)
+{
+  if (g_overview_clock != nullptr && g_overview_after_paint_id != 0) {
+    g_signal_handler_disconnect (g_overview_clock, g_overview_after_paint_id);
+  }
+  g_overview_clock = nullptr;
+  g_overview_after_paint_id = 0;
+}
+
+static void
+ensure_after_paint_hook (GdkFrameClock *clock)
+{
+  if (clock == nullptr)
+    return;
+  if (g_overview_clock == clock && g_overview_after_paint_id != 0)
+    return;
+  disconnect_after_paint_hook ();
+  g_overview_clock = clock;
+  g_overview_after_paint_id = g_signal_connect (
+      clock, "after-paint", G_CALLBACK (on_overview_after_paint), nullptr);
+}
+
+void
+sync_mini_previews_visibility (BYTE opacity)
+{
+  if (g_mini_slots.empty ())
+    return;
+
+  std::vector<RECT> occluders;
+  build_mini_occluder_boxes (&occluders);
+
+  const int dpi_scale =
+      g_window != nullptr ? std::max (gtk_widget_get_scale_factor (g_window), 1)
+                          : 1;
+  const double pivot_x =
+      (static_cast<double> (g_thumbs_rect.left) + g_thumbs_rect.right) * 0.5;
+  const double pivot_y =
+      (static_cast<double> (g_thumbs_rect.top) + g_thumbs_rect.bottom) * 0.5;
+  const double cur_scale = std::clamp (g_thumbs_cur_scale, 0.05, 2.0);
+  const double cur_ty_px = g_thumbs_cur_ty * dpi_scale;
+  const BYTE effective_opacity = opacity;
+
+  for (MiniSlot &m : g_mini_slots) {
+    if (m.thumb == nullptr)
+      continue;
+    if (effective_opacity == 0) {
+      if (!m.props_applied || m.last_visible) {
+        DWM_THUMBNAIL_PROPERTIES props = {};
+        props.dwFlags = DWM_TNP_VISIBLE | DWM_TNP_OPACITY |
+                        DWM_TNP_SOURCECLIENTAREAONLY;
+        props.fVisible = FALSE;
+        props.opacity = 0;
+        props.fSourceClientAreaOnly = FALSE;
+        DwmUpdateThumbnailProperties (m.thumb, &props);
+        m.last_visible = false;
+        m.last_opacity = 0;
+        m.props_applied = true;
+      }
+      continue;
+    }
+
+    if (!m.has_src_size) {
+      SIZE sz{};
+      if (SUCCEEDED (DwmQueryThumbnailSourceSize (m.thumb, &sz)) &&
+          sz.cx > 0 && sz.cy > 0) {
+        m.src_size = sz;
+        m.has_src_size = true;
+      }
+    }
+
+    const RECT transformed = transform_rect_around_pivot (
+        m.rect, pivot_x, pivot_y, cur_scale, cur_ty_px);
+    MiniThumbClipResult clip =
+        compute_mini_thumb_clip (transformed, m.src_size, occluders);
+    if (!clip.visible) {
+      if (!m.props_applied || m.last_visible) {
+        DWM_THUMBNAIL_PROPERTIES props = {};
+        props.dwFlags = DWM_TNP_VISIBLE | DWM_TNP_OPACITY |
+                        DWM_TNP_SOURCECLIENTAREAONLY;
+        props.fVisible = FALSE;
+        props.opacity = 0;
+        props.fSourceClientAreaOnly = FALSE;
+        DwmUpdateThumbnailProperties (m.thumb, &props);
+        m.last_visible = false;
+        m.last_opacity = 0;
+        m.props_applied = true;
+      }
+      continue;
+    }
+
+    const bool uncropped = EqualRect (&clip.dest_rect, &transformed);
+    if (uncropped && m.last_has_src && m.has_src_size) {
+      clip.src_rect = RECT{0, 0, m.src_size.cx, m.src_size.cy};
+    }
+    const bool set_src = m.has_src_size && (!uncropped || m.last_has_src);
+    if (m.props_applied && m.last_visible &&
+        m.last_opacity == effective_opacity && m.last_has_src == set_src &&
+        EqualRect (&m.last_dest, &clip.dest_rect) &&
+        (!set_src || EqualRect (&m.last_src, &clip.src_rect))) {
+      continue;
+    }
+
+    DWM_THUMBNAIL_PROPERTIES props = {};
+    props.dwFlags = DWM_TNP_VISIBLE | DWM_TNP_RECTDESTINATION |
+                    DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
+    if (set_src)
+      props.dwFlags |= DWM_TNP_RECTSOURCE;
+    props.fVisible = TRUE;
+    props.opacity = effective_opacity;
+    props.rcDestination = clip.dest_rect;
+    props.rcSource = clip.src_rect;
+    props.fSourceClientAreaOnly = FALSE;
+    DwmUpdateThumbnailProperties (m.thumb, &props);
+
+    m.last_visible = true;
+    m.last_opacity = effective_opacity;
+    m.last_dest = clip.dest_rect;
+    m.last_src = clip.src_rect;
+    m.last_has_src = set_src;
+    m.props_applied = true;
+  }
 }
 
 void
 set_mini_opacity (BYTE opacity)
 {
-  if (g_last_mini_opacity == static_cast<int> (opacity))
-    return;
-  g_last_mini_opacity = static_cast<int> (opacity);
-  for (MiniSlot &m : g_mini_slots) {
-    if (m.thumb == nullptr)
-      continue;
-    DWM_THUMBNAIL_PROPERTIES props = {};
-    props.dwFlags = DWM_TNP_VISIBLE | DWM_TNP_RECTDESTINATION |
-                    DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
-    props.fVisible = (opacity > 0) ? TRUE : FALSE;
-    props.opacity = opacity;
-    props.rcDestination = m.rect;
-    props.fSourceClientAreaOnly = FALSE;
-    DwmUpdateThumbnailProperties (m.thumb, &props);
-  }
+  g_mini_target_opacity = opacity;
+  sync_mini_previews_visibility (opacity);
 }
 
 // One DWM thumbnail per (desktop, window) pair inside the pills
@@ -2274,12 +3113,19 @@ create_mini_previews (HMONITOR monitor, const RECT &monitor_rect,
   const std::vector<int> *desk_ptr = pre_desktops;
   if (all_ptr == nullptr || desk_ptr == nullptr ||
       all_ptr->size () != desk_ptr->size ()) {
-    EnumContext ctx{monitor, monitor_rect, &local_all, false, true,
+    std::vector<OvWindowInfo> raw_all;
+    EnumContext ctx{monitor, monitor_rect, &raw_all, false, true,
                     winome::get_config ().overview_window_blacklist};
     EnumWindows (collect_windows, reinterpret_cast<LPARAM> (&ctx));
-    local_desktops.assign (local_all.size (), -1);
-    for (size_t i = 0; i < local_all.size (); ++i)
-      local_desktops[i] = vd::window_desktop_index (local_all[i].hwnd);
+    local_all.reserve (raw_all.size ());
+    local_desktops.reserve (raw_all.size ());
+    for (const OvWindowInfo &w : raw_all) {
+      int wd = vd::window_desktop_index (w.hwnd);
+      if (window_cloaked_flags (w.hwnd) != 0 && wd < 0)
+        continue;
+      local_all.push_back (w);
+      local_desktops.push_back (wd);
+    }
     all_ptr = &local_all;
     desk_ptr = &local_desktops;
   }
@@ -2341,6 +3187,12 @@ create_mini_previews (HMONITOR monitor, const RECT &monitor_rect,
                                            &thumb)) &&
           thumb != nullptr) {
         m.thumb = thumb;
+        SIZE src_sz{};
+        if (SUCCEEDED (DwmQueryThumbnailSourceSize (thumb, &src_sz)) &&
+            src_sz.cx > 0 && src_sz.cy > 0) {
+          m.src_size = src_sz;
+          m.has_src_size = true;
+        }
         g_mini_slots.push_back (m);
       }
     }
@@ -2360,18 +3212,29 @@ static bool g_in_dynamic_ws_sync = false;
 static bool
 sync_dynamic_workspaces (HMONITOR monitor, const RECT &monitor_rect,
                          std::vector<OvWindowInfo> *out_all = nullptr,
-                         std::vector<int> *out_window_desktop = nullptr)
+                         std::vector<int> *out_window_desktop = nullptr,
+                         std::vector<vd::DesktopInfo> *out_desktops = nullptr)
 {
-  std::vector<OvWindowInfo> all;
-  EnumContext ctx{monitor, monitor_rect, &all, false, true,
+  std::vector<OvWindowInfo> raw_all;
+  EnumContext ctx{monitor, monitor_rect, &raw_all, false, true,
                   winome::get_config ().overview_window_blacklist};
   EnumWindows (collect_windows, reinterpret_cast<LPARAM> (&ctx));
 
   std::vector<vd::DesktopInfo> ds = vd::desktops ();
-  std::vector<int> win_desk (all.size (), -1);
-  if (!ds.empty ()) {
-    for (size_t i = 0; i < all.size (); ++i)
-      win_desk[i] = vd::window_desktop_index (all[i].hwnd);
+  std::vector<OvWindowInfo> all;
+  std::vector<int> win_desk;
+  all.reserve (raw_all.size ());
+  win_desk.reserve (raw_all.size ());
+  for (const OvWindowInfo &w : raw_all) {
+    const int d = ds.empty () ? -1 : vd::window_desktop_index (w.hwnd);
+    // Cloaked windows are only legitimate when virtual desktops are active and
+    // the window belongs to a known desktop (DWM_CLOAKED_SHELL on another WS).
+    // Drop cloaked system/UWP ghosts that have no desktop (d < 0) so they never
+    // fall back onto the active workspace.
+    if (window_cloaked_flags (w.hwnd) != 0 && (ds.empty () || d < 0))
+      continue;
+    all.push_back (w);
+    win_desk.push_back (d);
   }
 
   const bool can_manage =
@@ -2400,10 +3263,13 @@ sync_dynamic_workspaces (HMONITOR monitor, const RECT &monitor_rect,
     }
     g_in_dynamic_ws_sync = false;
 
-    if (changed && !plan.remove_indices.empty ()) {
-      // Removing an intermediate desktop shifts higher desktop indices down.
-      for (size_t i = 0; i < all.size (); ++i)
-        win_desk[i] = vd::window_desktop_index (all[i].hwnd);
+    if (changed) {
+      ds = vd::desktops ();
+      if (!plan.remove_indices.empty ()) {
+        // Removing an intermediate desktop shifts higher desktop indices down.
+        for (size_t i = 0; i < all.size (); ++i)
+          win_desk[i] = vd::window_desktop_index (all[i].hwnd);
+      }
     }
   }
 
@@ -2411,6 +3277,8 @@ sync_dynamic_workspaces (HMONITOR monitor, const RECT &monitor_rect,
     *out_all = std::move (all);
   if (out_window_desktop != nullptr)
     *out_window_desktop = std::move (win_desk);
+  if (out_desktops != nullptr)
+    *out_desktops = std::move (ds);
   return changed;
 }
 
@@ -2581,10 +3449,15 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
       g_desktops.size () > 1 || (g_drag_active && !g_desktops.empty ());
   if (g_thumbs_has_pills) {
     int box_h = (int)(wa_h * kMaxThumbnailScale) / scale;  // logical
-    overview_thumbs_repopulate (g_thumbs, (int)g_desktops.size (),
-                                g_desktop_active, box_h, (double)mw / scale,
-                                (double)mw, (double)wa_h, g_wallpaper,
-                                can_manage, g_drag_active);
+    const double panel_ratio =
+        (panel_height > 0 && wa_h > 0)
+            ? (static_cast<double> (panel_height) / static_cast<double> (wa_h))
+            : 0.0;
+    overview_thumbs_repopulate (
+        g_thumbs, (int)g_desktops.size (), g_desktop_active, box_h,
+        (double)mw / scale, (double)mw, (double)wa_h,
+        active_wallpaper_thumb_texture (),
+        can_manage, g_drag_active, panel_ratio);
     thumbs_h = overview_thumbs_get_height (g_thumbs) * scale;
   } else {
     overview_thumbs_repopulate (g_thumbs, 0, -1, 0, 0, 0, 0, nullptr, false,
@@ -2594,7 +3467,8 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
 
   // Dash (16% cap, ControlsManagerLayout DASH_MAX_HEIGHT_RATIO).
   int dash_max = (int)(wa_h * kDashMaxHeightRatio + 0.5);
-  overview_dash_repopulate (g_dash, monitor, dash_max / scale);
+  overview_dash_repopulate (g_dash, monitor, dash_max / scale,
+                            g_desktop_active);
   int dash_w = overview_dash_get_width (g_dash) * scale;
   int dash_h = std::min (overview_dash_get_height (g_dash) * scale, dash_max);
 
@@ -2700,8 +3574,8 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
   return true;
 }
 
-static void
-apply_ws_boxes (const std::vector<RECT> &boxes)
+static bool
+apply_ws_boxes (const std::vector<RECT> &boxes, bool sync_mini = true)
 {
   const bool settled = (g_anim.source == 0 && g_switch_source == 0);
   const int active_ws =
@@ -2722,23 +3596,55 @@ apply_ws_boxes (const std::vector<RECT> &boxes)
       }
     }
   }
-  if (same)
-    return;
+  if (same) {
+    if (settled && (!g_ws_hist1_boxes.empty () || !g_ws_hist2_boxes.empty ())) {
+      g_ws_hist1_boxes.clear ();
+      g_ws_hist2_boxes.clear ();
+      if (sync_mini)
+        sync_mini_previews_visibility (g_mini_target_opacity);
+    }
+    return false;
+  }
+  if (settled) {
+    g_ws_hist1_boxes.clear ();
+    g_ws_hist2_boxes.clear ();
+  } else {
+    g_ws_hist2_boxes = std::move (g_ws_hist1_boxes);
+    g_ws_hist1_boxes = g_ws_cur_boxes;
+  }
   g_ws_cur_boxes = boxes;
   g_bg_cur = active_rect;
   g_ws_bg_last_radius = g_bg_radius;
-  if (g_ws_bg != nullptr)
+  if (sync_mini)
+    sync_mini_previews_visibility (g_mini_target_opacity);
+  if (g_ws_bg != nullptr) {
     gtk_widget_queue_draw (g_ws_bg);
+    return true;
+  }
+  return false;
 }
 
-void
-apply_bg_rect (const RECT &rect)
+bool
+apply_bg_rect (const RECT &rect, bool sync_mini = true)
 {
   const bool settled = (g_anim.source == 0 && g_switch_source == 0);
   if (g_ws_cur_boxes.size () <= 1 && EqualRect (&g_bg_cur, &rect) &&
       g_ws_bg_last_radius == g_bg_radius &&
       g_ws_bg_settled_shadow_drawn == settled) {
-    return;
+    if (settled && (!g_ws_hist1_boxes.empty () || !g_ws_hist2_boxes.empty ())) {
+      g_ws_hist1_boxes.clear ();
+      g_ws_hist2_boxes.clear ();
+      if (sync_mini)
+        sync_mini_previews_visibility (g_mini_target_opacity);
+    }
+    return false;
+  }
+  if (settled) {
+    g_ws_hist1_boxes.clear ();
+    g_ws_hist2_boxes.clear ();
+  } else {
+    g_ws_hist2_boxes = std::move (g_ws_hist1_boxes);
+    g_ws_hist1_boxes = g_ws_cur_boxes;
   }
   g_bg_cur = rect;
   if (g_ws_cur_boxes.size () <= 1) {
@@ -2749,44 +3655,81 @@ apply_bg_rect (const RECT &rect)
     g_ws_cur_boxes[static_cast<size_t> (active_ws)] = rect;
   }
   g_ws_bg_last_radius = g_bg_radius;
-  if (g_ws_bg != nullptr)
+  if (sync_mini)
+    sync_mini_previews_visibility (g_mini_target_opacity);
+  if (g_ws_bg != nullptr) {
     gtk_widget_queue_draw (g_ws_bg);
+    return true;
+  }
+  return false;
 }
 
 static void
-apply_app_grid_slide (double slide_y)
+cancel_settle_hover (void)
 {
-  if (g_app_grid == nullptr)
-    return;
-  const int snapped = static_cast<int> (std::lround (slide_y));
-  if (snapped == g_grid_last_moved_y)
-    return;
-  g_grid_last_moved_y = snapped;
-  if (g_app_grid_clip != nullptr) {
-    app_grid_clip_set_slide (
-        g_app_grid_clip, snapped == 0 ? 0.0f : static_cast<float> (slide_y));
-  } else if (g_root != nullptr) {
-    if (snapped == 0) {
-      gtk_fixed_set_child_transform (GTK_FIXED (g_root), g_app_grid, nullptr);
-    } else {
-      graphene_point_t pt =
-          GRAPHENE_POINT_INIT (0.0f, static_cast<float> (slide_y));
-      GskTransform *xf = gsk_transform_translate (nullptr, &pt);
-      gtk_fixed_set_child_transform (GTK_FIXED (g_root), g_app_grid, xf);
-      gsk_transform_unref (xf);
-    }
+  if (g_settle_hover_timer != 0) {
+    g_source_remove (g_settle_hover_timer);
+    g_settle_hover_timer = 0;
   }
 }
 
+static gboolean
+settle_hover_cb (gpointer user_data G_GNUC_UNUSED)
+{
+  g_settle_hover_timer = 0;
+  if (g_window == nullptr || !gtk_widget_get_visible (g_window) || !g_placed ||
+      g_anim.source != 0 || g_switch_source != 0 || g_search_fade_source != 0 ||
+      g_app_grid_mode || g_search_mode ||
+      g_target_state != ControlsState::WINDOW_PICKER) {
+    return G_SOURCE_REMOVE;
+  }
+  set_hover (slot_at_cursor ());
+  return G_SOURCE_REMOVE;
+}
+
 static void
-ensure_app_grid_synced (void)
+schedule_settle_hover (guint delay_ms)
+{
+  cancel_settle_hover ();
+  g_settle_hover_timer = g_timeout_add_full (
+      G_PRIORITY_LOW, delay_ms, settle_hover_cb, nullptr, nullptr);
+}
+
+static void
+cancel_post_hide_workarea (void)
+{
+  if (g_post_hide_workarea_timer != 0) {
+    g_source_remove (g_post_hide_workarea_timer);
+    g_post_hide_workarea_timer = 0;
+  }
+}
+
+static gboolean
+post_hide_workarea_cb (gpointer user_data G_GNUC_UNUSED)
+{
+  g_post_hide_workarea_timer = 0;
+  if (!overview_active () && overview_is_open () == 0)
+    reassert_panel_workarea_now ();
+  return G_SOURCE_REMOVE;
+}
+
+static void
+schedule_post_hide_workarea (guint delay_ms)
+{
+  cancel_post_hide_workarea ();
+  g_post_hide_workarea_timer = g_timeout_add_full (
+      G_PRIORITY_LOW, delay_ms, post_hide_workarea_cb, nullptr, nullptr);
+}
+
+static void
+ensure_app_grid_synced (bool refresh_running = false)
 {
   if (g_app_grid == nullptr || g_grid_w <= 0 || g_grid_h <= 0)
     return;
   app_grid_clip_set_bounds (g_app_grid_clip, g_grid_w, g_grid_h);
   gtk_widget_set_size_request (g_app_grid, g_grid_w, g_grid_h);
   app_grid_set_query (g_app_grid, "");
-  app_grid_rebuild (g_app_grid, g_grid_w, g_grid_h);
+  app_grid_rebuild (g_app_grid, g_grid_w, g_grid_h, refresh_running);
 }
 
 static void
@@ -3103,13 +4046,11 @@ place_overview_locked (bool opening, int switch_dir)
       static_cast<HWND> (gdk_win32_surface_get_handle (surface));
   apply_ex_styles (g_overview_hwnd);
 
-  GtkWidget *chrome_wins[] = {g_chrome_window, g_icon_window,
-                              g_caption_window};
+  // Bind owner for any already-realized chrome windows; unrealized chrome
+  // windows are realized lazily on first hover (or staggered low-priority
+  // startup prewarm) so opening Overview right after startup never blocks on
+  // 3 extra OpenGL window realizations.
   HWND chrome_hwnds[] = {g_chrome_hwnd, g_icon_hwnd, g_caption_hwnd};
-  for (GtkWidget *cw : chrome_wins) {
-    if (cw != nullptr && !gtk_widget_get_realized (cw))
-      gtk_widget_realize (cw);
-  }
   for (HWND ch : chrome_hwnds)
     chrome_bind_owner (ch);
 
@@ -3127,14 +4068,41 @@ place_overview_locked (bool opening, int switch_dir)
 
   load_wallpaper ();
 
+  // Hybrid third-party live wallpaper engine support (Option C):
+  // fast (<50us) probe for Wallpaper Engine / Lively / Sucrose under Progman /
+  // WorkerW. When absent or disabled, zero WGC overhead is incurred.
+  const std::string live_mode =
+      sanitize_live_wallpaper_mode (winome::get_config ().live_wallpaper_mode);
+  if (live_mode != "off") {
+    LiveWallpaperTarget target = live_wallpaper_detect_target (mi.rcMonitor);
+    if (target.active) {
+      g_using_live_wallpaper = true;
+      live_wallpaper_set_paused (opening || g_anim.source != 0 ||
+                                 g_switch_source != 0);
+      live_wallpaper_start (target, mi.rcMonitor, live_mode == "live",
+                            on_live_wallpaper_frame, nullptr);
+    } else {
+      g_using_live_wallpaper = false;
+      live_wallpaper_stop ();
+      g_clear_object (&g_live_wallpaper);
+      g_clear_object (&g_live_wallpaper_thumb);
+    }
+  } else {
+    g_using_live_wallpaper = false;
+    live_wallpaper_stop ();
+    g_clear_object (&g_live_wallpaper);
+    g_clear_object (&g_live_wallpaper_thumb);
+  }
+
   // Synchronize dynamic workspaces (GNOME WorkspaceTracker._checkWorkspaces)
   // and enumerate all desktops' eligible windows in a single pass.
   std::vector<OvWindowInfo> all_windows;
   std::vector<int> window_desktop;
+  std::vector<vd::DesktopInfo> synced_desktops;
   sync_dynamic_workspaces (monitor, mi.rcMonitor, &all_windows,
-                           &window_desktop);
+                           &window_desktop, &synced_desktops);
 
-  g_desktops = vd::desktops ();
+  g_desktops = std::move (synced_desktops);
   g_desktop_active = g_desktops.empty () ? -1 : vd::current_index ();
   if (g_desktop_active < 0)
     g_desktops.clear ();
@@ -3144,6 +4112,9 @@ place_overview_locked (bool opening, int switch_dir)
     reset_drag_state ();
   g_print ("[ov] desktops=%zu active=%d\n", g_desktops.size (),
            g_desktop_active);
+  winome_shell_panel_set_workspace_scroll (
+      std::max (static_cast<int> (g_desktops.size ()), 1),
+      static_cast<double> (std::max (g_desktop_active, 0)));
 
   const std::vector<RECT> prev_ws_cur_boxes = g_ws_cur_boxes;
 
@@ -3279,6 +4250,7 @@ place_overview_locked (bool opening, int switch_dir)
       e.target = s.window.hwnd;
       e.thumb = nullptr;
       e.desktop_index = d;
+      e.canonical_start = s.window.rect;
       e.start = (d == active_ws)
                     ? s.window.rect
                     : remap_rect_between_boxes (s.window.rect, g_bg_full,
@@ -3378,15 +4350,38 @@ place_overview_locked (bool opening, int switch_dir)
     focus_overview_window (false);
   restack_locked ();
 
-  // Register DWM thumbnails once (in back-to-front desktop Z-order): start at
-  // real desktop rects when opening, slide-in start offset when switching
-  // desktops, or current/settled rects otherwise.
-  create_previews (opening, switch_off_x);
+  g_ws_hist1_boxes.clear ();
+  g_ws_hist2_boxes.clear ();
 
-  // Mini window previews inside the workspace thumbnail pills.
+  const bool opening_to_grid =
+      opening && g_pending_show_state == ControlsState::APP_GRID;
+  g_thumbs_cur_scale = (opening_to_grid || (!opening && g_app_grid_mode)) ? 0.5 : 1.0;
+  g_thumbs_cur_ty = (opening_to_grid || (!opening && g_app_grid_mode))
+                        ? (overview_thumbs_get_height (g_thumbs) * 0.5)
+                        : 0.0;
+  if (g_thumbs != nullptr)
+    overview_thumbs_set_transform (g_thumbs, g_thumbs_cur_scale, g_thumbs_cur_ty);
+
+  // Register mini window previews inside the workspace thumbnail pills FIRST
+  // so they always sit underneath real workspace window clones in DWM's
+  // composition order. When opening to WINDOW_PICKER, mini previews start at
+  // opacity 255 (clipped behind g_ws_full_boxes at t=0) and unveil smoothly
+  // with zero flash as the active workspace shrinks — matching GNOME Shell's
+  // overviewControls.js _getThumbnailsBoxParams().
+  const bool had_reused_slots = std::any_of (
+      g_slots.begin (), g_slots.end (),
+      [] (const SlotEntry &e) { return e.thumb != nullptr; });
   create_mini_previews (monitor, mi.rcMonitor, geo.thumbs_x, geo.thumbs_y,
-                        (opening || g_app_grid_mode) ? 0 : 255, &all_windows,
-                        &window_desktop);
+                        (opening_to_grid || (!opening && g_app_grid_mode))
+                            ? 0
+                            : 255,
+                        &all_windows, &window_desktop);
+
+  // Register workspace window clones AFTER mini previews (in back-to-front
+  // desktop Z-order): start at real desktop rects when opening, slide-in
+  // start offset when switching desktops, or current/settled rects otherwise.
+  create_previews (opening, switch_off_x,
+                   had_reused_slots && !g_mini_slots.empty ());
 
   g_placed = true;
   g_print ("[ov] placed %dx%d slots=%zu ws=%ldx%ld grid=%dx%d@(%d,%d) dash=%d\n",
@@ -3399,14 +4394,26 @@ place_overview_locked (bool opening, int switch_dir)
     g_bg_cur = g_bg_full;
     g_ws_cur_boxes = g_ws_full_boxes;
     g_bg_radius = 0.0;
-    g_thumbs_cur_opacity = 0.0;
+    const bool start_thumbs_ready =
+        g_thumbs_has_pills && desired != ControlsState::APP_GRID;
+    g_thumbs_cur_opacity = start_thumbs_ready ? 1.0 : 0.0;
+    g_thumbs_cur_scale = start_thumbs_ready ? 1.0 : 0.5;
+    g_thumbs_cur_ty = start_thumbs_ready
+                          ? 0.0
+                          : (overview_thumbs_get_height (g_thumbs) * 0.5);
     g_grid_cur_opacity = 0.0;
     g_grid_cur_slide_y = kGridSlideOffsetPx;
-    if (g_thumbs != nullptr)
-      gtk_widget_set_opacity (g_thumbs, 0.0);
+    if (g_thumbs != nullptr) {
+      overview_thumbs_set_transform (g_thumbs, g_thumbs_cur_scale,
+                                     g_thumbs_cur_ty);
+      gtk_widget_set_opacity (g_thumbs, g_thumbs_cur_opacity);
+      gtk_widget_set_visible (g_thumbs, FALSE);
+    }
     if (g_app_grid != nullptr) {
-      gtk_widget_set_opacity (g_app_grid, 0.0);
-      apply_app_grid_slide (kGridSlideOffsetPx);
+      app_grid_set_transition_opacity (g_app_grid, true, 1.0);
+      app_grid_clip_set_transition (g_app_grid_clip,
+                                    desired == ControlsState::APP_GRID, 0.0,
+                                    kGridSlideOffsetPx, true);
       sync_app_grid_visible (desired == ControlsState::APP_GRID);
     }
     start_state_transition (desired, kOpenMs);
@@ -3415,15 +4422,23 @@ place_overview_locked (bool opening, int switch_dir)
     g_bg_radius_target = g_app_grid_mode ? g_radius_grid : g_radius_picker;
     g_bg_radius = g_bg_radius_target;
     g_thumbs_cur_opacity = (!g_app_grid_mode && g_thumbs_has_pills) ? 1.0 : 0.0;
+    g_thumbs_cur_scale = g_app_grid_mode ? 0.5 : 1.0;
+    g_thumbs_cur_ty =
+        g_app_grid_mode ? (overview_thumbs_get_height (g_thumbs) * 0.5) : 0.0;
     if (g_thumbs != nullptr) {
+      overview_thumbs_set_transform (g_thumbs, g_thumbs_cur_scale,
+                                     g_thumbs_cur_ty);
       gtk_widget_set_visible (g_thumbs,
                               !g_app_grid_mode && g_thumbs_has_pills);
       gtk_widget_set_opacity (g_thumbs, g_thumbs_cur_opacity);
     }
     set_mini_opacity (g_app_grid_mode ? 0 : 255);
     if (g_app_grid != nullptr) {
-      apply_app_grid_slide (g_app_grid_mode ? 0.0 : kGridSlideOffsetPx);
-      gtk_widget_set_opacity (g_app_grid, g_app_grid_mode ? 1.0 : 0.0);
+      app_grid_set_transition_opacity (g_app_grid, false, 1.0);
+      app_grid_clip_set_transition (g_app_grid_clip, false,
+                                    g_app_grid_mode ? 1.0 : 0.0,
+                                    g_app_grid_mode ? 0.0 : kGridSlideOffsetPx,
+                                    true);
       sync_app_grid_visible (g_app_grid_mode);
     }
     g_grid_cur_opacity = g_app_grid_mode ? 1.0 : 0.0;
@@ -3683,9 +4698,18 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
   (void)user_data;
   Animation &anim = g_anim;
 
+  flush_pending_dwm_frame ();
+  ensure_after_paint_hook (clock);
+
   // Frame clock keeps the 250ms transition locked to the compositor's
-  // cadence (a fixed 16ms timer beats against the display refresh).
+  // cadence (a fixed 16ms timer beats against the display refresh). Anchor
+  // start_us on the first rendered frame so one-time map/GL setup time never
+  // eats the opening third of the transition.
   gint64 now = gdk_frame_clock_get_frame_time (clock);
+  if (!anim.started) {
+    anim.started = true;
+    anim.start_us = now - 8000;
+  }
   g_anim_tracker.record_frame_time_us (now);
   double t = (now - anim.start_us) / 1000.0 / (double)anim.duration_ms;
   if (t < 0.0)
@@ -3703,44 +4727,121 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
 
   RECT bg = lerp_rect (anim.bg_from, anim.bg_to, e);
   g_bg_radius = anim.radius_from + (anim.radius_to - anim.radius_from) * e;
+  g_panel_cur_progress =
+      std::clamp (anim.panel_from + (anim.panel_to - anim.panel_from) * e,
+                  0.0, 1.0);
+  winome_shell_panel_set_overview_progress (g_panel_cur_progress);
+  bool gtk_will_paint = false;
   if (!g_ws_anim_to_boxes.empty () &&
       g_ws_anim_from_boxes.size () == g_ws_anim_to_boxes.size ()) {
     std::vector<RECT> cur_boxes (g_ws_anim_to_boxes.size ());
     for (size_t i = 0; i < g_ws_anim_to_boxes.size (); ++i)
       cur_boxes[i] =
           lerp_rect (g_ws_anim_from_boxes[i], g_ws_anim_to_boxes[i], e);
-    apply_ws_boxes (cur_boxes);
+    gtk_will_paint = apply_ws_boxes (cur_boxes, false) || gtk_will_paint;
   } else {
-    apply_bg_rect (bg);
+    gtk_will_paint = apply_bg_rect (bg, false) || gtk_will_paint;
+  }
+
+  // Keep thumbnails fade/scale/drop ahead of the workspace split gap in
+  // WINDOW_PICKER <-> APP_GRID so empty pills never peek between separated
+  // 15% workspace cards.
+  double p_thumbs = e;
+  if (anim.to_state == ControlsState::APP_GRID &&
+      anim.from_state != ControlsState::APP_GRID) {
+    p_thumbs = std::clamp (e * 1.65, 0.0, 1.0);
+  } else if (anim.from_state == ControlsState::APP_GRID &&
+             anim.to_state == ControlsState::WINDOW_PICKER) {
+    p_thumbs = std::clamp ((e - 0.35) / 0.65, 0.0, 1.0);
   }
 
   g_thumbs_cur_opacity =
-      anim.thumbs_from + (anim.thumbs_to - anim.thumbs_from) * e;
-  if (g_thumbs != nullptr && gtk_widget_get_visible (g_thumbs)) {
-    double f = std::clamp (g_thumbs_cur_opacity, 0.0, 1.0);
-    gtk_widget_set_opacity (g_thumbs, f);
-    set_mini_opacity ((BYTE)(255 * f));
+      anim.thumbs_from + (anim.thumbs_to - anim.thumbs_from) * p_thumbs;
+  g_thumbs_cur_scale =
+      anim.thumbs_scale_from +
+      (anim.thumbs_scale_to - anim.thumbs_scale_from) * p_thumbs;
+  g_thumbs_cur_ty =
+      anim.thumbs_ty_from + (anim.thumbs_ty_to - anim.thumbs_ty_from) * p_thumbs;
+
+  bool update_mini = false;
+  BYTE desired_mini_op = 0;
+  if (g_thumbs != nullptr && g_thumbs_has_pills) {
+    const double f = std::clamp (g_thumbs_cur_opacity, 0.0, 1.0);
+    const int dpi_scale =
+        g_window != nullptr ? std::max (gtk_widget_get_scale_factor (g_window), 1)
+                            : 1;
+    const double pivot_x =
+        (static_cast<double> (g_thumbs_rect.left) + g_thumbs_rect.right) * 0.5;
+    const double pivot_y =
+        (static_cast<double> (g_thumbs_rect.top) + g_thumbs_rect.bottom) * 0.5;
+    const RECT thumbs_live_rect = transform_rect_around_pivot (
+        g_thumbs_rect, pivot_x, pivot_y, g_thumbs_cur_scale,
+        g_thumbs_cur_ty * dpi_scale);
+    const bool covered =
+        is_rect_fully_covered_by_boxes (thumbs_live_rect, g_ws_cur_boxes);
+    const bool want_vis = (!covered && f > 0.01);
+    if (gtk_widget_get_visible (g_thumbs) != (want_vis ? TRUE : FALSE)) {
+      gtk_widget_set_visible (g_thumbs, want_vis ? TRUE : FALSE);
+      gtk_will_paint = true;
+    }
+    if (want_vis) {
+      overview_thumbs_set_transform (g_thumbs, g_thumbs_cur_scale,
+                                     g_thumbs_cur_ty);
+      if (std::fabs (gtk_widget_get_opacity (g_thumbs) - f) > 0.015) {
+        gtk_widget_set_opacity (g_thumbs, f);
+        gtk_will_paint = true;
+      }
+    }
+    update_mini = true;
+    desired_mini_op =
+        want_vis ? static_cast<BYTE> (std::lround (255.0 * f)) : 0;
   }
 
   g_grid_cur_opacity =
       anim.grid_opacity_from + (anim.grid_opacity_to - anim.grid_opacity_from) * e;
   g_grid_cur_slide_y =
       anim.grid_slide_from + (anim.grid_slide_to - anim.grid_slide_from) * e;
-  if (g_app_grid != nullptr && gtk_widget_get_visible (g_app_grid)) {
-    app_grid_set_transition_opacity (
-        g_app_grid, true, std::clamp (g_grid_cur_opacity, 0.0, 1.0));
-    apply_app_grid_slide (g_grid_cur_slide_y);
+  if (g_app_grid != nullptr && g_app_grid_clip != nullptr &&
+      gtk_widget_get_visible (g_app_grid_clip)) {
+    app_grid_clip_set_transition (
+        g_app_grid_clip, true, std::clamp (g_grid_cur_opacity, 0.0, 1.0),
+        g_grid_cur_slide_y);
   }
 
-  for (SlotEntry &s : g_slots) {
-    int op = (int)(s.anim_from_opacity +
-                   ((double)s.anim_to_opacity - s.anim_from_opacity) * e + 0.5);
-    BYTE clamped_op = static_cast<BYTE> (std::clamp (op, 0, 255));
-    apply_thumb_rect (s, lerp_rect (s.anim_from, s.anim_to, e), clamped_op);
+  // Defer DWM thumbnail commits to GdkFrameClock::after-paint whenever GTK is
+  // painting a new frame this tick (including the final settle frame for
+  // WINDOW_PICKER / APP_GRID), so wglSwapBuffers (g_ws_bg + g_thumbs) and
+  // DwmUpdateThumbnailProperties (g_slots + g_mini_slots) hit DWM's compositor
+  // in the exact same VSync with zero 1-frame empty-pill flash or lag.
+  const bool defer_to_after_paint =
+      ((t < 1.0 || anim.to_state != ControlsState::HIDDEN) &&
+       gtk_will_paint && g_overview_after_paint_id != 0);
+  if (defer_to_after_paint) {
+    for (SlotEntry &s : g_slots) {
+      int op = (int)(s.anim_from_opacity +
+                     ((double)s.anim_to_opacity - s.anim_from_opacity) * e + 0.5);
+      s.pending_rect = lerp_rect (s.anim_from, s.anim_to, e);
+      s.pending_opacity = static_cast<BYTE> (std::clamp (op, 0, 255));
+      s.has_pending_dwm = true;
+    }
+    g_dwm_pending_has_mini = update_mini;
+    g_dwm_pending_mini_opacity = desired_mini_op;
+    g_dwm_frame_pending = true;
+  } else {
+    clear_pending_dwm_frame ();
+    for (SlotEntry &s : g_slots) {
+      int op = (int)(s.anim_from_opacity +
+                     ((double)s.anim_to_opacity - s.anim_from_opacity) * e + 0.5);
+      BYTE clamped_op = static_cast<BYTE> (std::clamp (op, 0, 255));
+      apply_thumb_rect (s, lerp_rect (s.anim_from, s.anim_to, e), clamped_op);
+    }
+    if (update_mini)
+      set_mini_opacity (desired_mini_op);
   }
 
   if (t >= 1.0) {
     anim.source = 0;
+    anim.started = false;
     auto fstats = g_anim_tracker.snapshot ();
     if (fstats.frames > 0) {
       perf_record_overview_frame_stats (fstats);
@@ -3754,40 +4855,77 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
       return G_SOURCE_REMOVE;
     }
     // Re-draw settled workspace boxes once anim.source == 0 to paint drop-shadows.
+    bool settle_painted = false;
     if (!g_ws_anim_to_boxes.empty ())
-      apply_ws_boxes (g_ws_anim_to_boxes);
+      settle_painted = apply_ws_boxes (g_ws_anim_to_boxes, false);
     else
-      apply_bg_rect (bg);
+      settle_painted = apply_bg_rect (bg, false);
+    const bool settle_defer =
+        (settle_painted || defer_to_after_paint) &&
+        g_overview_after_paint_id != 0;
     if (anim.to_state == ControlsState::APP_GRID) {
-      if (g_thumbs != nullptr && gtk_widget_get_visible (g_thumbs)) {
-        gtk_widget_set_opacity (g_thumbs, 0.0);
-        gtk_widget_set_visible (g_thumbs, FALSE);
+      g_thumbs_cur_opacity = 0.0;
+      g_thumbs_cur_scale = 0.5;
+      g_thumbs_cur_ty = overview_thumbs_get_height (g_thumbs) * 0.5;
+      if (g_thumbs != nullptr) {
+        overview_thumbs_set_transform (g_thumbs, g_thumbs_cur_scale,
+                                       g_thumbs_cur_ty);
+        if (gtk_widget_get_visible (g_thumbs)) {
+          gtk_widget_set_opacity (g_thumbs, 0.0);
+          gtk_widget_set_visible (g_thumbs, FALSE);
+        }
       }
-      set_mini_opacity (0);
+      if (settle_defer) {
+        g_dwm_pending_has_mini = true;
+        g_dwm_pending_mini_opacity = 0;
+        g_dwm_frame_pending = true;
+      } else {
+        set_mini_opacity (0);
+      }
       if (g_app_grid != nullptr) {
+        sync_app_grid_visible (true);
+        app_grid_clip_set_transition (g_app_grid_clip, false, 1.0, 0.0, true);
         app_grid_set_transition_opacity (g_app_grid, false, 1.0);
-        apply_app_grid_slide (0.0);
+        app_grid_refresh_running (g_app_grid);
+        app_grid_clip_schedule_page0_capture (g_app_grid_clip);
       }
       g_grid_cur_opacity = 1.0;
       g_grid_cur_slide_y = 0.0;
+      live_wallpaper_set_paused (false);
       apply_pending_desktop_sync_if_any ();
       return G_SOURCE_REMOVE;
     }
     // Settled on WINDOW_PICKER.
-    if (g_app_grid != nullptr && gtk_widget_get_visible (g_app_grid)) {
-      app_grid_set_transition_opacity (g_app_grid, false, 0.0);
+    if (g_app_grid != nullptr && g_app_grid_clip != nullptr &&
+        gtk_widget_get_visible (g_app_grid_clip)) {
+      app_grid_clip_set_transition (g_app_grid_clip, false, 0.0,
+                                    kGridSlideOffsetPx, true);
+      app_grid_set_transition_opacity (g_app_grid, false, 1.0);
       sync_app_grid_visible (false);
     }
     g_grid_cur_opacity = 0.0;
     g_grid_cur_slide_y = kGridSlideOffsetPx;
+    g_thumbs_cur_opacity = g_thumbs_has_pills ? 1.0 : 0.0;
+    g_thumbs_cur_scale = 1.0;
+    g_thumbs_cur_ty = 0.0;
     if (g_thumbs != nullptr && g_thumbs_has_pills) {
+      overview_thumbs_set_transform (g_thumbs, 1.0, 0.0);
+      gtk_widget_set_visible (g_thumbs, TRUE);
       gtk_widget_set_opacity (g_thumbs, 1.0);
-      set_mini_opacity (255);
+      if (settle_defer) {
+        g_dwm_pending_has_mini = true;
+        g_dwm_pending_mini_opacity = 255;
+        g_dwm_frame_pending = true;
+      } else {
+        set_mini_opacity (255);
+      }
     }
     if (g_pending_desktop_sync)
       apply_pending_desktop_sync_if_any ();
     else
-      set_hover (slot_at_cursor ());
+      schedule_settle_hover (140);
+    if (g_anim.source == 0 && g_switch_source == 0)
+      live_wallpaper_set_paused (false);
     return G_SOURCE_REMOVE;
   }
   return G_SOURCE_CONTINUE;
@@ -3800,14 +4938,18 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
 static void
 switch_cancel (void)
 {
+  clear_pending_dwm_frame ();
   if (g_switch_source != 0) {
     gtk_widget_remove_tick_callback (g_window, g_switch_source);
     g_switch_source = 0;
   }
+  g_switch_started = false;
   for (SlotEntry &l : g_leaving)
     if (l.thumb != nullptr)
       DwmUnregisterThumbnail (l.thumb);
   g_leaving.clear ();
+  g_ws_hist1_boxes.clear ();
+  g_ws_hist2_boxes.clear ();
 }
 
 // Snap-finish an in-flight switch with the overview still on screen.
@@ -3822,16 +4964,23 @@ switch_finish (bool restore_hover)
   g_bg_final = target_bg;
   apply_ws_boxes (g_app_grid_mode ? g_ws_grid_boxes : g_ws_picker_boxes);
   overview_thumbs_set_indicator_value (g_thumbs, -1.0);
+  winome_shell_panel_set_workspace_scroll (
+      std::max (static_cast<int> (g_desktops.size ()), 1),
+      static_cast<double> (std::max (g_desktop_active, 0)));
   for (SlotEntry &s : g_slots) {
     BYTE op = g_search_mode ? 0 : (g_app_grid_mode ? s.grid_opacity : 255);
     if (g_app_grid_mode && g_folder_dialog_open && op > 0)
       op = 76;
     apply_thumb_rect (s, s.rect, op);
   }
+  if (winome::get_config ().dash_isolate_workspaces)
+    refresh_dash_in_place ();
   if (restore_hover && !g_app_grid_mode && !g_search_mode &&
       g_target_state == ControlsState::WINDOW_PICKER) {
     set_hover (slot_at_cursor ());
   }
+  if (g_anim.source == 0)
+    live_wallpaper_set_paused (false);
 }
 
 static gboolean
@@ -3839,8 +4988,14 @@ switch_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
 {
   (void)widget;
   (void)user_data;
-  double t = (gdk_frame_clock_get_frame_time (clock) - g_switch_start_us) /
-             1000.0 / (double)kSwitchMs;
+  flush_pending_dwm_frame ();
+  ensure_after_paint_hook (clock);
+  const gint64 now = gdk_frame_clock_get_frame_time (clock);
+  if (!g_switch_started) {
+    g_switch_started = true;
+    g_switch_start_us = now - 8000;
+  }
+  double t = (now - g_switch_start_us) / 1000.0 / (double)kSwitchMs;
   if (t < 0.0)
     t = 0.0;
   if (t > 1.0)
@@ -3864,13 +5019,26 @@ switch_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
       cur_boxes[static_cast<size_t> (d)] = picker_box_for_desktop (
           d, scroll_pos, g_bg_picker, g_monitor_w, scale);
     }
-    apply_ws_boxes (cur_boxes);
+    const bool gtk_will_paint = apply_ws_boxes (cur_boxes, false);
+    const bool defer =
+        (t < 1.0 && gtk_will_paint && g_overview_after_paint_id != 0);
     for (SlotEntry &s : g_slots) {
       int d = std::clamp (s.desktop_index, 0, ws_count - 1);
       RECT r = remap_rect_between_boxes (
           s.canonical_picker_rect, g_bg_picker,
           cur_boxes[static_cast<size_t> (d)]);
-      apply_thumb_rect (s, r, g_search_mode ? 0 : 255);
+      BYTE op = g_search_mode ? 0 : 255;
+      if (defer) {
+        s.pending_rect = r;
+        s.pending_opacity = op;
+        s.has_pending_dwm = true;
+      } else {
+        apply_thumb_rect (s, r, op);
+      }
+    }
+    if (defer) {
+      g_dwm_pending_has_mini = false;
+      g_dwm_frame_pending = true;
     }
   } else {
     apply_ws_boxes (g_ws_grid_boxes);
@@ -3882,12 +5050,94 @@ switch_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
     }
   }
   overview_thumbs_set_indicator_value (g_thumbs, scroll_pos);
+  winome_shell_panel_set_workspace_scroll (ws_count, scroll_pos);
 
   if (t >= 1.0) {
+    clear_pending_dwm_frame ();
     switch_finish (true);
     return G_SOURCE_REMOVE;
   }
   return G_SOURCE_CONTINUE;
+}
+
+static void
+refresh_dash_in_place (void)
+{
+  if (g_dash == nullptr || g_window == nullptr || g_root == nullptr ||
+      g_panel_hwnd == nullptr || !gtk_widget_get_visible (g_window) ||
+      !g_placed || g_target_state == ControlsState::HIDDEN) {
+    return;
+  }
+  HMONITOR monitor = MonitorFromWindow (g_panel_hwnd, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO mi{};
+  mi.cbSize = sizeof (mi);
+  if (!GetMonitorInfoW (monitor, &mi))
+    return;
+  int scale = std::max (gtk_widget_get_scale_factor (g_window), 1);
+  int mw = mi.rcMonitor.right - mi.rcMonitor.left;
+  int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+  int wa_h = std::max (mh - g_panel_height, 1);
+  int dash_max = (int)(wa_h * kDashMaxHeightRatio + 0.5);
+  overview_dash_repopulate (g_dash, monitor, dash_max / scale,
+                            g_desktop_active);
+  int dash_w = overview_dash_get_width (g_dash) * scale;
+  int dash_h = std::min (overview_dash_get_height (g_dash) * scale, dash_max);
+  g_dash_top = g_panel_height + wa_h - dash_h;
+  gtk_fixed_move (GTK_FIXED (g_root), g_dash, (mw - dash_w) / 2 / scale,
+                  g_dash_top / scale);
+}
+
+static gboolean
+dash_resync_timeout_cb (gpointer user_data G_GNUC_UNUSED)
+{
+  g_dash_resync_timer = 0;
+  refresh_dash_in_place ();
+  return G_SOURCE_REMOVE;
+}
+
+static void
+schedule_dash_resync (guint delay_ms = 120)
+{
+  if (g_dash_resync_timer != 0)
+    g_source_remove (g_dash_resync_timer);
+  g_dash_resync_timer =
+      g_timeout_add (delay_ms, dash_resync_timeout_cb, nullptr);
+}
+
+static void
+on_overview_config_changed (void *user_data G_GNUC_UNUSED)
+{
+  refresh_dash_in_place ();
+  const std::string live_mode =
+      sanitize_live_wallpaper_mode (winome::get_config ().live_wallpaper_mode);
+  if (live_mode == "off") {
+    const bool was_live = g_using_live_wallpaper;
+    g_using_live_wallpaper = false;
+    live_wallpaper_stop ();
+    g_clear_object (&g_live_wallpaper);
+    g_clear_object (&g_live_wallpaper_thumb);
+    if (was_live) {
+      if (g_ws_bg != nullptr && gtk_widget_get_visible (g_ws_bg))
+        gtk_widget_queue_draw (g_ws_bg);
+      if (g_thumbs != nullptr)
+        overview_thumbs_set_wallpaper (g_thumbs,
+                                       active_wallpaper_thumb_texture ());
+    }
+  } else if (g_window != nullptr && gtk_widget_get_visible (g_window) &&
+             g_panel_hwnd != nullptr) {
+    HMONITOR mon = MonitorFromWindow (g_panel_hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof (mi);
+    if (GetMonitorInfoW (mon, &mi)) {
+      LiveWallpaperTarget target = live_wallpaper_detect_target (mi.rcMonitor);
+      if (target.active) {
+        g_using_live_wallpaper = true;
+        live_wallpaper_set_paused (g_anim.source != 0 || g_switch_source != 0);
+        live_wallpaper_start (target, mi.rcMonitor, live_mode == "live",
+                              on_live_wallpaper_frame, nullptr);
+      }
+    }
+  }
 }
 
 // Animated workspace switch (WorkspacesView._scrollToActive: 250ms
@@ -3946,11 +5196,27 @@ switch_workspace_animated (int to)
   for (SlotEntry &s : g_slots) {
     int d = std::clamp (s.desktop_index, 0, ws_count - 1);
     const RECT &ws_picker_d = g_ws_picker_boxes[static_cast<size_t> (d)];
+    const RECT &ws_full_d = g_ws_full_boxes[static_cast<size_t> (d)];
     s.picker_rect = (d == to)
                         ? s.canonical_picker_rect
                         : remap_rect_between_boxes (
                               s.canonical_picker_rect, g_bg_picker, ws_picker_d);
     s.rect = g_app_grid_mode ? s.grid_rect : s.picker_rect;
+    // Keep HIDDEN close-animation endpoints aligned with the newly active
+    // workspace so exiting Overview zooms into workspace `to` while sliding
+    // neighboring workspaces' windows off-screen with their workspace boxes.
+    s.minimized = (d == to) && s.minimized_any;
+    if (s.minimized) {
+      s.start.left = ws_picker_d.left;
+      s.start.top = ws_picker_d.top;
+      s.start.right = s.start.left + 1;
+      s.start.bottom = s.start.top + 1;
+    } else {
+      s.start = (d == to)
+                    ? s.canonical_start
+                    : remap_rect_between_boxes (s.canonical_start, g_bg_full,
+                                                ws_full_d);
+    }
   }
 
   if (g_thumbs != nullptr && g_thumbs_has_pills) {
@@ -3959,19 +5225,28 @@ switch_workspace_animated (int to)
     bool can_manage =
         vd::vtable_slots_for_build (vd::windows_build_number ())
             .can_manage_desktops;
+    const double panel_ratio =
+        (g_panel_height > 0 && wa_h > 0)
+            ? (static_cast<double> (g_panel_height) / static_cast<double> (wa_h))
+            : 0.0;
     overview_thumbs_repopulate (
         g_thumbs, (int)g_desktops.size (), g_desktop_active, box_h,
         (double)g_monitor_w / scale, (double)g_monitor_w, (double)wa_h,
-        g_wallpaper, can_manage, false);
+        active_wallpaper_thumb_texture (),
+        can_manage, false, panel_ratio);
   }
 
+  live_wallpaper_set_paused (true);
   g_switch_from = from_pos;
   g_switch_to = static_cast<double> (to);
   g_switch_cur_pos = from_pos;
   g_switch_width = g_ws_box.right - g_ws_box.left;
+  g_switch_started = false;
   g_switch_start_us = g_get_monotonic_time ();
   g_last_internal_switch_us = g_switch_start_us;
   overview_thumbs_set_indicator_value (g_thumbs, from_pos);
+  winome_shell_panel_set_workspace_scroll (
+      std::max (static_cast<int> (g_desktops.size ()), 1), from_pos);
   g_switch_source =
       gtk_widget_add_tick_callback (g_window, switch_tick, nullptr, nullptr);
   g_print ("[ov] workspace switch %.2f -> %d (animated)\n", from_pos, to);
@@ -3982,12 +5257,19 @@ start_state_transition (ControlsState to_state, guint duration_ms)
 {
   if (g_window == nullptr)
     return;
+  live_wallpaper_set_paused (true);
+  flush_pending_dwm_frame ();
   if (g_switch_source != 0)
     switch_finish (false);
   if (g_anim.source != 0) {
     gtk_widget_remove_tick_callback (g_window, g_anim.source);
     g_anim.source = 0;
   }
+  cancel_search_fade ();
+  cancel_settle_hover ();
+  cancel_post_hide_workarea ();
+  set_hover (-1, true);
+  reset_drag_state ();
 
   ControlsState prev_target = g_target_state;
   g_target_state = to_state;
@@ -3995,8 +5277,6 @@ start_state_transition (ControlsState to_state, guint duration_ms)
   g_atomic_can_shift_app_grid.store (to_state == ControlsState::WINDOW_PICKER,
                                      std::memory_order_release);
 
-  if (to_state != ControlsState::WINDOW_PICKER)
-    set_hover (-1, true);
   if (to_state != ControlsState::APP_GRID && g_app_grid != nullptr) {
     app_grid_close_open_folder (g_app_grid);
     app_grid_close_menu (g_app_grid);
@@ -4007,6 +5287,7 @@ start_state_transition (ControlsState to_state, guint duration_ms)
   g_anim.from_state = prev_target;
   g_anim.to_state = to_state;
   g_anim.duration_ms = std::max (duration_ms, 1u);
+  g_anim.started = false;
   g_grid_last_moved_y = INT_MIN;
 
   // Snapshot live visual state so mid-flight interruptions are completely
@@ -4015,8 +5296,15 @@ start_state_transition (ControlsState to_state, guint duration_ms)
   g_ws_anim_from_boxes = g_ws_cur_boxes;
   g_anim.radius_from = g_bg_radius;
   g_anim.thumbs_from = g_thumbs_cur_opacity;
+  g_anim.thumbs_scale_from = g_thumbs_cur_scale;
+  g_anim.thumbs_ty_from = g_thumbs_cur_ty;
   g_anim.grid_opacity_from = g_grid_cur_opacity;
   g_anim.grid_slide_from = g_grid_cur_slide_y;
+  g_anim.panel_from = g_panel_cur_progress;
+  g_anim.panel_to = (to_state == ControlsState::HIDDEN) ? 0.0 : 1.0;
+
+  const double thumbs_grid_ty =
+      g_thumbs != nullptr ? (overview_thumbs_get_height (g_thumbs) * 0.5) : 0.0;
 
   if (to_state == ControlsState::WINDOW_PICKER) {
     g_anim.bg_to = g_bg_picker;
@@ -4026,13 +5314,18 @@ start_state_transition (ControlsState to_state, guint duration_ms)
     g_bg_radius_target = g_radius_picker;
     g_ws_box = g_bg_picker;
     g_anim.thumbs_to = g_thumbs_has_pills ? 1.0 : 0.0;
-    if (g_thumbs != nullptr && g_thumbs_has_pills)
-      gtk_widget_set_visible (g_thumbs, TRUE);
+    g_anim.thumbs_scale_to = 1.0;
+    g_anim.thumbs_ty_to = 0.0;
     g_anim.grid_opacity_to = 0.0;
     g_anim.grid_slide_to = kGridSlideOffsetPx;
-    if (g_app_grid != nullptr && gtk_widget_get_visible (g_app_grid)) {
-      app_grid_set_transition_opacity (
-          g_app_grid, true, std::clamp (g_grid_cur_opacity, 0.0, 1.0));
+    if (g_app_grid != nullptr && g_app_grid_clip != nullptr &&
+        gtk_widget_get_visible (g_app_grid_clip)) {
+      app_grid_set_transition_opacity (g_app_grid, true, 1.0);
+      const bool using_cache = app_grid_clip_begin_transition (
+          g_app_grid_clip, std::clamp (g_grid_cur_opacity, 0.0, 1.0),
+          g_grid_cur_slide_y);
+      if (using_cache)
+        gtk_widget_set_visible (g_app_grid, FALSE);
     }
     for (SlotEntry &s : g_slots) {
       s.anim_from = s.current;
@@ -4048,22 +5341,36 @@ start_state_transition (ControlsState to_state, guint duration_ms)
     g_anim.radius_to = g_radius_grid;
     g_bg_radius_target = g_radius_grid;
     g_ws_box = g_bg_grid;
+    // Match GNOME Shell overviewControls.js _getThumbnailsBoxParams():
+    // fade opacity 1->0, scale 1->0.5 around (0.5, 0.5), translate_y 0->h/2.
     g_anim.thumbs_to = 0.0;
+    g_anim.thumbs_scale_to = 0.5;
+    g_anim.thumbs_ty_to = thumbs_grid_ty;
     g_anim.grid_opacity_to = 1.0;
     g_anim.grid_slide_to = 0.0;
     if (g_app_grid != nullptr) {
-      ensure_app_grid_synced ();
-      if (prev_target != ControlsState::APP_GRID && !gtk_widget_get_visible (g_app_grid)) {
+      ensure_app_grid_synced (false);
+      const bool was_hidden =
+          (prev_target != ControlsState::APP_GRID &&
+           (g_app_grid_clip == nullptr ||
+            !gtk_widget_get_visible (g_app_grid_clip)));
+      if (was_hidden) {
         app_grid_reset_page (g_app_grid);
         g_grid_cur_opacity = 0.0;
         g_grid_cur_slide_y = kGridSlideOffsetPx;
         g_anim.grid_opacity_from = 0.0;
         g_anim.grid_slide_from = kGridSlideOffsetPx;
       }
-      app_grid_set_transition_opacity (
-          g_app_grid, true, std::clamp (g_grid_cur_opacity, 0.0, 1.0));
-      apply_app_grid_slide (g_grid_cur_slide_y);
-      sync_app_grid_visible (true);
+      app_grid_set_transition_opacity (g_app_grid, true, 1.0);
+      const bool using_cache = app_grid_clip_begin_transition (
+          g_app_grid_clip, std::clamp (g_grid_cur_opacity, 0.0, 1.0),
+          g_grid_cur_slide_y);
+      if (using_cache && g_app_grid_clip != nullptr) {
+        gtk_widget_set_visible (g_app_grid_clip, TRUE);
+        gtk_widget_set_visible (g_app_grid, FALSE);
+      } else {
+        sync_app_grid_visible (true);
+      }
     }
     for (SlotEntry &s : g_slots) {
       s.anim_from = s.current;
@@ -4079,23 +5386,45 @@ start_state_transition (ControlsState to_state, guint duration_ms)
     g_ws_anim_to_boxes = g_ws_full_boxes;
     g_anim.radius_to = 0.0;
     g_bg_radius_target = 0.0;
-    g_anim.thumbs_to = 0.0;
+    // Match GNOME Shell overviewControls.js: when closing from WINDOW_PICKER,
+    // keep the thumbnails bar (and its mini window previews) stationary at
+    // opacity 1.0 behind the expanding workspace so it is smoothly covered
+    // without flashing; when closing directly from APP_GRID, keep it hidden.
+    const bool keep_hidden_from_grid =
+        (prev_target == ControlsState::APP_GRID && g_thumbs_cur_opacity <= 0.01);
+    if (keep_hidden_from_grid) {
+      g_anim.thumbs_to = 0.0;
+      g_anim.thumbs_scale_to = 0.5;
+      g_anim.thumbs_ty_to = thumbs_grid_ty;
+    } else {
+      g_anim.thumbs_to = g_thumbs_has_pills ? 1.0 : 0.0;
+      g_anim.thumbs_scale_to = 1.0;
+      g_anim.thumbs_ty_to = 0.0;
+    }
     g_anim.grid_opacity_to = 0.0;
     g_anim.grid_slide_to = kGridSlideOffsetPx;
-    if (g_app_grid != nullptr && gtk_widget_get_visible (g_app_grid)) {
-      app_grid_set_transition_opacity (
-          g_app_grid, true, std::clamp (g_grid_cur_opacity, 0.0, 1.0));
+    if (g_app_grid != nullptr && g_app_grid_clip != nullptr &&
+        gtk_widget_get_visible (g_app_grid_clip)) {
+      app_grid_set_transition_opacity (g_app_grid, true, 1.0);
+      const bool using_cache = app_grid_clip_begin_transition (
+          g_app_grid_clip, std::clamp (g_grid_cur_opacity, 0.0, 1.0),
+          g_grid_cur_slide_y);
+      if (using_cache)
+        gtk_widget_set_visible (g_app_grid, FALSE);
     }
     for (SlotEntry &s : g_slots) {
       s.anim_from = s.current;
       s.anim_from_opacity = s.current_opacity;
       s.anim_to = s.start;
-      s.anim_to_opacity = s.minimized ? 0 : 255;
+      s.anim_to_opacity = s.minimized_any ? 0 : 255;
     }
   }
 
   if (g_ws_anim_from_boxes.size () != g_ws_anim_to_boxes.size ())
     g_ws_anim_from_boxes = g_ws_anim_to_boxes;
+
+  g_ws_hist1_boxes.clear ();
+  g_ws_hist2_boxes.clear ();
 
   restack_locked ();
   g_anim.start_us = g_get_monotonic_time ();
@@ -4117,6 +5446,12 @@ overview_idle_trim_cb (gpointer user_data)
 void
 finish_hide (void)
 {
+  g_panel_cur_progress = 0.0;
+  winome_shell_panel_set_overview_progress (0.0);
+  winome_shell_panel_set_workspace_scroll (-1, -1.0);
+  live_wallpaper_stop ();
+  clear_pending_dwm_frame ();
+  cancel_settle_hover ();
   set_hover (-1, true);
   cancel_pending_place_idles ();
   cancel_delayed_rebuild ();
@@ -4150,7 +5485,7 @@ finish_hide (void)
     app_grid_close_open_folder (g_app_grid);
     app_grid_close_menu (g_app_grid);
     app_grid_reset_page (g_app_grid);
-    apply_app_grid_slide (0.0);
+    app_grid_clip_set_transition (g_app_grid_clip, false, 1.0, 0.0, true);
     app_grid_set_transition_opacity (g_app_grid, false, 1.0);
     sync_app_grid_visible (false);
   }
@@ -4200,12 +5535,19 @@ finish_hide (void)
   // #222226 flash while the placement idle is still pending.
   g_bg_cur = g_bg_full;
   g_ws_cur_boxes.assign (1, g_bg_full);
+  g_ws_hist1_boxes.clear ();
+  g_ws_hist2_boxes.clear ();
   g_bg_radius = 0.0;
   g_ws_bg_last_radius = -1.0;
   g_ws_bg_settled_shadow_drawn = false;
   g_thumbs_cur_opacity = 0.0;
-  if (g_thumbs != nullptr)
-    gtk_widget_set_opacity (g_thumbs, 1.0);
+  g_thumbs_cur_scale = 1.0;
+  g_thumbs_cur_ty = 0.0;
+  if (g_thumbs != nullptr) {
+    overview_thumbs_set_transform (g_thumbs, 1.0, 0.0);
+    gtk_widget_set_opacity (g_thumbs, 0.0);
+    gtk_widget_set_visible (g_thumbs, FALSE);
+  }
   if (g_overview_hwnd != nullptr && IsWindow (g_overview_hwnd))
     apply_ex_styles (g_overview_hwnd);
   bool was_discarded =
@@ -4220,6 +5562,7 @@ finish_hide (void)
       (g_desktops.empty () || vd::window_on_current (restore_hwnd))) {
     SetForegroundWindow (restore_hwnd);
   }
+  schedule_post_hide_workarea (180);
 }
 
 static void
@@ -4595,6 +5938,10 @@ on_drag_end (GtkGestureDrag *drag G_GNUC_UNUSED, double dx, double dy,
   if (moved) {
     reset_drag_state ();
     rebuild_now ();
+    // Explorer may finish committing the moved window's desktop GUID a few
+    // dozen ms asynchronously; run a lightweight follow-up dash refresh so
+    // workspace-isolated mode never leaves stale icons behind.
+    schedule_dash_resync (120);
     return;
   }
 
@@ -4867,9 +6214,10 @@ on_overview_surface_layout (GdkSurface *surface G_GNUC_UNUSED,
 {
   if (g_window == nullptr || !gtk_widget_get_visible (g_window))
     return;
+  if (g_anim.source != 0 || g_switch_source != 0)
+    return;
   restack_locked ();
-  if (g_placed && g_target_state != ControlsState::HIDDEN &&
-      g_anim.source == 0 && g_switch_source == 0) {
+  if (g_placed && g_target_state != ControlsState::HIDDEN) {
     int scale = std::max (gtk_widget_get_scale_factor (g_window), 1);
     int cur_search_h = g_placed_search_h;
     if (g_search != nullptr && gtk_widget_get_visible (g_search)) {
@@ -4897,6 +6245,7 @@ on_realize (GtkWidget *widget, gpointer user_data)
       g_signal_connect (surface, "layout",
                         G_CALLBACK (on_overview_surface_layout), nullptr);
     }
+    ensure_after_paint_hook (gdk_surface_get_frame_clock (surface));
   }
 }
 
@@ -5032,23 +6381,7 @@ on_app_grid_pins_changed (void *user_data G_GNUC_UNUSED)
   if (g_dash != nullptr && g_window != nullptr &&
       gtk_widget_get_visible (g_window)) {
     if (g_target_state == ControlsState::APP_GRID && g_panel_hwnd != nullptr) {
-      HMONITOR monitor =
-          MonitorFromWindow (g_panel_hwnd, MONITOR_DEFAULTTONEAREST);
-      MONITORINFO mi{};
-      mi.cbSize = sizeof (mi);
-      if (GetMonitorInfoW (monitor, &mi)) {
-        int scale = std::max (gtk_widget_get_scale_factor (g_window), 1);
-        int mw = mi.rcMonitor.right - mi.rcMonitor.left;
-        int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
-        int wa_h = std::max (mh - g_panel_height, 1);
-        int dash_max = (int)(wa_h * kDashMaxHeightRatio + 0.5);
-        overview_dash_repopulate (g_dash, monitor, dash_max / scale);
-        int dash_w = overview_dash_get_width (g_dash) * scale;
-        int dash_h =
-            std::min (overview_dash_get_height (g_dash) * scale, dash_max);
-        gtk_fixed_move (GTK_FIXED (g_root), g_dash, (mw - dash_w) / 2 / scale,
-                        (g_panel_height + wa_h - dash_h) / scale);
-      }
+      refresh_dash_in_place ();
       if (g_app_grid != nullptr)
         app_grid_refresh_running (g_app_grid);
       return;
@@ -5064,8 +6397,9 @@ dynamic_workspaces_startup_cb (gpointer user_data)
   g_dyn_ws_startup_timer = 0;
   if (g_window == nullptr)
     return G_SOURCE_REMOVE;
-  if (gtk_widget_get_visible (g_window) && g_placed &&
-      g_target_state != ControlsState::HIDDEN && overview_active ()) {
+  if (g_anim.source != 0 || g_switch_source != 0 ||
+      (gtk_widget_get_visible (g_window) && g_placed &&
+       g_target_state != ControlsState::HIDDEN && overview_active ())) {
     return G_SOURCE_REMOVE;
   }
   HMONITOR mon = (g_panel_hwnd != nullptr)
@@ -5171,11 +6505,30 @@ apply_pending_desktop_sync_if_any (void)
     rebuild_now ();
 }
 
+void on_app_index_ready (void *user_data G_GNUC_UNUSED);
+
+static gboolean
+deferred_app_index_ready_cb (gpointer user_data G_GNUC_UNUSED)
+{
+  g_app_index_defer_timer = 0;
+  on_app_index_ready (nullptr);
+  return G_SOURCE_REMOVE;
+}
+
 void
 on_app_index_ready (void *user_data G_GNUC_UNUSED)
 {
   if (g_window == nullptr || g_app_grid == nullptr || g_panel_hwnd == nullptr)
     return;
+  // Never run synchronous App Grid prewarm/page build while an Overview
+  // animation is running — defer briefly until idle so startup stays snappy.
+  if (g_anim.source != 0 || g_switch_source != 0 || g_search_fade_source != 0) {
+    if (g_app_index_defer_timer == 0) {
+      g_app_index_defer_timer = g_timeout_add_full (
+          G_PRIORITY_LOW, 350, deferred_app_index_ready_cb, nullptr, nullptr);
+    }
+    return;
+  }
   HMONITOR monitor = MonitorFromWindow (g_panel_hwnd, MONITOR_DEFAULTTONEAREST);
   MONITORINFO mi{};
   mi.cbSize = sizeof (mi);
@@ -5186,7 +6539,7 @@ on_app_index_ready (void *user_data G_GNUC_UNUSED)
   int scale = std::max (gtk_widget_get_scale_factor (g_window), 1);
 
   if (g_wallpaper == nullptr)
-    load_wallpaper ();
+    start_wallpaper_prewarm_async ();
 
   int est_w = std::max (std::min (mw / scale - 32, 1820), 400);
   int est_h = std::max ((int)(mh / scale * 0.58), 260);
@@ -5247,9 +6600,6 @@ shift_app_grid_idle (gpointer user_data)
   if (g_target_state == ControlsState::HIDDEN)
     return G_SOURCE_REMOVE;
   if (g_target_state == ControlsState::WINDOW_PICKER) {
-    ensure_app_grid_synced ();
-    if (g_app_grid != nullptr)
-      app_grid_refresh_running (g_app_grid);
     start_state_transition (ControlsState::APP_GRID, kOpenMs);
   }
   restack_locked ();
@@ -5413,6 +6763,32 @@ start_search_fade (bool to_search)
   if (g_window == nullptr) {
     apply_search_fade_progress (target);
     return;
+  }
+  // Never run search cross-fade concurrently with workspace switch or
+  // open/app-grid transitions (both drive DWM thumbnail rects & opacities).
+  if (g_switch_source != 0)
+    switch_finish (false);
+  if (g_anim.source != 0 && g_target_state != ControlsState::HIDDEN) {
+    gtk_widget_remove_tick_callback (g_window, g_anim.source);
+    g_anim.source = 0;
+    g_anim.started = false;
+    if (!g_ws_anim_to_boxes.empty ())
+      apply_ws_boxes (g_ws_anim_to_boxes);
+    if (g_target_state == ControlsState::APP_GRID && g_app_grid != nullptr) {
+      sync_app_grid_visible (true);
+      app_grid_clip_set_transition (g_app_grid_clip, false, 1.0, 0.0, true);
+      app_grid_set_transition_opacity (g_app_grid, false, 1.0);
+      g_grid_cur_opacity = 1.0;
+      g_grid_cur_slide_y = 0.0;
+    } else if (g_target_state == ControlsState::WINDOW_PICKER) {
+      if (g_app_grid_clip != nullptr) {
+        app_grid_clip_set_transition (g_app_grid_clip, false, 0.0,
+                                      kGridSlideOffsetPx, true);
+        sync_app_grid_visible (false);
+      }
+      g_grid_cur_opacity = 0.0;
+      g_grid_cur_slide_y = kGridSlideOffsetPx;
+    }
   }
   if (std::fabs (g_search_fade_cur - target) < 0.005 &&
       g_search_fade_source == 0) {
@@ -5667,14 +7043,42 @@ overview_prewarm_idle_cb (gpointer user_data)
   g_prewarm_timer = 0;
   if (g_window == nullptr)
     return G_SOURCE_REMOVE;
-  if (g_wallpaper == nullptr)
-    load_wallpaper ();
-  if (!gtk_widget_get_visible (g_window) && !gtk_widget_get_realized (g_window))
-    gtk_widget_realize (g_window);
-  GtkWidget *chrome_wins[] = {g_chrome_window, g_icon_window, g_caption_window};
-  for (GtkWidget *cw : chrome_wins) {
+  // Never steal main-thread frames while the user is opening or animating.
+  if (g_anim.source != 0 || g_switch_source != 0 || g_search_fade_source != 0) {
+    g_prewarm_timer = g_timeout_add_full (
+        G_PRIORITY_LOW, 450, overview_prewarm_idle_cb, nullptr, nullptr);
+    return G_SOURCE_REMOVE;
+  }
+  // Stagger startup prewarm across small low-priority slices instead of
+  // blocking the main thread for 100-180ms right after launch:
+  //   step 0 -> kick off off-thread wallpaper decode/scale
+  //   step 1 -> realize g_window
+  //   step 2..4 -> realize hover chrome windows one per slice
+  if (g_prewarm_step == 0) {
+    if (g_wallpaper == nullptr)
+      start_wallpaper_prewarm_async ();
+    g_prewarm_step = 1;
+    g_prewarm_timer = g_timeout_add_full (
+        G_PRIORITY_LOW, 320, overview_prewarm_idle_cb, nullptr, nullptr);
+  } else if (g_prewarm_step == 1) {
+    if (!gtk_widget_get_visible (g_window) &&
+        !gtk_widget_get_realized (g_window)) {
+      gtk_widget_realize (g_window);
+    }
+    g_prewarm_step = 2;
+    g_prewarm_timer = g_timeout_add_full (
+        G_PRIORITY_LOW, 350, overview_prewarm_idle_cb, nullptr, nullptr);
+  } else if (g_prewarm_step >= 2 && g_prewarm_step <= 4) {
+    GtkWidget *chrome_wins[] = {g_chrome_window, g_icon_window,
+                                g_caption_window};
+    GtkWidget *cw = chrome_wins[g_prewarm_step - 2];
     if (cw != nullptr && !gtk_widget_get_realized (cw))
       gtk_widget_realize (cw);
+    ++g_prewarm_step;
+    if (g_prewarm_step <= 4) {
+      g_prewarm_timer = g_timeout_add_full (
+          G_PRIORITY_LOW, 280, overview_prewarm_idle_cb, nullptr, nullptr);
+    }
   }
   return G_SOURCE_REMOVE;
 }
@@ -5685,6 +7089,8 @@ void
 overview_init (HWND panel_hwnd)
 {
   g_panel_hwnd = panel_hwnd;
+  g_overview_alive = std::make_shared<std::atomic<bool>> (true);
+  g_prewarm_step = 0;
 
   g_window = gtk_window_new ();
   gtk_window_set_title (GTK_WINDOW (g_window), "WINOME Overview");
@@ -5880,6 +7286,7 @@ overview_init (HWND panel_hwnd)
   gtk_widget_add_controller (g_window, ws_scroll);
 
   vd::add_change_listener (on_overview_desktop_changed, nullptr);
+  add_config_listener (on_overview_config_changed, nullptr);
   g_signal_connect (
       g_window, "close-request",
       G_CALLBACK (+[] (GtkWindow *win G_GNUC_UNUSED,
@@ -5891,6 +7298,8 @@ overview_init (HWND panel_hwnd)
   g_signal_connect (
       g_window, "unrealize",
       G_CALLBACK (+[] (GtkWidget *w G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
+        clear_pending_dwm_frame ();
+        disconnect_after_paint_hook ();
         unsubclass_overview_hwnd ();
         g_overview_surface_hooked = false;
         chrome_detach_owners ();
@@ -5899,11 +7308,17 @@ overview_init (HWND panel_hwnd)
   g_signal_connect (
       g_window, "destroy",
       G_CALLBACK (+[] (GtkWidget *w, gpointer ud G_GNUC_UNUSED) {
+        clear_pending_dwm_frame ();
+        disconnect_after_paint_hook ();
         unsubclass_overview_hwnd ();
         g_overview_surface_hooked = false;
         cancel_pending_place_idles ();
         cancel_delayed_rebuild ();
         cancel_hover_idle ();
+        cancel_settle_hover ();
+        cancel_post_hide_workarea ();
+        if (g_overview_alive)
+          g_overview_alive->store (false, std::memory_order_release);
         if (g_idle_trim_timer != 0) {
           g_source_remove (g_idle_trim_timer);
           g_idle_trim_timer = 0;
@@ -5912,9 +7327,17 @@ overview_init (HWND panel_hwnd)
           g_source_remove (g_prewarm_timer);
           g_prewarm_timer = 0;
         }
+        if (g_app_index_defer_timer != 0) {
+          g_source_remove (g_app_index_defer_timer);
+          g_app_index_defer_timer = 0;
+        }
         if (g_dyn_ws_startup_timer != 0) {
           g_source_remove (g_dyn_ws_startup_timer);
           g_dyn_ws_startup_timer = 0;
+        }
+        if (g_dash_resync_timer != 0) {
+          g_source_remove (g_dash_resync_timer);
+          g_dash_resync_timer = 0;
         }
         if (g_drag_tick_source != 0) {
           gtk_widget_remove_tick_callback (w, g_drag_tick_source);
@@ -5941,8 +7364,17 @@ overview_init (HWND panel_hwnd)
         destroy_previews ();
         destroy_mini_previews ();
         vd::remove_change_listener (on_overview_desktop_changed, nullptr);
+        remove_config_listener (on_overview_config_changed, nullptr);
+        g_panel_cur_progress = 0.0;
+        winome_shell_panel_set_overview_progress (0.0);
+        winome_shell_panel_set_workspace_scroll (-1, -1.0);
+        live_wallpaper_stop ();
+        g_using_live_wallpaper = false;
         g_wallpaper_cache = WallpaperCacheKey{};
         g_clear_object (&g_wallpaper);
+        g_clear_object (&g_wallpaper_thumb);
+        g_clear_object (&g_live_wallpaper);
+        g_clear_object (&g_live_wallpaper_thumb);
 
         chrome_cancel_apply (&g_chrome_hooks);
         chrome_cancel_apply (&g_icon_hooks);
@@ -6023,7 +7455,9 @@ overview_init (HWND panel_hwnd)
 
   if (g_prewarm_timer != 0)
     g_source_remove (g_prewarm_timer);
-  g_prewarm_timer = g_timeout_add (350, overview_prewarm_idle_cb, nullptr);
+  g_prewarm_step = 0;
+  g_prewarm_timer = g_timeout_add_full (
+      G_PRIORITY_LOW, 120, overview_prewarm_idle_cb, nullptr, nullptr);
   schedule_dynamic_workspaces_check (1600);
 }
 
@@ -6037,6 +7471,8 @@ overview_show (void)
     g_source_remove (g_prewarm_timer);
     g_prewarm_timer = 0;
   }
+  cancel_settle_hover ();
+  cancel_post_hide_workarea ();
   cancel_delayed_rebuild ();
 
   cancel_search_fade ();
@@ -6096,16 +7532,14 @@ overview_show (void)
     if (!g_placed) {
       place_overview_locked (true);
     }
-    if (g_place_opening_source == 0) {
+    if (g_placed) {
+      cancel_pending_place_idles ();
+    } else if (g_place_opening_source == 0) {
       g_place_opening_source = g_idle_add_full (
           G_PRIORITY_HIGH_IDLE, overview_place_opening_idle, nullptr, nullptr);
     }
   } else if (g_placed && g_target_state == ControlsState::HIDDEN) {
     // Closing animation was mid-flight; reverse seamlessly back to picker or grid.
-    if (g_pending_show_state == ControlsState::APP_GRID && g_app_grid != nullptr) {
-      ensure_app_grid_synced ();
-      app_grid_refresh_running (g_app_grid);
-    }
     start_state_transition (g_pending_show_state, kOpenMs);
     if (winome_shell_panel_top_popover_hwnd () == nullptr)
       focus_overview_window (false);
@@ -6131,6 +7565,12 @@ overview_hide (void)
     cancel_search_fade ();
     g_search_fade_cur = 0.0;
     g_search_mode = false;
+    g_thumbs_cur_opacity = 0.0;
+    if (g_thumbs != nullptr) {
+      gtk_widget_set_opacity (g_thumbs, 0.0);
+      gtk_widget_set_visible (g_thumbs, FALSE);
+    }
+    set_mini_opacity (0);
     if (g_search_view != nullptr) {
       overview_search_view_reset (g_search_view);
       gtk_widget_set_opacity (g_search_view, 0.0);
@@ -6256,11 +7696,6 @@ overview_toggle_app_grid (void)
   ControlsState next = (g_target_state == ControlsState::APP_GRID)
                            ? ControlsState::WINDOW_PICKER
                            : ControlsState::APP_GRID;
-  if (next == ControlsState::APP_GRID) {
-    ensure_app_grid_synced ();
-    if (g_app_grid != nullptr)
-      app_grid_refresh_running (g_app_grid);
-  }
   start_state_transition (next, kOpenMs);
   if (winome_shell_panel_top_popover_hwnd () == nullptr)
     focus_overview_window (false);

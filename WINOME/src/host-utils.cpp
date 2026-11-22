@@ -9,6 +9,17 @@
 #include <shellscalingapi.h>
 
 #include <cctype>
+#include <cwchar>
+
+#ifndef DWM_CLOAKED_APP
+#define DWM_CLOAKED_APP 0x00000001
+#endif
+#ifndef DWM_CLOAKED_SHELL
+#define DWM_CLOAKED_SHELL 0x00000002
+#endif
+#ifndef DWM_CLOAKED_INHERITED
+#define DWM_CLOAKED_INHERITED 0x00000004
+#endif
 
 namespace winome {
 
@@ -123,7 +134,9 @@ bool is_overview_default_blacklisted_window_info(
     const std::string& class_name_utf8,
     const std::string& proc_name_utf8,
     const std::string& title_utf8,
-    bool cloaked) {
+    bool cloaked,
+    DWORD cloaked_flags,
+    bool has_core_window) {
   auto to_ascii_lower_char = [](unsigned char c) -> char {
     return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a')
                                   : static_cast<char>(c);
@@ -169,6 +182,10 @@ bool is_overview_default_blacklisted_window_info(
   const std::string title_trimmed = trim_ws(title_utf8);
   const std::string title_compact = compact_ascii_lower(title_trimmed);
 
+  const DWORD effective_cloak =
+      cloaked_flags != 0 ? cloaked_flags : (cloaked ? DWM_CLOAKED_SHELL : 0);
+  const bool is_cloaked_any = cloaked || (effective_cloak != 0);
+
   // 1. "Windows 输入体验" / "Windows Input Experience" (TextInputHost).
   if (proc_low == "textinputhost.exe" ||
       proc_low == "windowsinternal.composableshell.experiences.textinput.inputapp.exe" ||
@@ -181,13 +198,50 @@ bool is_overview_default_blacklisted_window_info(
   // ApplicationFrameWindow shells or un-titled WorkerW containers), while
   // keeping normal CabinetWClass / ExploreWClass folder windows and dialogs.
   if (proc_low == "explorer.exe" && title_trimmed.empty()) {
-    if (cloaked)
+    if (is_cloaked_any)
       return true;
     const bool is_real_explorer_ui =
         cls_low == "cabinetwclass" ||
         cls_low == "explorewclass" ||
         cls_low == "#32770";
     if (!is_real_explorer_ui)
+      return true;
+  }
+
+  // 3. App-cloaked / inherited-cloaked windows (DWM_CLOAKED_APP = 0x1,
+  // DWM_CLOAKED_INHERITED = 0x4) and empty/suspended UWP ApplicationFrameWindow
+  // containers that have no live Windows.UI.Core.CoreWindow child (which DWM
+  // renders as accent-colored splash screens with a centered icon).
+  if ((effective_cloak & (DWM_CLOAKED_APP | DWM_CLOAKED_INHERITED)) != 0)
+    return true;
+
+  const bool is_uwp_frame =
+      cls_low == "applicationframewindow" ||
+      proc_low == "applicationframehost.exe";
+  if (is_uwp_frame) {
+    if (!has_core_window)
+      return true;
+    if (title_trimmed.empty() && is_cloaked_any)
+      return true;
+  }
+
+  // 4. Pre-launched / suspended / cloaked Windows Settings ("设置" / "設定" /
+  // "Settings") UWP ghost shells. Windows 10/11 frequently keeps 1-2 cloaked
+  // ApplicationFrameWindow shells for SystemSettings in the background that
+  // render as solid accent-colored gear splash squares in Overview. An active
+  // user-opened Settings window on the current workspace (uncloaked with a
+  // live CoreWindow) remains visible.
+  const bool is_uwp_settings_host =
+      is_uwp_frame ||
+      cls_low == "windows.ui.core.corewindow" ||
+      proc_low == "systemsettings.exe";
+  const bool is_settings_title =
+      title_compact == "\xE8\xAE\xBE\xE7\xBD\xAE" ||  // "设置"
+      title_compact == "\xE8\xA8\xAD\xE5\xAE\x9A" ||  // "設定"
+      title_compact == "settings";
+  if (is_uwp_settings_host &&
+      (is_settings_title || proc_low == "systemsettings.exe")) {
+    if (is_cloaked_any || !has_core_window)
       return true;
   }
 
@@ -229,14 +283,34 @@ bool is_overview_default_blacklisted_hwnd(HWND hwnd, bool enabled) {
     }
   }
 
-  BOOL cloaked = FALSE;
+  DWORD cloaked = 0;
   DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+
+  bool has_core_window = true;
+  if (std::wcscmp(cls, L"ApplicationFrameWindow") == 0) {
+    HWND core =
+        FindWindowExW(hwnd, nullptr, L"Windows.UI.Core.CoreWindow", nullptr);
+    if (core == nullptr) {
+      // A minimized tombstoned UWP app on the taskbar (cloaked == 0 and
+      // IsIconic == TRUE) is still user-opened; a cloaked or non-minimized
+      // coreless ApplicationFrameWindow is a suspended splash ghost.
+      has_core_window = (cloaked == 0 && IsIconic(hwnd) != FALSE);
+    } else {
+      DWORD core_cloaked = 0;
+      DwmGetWindowAttribute(core, DWMWA_CLOAKED, &core_cloaked,
+                            sizeof(core_cloaked));
+      if ((core_cloaked & (DWM_CLOAKED_APP | DWM_CLOAKED_INHERITED)) != 0)
+        has_core_window = false;
+    }
+  }
 
   return is_overview_default_blacklisted_window_info(
       wide_to_utf8_buf(cls),
       wide_to_utf8_buf(proc_name.c_str()),
       wide_to_utf8_buf(title),
-      cloaked != FALSE);
+      cloaked != 0,
+      cloaked,
+      has_core_window);
 }
 
 }  // namespace winome

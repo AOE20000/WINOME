@@ -45,6 +45,8 @@ struct SettingsUi {
   GtkWidget* hot_cooldown_spin = nullptr;
   GtkWidget* win_key_switch = nullptr;
   GtkWidget* overview_blacklist_switch = nullptr;
+  GtkWidget* live_wallpaper_drop = nullptr;
+  GtkWidget* dash_scope_drop = nullptr;
   GtkWidget* end_session_confirm_switch = nullptr;
   GtkWidget* dev_mode_switch = nullptr;
   GtkWidget* dev_console_btn = nullptr;
@@ -402,6 +404,18 @@ void sync_ui_from_config() {
     gtk_switch_set_active(GTK_SWITCH(g_ui.overview_blacklist_switch),
                           cfg.overview_window_blacklist ? TRUE : FALSE);
   }
+  if (g_ui.live_wallpaper_drop != nullptr) {
+    guint sel = 0;
+    if (cfg.live_wallpaper_mode == "snapshot")
+      sel = 1;
+    else if (cfg.live_wallpaper_mode == "off")
+      sel = 2;
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(g_ui.live_wallpaper_drop), sel);
+  }
+  if (g_ui.dash_scope_drop != nullptr) {
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(g_ui.dash_scope_drop),
+                               cfg.dash_isolate_workspaces ? 1u : 0u);
+  }
   if (g_ui.end_session_confirm_switch != nullptr) {
     gtk_switch_set_active(GTK_SWITCH(g_ui.end_session_confirm_switch),
                           cfg.end_session_confirm ? TRUE : FALSE);
@@ -518,6 +532,26 @@ gboolean on_overview_blacklist_set(GtkSwitch* sw G_GNUC_UNUSED,
   cfg.overview_window_blacklist = state != FALSE;
   update_config(cfg);
   return FALSE;
+}
+
+void on_live_wallpaper_mode_changed(GObject* obj, GParamSpec* pspec G_GNUC_UNUSED,
+                                    gpointer ud G_GNUC_UNUSED) {
+  if (g_ui.syncing)
+    return;
+  WinomeConfig cfg = get_config();
+  guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(obj));
+  cfg.live_wallpaper_mode = (sel == 1) ? "snapshot" : (sel == 2 ? "off" : "live");
+  update_config(cfg);
+}
+
+void on_dash_scope_changed(GObject* obj, GParamSpec* pspec G_GNUC_UNUSED,
+                           gpointer ud G_GNUC_UNUSED) {
+  if (g_ui.syncing)
+    return;
+  WinomeConfig cfg = get_config();
+  guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(obj));
+  cfg.dash_isolate_workspaces = (sel == 1);
+  update_config(cfg);
 }
 
 gboolean on_dark_titlebars_set(GtkSwitch* sw G_GNUC_UNUSED, gboolean state, gpointer ud G_GNUC_UNUSED) {
@@ -714,6 +748,8 @@ void on_window_destroy(GtkWidget* widget G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSE
   g_ui.hot_cooldown_spin = nullptr;
   g_ui.win_key_switch = nullptr;
   g_ui.overview_blacklist_switch = nullptr;
+  g_ui.live_wallpaper_drop = nullptr;
+  g_ui.dash_scope_drop = nullptr;
   g_ui.end_session_confirm_switch = nullptr;
   g_ui.dev_mode_switch = nullptr;
   g_ui.dev_console_btn = nullptr;
@@ -873,9 +909,40 @@ GtkWidget* build_behavior_page() {
   append_row_to_card(
       trig_card,
       make_row(tr("Overview System Blacklist", "概览默认黑名单"),
-               tr("Exclude \"Windows Input Experience\" and nameless blank Explorer windows from Overview",
-                  "默认在概览中过滤“Windows输入体验”及资源管理器的无名无画面窗口"),
+               tr("Exclude \"Windows Input Experience\", suspended/ghost \"Settings\" UWP windows, and nameless blank Explorer windows from Overview",
+                  "默认在概览中过滤“Windows输入体验”、后台挂起的“设置”幽灵窗口及资源管理器的无名无画面窗口"),
                g_ui.overview_blacklist_switch),
+      true);
+
+  const char* const live_wp_modes[] = {
+      tr("Live (30 FPS in Overview)", "实时动态（概览中 30 FPS）"),
+      tr("Snapshot on Open", "打开概览时抓帧"),
+      tr("Off (Static Wallpaper)", "关闭（仅静态壁纸）"),
+      nullptr};
+  g_ui.live_wallpaper_drop = gtk_drop_down_new_from_strings(live_wp_modes);
+  g_signal_connect(g_ui.live_wallpaper_drop, "notify::selected",
+                   G_CALLBACK(on_live_wallpaper_mode_changed), nullptr);
+  append_row_to_card(
+      trig_card,
+      make_row(tr("Live Wallpaper Engine Support", "第三方动态壁纸兼容"),
+               tr("Automatically mirror Wallpaper Engine / Lively / Sucrose inside Overview via borderless Windows.Graphics.Capture (zero overhead when inactive)",
+                  "自动检测 Wallpaper Engine / Lively / Sucrose 等壁纸引擎并通过无边框 WGC 在概览内实时同步（未运行时零开销）"),
+               g_ui.live_wallpaper_drop),
+      true);
+
+  const char* const dash_scopes[] = {
+      tr("All Workspaces", "所有工作区"),
+      tr("Current Workspace Only", "仅当前工作区"),
+      nullptr};
+  g_ui.dash_scope_drop = gtk_drop_down_new_from_strings(dash_scopes);
+  g_signal_connect(g_ui.dash_scope_drop, "notify::selected",
+                   G_CALLBACK(on_dash_scope_changed), nullptr);
+  append_row_to_card(
+      trig_card,
+      make_row(tr("Dash Applications", "程序坞应用范围"),
+               tr("Show running applications from all workspaces or only the active workspace",
+                  "选择在程序坞中显示所有工作区的应用，或仅显示当前工作区的应用"),
+               g_ui.dash_scope_drop),
       true);
 
   g_ui.end_session_confirm_switch = gtk_switch_new();

@@ -261,6 +261,10 @@ void sanitize_config(WinomeConfig* cfg) {
   if (cfg->clock_format != "auto" && cfg->clock_format != "24h" &&
       cfg->clock_format != "12h")
     cfg->clock_format = "auto";
+  if (cfg->live_wallpaper_mode != "live" &&
+      cfg->live_wallpaper_mode != "snapshot" &&
+      cfg->live_wallpaper_mode != "off")
+    cfg->live_wallpaper_mode = "live";
   cfg->hot_corner_cooldown_ms = std::clamp(cfg->hot_corner_cooldown_ms, 100, 5000);
 }
 
@@ -359,6 +363,10 @@ std::string serialize_config(const WinomeConfig& cfg) {
   out += cfg.win_key_overview ? "true" : "false";
   out += ",\n  \"overview_window_blacklist\": ";
   out += cfg.overview_window_blacklist ? "true" : "false";
+  out += ",\n  \"live_wallpaper_mode\": ";
+  append_escaped_json_string(cfg.live_wallpaper_mode, &out);
+  out += ",\n  \"dash_isolate_workspaces\": ";
+  out += cfg.dash_isolate_workspaces ? "true" : "false";
   out += ",\n  \"multi_monitor_panels\": ";
   out += cfg.multi_monitor_panels ? "true" : "false";
   out += ",\n  \"end_session_confirm\": ";
@@ -427,6 +435,10 @@ bool parse_config(const std::string& json, WinomeConfig* out) {
       ok = parse_json_bool(json, &pos, &cfg.win_key_overview);
     else if (key == "overview_window_blacklist")
       ok = parse_json_bool(json, &pos, &cfg.overview_window_blacklist);
+    else if (key == "live_wallpaper_mode")
+      ok = parse_json_string(json, &pos, &cfg.live_wallpaper_mode);
+    else if (key == "dash_isolate_workspaces")
+      ok = parse_json_bool(json, &pos, &cfg.dash_isolate_workspaces);
     else if (key == "multi_monitor_panels")
       ok = parse_json_bool(json, &pos, &cfg.multi_monitor_panels);
     else if (key == "end_session_confirm")

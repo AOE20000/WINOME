@@ -5,6 +5,7 @@
 #include "quick-settings.h"
 #include "i18n.h"
 #include "notifications.h"
+#include "shell-panel.h"
 #include "st-engine.h"
 #include "system-status.h"
 
@@ -346,6 +347,7 @@ on_datemenu_dnd_state_set (GtkSwitch *sw G_GNUC_UNUSED,
                            gpointer G_GNUC_UNUSED user_data)
 {
   winome::set_do_not_disturb (state != FALSE);
+  winome::notifications_notify_dnd_changed ();
   return FALSE;
 }
 
@@ -505,12 +507,73 @@ on_notif_expand_clicked (GtkButton *btn, gpointer G_GNUC_UNUSED user_data)
     gtk_widget_remove_css_class (GTK_WIDGET (btn), "expanded");
 }
 
+static void
+on_notif_card_clicked (GtkGestureClick *gesture,
+                       int n_press G_GNUC_UNUSED,
+                       double x,
+                       double y,
+                       gpointer user_data)
+{
+  GtkWidget *card = GTK_WIDGET (user_data);
+  if (card != nullptr) {
+    GtkWidget *picked = gtk_widget_pick (card, x, y, GTK_PICK_DEFAULT);
+    for (GtkWidget *w = picked; w != nullptr && w != card;
+         w = gtk_widget_get_parent (w)) {
+      if (GTK_IS_BUTTON (w))
+        return;
+    }
+  }
+  gtk_gesture_set_state (GTK_GESTURE (gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+  auto *key = static_cast<uint64_t *> (
+      g_object_get_data (G_OBJECT (card), "notif-key"));
+  if (key != nullptr && *key != 0) {
+    winome::notifications_activate (*key, -1);
+    winome_shell_panel_close_popovers ();
+  }
+}
+
+struct NotifActionData {
+  uint64_t key = 0;
+  int action_index = -1;
+};
+
+static void
+free_notif_action_data (gpointer data)
+{
+  delete static_cast<NotifActionData *> (data);
+}
+
+static void
+on_notif_action_clicked (GtkButton *btn, gpointer G_GNUC_UNUSED user_data)
+{
+  auto *act = static_cast<NotifActionData *> (
+      g_object_get_data (G_OBJECT (btn), "notif-action"));
+  if (act != nullptr && act->key != 0) {
+    winome::notifications_activate (act->key, act->action_index);
+    winome_shell_panel_close_popovers ();
+  }
+}
+
 static GtkWidget *
 create_notification_card (const winome::ShellNotification &notif,
                           int64_t now_unix)
 {
   GtkWidget *card = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
   gtk_widget_add_css_class (card, "message");
+  g_object_set_data_full (G_OBJECT (card), "notif-key",
+                          new uint64_t (notif.key), free_notif_key);
+
+  const bool activatable = notif.from_winrt || !notif.app_id.empty () ||
+                           !notif.launch_args.empty () || !notif.url.empty ();
+  if (activatable) {
+    GtkGesture *click = gtk_gesture_click_new ();
+    gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click),
+                                   GDK_BUTTON_PRIMARY);
+    g_signal_connect (click, "released", G_CALLBACK (on_notif_card_clicked),
+                      card);
+    gtk_widget_add_controller (card, GTK_EVENT_CONTROLLER (click));
+    gtk_widget_set_cursor_from_name (card, "pointer");
+  }
 
   GtkWidget *header = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, cal_msg_header_spacing ());
   gtk_widget_add_css_class (header, "message-header");
@@ -592,6 +655,26 @@ create_notification_card (const winome::ShellNotification &notif,
   if (body != nullptr)
     gtk_box_append (GTK_BOX (content), body);
 
+  if (!notif.actions.empty ()) {
+    GtkWidget *actions_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_add_css_class (actions_box, "notification-actions");
+    for (size_t i = 0; i < notif.actions.size (); ++i) {
+      GtkWidget *btn =
+          gtk_button_new_with_label (notif.actions[i].label.c_str ());
+      gtk_widget_add_css_class (btn, "notification-button");
+      gtk_widget_set_hexpand (btn, TRUE);
+      gtk_widget_set_focus_on_click (btn, FALSE);
+      g_object_set_data_full (
+          G_OBJECT (btn), "notif-action",
+          new NotifActionData {notif.key, static_cast<int> (i)},
+          free_notif_action_data);
+      g_signal_connect (btn, "clicked", G_CALLBACK (on_notif_action_clicked),
+                        nullptr);
+      gtk_box_append (GTK_BOX (actions_box), btn);
+    }
+    gtk_box_append (GTK_BOX (content), actions_box);
+  }
+
   gtk_box_append (GTK_BOX (body_row), content);
   gtk_box_append (GTK_BOX (card), body_row);
   return card;
@@ -644,6 +727,20 @@ on_calendar_notifications_changed (void *user_data)
     return;
   CalendarData *data = static_cast<CalendarData *> (
       g_object_get_data (G_OBJECT (cal), "calendar-data"));
+  if (data != nullptr && data->dnd_switch != nullptr) {
+    bool dnd_on = false;
+    if (winome::get_do_not_disturb (&dnd_on)) {
+      gboolean want = dnd_on ? TRUE : FALSE;
+      if (gtk_switch_get_active (GTK_SWITCH (data->dnd_switch)) != want) {
+        g_signal_handlers_block_by_func (data->dnd_switch,
+            (gpointer) on_datemenu_dnd_state_set, NULL);
+        gtk_switch_set_active (GTK_SWITCH (data->dnd_switch), want);
+        gtk_switch_set_state (GTK_SWITCH (data->dnd_switch), want);
+        g_signal_handlers_unblock_by_func (data->dnd_switch,
+            (gpointer) on_datemenu_dnd_state_set, NULL);
+      }
+    }
+  }
   rebuild_message_list (data, false);
 }
 
@@ -1065,5 +1162,5 @@ winome_calendar_refresh (GtkWidget *calendar)
     }
   }
 
-  rebuild_message_list (data, false);
+  rebuild_message_list (data, true);
 }

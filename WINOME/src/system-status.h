@@ -48,7 +48,12 @@ bool get_brightness(double* out);
 // Set current screen brightness as 0..1 fraction.
 bool set_brightness(double fraction);
 
-// Get/set Windows dark mode (AppsUseLightTheme / SystemUsesLightTheme).
+// Get/set Windows dark mode via fine-grained Personalize registry flags
+// (AppsUseLightTheme / SystemUsesLightTheme). Never writes or applies
+// Windows .theme files and never alters desktop wallpaper/slideshow settings.
+bool get_theme_modes(bool* apps_dark, bool* system_dark);
+bool set_app_dark_mode(bool dark);
+bool set_system_dark_mode(bool dark);
 bool get_dark_mode(bool* out);
 bool set_dark_mode(bool dark);
 
@@ -63,6 +68,9 @@ bool get_bluetooth_status(bool* present, bool* enabled,
                           char* connected_name, int name_size);
 bool set_bluetooth_enabled(bool enabled);
 int get_bluetooth_devices(BluetoothDevice* out, int max_count);
+int get_bluetooth_devices_ex(BluetoothDevice* out, int max_count,
+                             bool issue_inquiry);
+void sort_bluetooth_devices(BluetoothDevice* devs, int count);
 
 // Windows Night Light (Blue Light Reduction) state.
 bool get_night_light(bool* out);

@@ -38,7 +38,7 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 - **图层与置顶**：面板与弹出窗各自作为独立无边框顶层窗口（`shadow-wrap` 卡片），由 `WH_MOUSE_LL` 钩子处理外部点击关闭；`WS_EX_TOOLWINDOW` 由 `fullscreen-watcher` 周期性重断言防止被 GDK configure 重置。
 - **层级契约**：`popover > panel > 概览 chrome 窗口 > 概览窗口 > 应用 > 壁纸`。
 - **与概览协作**：
-  - 打开概览时关闭已开弹出窗，并给面板加 `.overview` 类使底色透明（`#panel.overview { background-color: transparent }`，对应上游 `#panel:overview`）；
+  - 打开概览时关闭已开弹出窗，顶栏背景按概览过渡进度帧同步插值（`#000000 ↔ #222226`），左侧 `WinomeActivitiesBtn` 指示点随概览内连续工作区切换进度实时平滑形变（对齐上游 `WorkspaceDot`）；
   - 允许在概览上方直接打开快速设置或日历；
   - 弹出窗被外部点击关闭时，通过 `winome_shell_panel_popover_just_closed()` 通知概览吞掉该次点击（对应 GNOME 菜单 grab 语义），不连带关闭概览。
 
@@ -58,7 +58,8 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 | `app-index.cpp` | `appSystem.js`, `appSearch.js` | 异步索引开始菜单 `.lnk`/`.url`（保留 User/Common `Programs` 目录顺序、`folder_name`/`folder_order`/`item_order`）、原生 AES-256-CBC/MT19937 解密 Win11 `start2.bin`（`decrypt_start2_bin_bytes()`，完整还原固定项与 `pinType: 2` 文件夹编组，含 `KnownFolder` `{GUID}` 与 `Export-StartLayout` 回退）及 `FOLDERID_AppsFolder`（附加 Win32 AUMID、`PKEY_AppUserModel_ID`）、`build_app_grid_items()` 两级单向同步编排（开始菜单固定配置优先 → 未固定项按目录顺序自动分组，严格单向不回写磁盘）、`FindFirstChangeNotificationW` 目录与 `start2.bin` 单向监听、`1024` 条上限 `GdkTexture` LRU 缓存与后台 `RawDecodedIcon` 解码 |
 | `app-grid.cpp` | `appDisplay.js` | 宿主内分页应用网格（`.icon-grid` / `.overview-tile` / `.app-folder` 2×2 缩略预览 / 居中 `.app-folder-dialog` 文件夹弹层与 `.folder-name-container` / `.folder-name-label`、`Esc` 或点击外部关闭 / `WinomeAppIcon` + `GSK_SCALING_FILTER_TRILINEAR` / 按当前页优先的异步分批图标加载 / 结构缓存与 `app_grid_prewarm()` / `.app-grid-running-dot` 运行点指示 / 右键 AppMenu 上下文菜单 / 滚轮与指示点翻页 / 响应式 6×4・5×3・4×3 排布） |
 | `overview-thumbs.cpp` | `workspaceThumbnail.js` | 虚拟桌面壁纸药丸行（支持拖拽落点高亮、仅 1 个桌面拖拽时自动展开 `[Desktop 1] [+]`、`+` 新建与悬停 `×`/中键关闭桌面、活动桌面指示器与迷你 DWM 预览） |
-| `ws-osd.cpp` | `workspaceSwitcherPopup.js` | 概览外切换桌面时，通过 `vd::add_change_listener()` 在主屏底部中央显示圆点 OSD（100ms EASE_OUT_QUAD 淡入 → 600ms 常驻 → 100ms 淡出，连续切换重置计时） |
+| `live-wallpaper.cpp` | 第三方动态壁纸引擎兼容（Option C 混合方案） | 快速探测 `Progman`/`WorkerW` 下的 Wallpaper Engine / Lively / Sucrose 渲染窗口，通过无边框 `Windows.Graphics.Capture`（`IsBorderRequired=false`）在概览内 30 FPS 实时同步或抓帧（受 `live_wallpaper_mode` 控制，静态壁纸场景零开销） |
+| `ws-osd.cpp` | `workspaceSwitcherPopup.js` | 概览外切换桌面时，通过 `vd::add_change_listener()` 在主屏底部中央显示透明胶囊圆点 OSD（`#winomeWsOsdWindow` 透明顶层窗 + 禁用 Win11 DWM 非客户区边框/圆角 + `WS_EX_TRANSPARENT` 鼠标穿透；100ms EASE_OUT_QUAD 淡入 → 600ms 常驻 → 100ms 淡出，连续切换重置计时） |
 
 ### 关键实现细节
 
@@ -85,10 +86,10 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 
 | 模块 | 实现机制 | 备注与降级策略 |
 |------|----------|----------------|
-| **Wi-Fi**（`src/wifi-networks.cpp`） | 运行时加载 `wlanapi.dll`，进程常驻 `WlanOpenHandle` 并注册 `WlanRegisterNotification` 事件通知 | 无网卡或缺失 `wlanapi.dll` 时触发状态报告并安静降级；支持异步扫描、BSSID 信号合并、已存 Profile 与内嵌密码输入生成 WLAN XML 连接、断开网络 |
-| **电源模式**（`src/power-modes.cpp`） | `PowrProf` + `powersetting.h` 枚举并切换节能 / 均衡（含 Win11 GUID）/ 性能 | `PowerEnumerate` 探测缺失的方案不显示；无法识别时副标题回退显示均衡 |
-| **系统状态与会话弹窗**（`src/system-status.cpp`、`src/end-session-dialog.cpp`） | 电量 `GetSystemPowerStatus`、音量 WASAPI `IAudioEndpointVolumeCallback`（事件驱动与静音切换）、屏幕亮度 WMI (`ROOT\WMI`) + `dxva2.dll` DDC/CI、电源操作自动申请 `SE_SHUTDOWN_NAME` | 外接显示器/台式机无物理亮度调节能力时动态隐藏亮度滑块行；Restart / Power Off / Log Out 在 `end_session_confirm` 开启时先显示 GNOME `.modal-dialog` 60 秒确认弹窗 |
-| **WinRT 与通知中心**（`src/winrt-bridge.cpp`、`src/notifications.cpp`、`src/calendar.cpp`） | 异步探测并桥接 Windows Radio（蓝牙开关/已配对列表）、SMTC 媒体控制与 `UserNotificationListener`（`std::shared_ptr<State>` 防超时 UAF、`winrt_acquire_com_getter_safe()` 补偿 Win11 `wpnapps.dll!NotificationVisual::get_Bindings` 漏 `AddRef` 缺陷、`60s` 拒绝冷却、`NotifWorker` 可 join 单线程 `2s`/`6s` 自适应刷新） | 在顶栏弹出双栏 DateMenu（SMTC 媒体卡片 + 通知列表/勿扰开关 + 日历）并在非勿扰/非全屏下显示顶部通知横幅 |
+| **Wi-Fi**（`src/wifi-networks.cpp`） | 运行时加载 `wlanapi.dll`，进程常驻 `WlanOpenHandle` 并注册 `WlanRegisterNotification` 事件通知；快速设置抽屉打开期间由事件监听 + 4s 后台扫描异步实时刷新 | 无网卡或缺失 `wlanapi.dll` 时触发状态报告并安静降级；支持异步扫描、BSSID 信号合并、已存 Profile 与内嵌密码输入生成 WLAN XML 连接、断开网络 |
+| **电源模式**（`src/power-modes.cpp`） | 动态加载 `powrprof.dll` 的 Windows 10/11 Power Overlay Schemes（`PowerGetEffectiveOverlayScheme` / `PowerGetActualOverlayScheme` / `PowerSetActiveOverlayScheme`）实现节能 / 均衡 / 性能三档与系统设置双向同步 | 若当前为旧版非平衡基础计划则自动切回平衡计划使覆盖方案生效；不支持 Overlay 的旧系统自动回退传统 `PowerEnumerate`/`PowerSetActiveScheme` |
+| **系统状态、明暗主题与会话弹窗**（`src/system-status.cpp`、`src/end-session-dialog.cpp`） | 电量 `GetSystemPowerStatus`、音量 WASAPI `IAudioEndpointVolumeCallback`（事件驱动与静音切换）、屏幕亮度 WMI (`ROOT\WMI`) + `dxva2.dll` DDC/CI、细粒度独立 `AppsUseLightTheme` / `SystemUsesLightTheme` 注册表读写（绝不创建或覆盖 Windows `.theme` 与幻灯片壁纸）、蓝牙抽屉 3s/9s 异步刷新、电源操作自动申请 `SE_SHUTDOWN_NAME` | 外接显示器/台式机无物理亮度调节能力时动态隐藏亮度滑块行；Restart / Power Off / Log Out 在 `end_session_confirm` 开启时先显示 GNOME `.modal-dialog` 60 秒确认弹窗 |
+| **WinRT 与通知中心**（`src/winrt-bridge.cpp`、`src/notifications.cpp`、`src/calendar.cpp`） | 异步桥接 Windows Radio（蓝牙开关/已配对列表）、SMTC 媒体控制与 `UserNotificationListener`（`std::shared_ptr<State>` 防超时 UAF、`winrt_acquire_com_getter_safe()` 补偿 Win11 `wpnapps.dll!NotificationVisual::get_Bindings` 漏 `AddRef`、只读 `wpndatabase.db` SQLite 回退与 XML 元数据补全、Win11 逐 ID `RemoveNotification` 联动清除），并支持点击通知卡片/横幅/操作按钮通过协议 URI、`IApplicationActivationManager` 深链、Win32 窗口唤醒或 `AppIndex` 打开对应应用 | 在顶栏弹出双栏 DateMenu（SMTC 媒体卡片 + 可点击通知列表/操作按钮/勿扰开关 + 日历）并在非勿扰/非全屏下显示顶部通知横幅 |
 | **系统托盘**（`src/systray.cpp`、`src/native-taskbar.cpp`） | 混合采集经典 `ToolbarWindow32` 与 Win11 XAML（`DesktopWindowContentBridge` 中的 `NotifyItemIcon` / `TopLevelWindowForOverflowXamlIsland` / `NotifyIconOverflowWindow`）第三方托盘图标；拆分为独立 `action_worker`（高优点击/溢出切换）与 `scan_worker`（`5s` 巡检并保留 `last_xo_items`，`shell_tray_mu` 保护显隐切换），配置 `IUIAutomation2`（`800ms`/`1500ms` 超时）与 `FindAllBuildCache` 批量拉取属性，并以 `entry.id`/标题双重内存缓存来自 `HKCU\Control Panel\NotifyIconSettings` 的真实图标 | 按 `TraySurface` 直达激活（溢出项免盲扫 `Shell_TrayWnd`），点击/右键立即收起 GTK 浮层并 `AllowSetForegroundWindow(ASFW_ANY)`，优先 `IUIAutomationElement3::ShowContextMenu()`（失败回退 `Shift+F10`/物理右键，右键保活 `1500ms` + `#32768` 检测）；`inspect.tray` 为非阻塞瞬时快照（`SendMessageTimeoutW` 50ms + 缓存 `uia_probe`），`winome-ctl` 启用 `PeekNamedPipe` 回复超时保护 |
 | **多屏、外观统一、配置与设置**（`src/monitor-manager.cpp`、`src/window-theming.cpp`、`src/config.cpp`、`src/i18n.cpp`、`src/settings-window.cpp`） | `EnumDisplayMonitors` 与 `SPI_SETWORKAREA`（`on_workarea_changed`）管理多屏面板与 DPI 变化；`window-theming` 通过 `SetWinEventHook` 零注入应用 DWM 暗色标题栏/圆角（默认关闭）；`%LOCALAPPDATA%\WINOME\config.json` 热重载；深色 Adwaita GTK4 设置窗 | 支持单/全屏顶栏策略、热角与 Win 键策略、概览默认黑名单（`overview_window_blacklist`）、可选窗口外观统一、时钟/电量选项、`Diagnostics` 遥测页与桌面重启自恢复 |
 

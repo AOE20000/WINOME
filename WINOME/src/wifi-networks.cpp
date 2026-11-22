@@ -461,6 +461,7 @@ winome_wifi_scan (WinomeWifiNetwork **out, guint *out_count)
                strcmp (current_ssid, slot->ssid) == 0);
           count++;
         }
+        winome_wifi_sort_networks (result, count);
         *out = result;
         if (out_count != nullptr)
           *out_count = count;
@@ -694,6 +695,123 @@ winome_wifi_connect_with_password (const char *ssid,
         params.dwFlags = 0;
         ok = g_api.Connect (client, &info->InterfaceGuid, &params, nullptr)
              == ERROR_SUCCESS;
+      }
+    }
+    g_api.FreeMemory (list);
+  }
+  g_api.CloseHandle (client, nullptr);
+  return ok;
+}
+
+void
+winome_wifi_sort_networks (WinomeWifiNetwork *nets, guint count)
+{
+  if (nets == nullptr || count <= 1)
+    return;
+  std::sort (nets, nets + count,
+             [] (const WinomeWifiNetwork &a, const WinomeWifiNetwork &b) {
+               if (a.connected != b.connected)
+                 return a.connected != FALSE;
+               if (a.signal_quality != b.signal_quality)
+                 return a.signal_quality > b.signal_quality;
+               return std::strcmp (a.ssid, b.ssid) < 0;
+             });
+}
+
+gboolean
+winome_wifi_query_snapshot_threadsafe (WinomeWifiStatus *status_out,
+                                       WinomeWifiNetwork **nets_out,
+                                       guint *count_out,
+                                       gboolean trigger_scan)
+{
+  if (status_out != nullptr)
+    memset (status_out, 0, sizeof (*status_out));
+  if (nets_out != nullptr)
+    *nets_out = nullptr;
+  if (count_out != nullptr)
+    *count_out = 0;
+
+  if (!load_api ())
+    return FALSE;
+
+  DWORD negotiated = 0;
+  HANDLE client = nullptr;
+  if (g_api.OpenHandle (2, nullptr, &negotiated, &client) != ERROR_SUCCESS ||
+      client == nullptr) {
+    return FALSE;
+  }
+
+  PWLAN_INTERFACE_INFO_LIST list = nullptr;
+  gboolean ok = FALSE;
+  if (enum_interfaces (client, &list)) {
+    const WLAN_INTERFACE_INFO *info = pick_interface (list);
+    if (info != nullptr) {
+      WinomeWifiStatus st = {};
+      const bool base_enabled =
+          (info->isState != wlan_interface_state_not_ready);
+      st.enabled = query_radio_enabled (client, info->InterfaceGuid,
+                                        base_enabled);
+      st.connected =
+          (info->isState == wlan_interface_state_connected ||
+           info->isState == wlan_interface_state_ad_hoc_network_formed);
+      if (query_connection (client, info->InterfaceGuid, st.ssid,
+                            sizeof (st.ssid), &st.signal_quality)) {
+        st.connected = TRUE;
+      }
+      if (status_out != nullptr)
+        *status_out = st;
+      ok = TRUE;
+
+      if (trigger_scan && st.enabled && g_api.Scan != nullptr)
+        g_api.Scan (client, &info->InterfaceGuid, nullptr, nullptr, nullptr);
+
+      if (nets_out != nullptr && st.enabled) {
+        PWLAN_AVAILABLE_NETWORK_LIST avail = nullptr;
+        if (g_api.GetAvailableNetworkList (client, &info->InterfaceGuid, 0,
+                                           nullptr, &avail) == ERROR_SUCCESS &&
+            avail != nullptr) {
+          auto *result = static_cast<WinomeWifiNetwork *> (
+              calloc (avail->dwNumberOfItems + 1, sizeof (WinomeWifiNetwork)));
+          if (result != nullptr) {
+            DWORD count = 0;
+            for (DWORD i = 0; i < avail->dwNumberOfItems; i++) {
+              const WLAN_AVAILABLE_NETWORK &net = avail->Network[i];
+              char name[97] = "";
+              copy_ssid (net.dot11Ssid, name, sizeof (name));
+              if (name[0] == '\0')
+                continue;
+
+              bool merged = false;
+              for (DWORD k = 0; k < count; k++) {
+                if (strcmp (result[k].ssid, name) == 0) {
+                  if ((int)net.wlanSignalQuality > result[k].signal_quality) {
+                    result[k].signal_quality = (int)net.wlanSignalQuality;
+                    result[k].secured = net.bSecurityEnabled != 0;
+                    result[k].connectable = net.bNetworkConnectable != 0;
+                  }
+                  merged = true;
+                  break;
+                }
+              }
+              if (merged)
+                continue;
+
+              WinomeWifiNetwork *slot = &result[count];
+              memcpy (slot->ssid, name, sizeof (name));
+              slot->signal_quality = (int)net.wlanSignalQuality;
+              slot->secured = net.bSecurityEnabled != 0;
+              slot->connectable = net.bNetworkConnectable != 0;
+              slot->connected =
+                  (st.ssid[0] != '\0' && strcmp (st.ssid, slot->ssid) == 0);
+              count++;
+            }
+            winome_wifi_sort_networks (result, count);
+            *nets_out = result;
+            if (count_out != nullptr)
+              *count_out = count;
+          }
+          g_api.FreeMemory (avail);
+        }
       }
     }
     g_api.FreeMemory (list);

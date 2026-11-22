@@ -64,6 +64,18 @@ gchar *winome_wifi_build_profile_xml (const char *ssid,
 // Issue a non-blocking hardware WLAN scan on a background thread.
 void winome_wifi_trigger_scan_async (void);
 
+// Thread-safe snapshot for background worker threads: opens a local WLAN
+// handle, optionally triggers hardware WlanScan, populates @status_out and
+// sorted @nets_out (free with winome_wifi_free_networks), and closes the handle.
+gboolean winome_wifi_query_snapshot_threadsafe (WinomeWifiStatus *status_out,
+                                                WinomeWifiNetwork **nets_out,
+                                                guint *count_out,
+                                                gboolean trigger_scan);
+
+// Sort networks GNOME-style: connected first, then signal_quality descending,
+// then SSID ascending (exposed for unit tests).
+void winome_wifi_sort_networks (WinomeWifiNetwork *nets, guint count);
+
 // Disconnect the current association (the radio stays on).
 gboolean winome_wifi_disconnect (void);
 

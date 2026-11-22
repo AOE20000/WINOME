@@ -116,7 +116,12 @@ void overview_thumbs_repopulate (GtkWidget *thumbs, int count, int active,
                                  double porthole_w, double porthole_h,
                                  GdkTexture *wallpaper,
                                  bool can_manage = false,
-                                 bool force_show = false);
+                                 bool force_show = false,
+                                 double panel_top_ratio = 0.0);
+
+// Update only the wallpaper texture for live wallpaper frames without
+// rebuilding pill geometry or triggering resize churn.
+void overview_thumbs_set_wallpaper (GtkWidget *thumbs, GdkTexture *wallpaper);
 
 // Natural size in LOGICAL px; height 0 when there is nothing to show.
 int overview_thumbs_get_width (GtkWidget *thumbs);
@@ -134,6 +139,12 @@ double overview_thumbs_get_scale (GtkWidget *thumbs);
 // Continuous indicator position while a workspace switch animates. Negative
 // snaps back to `active`.
 void overview_thumbs_set_indicator_value (GtkWidget *thumbs, double value);
+
+// GPU snapshot transform matching GNOME Shell overviewControls.js
+// _getThumbnailsBoxParams() (pivot 0.5, 0.5: scale 1.0->0.5, translate_y
+// 0->height/2 when transitioning between WINDOW_PICKER and APP_GRID).
+void overview_thumbs_set_transform (GtkWidget *thumbs, double scale,
+                                    double translate_y);
 
 // Highlight target index during window drag (-1 = none, 0..count-1 = pill,
 // count = '+' new-desktop pill).

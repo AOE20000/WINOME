@@ -70,6 +70,7 @@ struct DashApp {
   std::string name;          // hover label text (UTF-8)
   GdkTexture *icon = nullptr;
   std::vector<HWND> windows; // z-order, topmost first
+  std::vector<int> window_desktops; // parallel to windows (-1 if unknown)
   bool pinned = false;
 };
 
@@ -95,10 +96,12 @@ struct WinomeDash {
   int pill_x = 0, pill_y = 0, pill_w = 0, pill_h = 0; // widget-relative
   std::vector<DashTileRect> tile_rects;
   int hover_index = -1;    // -1 = none
+  int pressed_index = -1;  // -1 = none
   bool show_apps_active = false;
 
   HMONITOR last_monitor = nullptr;
   int last_max_height = 96;
+  int last_active_desktop = -1;
 
   void (*show_apps_cb) (void *) = nullptr;
   void *show_apps_data = nullptr;
@@ -106,8 +109,10 @@ struct WinomeDash {
   void *changed_data = nullptr;
 
   GdkRGBA pill_color;
+  GdkRGBA pill_border_color;
   GdkRGBA tile_color;
   GdkRGBA tile_hover_color;
+  GdkRGBA tile_active_color;
   GdkRGBA tile_checked_color;
   GdkRGBA sep_color;
   GdkRGBA fg_color;
@@ -133,10 +138,12 @@ resolve_colors (WinomeDash *self)
   self->colors_resolved = true;
 
   self->pill_color = (GdkRGBA){0.22f, 0.22f, 0.23f, 1.0f};   // #38383b
+  self->pill_border_color = (GdkRGBA){0.98f, 0.98f, 0.98f, 0.08f};
   self->tile_color = self->pill_color;                        // flat on dash
   self->tile_hover_color = (GdkRGBA){0.286f, 0.286f, 0.302f, 1.0f}; // #49494d
+  self->tile_active_color = (GdkRGBA){0.345f, 0.345f, 0.365f, 1.0f}; // #58585d
   self->tile_checked_color = (GdkRGBA){0.294f, 0.294f, 0.310f, 1.0f}; // #4b4b4f
-  self->sep_color = (GdkRGBA){0.98f, 0.98f, 0.98f, 0.12f};
+  self->sep_color = (GdkRGBA){0.98f, 0.98f, 0.98f, 0.14f};
   self->fg_color = (GdkRGBA){0.98f, 0.98f, 0.98f, 1.0f};      // #fafafb
 
   StEngine *engine = StEngine::get ();
@@ -206,12 +213,12 @@ dash_is_alt_tab_window (HWND hwnd)
   return true;
 }
 
-bool
-dash_is_cloaked (HWND hwnd)
+DWORD
+dash_cloaked_flags (HWND hwnd)
 {
-  BOOL cloaked = FALSE;
+  DWORD cloaked = 0;
   DwmGetWindowAttribute (hwnd, DWMWA_CLOAKED, &cloaked, sizeof (cloaked));
-  return cloaked != FALSE;
+  return cloaked;
 }
 
 std::wstring
@@ -328,10 +335,17 @@ exe_file_description (const std::wstring &exe)
   return result;
 }
 
+struct DashWindowEntry {
+  HWND hwnd = nullptr;
+  int desktop_index = -1;
+};
+
 struct EnumCtx {
-  HMONITOR monitor;
-  std::vector<HWND> *windows;
-  bool vd_filter = false;
+  HMONITOR monitor = nullptr;
+  std::vector<DashWindowEntry> *windows = nullptr;
+  bool vd_available = false;
+  bool isolate_workspaces = false;
+  int target_desktop = -1;
   bool use_blacklist = true;
 };
 
@@ -343,10 +357,17 @@ dash_collect (HWND hwnd, LPARAM lparam)
       is_overview_default_blacklisted_hwnd (hwnd, ctx->use_blacklist))
     return TRUE;
 
-  if (ctx->vd_filter) {
-    if (!vd::window_on_current (hwnd))
-      return TRUE;
-  } else if (dash_is_cloaked (hwnd)) {
+  const DWORD cloaked = dash_cloaked_flags (hwnd);
+  int win_ws = -1;
+  bool on_cur = false;
+  if (ctx->vd_available) {
+    win_ws = vd::window_desktop_index (hwnd);
+    if (win_ws < 0 && ctx->isolate_workspaces)
+      on_cur = vd::window_on_current (hwnd);
+  }
+  if (!should_include_dash_window (ctx->isolate_workspaces, ctx->vd_available,
+                                   ctx->target_desktop, win_ws, on_cur,
+                                   cloaked)) {
     return TRUE;
   }
 
@@ -365,7 +386,7 @@ dash_collect (HWND hwnd, LPARAM lparam)
   if (MonitorFromRect (&r, MONITOR_DEFAULTTONULL) != ctx->monitor)
     return TRUE;
 
-  ctx->windows->push_back (hwnd);
+  ctx->windows->push_back (DashWindowEntry{hwnd, win_ws});
   return TRUE;
 }
 
@@ -481,6 +502,11 @@ place_label (WinomeDash *self, int index)
                              ? gtk_widget_get_opacity (self->label)
                              : 0.0;
   gtk_widget_set_opacity (self->label, start_opacity);
+  if (self->root_fixed != nullptr &&
+      gtk_widget_get_parent (self->label) == self->root_fixed) {
+    // Keep .dash-label above g_ws_bg / g_app_grid_clip inside root GtkFixed.
+    gtk_widget_insert_before (self->label, self->root_fixed, nullptr);
+  }
   gtk_widget_set_visible (self->label, TRUE);
   tween_opacity (self->label, start_opacity, 1.0, kLabelShowMs,
                  Ease::ease_out_quad);
@@ -535,19 +561,35 @@ activate_app (WinomeDash *self, int index)
   if (index < 0 || index >= (int)self->apps.size ())
     return;
 
+  const DashApp &app = self->apps[index];
+  const int cur_ws =
+      self->last_active_desktop >= 0 ? self->last_active_desktop
+                                     : vd::current_index ();
   HWND best = nullptr;
-  for (HWND hwnd : self->apps[index].windows) {
+  int best_ws = -1;
+  // Prefer a window on the currently active workspace if available; otherwise
+  // fall back to the topmost window across all workspaces and switch to it.
+  for (size_t i = 0; i < app.windows.size (); ++i) {
+    HWND hwnd = app.windows[i];
     if (!IsWindow (hwnd))
       continue;
-    best = hwnd;
-    break;
+    int ws = (i < app.window_desktops.size ()) ? app.window_desktops[i] : -1;
+    if (best == nullptr) {
+      best = hwnd;
+      best_ws = ws;
+    }
+    if (cur_ws >= 0 && ws == cur_ws) {
+      best = hwnd;
+      best_ws = ws;
+      break;
+    }
   }
   if (best == nullptr) {
     overview_discard_restore_focus ();
-    if (app_index_launch_id (self->apps[index].id, false) ||
-        (!self->apps[index].exe_path.empty () &&
+    if (app_index_launch_id (app.id, false) ||
+        (!app.exe_path.empty () &&
          reinterpret_cast<INT_PTR> (ShellExecuteW (
-             nullptr, L"open", self->apps[index].exe_path.c_str (), nullptr,
+             nullptr, L"open", app.exe_path.c_str (), nullptr,
              nullptr, SW_SHOWNORMAL)) > 32)) {
       close_overview ("dash-launch-favorite");
     }
@@ -555,6 +597,10 @@ activate_app (WinomeDash *self, int index)
   }
 
   overview_discard_restore_focus ();
+  if (best_ws < 0 && vd::available ())
+    best_ws = vd::window_desktop_index (best);
+  if (best_ws >= 0 && best_ws != vd::current_index ())
+    vd::switch_to (best_ws);
   if (IsIconic (best))
     ShowWindow (best, SW_RESTORE);
   SetForegroundWindow (best);
@@ -647,7 +693,7 @@ on_dash_menu_toggle_pin (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
   toggle_app_id_pinned (ctx->app_id);
   overview_dash_close_menu (GTK_WIDGET (self));
   overview_dash_repopulate (GTK_WIDGET (self), self->last_monitor,
-                            self->last_max_height);
+                            self->last_max_height, self->last_active_desktop);
   if (self->changed_cb != nullptr)
     self->changed_cb (self->changed_data);
 }
@@ -667,6 +713,7 @@ on_dash_menu_close_all (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 struct DashWindowCtx {
   WinomeDash *self = nullptr;
   HWND hwnd = nullptr;
+  int desktop_index = -1;
 };
 
 void
@@ -675,8 +722,13 @@ on_dash_menu_window (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
   auto *wctx = static_cast<DashWindowCtx *> (user_data);
   WinomeDash *self = wctx->self;
   HWND hwnd = wctx->hwnd;
+  int ws = wctx->desktop_index;
   overview_dash_close_menu (GTK_WIDGET (self));
   overview_discard_restore_focus ();
+  if (ws < 0 && vd::available ())
+    ws = vd::window_desktop_index (hwnd);
+  if (ws >= 0 && ws != vd::current_index ())
+    vd::switch_to (ws);
   if (app_index_activate_hwnd (hwnd))
     close_overview ("dash-activate-window");
 }
@@ -767,16 +819,27 @@ show_dash_context_menu (WinomeDash *self, int index)
     gtk_widget_set_sensitive (hdr, FALSE);
     gtk_box_append (GTK_BOX (box), hdr);
 
+    const bool show_ws_tag =
+        !get_config ().dash_isolate_workspaces && vd::count () > 1;
+    const int cur_ws =
+        self->last_active_desktop >= 0 ? self->last_active_desktop
+                                       : vd::current_index ();
     int shown = 0;
-    for (HWND hwnd : app.windows) {
-      if (!IsWindow (hwnd) || shown >= 8)
+    for (size_t wi = 0; wi < app.windows.size () && shown < 8; ++wi) {
+      HWND hwnd = app.windows[wi];
+      if (!IsWindow (hwnd))
         continue;
+      int ws = (wi < app.window_desktops.size ()) ? app.window_desktops[wi] : -1;
       wchar_t wtitle[256] = L"";
       GetWindowTextW (hwnd, wtitle, 256);
       std::string title = app_wide_to_utf8 (wtitle);
       if (title.empty ())
         title = app.name;
-      auto *wctx = new DashWindowCtx{self, hwnd};
+      if (show_ws_tag && ws >= 0 && ws != cur_ws) {
+        title += std::string (" · ") + tr ("Workspace ", "工作区 ") +
+                 std::to_string (ws + 1);
+      }
+      auto *wctx = new DashWindowCtx{self, hwnd, ws};
       GtkWidget *wbtn = gtk_button_new_with_label (title.c_str ());
       gtk_widget_set_name (wbtn, "winome-dash-ctx-item");
       gtk_widget_add_css_class (wbtn, "popup-menu-item");
@@ -918,27 +981,146 @@ on_dash_motion_leave (GtkEventControllerMotion *motion, gpointer user_data)
   hide_label (self);
 }
 
+struct DashScopeCtx {
+  WinomeDash *self = nullptr;
+  bool isolate = false;
+};
+
+void
+on_dash_scope_menu_clicked (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
+{
+  auto *sctx = static_cast<DashScopeCtx *> (user_data);
+  WinomeDash *self = sctx->self;
+  bool isolate = sctx->isolate;
+  overview_dash_close_menu (GTK_WIDGET (self));
+  WinomeConfig cfg = get_config ();
+  if (cfg.dash_isolate_workspaces != isolate) {
+    cfg.dash_isolate_workspaces = isolate;
+    update_config (cfg);
+  }
+}
+
+void
+show_dash_scope_menu (WinomeDash *self, double x, double y)
+{
+  overview_dash_close_menu (GTK_WIDGET (self));
+  hide_label (self);
+
+  GtkWidget *popover = gtk_popover_new ();
+  install_bundled_fonts (popover);
+  gtk_widget_add_css_class (popover, "winome-context-popover");
+  gtk_widget_set_parent (popover, GTK_WIDGET (self));
+  gtk_popover_set_has_arrow (GTK_POPOVER (popover), TRUE);
+  gtk_popover_set_position (GTK_POPOVER (popover), GTK_POS_TOP);
+  gtk_popover_set_autohide (GTK_POPOVER (popover), TRUE);
+  GdkRectangle target = {(int)x - 4, (int)y - 4, 8, 8};
+  gtk_popover_set_pointing_to (GTK_POPOVER (popover), &target);
+
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
+  GtkWidget *hdr =
+      gtk_label_new (tr ("Dash Applications", "程序坞应用范围"));
+  gtk_label_set_xalign (GTK_LABEL (hdr), 0.0f);
+  gtk_widget_add_css_class (hdr, "popup-menu-item");
+  gtk_widget_add_css_class (hdr, "popup-inactive-menu-item");
+  gtk_widget_set_sensitive (hdr, FALSE);
+  gtk_box_append (GTK_BOX (box), hdr);
+
+  const bool iso = get_config ().dash_isolate_workspaces;
+  auto add_opt = [&] (const char *en, const char *zh, bool want_iso) {
+    std::string label =
+        std::string (iso == want_iso ? "✓  " : "     ") + tr (en, zh);
+    auto *sctx = new DashScopeCtx{self, want_iso};
+    GtkWidget *btn = gtk_button_new_with_label (label.c_str ());
+    gtk_widget_set_name (btn, "winome-dash-ctx-item");
+    gtk_widget_add_css_class (btn, "popup-menu-item");
+    gtk_widget_set_focus_on_click (btn, FALSE);
+    GtkWidget *lbl = gtk_button_get_child (GTK_BUTTON (btn));
+    if (GTK_IS_LABEL (lbl))
+      gtk_label_set_xalign (GTK_LABEL (lbl), 0.0f);
+    g_object_set_data_full (
+        G_OBJECT (btn), "winome-dash-scope-ctx", sctx,
+        [] (gpointer p) { delete static_cast<DashScopeCtx *> (p); });
+    g_signal_connect (btn, "clicked", G_CALLBACK (on_dash_scope_menu_clicked),
+                      sctx);
+    gtk_box_append (GTK_BOX (box), btn);
+  };
+  add_opt ("Show Apps from All Workspaces", "显示所有工作区的应用", false);
+  add_opt ("Current Workspace Only", "仅显示当前工作区的应用", true);
+
+  gtk_popover_set_child (GTK_POPOVER (popover), box);
+  g_signal_connect (
+      popover, "closed", G_CALLBACK (+[] (GtkPopover *p, gpointer d) {
+        auto *dash = WINOME_DASH (d);
+        if (dash->active_menu == GTK_WIDGET (p))
+          dash->active_menu = nullptr;
+        if (gtk_widget_get_parent (GTK_WIDGET (p)) != nullptr)
+          gtk_widget_unparent (GTK_WIDGET (p));
+      }),
+      self);
+  g_signal_connect (
+      popover, "map", G_CALLBACK (+[] (GtkWidget *p, gpointer G_GNUC_UNUSED) {
+        promote_dash_popover_hwnd_topmost (p);
+      }),
+      nullptr);
+  self->active_menu = popover;
+  gtk_popover_popup (GTK_POPOVER (popover));
+  promote_dash_popover_hwnd_topmost (popover);
+}
+
+void
+on_dash_press (GtkGestureClick *gesture, int n_press G_GNUC_UNUSED, double x,
+               double y, gpointer user_data)
+{
+  WinomeDash *self = WINOME_DASH (user_data);
+  guint button =
+      gtk_gesture_single_get_current_button (GTK_GESTURE_SINGLE (gesture));
+  if (button != GDK_BUTTON_PRIMARY)
+    return;
+  int idx = tile_at (self, x, y);
+  if (idx != self->pressed_index) {
+    self->pressed_index = idx;
+    gtk_widget_queue_draw (GTK_WIDGET (self));
+  }
+}
+
+void
+on_dash_click_stopped (GtkGestureClick *gesture G_GNUC_UNUSED,
+                       gpointer user_data)
+{
+  WinomeDash *self = WINOME_DASH (user_data);
+  if (self->pressed_index != -1) {
+    self->pressed_index = -1;
+    gtk_widget_queue_draw (GTK_WIDGET (self));
+  }
+}
+
 void
 on_dash_click (GtkGestureClick *gesture, int n_press, double x, double y,
                gpointer user_data)
 {
   (void)n_press;
   WinomeDash *self = WINOME_DASH (user_data);
+  if (self->pressed_index != -1) {
+    self->pressed_index = -1;
+    gtk_widget_queue_draw (GTK_WIDGET (self));
+  }
   guint button =
       gtk_gesture_single_get_current_button (GTK_GESTURE_SINGLE (gesture));
   int index = tile_at (self, x, y);
-  if (index < 0)
-    return;
 
   if (button == GDK_BUTTON_SECONDARY) {
-    if (index < (int)self->apps.size ()) {
+    if (index >= 0 && index < (int)self->apps.size ()) {
       gtk_gesture_set_state (GTK_GESTURE (gesture), GTK_EVENT_SEQUENCE_CLAIMED);
       show_dash_context_menu (self, index);
+    } else if (x >= self->pill_x && x < self->pill_x + self->pill_w &&
+               y >= self->pill_y && y < self->pill_y + self->pill_h) {
+      gtk_gesture_set_state (GTK_GESTURE (gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+      show_dash_scope_menu (self, x, y);
     }
     return;
   }
 
-  if (button != GDK_BUTTON_PRIMARY)
+  if (index < 0 || button != GDK_BUTTON_PRIMARY)
     return;
 
   if (index < (int)self->apps.size ()) {
@@ -967,7 +1149,7 @@ winome_dash_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
   if (w <= 0 || h <= 0)
     return;
 
-  // .dash-background pill.
+  // .dash-background pill with subtle 1px GNOME border.
   graphene_rect_t pill_rect;
   graphene_rect_init (&pill_rect, self->pill_x, self->pill_y, self->pill_w,
                       self->pill_h);
@@ -976,13 +1158,17 @@ winome_dash_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
   gtk_snapshot_push_rounded_clip (snapshot, &pill);
   gtk_snapshot_append_color (snapshot, &self->pill_color, &pill_rect);
   gtk_snapshot_pop (snapshot);
+  const float border_w[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+  const GdkRGBA border_c[4] = {self->pill_border_color, self->pill_border_color,
+                               self->pill_border_color, self->pill_border_color};
+  gtk_snapshot_append_border (snapshot, &pill, border_w, border_c);
 
   // Separator between Pinned Favorites and Unpinned Running Apps.
   if (self->separator_x >= 0) {
     graphene_rect_t sep_rect;
     graphene_rect_init (&sep_rect, (float)self->separator_x,
-                        (float)(self->pill_y + kDashPadV), 1.0f,
-                        (float)(self->pill_h - 2 * kDashPadV));
+                        (float)(self->pill_y + kDashPadV + 6), 1.0f,
+                        (float)std::max (self->pill_h - 2 * kDashPadV - 12, 8));
     gtk_snapshot_append_color (snapshot, &self->sep_color, &sep_rect);
   }
 
@@ -991,9 +1177,11 @@ winome_dash_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
     const DashTileRect &r = self->tile_rects[i];
     bool is_show_apps = (i == (int)self->apps.size ());
 
-    // .overview-icon tile background (hover / show-apps checked state).
+    // .overview-icon tile background (active / hover / show-apps checked).
     const GdkRGBA *bg_tile = nullptr;
-    if (is_show_apps && self->show_apps_active && i != self->hover_index)
+    if (i == self->pressed_index)
+      bg_tile = &self->tile_active_color;
+    else if (is_show_apps && self->show_apps_active && i != self->hover_index)
       bg_tile = &self->tile_checked_color;
     else if (i == self->hover_index)
       bg_tile = &self->tile_hover_color;
@@ -1049,11 +1237,11 @@ winome_dash_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
       }
     }
 
-    // Running dot: only shown when the app has open windows on this monitor
-    // (favorites with no active windows show cleanly without a dot).
+    // Running dot: centered cleanly in the bottom padding BELOW the tile
+    // (upstream _dash.scss .app-grid-running-dot), never overlapping the icon.
     if (i < (int)self->apps.size () && !self->apps[i].windows.empty ()) {
       double cx = r.x + r.w / 2.0;
-      double dy = r.y + r.h - kTilePad - kDotSize / 2.0 - 0.5;
+      double dy = r.y + r.h + 2.5;
       graphene_rect_t dot;
       graphene_rect_init (&dot, cx - kDotSize / 2.0, dy, kDotSize, kDotSize);
       GskRoundedRect rr;
@@ -1091,7 +1279,9 @@ winome_dash_init (WinomeDash *self)
   self->icon_size = 64;
   self->item_gap = kItemGap;
   self->hover_index = -1;
+  self->pressed_index = -1;
   self->last_max_height = 96;
+  self->last_active_desktop = -1;
   gtk_widget_set_cursor_from_name (GTK_WIDGET (self), "default");
 }
 
@@ -1241,6 +1431,8 @@ overview_dash_new (GtkWidget *root_fixed)
 
   GtkGesture *click = gtk_gesture_click_new ();
   gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), 0);
+  g_signal_connect (click, "pressed", G_CALLBACK (on_dash_press), self);
+  g_signal_connect (click, "stopped", G_CALLBACK (on_dash_click_stopped), self);
   g_signal_connect (click, "released", G_CALLBACK (on_dash_click), self);
   gtk_widget_add_controller (GTK_WIDGET (self), GTK_EVENT_CONTROLLER (click));
 
@@ -1295,7 +1487,8 @@ overview_dash_close_menu (GtkWidget *dash)
 }
 
 void
-overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
+overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height,
+                          int active_desktop)
 {
   if (dash == nullptr)
     return;
@@ -1303,8 +1496,10 @@ overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
   overview_dash_close_menu (dash);
   hide_label (self);
   self->hover_index = -1;
+  self->pressed_index = -1;
   self->last_monitor = monitor;
   self->last_max_height = max_height;
+  self->last_active_desktop = active_desktop;
   clear_apps (self);
 
   // Icon size ceiling from available dash height.
@@ -1317,9 +1512,14 @@ overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
   }
 
   // Enumerate windows top-down and group into running applications.
-  std::vector<HWND> windows;
-  EnumCtx ctx{monitor, &windows, vd::available (),
-              winome::get_config ().overview_window_blacklist};
+  WinomeConfig cfg = get_config ();
+  const bool vd_avail = vd::available ();
+  const int target_ws =
+      (active_desktop >= 0) ? active_desktop
+                            : (vd_avail ? vd::current_index () : -1);
+  std::vector<DashWindowEntry> windows;
+  EnumCtx ctx{monitor, &windows, vd_avail, cfg.dash_isolate_workspaces,
+              target_ws, cfg.overview_window_blacklist};
   EnumWindows (dash_collect, reinterpret_cast<LPARAM> (&ctx));
 
   struct RunningGroup {
@@ -1327,10 +1527,12 @@ overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
     std::wstring exe;
     std::string name;
     std::vector<HWND> windows;
+    std::vector<int> window_desktops;
   };
   std::vector<RunningGroup> running;
 
-  for (HWND hwnd : windows) {
+  for (const DashWindowEntry &we : windows) {
+    HWND hwnd = we.hwnd;
     std::wstring aumid = window_aumid (hwnd);
     std::wstring exe = window_exe_path (hwnd);
     std::string id = canonical_app_id (aumid, exe, std::wstring{});
@@ -1353,9 +1555,9 @@ overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
       idx = running.size () - 1;
     }
     running[idx].windows.push_back (hwnd);
+    running[idx].window_desktops.push_back (we.desktop_index);
   }
 
-  WinomeConfig cfg = get_config ();
   std::vector<bool> running_consumed (running.size (), false);
 
   auto find_running_match = [&] (const std::string &pin_id) -> size_t {
@@ -1413,6 +1615,7 @@ overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
       running_consumed[ridx] = true;
       cand.app.exe_path = running[ridx].exe;
       cand.app.windows = std::move (running[ridx].windows);
+      cand.app.window_desktops = std::move (running[ridx].window_desktops);
       cand.app.name = cand.has_entry ? cand.entry.name : running[ridx].name;
       cand.from_running = true;
     } else if (cand.has_entry) {
@@ -1440,6 +1643,7 @@ overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
     cand.app.exe_path = g.exe;
     cand.app.name = g.name;
     cand.app.windows = std::move (g.windows);
+    cand.app.window_desktops = std::move (g.window_desktops);
     cand.app.pinned = false;
     cand.from_running = true;
     running_cands.push_back (std::move (cand));
@@ -1522,8 +1726,13 @@ overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height)
   for (int i = 0; i < keep_running; ++i)
     finalize_candidate (running_cands[i]);
 
+  const int prev_pill_w = self->pill_w;
+  const int prev_pill_h = self->pill_h;
   recompute_layout (self);
-  gtk_widget_queue_resize (dash);
+  if (self->pill_w != prev_pill_w || self->pill_h != prev_pill_h)
+    gtk_widget_queue_resize (dash);
+  else
+    gtk_widget_queue_draw (dash);
 }
 
 int

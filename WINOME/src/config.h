@@ -18,6 +18,8 @@ struct WinomeConfig {
   int hot_corner_cooldown_ms = 500;
   bool win_key_overview = true;
   bool overview_window_blacklist = true;
+  std::string live_wallpaper_mode = "live";  // "live", "snapshot", "off"
+  bool dash_isolate_workspaces = false;  // false = all workspaces, true = active workspace only
   bool multi_monitor_panels = true;
   bool end_session_confirm = true;
   bool unify_dark_titlebars = false;

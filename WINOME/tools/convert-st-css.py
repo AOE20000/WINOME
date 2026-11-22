@@ -386,16 +386,16 @@ window.quick-settings-popover-window {
 
 /* Panel font: the bundled Cantarell (GNOME's default UI font) at 11pt, so
    every em value in the stylesheet (panel height, workspace-dot, paddings)
-   resolves to the same pixel size as GNOME Shell computes it. */
+   resolves to the same pixel size as GNOME Shell computes it. Backdrop fade
+   (#000000 <-> #222226) is driven frame-locked by overview.cpp via
+   WinomePanelLayout::snapshot rather than an independent CSS clock. */
 #panel {
   font: 11pt "Cantarell";
+  transition: none;
 }
 
 /* Opaque #222226 panel over the Activities overview, matching native
-   #overviewGroup's #222226 backdrop. Because #panel and window.winome-overview
-   are separate Win32 toplevel OpenGL surfaces, keeping #panel.overview opaque
-   (#222226 instead of alpha-0 transparent) blends seamlessly with the overview
-   while preventing DWM/WGL alpha-composition flicker on the top bar. */
+   #overviewGroup's #222226 backdrop. */
 #panel.overview {
   background-color: #222226;
 }
@@ -491,18 +491,30 @@ entry.search-entry:focus-within placeholder {
 
 /* GNOME keeps a panel button highlighted (:active / :overview) while its menu
    or the Activities overview / App Grid is open; GTK4 clears :active when the
-   mouse is released. The host toggles "open" / "overview" classes so the
-   highlight persists exactly like gnome-shell's panel.js ActivitiesButton and
-   popup menus. */
-#panel .panel-button:not(.clock-display).open,
-#panel.overview .panel-button#panelActivities,
-#panel .panel-button#panelActivities.overview {
+   mouse is released. The host toggles "open" for popup menus while
+   #panelActivities paints its overview/hover pill and continuous workspace dots
+   in lockstep with overview.cpp. */
+#panel .panel-button:not(.clock-display).open {
   background-color: rgba(250, 250, 251, 0.28);
 }
-#panel .panel-button:not(.clock-display).open:hover,
-#panel.overview .panel-button#panelActivities:hover,
-#panel .panel-button#panelActivities.overview:hover {
+#panel .panel-button:not(.clock-display).open:hover {
   background-color: rgba(250, 250, 251, 0.32);
+}
+#panel .panel-button#panelActivities,
+#panel .panel-button#panelActivities:hover,
+#panel .panel-button#panelActivities:active,
+#panel .panel-button#panelActivities:checked,
+#panel .panel-button#panelActivities:focus,
+#panel .panel-button#panelActivities.open,
+#panel .panel-button#panelActivities.overview,
+#panel.overview .panel-button#panelActivities,
+#panel.overview .panel-button#panelActivities:hover {
+  padding: 0;
+  border: none;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  transition: none;
 }
 #panel .panel-button.clock-display.open .clock {
   background-color: rgba(255, 255, 255, 0.28);
@@ -741,6 +753,38 @@ window#winomeToastWindow {
 }
 window#winomeToastWindow .notification-banner {
   margin: 8px 10px 12px 10px;
+}
+
+/* Workspace switcher OSD toplevel (workspaceSwitcherPopup.js) stays completely
+   transparent so only the GNOME dark capsule and workspace dots appear. */
+window#winomeWsOsdWindow {
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  border: none;
+}
+
+/* Action buttons rendered inside Windows toast cards & banners. */
+.message .notification-actions {
+  margin-top: 6px;
+}
+.message .notification-actions button.notification-button {
+  min-height: 28px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 0.91em;
+  font-weight: 700;
+  color: #ffffff;
+  background-color: rgba(255, 255, 255, 0.12);
+  border: none;
+  box-shadow: none;
+  background-image: none;
+}
+.message .notification-actions button.notification-button:hover {
+  background-color: rgba(255, 255, 255, 0.2);
+}
+.message .notification-actions button.notification-button:active {
+  background-color: rgba(255, 255, 255, 0.28);
 }
 
 /* Tray popover: clean GNOME 47/48 card with 4-column rounded icon tiles and

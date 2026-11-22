@@ -32,6 +32,7 @@
 #include <gdk/win32/gdkwin32.h>
 
 #include <windows.h>
+#include <dwmapi.h>
 
 #include <algorithm>
 
@@ -51,6 +52,7 @@ constexpr double kUnit = 32.0;      // $ws_indicator_height
 constexpr double kDotActive = 32.0 / 3.0;
 constexpr double kDotInactive = 32.0 / 6.0;
 constexpr double kMarginBottom = 60.0;  // 4em @ 11pt
+constexpr double kShadowPad = 8.0;      // transparent gutter for OSD elevation shadow
 
 // %osd_panel: lighten(#222226, 5%) with a 1px
 // transparentize(white, 0.98) border; the 999px radius clamps to a capsule.
@@ -147,6 +149,13 @@ draw_osd (GtkDrawingArea *area, cairo_t *cr, int width, int height,
 {
   (void)area;
   (void)user_data;
+
+  // Always clear to full alpha=0 first so frame 0 or empty states never leave
+  // opaque pixels behind the capsule.
+  cairo_set_operator (cr, CAIRO_OPERATOR_CLEAR);
+  cairo_paint (cr);
+  cairo_set_operator (cr, CAIRO_OPERATOR_OVER);
+
   if (g_count <= 0 || width <= 0 || height <= 0)
     return;
 
@@ -155,27 +164,45 @@ draw_osd (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   if (f <= 0.0)
     return;
 
-  cairo_set_operator (cr, CAIRO_OPERATOR_CLEAR);
-  cairo_paint (cr);
-  cairo_set_operator (cr, CAIRO_OPERATOR_OVER);
-
-  // Capsule panel ($forced_circular_radius 999px clamps to height/2).
+  // Capsule panel ($forced_circular_radius 999px clamps to ch/2) centered
+  // inside the transparent shadow gutter.
   const OsdMetrics &m = osd_metrics ();
-  double r = height / 2.0;
-  cairo_new_sub_path (cr);
-  cairo_arc (cr, width - r, r, r, -G_PI_2, G_PI_2);
-  cairo_arc (cr, r, r, r, G_PI_2, 3 * G_PI_2);
-  cairo_close_path (cr);
-  cairo_set_source_rgba (cr, m.bg_r, m.bg_g, m.bg_b, 1.0 * f);
+  const double pad = kShadowPad;
+  const double cw = std::max (1.0, width - 2.0 * pad);
+  const double ch = std::max (1.0, height - 2.0 * pad);
+  const double r = ch / 2.0;
+
+  auto pill_path = [cr] (double x, double y, double pw, double rad) {
+    cairo_new_sub_path (cr);
+    cairo_arc (cr, x + pw - rad, y + rad, rad, -G_PI_2, G_PI_2);
+    cairo_arc (cr, x + rad, y + rad, rad, G_PI_2, 3 * G_PI_2);
+    cairo_close_path (cr);
+  };
+
+  // Soft 3-layer elevation shadow matching GNOME Shell's floating OSD pill.
+  for (int layer = 3; layer >= 1; --layer) {
+    const double spread = static_cast<double> (layer) * 1.6;
+    const double dy = static_cast<double> (layer) * 0.9;
+    const double alpha = (0.11 - 0.025 * layer) * f;
+    pill_path (pad - spread, pad + dy - spread * 0.5,
+               cw + 2.0 * spread, r + spread * 0.5);
+    cairo_set_source_rgba (cr, 0.0, 0.0, 0.0, alpha);
+    cairo_fill (cr);
+  }
+
+  // Main %osd_panel capsule (#2e2e33) + crisp 1px inset hairline border.
+  pill_path (pad + 0.5, pad + 0.5, cw - 1.0,
+             std::max (1.0, (ch - 1.0) / 2.0));
+  cairo_set_source_rgba (cr, m.bg_r, m.bg_g, m.bg_b, 0.98 * f);
   cairo_fill_preserve (cr);
-  cairo_set_source_rgba (cr, 1.0, 1.0, 1.0, 0.02 * f);
+  cairo_set_source_rgba (cr, 1.0, 1.0, 1.0, 0.08 * f);
   cairo_set_line_width (cr, 1.0);
   cairo_stroke (cr);
 
   // One 32px unit per workspace; dots grow via the padding/margin pairs
-  // from the stylesheet (drawn centered on the unit here).
-  double x = m.padding_x + m.unit / 2.0;
-  double cy = m.padding_y + m.unit / 2.0;
+  // from _workspace-switcher.scss (drawn centered on each unit).
+  double x = pad + m.padding_x + m.unit / 2.0;
+  double cy = pad + m.padding_y + m.unit / 2.0;
   for (int i = 0; i < g_count; ++i) {
     bool active = i == g_active;
     double dot = (active ? m.dot_active : m.dot_inactive) / 2.0;
@@ -235,9 +262,11 @@ osd_present (void)
 
   const OsdMetrics &m = osd_metrics ();
   int n = std::max (g_count, 1);
-  int w = (int)(2 * m.padding_x + n * m.unit + (n - 1) * m.spacing + 0.5);
-  int h = (int)(2 * m.padding_y + m.unit + 0.5);
+  int w = (int)(2 * (m.padding_x + kShadowPad) + n * m.unit +
+                (n - 1) * m.spacing + 0.5);
+  int h = (int)(2 * (m.padding_y + kShadowPad) + m.unit + 0.5);
   gtk_widget_set_size_request (g_area, w, h);
+  gtk_window_set_default_size (GTK_WINDOW (g_window), w, h);
 
   if (g_hwnd == nullptr || !IsWindow (g_hwnd))
     return;
@@ -249,9 +278,10 @@ osd_present (void)
   if (!GetMonitorInfoW (mon, &mi))
     return;
 
-  int scale = gtk_widget_get_scale_factor (g_window);
+  int scale = std::max (1, gtk_widget_get_scale_factor (g_window));
   int pw = w * scale, ph = h * scale;
-  int margin = (int)(m.margin_bottom * scale);
+  // Offset by kShadowPad so the visible pill sits at exact margin_bottom (4em).
+  int margin = (int)(std::max (0.0, m.margin_bottom - kShadowPad) * scale);
   int x = mi.rcMonitor.left + (mi.rcMonitor.right - mi.rcMonitor.left) / 2 -
           pw / 2;
   int y = mi.rcMonitor.bottom - margin - ph;
@@ -331,10 +361,26 @@ on_osd_realize (GtkWidget *widget, gpointer user_data)
     return;
   g_hwnd = static_cast<HWND> (gdk_win32_surface_get_handle (surface));
   LONG_PTR ex = GetWindowLongPtrW (g_hwnd, GWL_EXSTYLE);
-  LONG_PTR want = ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+  LONG_PTR want = ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST |
+                  WS_EX_TRANSPARENT;
   want &= ~WS_EX_APPWINDOW;
   if (want != ex)
     SetWindowLongPtrW (g_hwnd, GWL_EXSTYLE, want);
+
+  // Suppress Windows 11 DWM rectangular shadow, border, and corner clipping so
+  // only the transparent Cairo capsule renders.
+  constexpr DWORD kDwmNcPolicyAttr = 2;      // DWMWA_NCRENDERING_POLICY
+  constexpr DWORD kDwmNcDisabled = 1;        // DWMNCRP_DISABLED
+  constexpr DWORD kDwmCornerPrefAttr = 33;   // DWMWA_WINDOW_CORNER_PREFERENCE
+  constexpr DWORD kDwmCornerDoNotRound = 1;  // DWMWCP_DONOTROUND
+  constexpr DWORD kDwmBorderColorAttr = 34;  // DWMWA_BORDER_COLOR
+  constexpr DWORD kDwmColorNone = 0xFFFFFFFEu;
+  DwmSetWindowAttribute (g_hwnd, kDwmNcPolicyAttr, &kDwmNcDisabled,
+                         sizeof (kDwmNcDisabled));
+  DwmSetWindowAttribute (g_hwnd, kDwmCornerPrefAttr, &kDwmCornerDoNotRound,
+                         sizeof (kDwmCornerDoNotRound));
+  DwmSetWindowAttribute (g_hwnd, kDwmBorderColorAttr, &kDwmColorNone,
+                         sizeof (kDwmColorNone));
 }
 
 static void
@@ -356,8 +402,10 @@ void
 ws_osd_init ()
 {
   g_window = gtk_window_new ();
+  gtk_widget_set_name (g_window, "winomeWsOsdWindow");
   gtk_window_set_decorated (GTK_WINDOW (g_window), FALSE);
   gtk_window_set_resizable (GTK_WINDOW (g_window), FALSE);
+  gtk_widget_set_focusable (g_window, FALSE);
   install_bundled_fonts (g_window);
 
   g_signal_connect (g_window, "realize", G_CALLBACK (on_osd_realize),

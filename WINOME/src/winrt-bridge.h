@@ -25,12 +25,23 @@ enum class WinomeMediaAction {
   Previous,
 };
 
+struct WinomeNotificationAction {
+  std::string label;
+  std::string arguments;
+  std::string activation_type;  // "foreground" | "protocol" | "background"
+};
+
 struct WinomeSystemNotification {
   uint32_t id = 0;
   int64_t timestamp_unix = 0;
   std::string app_name;
+  std::string app_id;           // AUMID or NotificationHandler.PrimaryId
   std::string title;
   std::string body;
+  std::string launch_args;      // <toast launch="...">
+  std::string activation_type;  // <toast activationType="...">
+  std::string url;              // direct protocol URI or first HTTP(S) link
+  std::vector<WinomeNotificationAction> actions;
 };
 
 // Query/set the system Bluetooth radio via Windows.Devices.Radios.Radio.
@@ -41,13 +52,36 @@ bool winrt_set_bluetooth_radio(bool enabled);
 bool winrt_get_media_info(WinomeMediaInfo* out);
 bool winrt_media_control(WinomeMediaAction action);
 
-// Query/dismiss Windows toast notifications via UserNotificationListener.
-// If Windows denies notification access (unpackaged desktop app policy),
-// returns false cleanly and sets *access_allowed = false without blocking.
+// Query/dismiss Windows toast notifications via UserNotificationListener,
+// falling back automatically to a read-only snapshot of Windows'
+// wpndatabase.db when running as an unpackaged Win32 app without MSIX identity.
 bool winrt_get_notifications(std::vector<WinomeSystemNotification>* out,
                              bool* access_allowed = nullptr);
 bool winrt_remove_notification(uint32_t id);
 bool winrt_clear_notifications();
+
+// Activate a notification's protocol URI, deep-link launch payload, or source
+// application (via ShellExecuteW / IApplicationActivationManager / exe focus).
+bool winrt_activate_notification(const std::string& app_id,
+                                 const std::string& app_name,
+                                 const std::string& launch_args,
+                                 const std::string& activation_type,
+                                 const std::string& fallback_url);
+
+// Pure helpers for Windows WPN toast XML parsing, URI extraction, and handler
+// ID formatting (unit-tested in winome-tests).
+bool parse_wpn_toast_xml(const std::string& xml,
+                         std::string* out_title,
+                         std::string* out_body);
+bool parse_wpn_toast_xml_full(const std::string& xml,
+                              WinomeSystemNotification* out);
+bool is_safe_protocol_uri(const std::string& value,
+                          const std::string& activation_type);
+std::string extract_notification_url(const std::string& launch_args,
+                                     const std::string& activation_type,
+                                     const std::string& title,
+                                     const std::string& body);
+std::string friendly_app_name_from_wpn_id(const std::string& primary_id);
 
 // Invokes a zero-argument COM property getter vtable slot
 // (`HRESULT STDMETHODCALLTYPE fn(void*, void**)`), probing via a second call

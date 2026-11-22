@@ -6,8 +6,15 @@
 #include "winrt-bridge.h"
 #include "perf-metrics.h"
 
+#include <sqlite3.h>
 #include <windows.h>
+#include <objbase.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <shobjidl.h>
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -18,6 +25,7 @@
 #include <queue>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -113,6 +121,25 @@ std::string wide_to_utf8(const wchar_t* wide, UINT32 len) {
   WideCharToMultiByte(CP_UTF8, 0, wide, static_cast<int>(len),
                       out.data(), bytes, nullptr, nullptr);
   return out;
+}
+
+std::wstring utf8_to_wide(const std::string& utf8) {
+  if (utf8.empty())
+    return {};
+  int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.data(),
+                                 static_cast<int>(utf8.size()), nullptr, 0);
+  if (wlen <= 0)
+    return {};
+  std::wstring out(static_cast<size_t>(wlen), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()),
+                      out.data(), wlen);
+  return out;
+}
+
+std::string ascii_lower(std::string s) {
+  for (char& c : s)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
 }
 
 std::string consume_hstring(WINOME_HSTRING hstr) {
@@ -266,6 +293,259 @@ int64_t winrt_filetime_to_unix(int64_t ft100ns) {
   if (ft100ns <= kEpochDiff100ns)
     return 0;
   return (ft100ns - kEpochDiff100ns) / 10000000LL;
+}
+
+void append_utf8_codepoint(uint32_t cp, std::string* out) {
+  if (cp == 0 || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu))
+    return;
+  if (cp < 0x80u) {
+    out->push_back(static_cast<char>(cp));
+  } else if (cp < 0x800u) {
+    out->push_back(static_cast<char>(0xC0u | (cp >> 6)));
+    out->push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+  } else if (cp < 0x10000u) {
+    out->push_back(static_cast<char>(0xE0u | (cp >> 12)));
+    out->push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+    out->push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+  } else {
+    out->push_back(static_cast<char>(0xF0u | (cp >> 18)));
+    out->push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+    out->push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+    out->push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+  }
+}
+
+std::string unescape_xml_entities(const std::string& raw) {
+  std::string out;
+  out.reserve(raw.size());
+  for (size_t i = 0; i < raw.size();) {
+    if (raw[i] == '&') {
+      const size_t semi = raw.find(';', i + 1);
+      if (semi != std::string::npos && semi - i <= 12) {
+        const std::string ent = raw.substr(i + 1, semi - i - 1);
+        if (ent == "amp") {
+          out.push_back('&');
+          i = semi + 1;
+          continue;
+        } else if (ent == "lt") {
+          out.push_back('<');
+          i = semi + 1;
+          continue;
+        } else if (ent == "gt") {
+          out.push_back('>');
+          i = semi + 1;
+          continue;
+        } else if (ent == "quot") {
+          out.push_back('"');
+          i = semi + 1;
+          continue;
+        } else if (ent == "apos") {
+          out.push_back('\'');
+          i = semi + 1;
+          continue;
+        } else if (ent.size() >= 2 && ent[0] == '#') {
+          uint32_t cp = 0;
+          bool valid = true;
+          if (ent[1] == 'x' || ent[1] == 'X') {
+            if (ent.size() < 3)
+              valid = false;
+            for (size_t k = 2; k < ent.size() && valid; ++k) {
+              char c = ent[k];
+              cp <<= 4;
+              if (c >= '0' && c <= '9') cp |= static_cast<uint32_t>(c - '0');
+              else if (c >= 'a' && c <= 'f') cp |= static_cast<uint32_t>(c - 'a' + 10);
+              else if (c >= 'A' && c <= 'F') cp |= static_cast<uint32_t>(c - 'A' + 10);
+              else valid = false;
+            }
+          } else {
+            for (size_t k = 1; k < ent.size() && valid; ++k) {
+              char c = ent[k];
+              if (c >= '0' && c <= '9')
+                cp = cp * 10u + static_cast<uint32_t>(c - '0');
+              else
+                valid = false;
+            }
+          }
+          if (valid && cp > 0) {
+            append_utf8_codepoint(cp, &out);
+            i = semi + 1;
+            continue;
+          }
+        }
+      }
+    }
+    out.push_back(raw[i++]);
+  }
+  return out;
+}
+
+std::string trim_whitespace(const std::string& s) {
+  size_t b = 0;
+  while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b])))
+    ++b;
+  size_t e = s.size();
+  while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1])))
+    --e;
+  return s.substr(b, e - b);
+}
+
+struct WpnDbFileStamp {
+  bool exists = false;
+  uint64_t size = 0;
+  uint64_t mtime = 0;
+
+  bool operator==(const WpnDbFileStamp& o) const {
+    return exists == o.exists && size == o.size && mtime == o.mtime;
+  }
+};
+
+WpnDbFileStamp stat_wide_file(const std::wstring& path) {
+  WpnDbFileStamp st{};
+  WIN32_FILE_ATTRIBUTE_DATA fad{};
+  if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+    st.exists = true;
+    st.size = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+    st.mtime = (static_cast<uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32) |
+               fad.ftLastWriteTime.dwLowDateTime;
+  }
+  return st;
+}
+
+struct WpnDbCache {
+  std::mutex mu;
+  bool valid = false;
+  WpnDbFileStamp db_stamp{};
+  WpnDbFileStamp wal_stamp{};
+  std::vector<WinomeSystemNotification> items;
+};
+
+WpnDbCache g_wpn_cache;
+
+bool read_wpn_database_fallback(std::vector<WinomeSystemNotification>* out) {
+  if (out == nullptr)
+    return false;
+  out->clear();
+
+  wchar_t local_app[MAX_PATH] = {};
+  DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", local_app, MAX_PATH);
+  if (len == 0 || len >= MAX_PATH)
+    return false;
+
+  const std::wstring base_dir = std::wstring(local_app);
+  const std::wstring src_db =
+      base_dir + L"\\Microsoft\\Windows\\Notifications\\wpndatabase.db";
+  const std::wstring src_wal = src_db + L"-wal";
+  const std::wstring src_shm = src_db + L"-shm";
+
+  const WpnDbFileStamp db_st = stat_wide_file(src_db);
+  if (!db_st.exists || db_st.size == 0)
+    return false;
+  const WpnDbFileStamp wal_st = stat_wide_file(src_wal);
+
+  {
+    std::lock_guard<std::mutex> lk(g_wpn_cache.mu);
+    if (g_wpn_cache.valid && g_wpn_cache.db_stamp == db_st &&
+        g_wpn_cache.wal_stamp == wal_st) {
+      *out = g_wpn_cache.items;
+      return true;
+    }
+  }
+
+  const std::wstring winome_dir = base_dir + L"\\WINOME";
+  CreateDirectoryW(winome_dir.c_str(), nullptr);
+  const std::wstring cache_dir = winome_dir + L"\\wpn-cache";
+  CreateDirectoryW(cache_dir.c_str(), nullptr);
+
+  const std::wstring dst_db = cache_dir + L"\\wpn.db";
+  const std::wstring dst_wal = dst_db + L"-wal";
+  const std::wstring dst_shm = dst_db + L"-shm";
+
+  if (!CopyFileW(src_db.c_str(), dst_db.c_str(), FALSE))
+    return false;
+  if (wal_st.exists)
+    CopyFileW(src_wal.c_str(), dst_wal.c_str(), FALSE);
+  else
+    DeleteFileW(dst_wal.c_str());
+  if (stat_wide_file(src_shm).exists)
+    CopyFileW(src_shm.c_str(), dst_shm.c_str(), FALSE);
+  else
+    DeleteFileW(dst_shm.c_str());
+
+  const std::string dst_utf8 =
+      wide_to_utf8(dst_db.c_str(), static_cast<UINT32>(dst_db.size()));
+  if (dst_utf8.empty())
+    return false;
+
+  sqlite3* db = nullptr;
+  if (sqlite3_open_v2(dst_utf8.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) !=
+          SQLITE_OK ||
+      db == nullptr) {
+    if (db != nullptr)
+      sqlite3_close(db);
+    return false;
+  }
+
+  FILETIME now_ft{};
+  GetSystemTimeAsFileTime(&now_ft);
+  const int64_t now_100ns =
+      (static_cast<int64_t>(now_ft.dwHighDateTime) << 32) |
+      static_cast<int64_t>(now_ft.dwLowDateTime);
+
+  static const char* kSql =
+      "SELECT n.Id, n.ArrivalTime, COALESCE(h.PrimaryId, ''), n.Payload "
+      "FROM Notification n "
+      "LEFT JOIN NotificationHandler h ON n.HandlerId = h.RecordId "
+      "WHERE n.Type = 'toast' "
+      "  AND (n.ExpiryTime = 0 OR n.ExpiryTime > ?1) "
+      "ORDER BY n.ArrivalTime DESC "
+      "LIMIT 50;";
+
+  sqlite3_stmt* stmt = nullptr;
+  std::vector<WinomeSystemNotification> parsed;
+  bool query_ok = false;
+  if (sqlite3_prepare_v2(db, kSql, -1, &stmt, nullptr) == SQLITE_OK &&
+      stmt != nullptr) {
+    sqlite3_bind_int64(stmt, 1, now_100ns);
+    query_ok = true;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+      const int64_t id_raw = sqlite3_column_int64(stmt, 0);
+      const int64_t arrival_raw = sqlite3_column_int64(stmt, 1);
+      const auto* primary_ptr =
+          reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+      const auto* payload_ptr =
+          static_cast<const char*>(sqlite3_column_blob(stmt, 3));
+      const int payload_bytes = sqlite3_column_bytes(stmt, 3);
+      if (payload_ptr == nullptr || payload_bytes <= 0)
+        continue;
+
+      std::string payload(payload_ptr, static_cast<size_t>(payload_bytes));
+      WinomeSystemNotification item;
+      if (!parse_wpn_toast_xml_full(payload, &item))
+        continue;
+
+      const std::string primary = primary_ptr != nullptr ? primary_ptr : "";
+      item.id = static_cast<uint32_t>(id_raw);
+      item.timestamp_unix = winrt_filetime_to_unix(arrival_raw);
+      item.app_id = primary;
+      item.app_name = friendly_app_name_from_wpn_id(primary);
+      parsed.push_back(std::move(item));
+    }
+    sqlite3_finalize(stmt);
+  }
+  sqlite3_close(db);
+
+  if (!query_ok)
+    return false;
+
+  {
+    std::lock_guard<std::mutex> lk(g_wpn_cache.mu);
+    g_wpn_cache.valid = true;
+    g_wpn_cache.db_stamp = db_st;
+    g_wpn_cache.wal_stamp = wal_st;
+    g_wpn_cache.items = parsed;
+  }
+  *out = std::move(parsed);
+  return true;
 }
 
 class WinRtWorker {
@@ -813,6 +1093,10 @@ bool winrt_get_notifications(std::vector<WinomeSystemNotification>* out,
       if (SUCCEEDED(vcall<HRESULT>(un.ptr, 7, app_raw.put())) && app_raw) {
         ComPtr app = qi(app_raw.ptr, kIID_IAppInfo);
         if (app) {
+          WINOME_HSTRING h_aumid = nullptr;
+          if (SUCCEEDED(vcall<HRESULT>(app.ptr, 7, &h_aumid)))
+            item.app_id = consume_hstring(h_aumid);
+
           ComPtr disp_raw;
           if (SUCCEEDED(vcall<HRESULT>(app.ptr, 8, disp_raw.put())) && disp_raw) {
             ComPtr disp = qi(disp_raw.ptr, kIID_IAppDisplayInfo);
@@ -890,27 +1174,610 @@ bool winrt_get_notifications(std::vector<WinomeSystemNotification>* out,
   if (!completed) {
     capability_record_failure(SubsystemId::WinRtNotifications,
                               "WinRT UserNotificationListener timed out");
+    if (read_wpn_database_fallback(out)) {
+      capability_set(SubsystemId::WinRtNotifications, CapabilityState::Active,
+                     "WPN database read-only fallback");
+      if (access_allowed != nullptr)
+        *access_allowed = true;
+      return true;
+    }
     if (access_allowed != nullptr)
       *access_allowed = false;
     return false;
   }
+  if (!st->ok || !st->allowed) {
+    if (read_wpn_database_fallback(out)) {
+      capability_set(SubsystemId::WinRtNotifications, CapabilityState::Active,
+                     "WPN database read-only fallback");
+      if (access_allowed != nullptr)
+        *access_allowed = true;
+      return true;
+    }
+  }
   if (access_allowed != nullptr)
     *access_allowed = st->allowed;
+
+  // Enrich live WinRT notifications with WPN XML launch arguments, protocol
+  // URIs, action buttons, and handler PrimaryId (UserNotificationListener does
+  // not expose <toast launch="..."> or <action .../> via WinRT interfaces).
+  if (!st->list.empty()) {
+    std::vector<WinomeSystemNotification> wpn_items;
+    if (read_wpn_database_fallback(&wpn_items) && !wpn_items.empty()) {
+      std::unordered_map<uint32_t, const WinomeSystemNotification*> by_id;
+      by_id.reserve(wpn_items.size());
+      for (const auto& w : wpn_items) {
+        if (w.id != 0)
+          by_id[w.id] = &w;
+      }
+      for (auto& item : st->list) {
+        auto it = by_id.find(item.id);
+        if (it != by_id.end()) {
+          const WinomeSystemNotification* w = it->second;
+          if (item.app_id.empty())
+            item.app_id = w->app_id;
+          item.launch_args = w->launch_args;
+          item.activation_type = w->activation_type;
+          item.actions = w->actions;
+          item.url = w->url;
+        }
+        if (item.url.empty()) {
+          item.url = extract_notification_url(item.launch_args,
+                                              item.activation_type,
+                                              item.title, item.body);
+        }
+      }
+    } else {
+      for (auto& item : st->list) {
+        item.url = extract_notification_url(item.launch_args,
+                                            item.activation_type,
+                                            item.title, item.body);
+      }
+    }
+  }
+
   *out = std::move(st->list);
   return st->ok;
+}
+
+namespace {
+
+std::string extract_xml_attr(const std::string& attrs, const char* name) {
+  if (attrs.empty() || name == nullptr || *name == '\0')
+    return {};
+  const std::string lower_attrs = ascii_lower(attrs);
+  const std::string lower_name = ascii_lower(name);
+  size_t pos = 0;
+  while (pos < lower_attrs.size()) {
+    const size_t found = lower_attrs.find(lower_name, pos);
+    if (found == std::string::npos)
+      return {};
+    const bool left_ok =
+        found == 0 ||
+        std::isspace(static_cast<unsigned char>(lower_attrs[found - 1]));
+    size_t i = found + lower_name.size();
+    while (i < lower_attrs.size() &&
+           std::isspace(static_cast<unsigned char>(lower_attrs[i]))) {
+      ++i;
+    }
+    if (!left_ok || i >= lower_attrs.size() || lower_attrs[i] != '=') {
+      pos = found + lower_name.size();
+      continue;
+    }
+    ++i;
+    while (i < attrs.size() &&
+           std::isspace(static_cast<unsigned char>(attrs[i]))) {
+      ++i;
+    }
+    if (i >= attrs.size() || (attrs[i] != '"' && attrs[i] != '\'')) {
+      pos = i;
+      continue;
+    }
+    const char quote = attrs[i++];
+    const size_t end = attrs.find(quote, i);
+    if (end == std::string::npos)
+      return {};
+    return trim_whitespace(unescape_xml_entities(attrs.substr(i, end - i)));
+  }
+  return {};
+}
+
+std::string find_first_http_url(const std::string& text) {
+  if (text.empty())
+    return {};
+  const std::string low = ascii_lower(text);
+  const size_t p_https = low.find("https://");
+  const size_t p_http = low.find("http://");
+  size_t start = std::string::npos;
+  if (p_https != std::string::npos && p_http != std::string::npos)
+    start = std::min(p_https, p_http);
+  else if (p_https != std::string::npos)
+    start = p_https;
+  else
+    start = p_http;
+
+  if (start == std::string::npos)
+    return {};
+
+  size_t end = start;
+  while (end < text.size()) {
+    const unsigned char c = static_cast<unsigned char>(text[end]);
+    if (std::isspace(c) || c == '<' || c == '>' || c == '"' || c == '\'')
+      break;
+    ++end;
+  }
+  while (end > start) {
+    const char tail = text[end - 1];
+    if (tail == '.' || tail == ',' || tail == ';' || tail == ')' ||
+        tail == ']' || tail == '}' || tail == '!' || tail == '?') {
+      --end;
+    } else {
+      break;
+    }
+  }
+  const std::string url = text.substr(start, end - start);
+  return url.size() > 8 ? url : std::string{};
+}
+
+std::wstring resolve_win32_aumid_path(const std::string& app_id) {
+  if (app_id.empty())
+    return {};
+  const std::wstring w = utf8_to_wide(app_id);
+  if (w.empty())
+    return {};
+
+  // Windows WPN NotificationHandler.PrimaryId uses KnownFolder GUID prefixes
+  // for desktop Win32 apps, e.g. {6D809377-6AF0-444B-8957-A3773F02200E}\App\app.exe
+  if (w.size() >= 39 && w[0] == L'{') {
+    const size_t close = w.find(L'}');
+    if (close == 37) {
+      const std::wstring guid_str = w.substr(0, 38);
+      GUID kf_guid{};
+      if (SUCCEEDED(CLSIDFromString(guid_str.c_str(), &kf_guid))) {
+        PWSTR kf_path = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(kf_guid, 0, nullptr, &kf_path)) &&
+            kf_path != nullptr) {
+          std::wstring full(kf_path);
+          CoTaskMemFree(kf_path);
+          std::wstring rest = w.substr(38);
+          if (!rest.empty() && rest[0] != L'\\' && !full.empty() &&
+              full.back() != L'\\') {
+            full += L'\\';
+          }
+          full += rest;
+          if (GetFileAttributesW(full.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return full;
+        }
+      }
+    }
+  }
+
+  if (w.find(L'\\') != std::wstring::npos &&
+      GetFileAttributesW(w.c_str()) != INVALID_FILE_ATTRIBUTES) {
+    return w;
+  }
+  return {};
+}
+
+bool focus_window_by_exe_path(const std::wstring& exe_path) {
+  if (exe_path.empty())
+    return false;
+  std::wstring target_base = exe_path;
+  const size_t slash = target_base.find_last_of(L"\\/");
+  if (slash != std::wstring::npos && slash + 1 < target_base.size())
+    target_base = target_base.substr(slash + 1);
+
+  struct MatchCtx {
+    std::wstring full_path;
+    std::wstring base_name;
+    HWND found = nullptr;
+  } ctx{exe_path, target_base, nullptr};
+
+  EnumWindows(
+      [](HWND hwnd, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<MatchCtx*>(lp);
+        if (!IsWindowVisible(hwnd))
+          return TRUE;
+        const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if ((ex & WS_EX_TOOLWINDOW) != 0)
+          return TRUE;
+        if (GetWindow(hwnd, GW_OWNER) != nullptr)
+          return TRUE;
+
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == 0 || pid == GetCurrentProcessId())
+          return TRUE;
+
+        HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (proc == nullptr)
+          return TRUE;
+        wchar_t buf[MAX_PATH * 2] = {};
+        DWORD sz = MAX_PATH * 2;
+        const bool got = QueryFullProcessImageNameW(proc, 0, buf, &sz) != FALSE;
+        CloseHandle(proc);
+        if (!got || buf[0] == L'\0')
+          return TRUE;
+
+        bool match = (_wcsicmp(buf, c->full_path.c_str()) == 0);
+        if (!match && !c->base_name.empty()) {
+          const wchar_t* last = wcsrchr(buf, L'\\');
+          const wchar_t* b = last != nullptr ? last + 1 : buf;
+          match = (_wcsicmp(b, c->base_name.c_str()) == 0);
+        }
+        if (match) {
+          c->found = hwnd;
+          return FALSE;
+        }
+        return TRUE;
+      },
+      reinterpret_cast<LPARAM>(&ctx));
+
+  if (ctx.found == nullptr)
+    return false;
+  if (IsIconic(ctx.found))
+    ShowWindow(ctx.found, SW_RESTORE);
+  DWORD pid = 0;
+  GetWindowThreadProcessId(ctx.found, &pid);
+  if (pid != 0)
+    AllowSetForegroundWindow(pid);
+  SetForegroundWindow(ctx.found);
+  return true;
+}
+
+bool shell_open_wide(const std::wstring& target) {
+  if (target.empty())
+    return false;
+  const HINSTANCE res = ShellExecuteW(nullptr, L"open", target.c_str(),
+                                      nullptr, nullptr, SW_SHOWNORMAL);
+  return reinterpret_cast<INT_PTR>(res) > 32;
+}
+
+}  // namespace
+
+bool is_safe_protocol_uri(const std::string& value,
+                          const std::string& activation_type) {
+  const std::string s = trim_whitespace(value);
+  if (s.size() < 4)
+    return false;
+  for (char c : s) {
+    if (c == '\r' || c == '\n')
+      return false;
+  }
+
+  const size_t colon = s.find(':');
+  if (colon == std::string::npos || colon < 2 || colon > 32)
+    return false;
+  if (!std::isalpha(static_cast<unsigned char>(s[0])))
+    return false;
+  for (size_t i = 1; i < colon; ++i) {
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    if (!std::isalnum(c) && c != '+' && c != '-' && c != '.')
+      return false;
+  }
+
+  const std::string scheme = ascii_lower(s.substr(0, colon));
+  // Never treat local file/script/powershell schemes as click-through URIs.
+  if (scheme == "file" || scheme == "javascript" || scheme == "vbscript" ||
+      scheme == "cmd" || scheme == "powershell") {
+    return false;
+  }
+
+  const std::string act = ascii_lower(trim_whitespace(activation_type));
+  if (act == "protocol")
+    return true;
+
+  if (scheme == "http" || scheme == "https")
+    return s.compare(colon, 3, "://") == 0 && s.size() > colon + 3;
+  if (scheme == "mailto" || scheme == "ms-settings" ||
+      scheme == "ms-windows-store" || scheme == "windowsdefender" ||
+      scheme == "ms-clock" || scheme == "ms-actioncenter") {
+    return s.size() > colon + 1;
+  }
+  // Custom app deep-link protocols (e.g. vscode://, tg://, discord://, steam://).
+  if (s.compare(colon, 3, "://") == 0 && s.size() > colon + 3)
+    return true;
+  return false;
+}
+
+std::string extract_notification_url(const std::string& launch_args,
+                                     const std::string& activation_type,
+                                     const std::string& title,
+                                     const std::string& body) {
+  const std::string trimmed_launch = trim_whitespace(launch_args);
+  if (is_safe_protocol_uri(trimmed_launch, activation_type))
+    return trimmed_launch;
+  std::string url = find_first_http_url(title);
+  if (!url.empty())
+    return url;
+  return find_first_http_url(body);
+}
+
+bool parse_wpn_toast_xml_full(const std::string& xml,
+                              WinomeSystemNotification* out) {
+  if (out == nullptr || xml.empty())
+    return false;
+  out->title.clear();
+  out->body.clear();
+  out->launch_args.clear();
+  out->activation_type.clear();
+  out->url.clear();
+  out->actions.clear();
+
+  // 1. Parse <toast launch="..." activationType="...">
+  const size_t toast_open = xml.find("<toast");
+  if (toast_open != std::string::npos) {
+    const size_t toast_end = xml.find('>', toast_open + 6);
+    if (toast_end != std::string::npos) {
+      const std::string attrs =
+          xml.substr(toast_open + 6, toast_end - (toast_open + 6));
+      out->launch_args = extract_xml_attr(attrs, "launch");
+      out->activation_type = extract_xml_attr(attrs, "activationType");
+    }
+  }
+
+  // 2. Parse visible <text> lines.
+  if (!parse_wpn_toast_xml(xml, &out->title, &out->body))
+    return false;
+
+  // 3. Parse interactive <action .../> buttons (skip system & contextMenu).
+  size_t pos = 0;
+  while (pos < xml.size() && out->actions.size() < 3) {
+    const size_t open = xml.find("<action", pos);
+    if (open == std::string::npos)
+      break;
+    const size_t after = open + 7;
+    if (after >= xml.size() ||
+        (!std::isspace(static_cast<unsigned char>(xml[after])) &&
+         xml[after] != '>' && xml[after] != '/')) {
+      pos = after;
+      continue;
+    }
+    const size_t end = xml.find('>', after);
+    if (end == std::string::npos)
+      break;
+    pos = end + 1;
+
+    const std::string attrs = xml.substr(after, end - after);
+    const std::string placement = ascii_lower(extract_xml_attr(attrs, "placement"));
+    if (placement == "contextmenu")
+      continue;
+    const std::string act_type =
+        ascii_lower(extract_xml_attr(attrs, "activationType"));
+    if (act_type == "system" || act_type == "background")
+      continue;
+
+    const std::string label = extract_xml_attr(attrs, "content");
+    const std::string args = extract_xml_attr(attrs, "arguments");
+    if (label.empty())
+      continue;
+
+    WinomeNotificationAction action;
+    action.label = label;
+    action.arguments = args;
+    action.activation_type = act_type.empty() ? "foreground" : act_type;
+    out->actions.push_back(std::move(action));
+  }
+
+  out->url = extract_notification_url(out->launch_args, out->activation_type,
+                                      out->title, out->body);
+  return true;
+}
+
+bool winrt_activate_notification(const std::string& app_id,
+                                 const std::string& app_name,
+                                 const std::string& launch_args,
+                                 const std::string& activation_type,
+                                 const std::string& fallback_url) {
+  (void)app_name;
+
+  // 1. Direct protocol / deep-link URI (e.g. https://, ms-settings:, vscode://).
+  const std::string trimmed_launch = trim_whitespace(launch_args);
+  if (is_safe_protocol_uri(trimmed_launch, activation_type)) {
+    if (shell_open_wide(utf8_to_wide(trimmed_launch)))
+      return true;
+  }
+
+  // 2. Standard Windows Action Center COM activation (passes launch arguments
+  // directly to UWP / MSIX / AUMID-registered desktop apps).
+  const std::wstring exe_path = resolve_win32_aumid_path(app_id);
+  const bool looks_like_file_path =
+      !exe_path.empty() || app_id.find('\\') != std::string::npos ||
+      app_id.find('/') != std::string::npos;
+
+  if (!app_id.empty() && !looks_like_file_path) {
+    const HRESULT co_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool need_uninit = SUCCEEDED(co_hr);
+    IApplicationActivationManager* aam = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_ApplicationActivationManager, nullptr,
+                                  CLSCTX_LOCAL_SERVER,
+                                  IID_IApplicationActivationManager,
+                                  reinterpret_cast<void**>(&aam));
+    bool activated = false;
+    if (SUCCEEDED(hr) && aam != nullptr) {
+      const std::wstring aumid_w = utf8_to_wide(app_id);
+      const std::wstring args_w = utf8_to_wide(trimmed_launch);
+      DWORD pid = 0;
+      hr = aam->ActivateApplication(
+          aumid_w.c_str(),
+          args_w.empty() ? nullptr : args_w.c_str(),
+          AO_NONE, &pid);
+      aam->Release();
+      if (SUCCEEDED(hr)) {
+        if (pid != 0)
+          AllowSetForegroundWindow(pid);
+        activated = true;
+      }
+    }
+    if (need_uninit)
+      CoUninitialize();
+    if (activated)
+      return true;
+  }
+
+  // 3. Win32 executable path (KnownFolder-prefixed or full path): focus an
+  // existing window if visible, otherwise launch the exe (wakes tray apps).
+  if (!exe_path.empty()) {
+    if (focus_window_by_exe_path(exe_path))
+      return true;
+    if (shell_open_wide(exe_path))
+      return true;
+  }
+
+  // 4. Fallback to shell:AppsFolder\<AUMID> for registered apps.
+  if (!app_id.empty() && !looks_like_file_path) {
+    const std::wstring apps_uri = L"shell:AppsFolder\\" + utf8_to_wide(app_id);
+    if (shell_open_wide(apps_uri))
+      return true;
+  }
+
+  // 5. Fallback to an HTTP(S) / protocol link extracted from notification text.
+  if (is_safe_protocol_uri(fallback_url, "")) {
+    if (shell_open_wide(utf8_to_wide(fallback_url)))
+      return true;
+  }
+
+  return false;
+}
+
+bool parse_wpn_toast_xml(const std::string& xml,
+                         std::string* out_title,
+                         std::string* out_body) {
+  if (out_title != nullptr)
+    out_title->clear();
+  if (out_body != nullptr)
+    out_body->clear();
+  if (xml.empty())
+    return false;
+
+  std::string title;
+  std::string body;
+  size_t pos = 0;
+  while (pos < xml.size()) {
+    const size_t open = xml.find("<text", pos);
+    if (open == std::string::npos)
+      break;
+    const size_t after_name = open + 5;
+    if (after_name >= xml.size() ||
+        (xml[after_name] != '>' && xml[after_name] != '/' &&
+         !std::isspace(static_cast<unsigned char>(xml[after_name])))) {
+      pos = after_name;
+      continue;
+    }
+    const size_t tag_end = xml.find('>', after_name);
+    if (tag_end == std::string::npos)
+      break;
+    if (xml[tag_end - 1] == '/') {
+      pos = tag_end + 1;
+      continue;
+    }
+    const std::string attrs = xml.substr(after_name, tag_end - after_name);
+    const bool is_attribution =
+        attrs.find("attribution") != std::string::npos;
+
+    const size_t close = xml.find("</text>", tag_end + 1);
+    if (close == std::string::npos)
+      break;
+    pos = close + 7;
+
+    if (is_attribution)
+      continue;
+
+    const std::string content =
+        trim_whitespace(unescape_xml_entities(xml.substr(tag_end + 1, close - (tag_end + 1))));
+    if (content.empty())
+      continue;
+    if (title.empty()) {
+      title = content;
+    } else {
+      if (!body.empty())
+        body += "\n";
+      body += content;
+    }
+  }
+
+  if (title.empty() && body.empty())
+    return false;
+  if (out_title != nullptr)
+    *out_title = std::move(title);
+  if (out_body != nullptr)
+    *out_body = std::move(body);
+  return true;
+}
+
+std::string friendly_app_name_from_wpn_id(const std::string& primary_id) {
+  if (primary_id.empty())
+    return "Windows";
+
+  std::string s = primary_id;
+  // Strip UWP entry point suffix (!App) and publisher hash (_8wekyb3d8bbwe).
+  const size_t bang = s.find('!');
+  if (bang != std::string::npos)
+    s = s.substr(0, bang);
+  const size_t under = s.rfind('_');
+  if (under != std::string::npos && s.size() - under >= 10) {
+    bool alnum = true;
+    for (size_t i = under + 1; i < s.size(); ++i) {
+      if (!std::isalnum(static_cast<unsigned char>(s[i]))) {
+        alnum = false;
+        break;
+      }
+    }
+    if (alnum)
+      s = s.substr(0, under);
+  }
+
+  // Extract executable basename for Win32 path-based AUMIDs.
+  const size_t slash = s.find_last_of("\\/");
+  if (slash != std::string::npos && slash + 1 < s.size())
+    s = s.substr(slash + 1);
+
+  if (s.size() > 4) {
+    std::string tail = s.substr(s.size() - 4);
+    for (char& c : tail)
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (tail == ".exe")
+      s.resize(s.size() - 4);
+  }
+
+  // Strip common reverse-DNS / vendor prefixes (e.g. electron.app.X, Microsoft.X).
+  if (s.rfind("electron.app.", 0) == 0 && s.size() > 13)
+    s = s.substr(13);
+  else if (s.rfind("Microsoft.Windows.", 0) == 0 && s.size() > 18)
+    s = s.substr(18);
+  else if (s.rfind("Microsoft.", 0) == 0 && s.size() > 10)
+    s = s.substr(10);
+  else if (s.rfind("Windows.SystemToast.", 0) == 0 && s.size() > 20)
+    s = s.substr(20);
+
+  if (s.size() > 10 && s.substr(s.size() - 10) == "ForWindows")
+    s.resize(s.size() - 10);
+
+  // If still dotted reverse-DNS (e.g. com.squirrel.Discord.Discord), take tail.
+  const size_t dot = s.rfind('.');
+  if (dot != std::string::npos && dot + 1 < s.size())
+    s = s.substr(dot + 1);
+
+  return s.empty() ? "Windows" : s;
 }
 
 bool winrt_remove_notification(uint32_t id) {
   struct State {
     bool ok = false;
+    HRESULT hr = E_FAIL;
   };
   auto st = std::make_shared<State>();
   const bool completed = WinRtWorker::instance().run([st, id] {
     bool allowed = false;
-    ComPtr listener = get_notification_listener(false, &allowed);
-    if (listener && allowed)
-      st->ok = SUCCEEDED(vcall<HRESULT>(listener.ptr, 13, id));
-  }, 1500);
+    ComPtr listener = get_notification_listener(true, &allowed);
+    if (listener && allowed) {
+      st->hr = vcall<HRESULT>(listener.ptr, 13, id);
+      st->ok = SUCCEEDED(st->hr);
+    }
+  }, 2000);
+  {
+    std::lock_guard<std::mutex> lk(g_wpn_cache.mu);
+    g_wpn_cache.valid = false;
+  }
   return completed && st->ok;
 }
 
@@ -921,10 +1788,54 @@ bool winrt_clear_notifications() {
   auto st = std::make_shared<State>();
   const bool completed = WinRtWorker::instance().run([st] {
     bool allowed = false;
-    ComPtr listener = get_notification_listener(false, &allowed);
-    if (listener && allowed)
-      st->ok = SUCCEEDED(vcall<HRESULT>(listener.ptr, 12));
-  }, 1500);
+    ComPtr listener = get_notification_listener(true, &allowed);
+    if (!listener || !allowed)
+      return;
+
+    // On Windows 11, IUserNotificationListener::ClearNotifications (slot 12)
+    // frequently no-ops for unpackaged listeners; enumerate active toast IDs
+    // and remove each via RemoveNotification (slot 13) first, then call
+    // ClearNotifications as belt-and-suspenders.
+    bool removed_any = false;
+    bool all_removed = true;
+    ComPtr op;
+    if (SUCCEEDED(vcall<HRESULT>(listener.ptr, 10, kNotificationKindToast,
+                                 op.put())) &&
+        op) {
+      ComPtr view;
+      if (await_operation_result(op.ptr, view.put(), 1500) && view) {
+        unsigned count = 0;
+        if (SUCCEEDED(vcall<HRESULT>(view.ptr, 7, &count))) {
+          std::vector<uint32_t> ids;
+          ids.reserve(count);
+          for (unsigned i = 0; i < count; ++i) {
+            ComPtr raw_un;
+            if (FAILED(vcall<HRESULT>(view.ptr, 6, i, raw_un.put())) || !raw_un)
+              continue;
+            ComPtr un = qi(raw_un.ptr, kIID_IUserNotification);
+            if (!un)
+              continue;
+            uint32_t nid = 0;
+            if (SUCCEEDED(vcall<HRESULT>(un.ptr, 8, &nid)) && nid != 0)
+              ids.push_back(nid);
+          }
+          for (uint32_t nid : ids) {
+            if (SUCCEEDED(vcall<HRESULT>(listener.ptr, 13, nid)))
+              removed_any = true;
+            else
+              all_removed = false;
+          }
+        }
+      }
+    }
+
+    const HRESULT clear_hr = vcall<HRESULT>(listener.ptr, 12);
+    st->ok = SUCCEEDED(clear_hr) || (removed_any && all_removed);
+  }, 3000);
+  {
+    std::lock_guard<std::mutex> lk(g_wpn_cache.mu);
+    g_wpn_cache.valid = false;
+  }
   return completed && st->ok;
 }
 

@@ -26,7 +26,7 @@
 
 - **宿主进程**：`WINOME/src/`（C++17 + GTK4，单进程含配置、i18n、设置窗、系统托盘、`shell-ipc` 双向 Named Pipe、60s 会话结束确认弹窗、`window-theming` 可选 DWM 统一样式、`perf-metrics` 遥测/熔断、纯 Win32 崩溃恢复弹窗、Looking Glass 控制台、`Alt+F2` 运行弹窗与 `plugin-host` 进程外插件宿主机）
 - **非提权 CLI 控制端**：`WINOME/ctl/`（`winome-ctl.exe`，无 UAC 清单、无 GTK4 依赖，经 User-SID + Medium-IL Named Pipe DACL 与宿主实时交互）
-- **概览（Activities）**：`WINOME/src/overview*.cpp` + `app-index.cpp` + `app-grid.cpp`（搜索、开始菜单 `start2.bin` 解密编组与 `Programs` 目录单向同步分页应用网格、默认黑名单过滤、Dash Favorites、DWM 缩略图与跨桌面拖拽）
+- **概览（Activities）**：`WINOME/src/overview*.cpp` + `live-wallpaper.cpp` + `app-index.cpp` + `app-grid.cpp`（搜索、第三方动态壁纸引擎无边框 WGC 混合同步、开始菜单 `start2.bin` 解密编组与 `Programs` 目录单向同步分页应用网格、默认黑名单过滤、Dash Favorites、DWM 缩略图与跨桌面拖拽）
 - **St CSS 引擎复刻**：`WINOME/st-compat/`（libcroco + st-theme-node，去 Clutter/Cogl）
 - **隐藏/替换 Windows 原生界面**：`WINOME/src/`（`native-taskbar.cpp` + `win-event-hook.cpp`，独立实现，思路受 Seelen-UI 启发）
 - **虚拟桌面**：`WINOME/src/virtual-desktop.cpp`（移植并扩展 VirtualDesktopAccessor-rust COM 接口，覆盖 Win11 22621 / 24H2+）
@@ -84,9 +84,9 @@ ninja -C build
 - [x] **概览触发与工作区快捷键**：**Win 键**单按开合 `WINDOW_PICKER`、**550ms 内双击 Win 键**丝滑进阶至 `APP_GRID`、**左上角热角**（`WH_MOUSE_LL`，全屏隐藏时自动卸钩）、`Win+PageUp/PageDown` 切换工作区、`Win+Shift+PageUp/PageDown` 移动活动窗口到相邻工作区并跟随，`Win+Tab` 打开开始菜单，其余不冲突快捷键（如 `Win+V` 剪贴板、`Win+E`、`Win+R`、`Win+Shift+S`、`Win+Ctrl+←/→` 等）通过单次原子 `SendInput` 序贯透传，均受 `config.json` 开关控制
 - [x] 概览显示**最小化窗口**、默认黑名单过滤（`overview_window_blacklist`，默认屏蔽“Windows 输入体验”与 `explorer.exe` 无名无画面窗，可在设置关闭）；面板与弹出窗位于概览之上；顶栏保留工作区；面板按显示器独立判断全屏自动隐藏；隐藏于 Alt-Tab（`WS_EX_TOOLWINDOW`）
 - [x] 多显示器与事件驱动：多屏顶栏/工作区、`WM_DISPLAYCHANGE` / `WM_DPICHANGED` / `WM_SETTINGCHANGE` / `WTSRegisterSessionNotification` 响应，WASAPI 音量与 `WlanRegisterNotification` 事件驱动更新
-- [x] **快速设置与视觉对齐**：电量/电源模式/电源动作（含 `SE_SHUTDOWN_NAME` 与 Quit WINOME）、WASAPI 音量与静音、WMI/DXVA2 屏幕亮度、Wlan 枚举与加密网络模态密码弹窗连接、WinRT 蓝牙设备切换、深色主题/勿扰/夜间模式/飞行模式；内置 GNOME symbolic SVG 图标并复刻 `QuickToggleMenu` 两阶段居中展开抽屉动效
-- [x] 日期与通知中心：双栏 DateMenu（SMTC 媒体控制卡片 + Windows 通知列表 + 勿扰联动与日历）、实时桌面通知横幅与上游对齐空状态/今日圆点样式
-- [x] **Activities 概览完全体**：`ControlsState` 三态（`HIDDEN` / `WINDOW_PICKER` / `APP_GRID`）统一打断过渡与预热、`Ctrl+F`/直输搜索（`.lnk`/`.url` + `FOLDERID_AppsFolder` UWP 应用与打开窗口）、开始菜单 `start2.bin` 解密固定项/文件夹与 `Programs` 目录单向同步编组（`.app-folder` / `.app-folder-dialog`）、Dash Favorites 持久化/右键菜单、1024 条 `GdkTexture` 高清图标 LRU 缓存与 `WinomeAppIcon` GPU 三线性缩放、宿主内分页应用网格与右键 AppMenu、窗口中键关闭、拖拽窗口缩略图跨桌面移动及 `+`/`×` 新建/删除虚拟桌面
+- [x] **快速设置与视觉对齐**：电量/Windows 10·11 Power Overlay 电源模式三档双向同步（兼容旧版电源计划回退）/电源动作（含 `SE_SHUTDOWN_NAME` 与 Quit WINOME）、WASAPI 音量与静音、WMI/DXVA2 屏幕亮度、Wi-Fi 与蓝牙抽屉打开期异步实时刷新（含加密网络模态密码弹窗连接）、细粒度独立应用/系统明暗主题切换（仅写 `Personalize` 注册表、绝不覆写 `.theme` 与幻灯片壁纸）、勿扰/夜间模式/飞行模式；内置 GNOME symbolic SVG 图标并复刻 `QuickToggleMenu` 两阶段居中展开抽屉动效
+- [x] **日期与通知中心**：双栏 DateMenu（SMTC 媒体控制卡片 + Windows 通知列表 + 勿扰联动与日历）、支持 `UserNotificationListener` 与只读 `wpndatabase.db` SQLite 回退、Win11 逐条联动清除通知、点击通知/悬浮横幅与 Toast 操作按钮直达协议链接/应用深链（`IApplicationActivationManager` / Win32 窗口唤醒 / AppIndex 回退）
+- [x] **Activities 概览完全体与顶栏/OSD 同步**：`ControlsState` 三态（`HIDDEN` / `WINDOW_PICKER` / `APP_GRID`）统一打断过渡与预热、无边框 WGC 第三方动态壁纸兼容（Wallpaper Engine / Lively / Sucrose，支持 `live_wallpaper_mode` 三档模式）、顶栏 `#000000 ↔ #222226` 帧同步过渡与左上角工作区圆点随概览/快捷键实时形变、透明胶囊化 `ws-osd` 桌面切换指示器、`Ctrl+F`/直输搜索（`.lnk`/`.url` + `FOLDERID_AppsFolder` UWP 应用与打开窗口）、开始菜单 `start2.bin` 解密固定项/文件夹与 `Programs` 目录单向同步编组（`.app-folder` / `.app-folder-dialog`）、Dash Favorites 持久化/右键菜单、1024 条 `GdkTexture` 高清图标 LRU 缓存与 `WinomeAppIcon` GPU 三线性缩放、宿主内分页应用网格与右键 AppMenu、窗口中键关闭、拖拽窗口缩略图跨桌面移动及 `+`/`×` 新建/删除虚拟桌面
 - [x] **Windows 虚拟桌面兼容**：基于 `RtlGetVersion` 区分 Win11 22621 / 24H2+ COM 接口槽位表（支持查询、切换、固定、移动窗口与创建/移除桌面）
 - [x] **事件驱动架构、性能遥测与熔断健康度**：消除 `hot-corner` / `overview` / `shell-panel` / `ws-osd` 轮询定时器；`fullscreen-watcher` 接入 `EVENT_SYSTEM_MINIMIZEEND` 与 `SPI_SETWORKAREA`；隔离 `FcConfigCreate()` Fontconfig 映射、壁纸按屏缩放与 15s 闲置 `app_icon_cache_trim`；修复 `vd` 与 `WinRT` 超时栈 UAF，在 `Settings -> Diagnostics` 与 `--status` 实时暴露遥测及子系统熔断状态
 - [x] 配置、多语言与原生地设置页：`%LOCALAPPDATA%\WINOME\config.json` 热重载、`i18n.cpp` 多语言、深色 Adwaita GTK4 设置窗口（含概览默认黑名单、外观统一、开发者模式开关与 `Diagnostics` 诊断页）

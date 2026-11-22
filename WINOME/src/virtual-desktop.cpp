@@ -1039,14 +1039,22 @@ switch_to (int index)
   const uint64_t seq_after =
       g_mutation_seq.fetch_add (1, std::memory_order_acq_rel) + 1;
   if (job->ok) {
+    bool should_schedule = false;
     {
       ObserverState &s = obs_state ();
       std::lock_guard<std::mutex> lock (s.mu);
       if (s.snapshot.valid && index >= 0 && index < s.snapshot.count) {
+        const bool changed = (s.snapshot.active_index != index);
         s.snapshot.active_index = index;
         s.snapshot_seq = seq_after;
+        if (changed && !s.listeners.empty () && !s.main_notify_queued) {
+          s.main_notify_queued = true;
+          should_schedule = true;
+        }
       }
     }
+    if (should_schedule)
+      g_idle_add (obs_deliver_main, nullptr);
     obs_schedule_hint_async ();
   }
   return job->ok;

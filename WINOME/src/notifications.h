@@ -19,8 +19,13 @@ struct ShellNotification {
   bool from_winrt = false;
   int64_t timestamp_unix = 0;
   std::string app_name;
+  std::string app_id;
   std::string title;
   std::string body;
+  std::string launch_args;
+  std::string activation_type;
+  std::string url;
+  std::vector<WinomeNotificationAction> actions;
 };
 
 using NotificationsChangedCallback = void (*)(void* user_data);
@@ -40,10 +45,16 @@ std::vector<ShellNotification> notifications_get_all();
 WinomeMediaInfo notifications_get_media();
 uint64_t notifications_generation();
 
-// Trigger dismissal / clearing / SMTC playback commands asynchronously.
+// Trigger activation (open protocol/URL, deep-link launch, or focus/launch
+// source app), dismissal, clearing, or SMTC playback commands asynchronously.
+void notifications_activate(uint64_t key, int action_index = -1);
 void notifications_dismiss(uint64_t key);
 void notifications_clear_all();
 void notifications_media_action(WinomeMediaAction action);
+
+// Notify listeners immediately when Do Not Disturb changes (and hide any active
+// floating banner when DND is enabled).
+void notifications_notify_dnd_changed();
 
 // Subscribe to asynchronous updates when notifications or media state change.
 void notifications_add_listener(NotificationsChangedCallback cb, void* user_data);

@@ -280,9 +280,14 @@ void apply_primary_panel_geometry_and_workarea(HWND primary_hwnd,
     return;
 
   // Never move/resize a hidden panel or issue SPI_SETWORKAREA while a
-  // fullscreen application (possibly at custom resolution) or lock screen is active.
-  if (panel_hidden) {
+  // fullscreen application (possibly at custom resolution), lock screen, or
+  // Overview animation/session is active. Issuing SPI_SETWORKAREA while the
+  // fullscreen Overview window is open causes Explorer/DWM workarea ping-pong
+  // storms right in the middle of 250ms animations.
+  if (panel_hidden || winome::overview_active() ||
+      winome::overview_is_open() != 0) {
     g_workarea_guard.pending_after_defer = true;
+    cancel_workarea_retry();
     return;
   }
 
@@ -470,8 +475,10 @@ void reassert_primary_workarea_and_styles() {
       break;
     }
   }
-  if (has_visible_panel)
+  if (has_visible_panel && !winome::overview_active() &&
+      winome::overview_is_open() == 0) {
     winome::overview_restack();
+  }
 }
 
 void CALLBACK fg_win_event_proc(HWINEVENTHOOK hook G_GNUC_UNUSED,

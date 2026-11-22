@@ -28,13 +28,21 @@ std::wstring app_data_dir();
 std::string app_data_dir_ascii();
 
 // Pure & HWND helpers for the Overview default blacklist (filters system ghost
-// surfaces like "Windows Input Experience" / TextInputHost and nameless blank
-// explorer.exe windows when enabled in settings).
+// surfaces like "Windows Input Experience" / TextInputHost, nameless blank
+// explorer.exe windows, and suspended/cloaked UWP "Settings" / "设置" shells
+// when enabled in settings).
+// @cloaked_flags is the optional DWMWA_CLOAKED bitmask (DWM_CLOAKED_APP = 0x1,
+// DWM_CLOAKED_SHELL = 0x2, DWM_CLOAKED_INHERITED = 0x4); when 0 and @cloaked is
+// true, it is treated as DWM_CLOAKED_SHELL.
+// @has_core_window indicates whether an ApplicationFrameWindow hosts a live
+// Windows.UI.Core.CoreWindow child (ignored for non-UWP classes).
 bool is_overview_default_blacklisted_window_info(
     const std::string& class_name_utf8,
     const std::string& proc_name_utf8,
     const std::string& title_utf8,
-    bool cloaked);
+    bool cloaked,
+    DWORD cloaked_flags = 0,
+    bool has_core_window = true);
 bool is_overview_default_blacklisted_hwnd(HWND hwnd, bool enabled);
 
 }  // namespace winome

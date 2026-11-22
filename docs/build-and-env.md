@@ -24,7 +24,9 @@ WINOME 在 Windows 下使用 MSYS2（UCRT64 工具链 + GTK4）进行开发与�
 ```bash
 pacman -S mingw-w64-ucrt-x86_64-gtk4 mingw-w64-ucrt-x86_64-pkgconf \
           mingw-w64-ucrt-x86_64-meson mingw-w64-ucrt-x86_64-ninja \
-          mingw-w64-ucrt-x86_64-gcc
+          mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-libepoxy \
+          mingw-w64-ucrt-x86_64-librsvg mingw-w64-ucrt-x86_64-sqlite3 \
+          mingw-w64-ucrt-x86_64-adwaita-icon-theme
 ```
 
 ### 调用方式

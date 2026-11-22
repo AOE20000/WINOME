@@ -888,6 +888,9 @@ apply_config_set_kv (const std::string &key, const std::string &val)
   } else if (key == "clock_format") {
     cfg.clock_format = val;
     ok = true;
+  } else if (key == "live_wallpaper_mode") {
+    cfg.live_wallpaper_mode = val;
+    ok = true;
   }
   if (!ok)
     return false;
@@ -986,7 +989,8 @@ on_activate (GtkApplication      *app,
         "overview_window_blacklist", "multi_monitor_panels",
         "end_session_confirm", "unify_dark_titlebars", "unify_rounded_corners",
         "clock_show_seconds", "show_battery_percentage",
-        "hot_corner_cooldown_ms", "language", "clock_format"};
+        "hot_corner_cooldown_ms", "language", "clock_format",
+        "live_wallpaper_mode"};
     bool known = false;
     for (const char *k : kAllowed) {
       if (key == k) {

@@ -31,6 +31,7 @@ jobs:
             mingw-w64-ucrt-x86_64-gtk4
             mingw-w64-ucrt-x86_64-libepoxy
             mingw-w64-ucrt-x86_64-librsvg
+            mingw-w64-ucrt-x86_64-sqlite3
             mingw-w64-ucrt-x86_64-adwaita-icon-theme
             mingw-w64-ucrt-x86_64-python
 

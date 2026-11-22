@@ -317,6 +317,7 @@ struct WinomeAppGrid {
   bool transition_frozen = false;
   bool frozen_dirty_icons = false;
   double transition_opacity = 1.0;
+  uint64_t visual_version = 1;
   guint scroll_timer = 0;
   guint refresh_timer = 0;
 
@@ -893,6 +894,7 @@ on_icon_batch_idle (gpointer user_data)
         app_icon_cache_store (raw.id, raw.size, tex);
         if (matching_size) {
           apply_texture_to_targets (st, raw.id, tex);
+          ++payload->self->visual_version;
           if (payload->self->transition_frozen)
             payload->self->frozen_dirty_icons = true;
         }
@@ -974,7 +976,7 @@ maybe_start_icon_worker (WinomeAppGrid *self)
         nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     bool did_co = SUCCEEDED (hr);
 
-    constexpr size_t kBatchSize = 8;
+    constexpr size_t kBatchSize = 4;
     std::vector<RawDecodedIcon> batch;
     batch.reserve (kBatchSize);
 
@@ -989,7 +991,9 @@ maybe_start_icon_worker (WinomeAppGrid *self)
       payload->worker_done = done;
       payload->items = std::move (batch);
       batch.clear ();
-      g_idle_add (on_icon_batch_idle, payload);
+      // Low priority so background startup icon uploads never preempt input
+      // events or GTK frame-clock animation ticks.
+      g_idle_add_full (G_PRIORITY_LOW, on_icon_batch_idle, payload, nullptr);
     };
 
     for (const PendingIconJob &job : jobs) {
@@ -1537,17 +1541,18 @@ build_folder_tile (WinomeAppGrid *self, const AppGridItem &folder,
   return btn;
 }
 
-void
+bool
 update_tile_dots_in_grid (GtkWidget *grid,
                           const std::vector<RunningWindow> &running_windows)
 {
   if (grid == nullptr)
-    return;
+    return false;
   if (GTK_IS_BOX (grid)) {
     GtkWidget *inner = gtk_widget_get_first_child (grid);
     if (inner != nullptr)
       grid = inner;
   }
+  bool any_changed = false;
   for (GtkWidget *tile = gtk_widget_get_first_child (grid); tile != nullptr;
        tile = gtk_widget_get_next_sibling (tile)) {
     auto *dot = GTK_WIDGET (
@@ -1558,7 +1563,10 @@ update_tile_dots_in_grid (GtkWidget *grid,
             g_object_get_data (G_OBJECT (tile), "winome-tile-action"))) {
       bool running = !match_entry_running_windows (ctx->entry, running_windows)
                           .empty ();
-      gtk_widget_set_visible (dot, running);
+      if (gtk_widget_get_visible (dot) != (running ? TRUE : FALSE)) {
+        gtk_widget_set_visible (dot, running);
+        any_changed = true;
+      }
     } else if (auto *fctx = static_cast<FolderTileCtx *> (
                    g_object_get_data (G_OBJECT (tile), "winome-folder-action"))) {
       bool any_running = false;
@@ -1568,9 +1576,13 @@ update_tile_dots_in_grid (GtkWidget *grid,
           break;
         }
       }
-      gtk_widget_set_visible (dot, any_running);
+      if (gtk_widget_get_visible (dot) != (any_running ? TRUE : FALSE)) {
+        gtk_widget_set_visible (dot, any_running);
+        any_changed = true;
+      }
     }
   }
+  return any_changed;
 }
 
 void
@@ -1579,11 +1591,16 @@ update_running_dots_in_place (WinomeAppGrid *self)
   if (self == nullptr || self->pages_stack == nullptr)
     return;
   self->running_windows = app_index_enumerate_running_windows ();
+  bool changed = false;
   for (GtkWidget *page_w = gtk_widget_get_first_child (self->pages_stack);
        page_w != nullptr; page_w = gtk_widget_get_next_sibling (page_w)) {
-    update_tile_dots_in_grid (page_w, self->running_windows);
+    if (update_tile_dots_in_grid (page_w, self->running_windows))
+      changed = true;
   }
-  update_tile_dots_in_grid (self->folder_dialog_grid, self->running_windows);
+  if (update_tile_dots_in_grid (self->folder_dialog_grid, self->running_windows))
+    changed = true;
+  if (changed)
+    ++self->visual_version;
 }
 
 void
@@ -1776,6 +1793,7 @@ rebuild_all_pages (WinomeAppGrid *self)
     }
   }
   update_page_controls (self);
+  ++self->visual_version;
   if (self->async != nullptr) {
     self->async->built_valid = true;
     self->async->built_query = self->query_lower;
@@ -1851,6 +1869,7 @@ winome_app_grid_init (WinomeAppGrid *self)
   self->avail_h = 560;
   self->can_scroll = true;
   self->transition_opacity = 1.0;
+  self->visual_version = 1;
 
   gtk_orientable_set_orientation (GTK_ORIENTABLE (self),
                                   GTK_ORIENTATION_VERTICAL);
@@ -1905,8 +1924,11 @@ winome_app_grid_init (WinomeAppGrid *self)
   gtk_stack_set_transition_type (GTK_STACK (self->pages_stack),
                                  GTK_STACK_TRANSITION_TYPE_SLIDE_LEFT_RIGHT);
   gtk_stack_set_transition_duration (GTK_STACK (self->pages_stack), 250);
-  gtk_stack_set_hhomogeneous (GTK_STACK (self->pages_stack), TRUE);
-  gtk_stack_set_vhomogeneous (GTK_STACK (self->pages_stack), TRUE);
+  // Every page_frame already has identical fixed size_request(grid_full_w,
+  // grid_full_h), so non-homogeneous stack avoids measuring hundreds of
+  // widgets on hidden pages when App Grid maps or invalidates.
+  gtk_stack_set_hhomogeneous (GTK_STACK (self->pages_stack), FALSE);
+  gtk_stack_set_vhomogeneous (GTK_STACK (self->pages_stack), FALSE);
   gtk_widget_set_overflow (self->pages_stack, GTK_OVERFLOW_HIDDEN);
   gtk_widget_set_halign (self->pages_stack, GTK_ALIGN_CENTER);
   gtk_widget_set_valign (self->pages_stack, GTK_ALIGN_CENTER);
@@ -2086,7 +2108,8 @@ app_grid_set_query (GtkWidget *grid, const std::string &query_lower)
 }
 
 void
-app_grid_rebuild (GtkWidget *grid, int avail_w, int avail_h)
+app_grid_rebuild (GtkWidget *grid, int avail_w, int avail_h,
+                  bool refresh_running)
 {
   WinomeAppGrid *self = WINOME_APP_GRID (grid);
   int eff_w = std::max (avail_w, 400);
@@ -2100,7 +2123,8 @@ app_grid_rebuild (GtkWidget *grid, int avail_w, int avail_h)
       self->async->built_avail_h == eff_h &&
       self->async->built_scale == scale &&
       self->async->built_revision == rev) {
-    update_running_dots_in_place (self);
+    if (refresh_running)
+      update_running_dots_in_place (self);
     maybe_start_icon_worker (self);
     return;
   }
@@ -2202,6 +2226,22 @@ app_grid_set_transition_opacity (GtkWidget *grid, bool frozen, double opacity)
       std::abs (gtk_widget_get_opacity (grid) - alpha) > 0.001) {
     gtk_widget_set_opacity (grid, alpha);
   }
+}
+
+uint64_t
+app_grid_visual_version (GtkWidget *grid)
+{
+  if (grid == nullptr)
+    return 0;
+  return WINOME_APP_GRID (grid)->visual_version;
+}
+
+int
+app_grid_current_page (GtkWidget *grid)
+{
+  if (grid == nullptr)
+    return 0;
+  return WINOME_APP_GRID (grid)->page;
 }
 
 bool

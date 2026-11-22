@@ -387,4 +387,167 @@ overview_compute_slots (const std::vector<OvWindowInfo> &windows,
   compute_window_slots (&last, box, monitor_height, slots);
 }
 
+MiniThumbClipResult
+compute_mini_thumb_clip (const RECT &full_dest, SIZE source_size,
+                         const std::vector<RECT> &occluder_boxes)
+{
+  MiniThumbClipResult out;
+  const LONG full_w = full_dest.right - full_dest.left;
+  const LONG full_h = full_dest.bottom - full_dest.top;
+  if (full_w < 1 || full_h < 1)
+    return out;
+
+  RECT vis = full_dest;
+  for (const RECT &occ : occluder_boxes) {
+    if (occ.right <= occ.left || occ.bottom <= occ.top)
+      continue;
+    const LONG ix1 = std::max (vis.left, occ.left);
+    const LONG iy1 = std::max (vis.top, occ.top);
+    const LONG ix2 = std::min (vis.right, occ.right);
+    const LONG iy2 = std::min (vis.bottom, occ.bottom);
+    if (ix1 >= ix2 || iy1 >= iy2)
+      continue;
+
+    // Evaluate the 4 axis-aligned remainder strips completely disjoint from @occ
+    // and retain whichever leaves the largest unoccluded preview area.
+    const RECT candidates[4] = {
+        {vis.left, vis.top, vis.right, iy1},     // top strip above occ
+        {vis.left, iy2, vis.right, vis.bottom},  // bottom strip below occ
+        {vis.left, vis.top, ix1, vis.bottom},    // left strip outside occ
+        {ix2, vis.top, vis.right, vis.bottom},   // right strip outside occ
+    };
+    long long best_area = 0;
+    RECT best_rect{};
+    for (const RECT &c : candidates) {
+      const long long cw = static_cast<long long> (c.right) - c.left;
+      const long long ch = static_cast<long long> (c.bottom) - c.top;
+      if (cw > 0 && ch > 0 && cw * ch > best_area) {
+        best_area = cw * ch;
+        best_rect = c;
+      }
+    }
+    if (best_area <= 0)
+      return out;
+    vis = best_rect;
+  }
+
+  const bool cropped =
+      (vis.left != full_dest.left || vis.top != full_dest.top ||
+       vis.right != full_dest.right || vis.bottom != full_dest.bottom);
+  if (cropped && (vis.right - vis.left < 2 || vis.bottom - vis.top < 2))
+    return out;
+
+  if (!cropped) {
+    out.visible = true;
+    out.dest_rect = vis;
+    out.src_rect = RECT{0, 0, source_size.cx, source_size.cy};
+    return out;
+  }
+
+  if (source_size.cx <= 0 || source_size.cy <= 0)
+    return out;
+
+  const double u0 =
+      static_cast<double> (vis.left - full_dest.left) / full_w;
+  const double v0 =
+      static_cast<double> (vis.top - full_dest.top) / full_h;
+  const double u1 =
+      static_cast<double> (vis.right - full_dest.left) / full_w;
+  const double v1 =
+      static_cast<double> (vis.bottom - full_dest.top) / full_h;
+
+  LONG sl = std::clamp<LONG> (
+      static_cast<LONG> (std::lround (u0 * source_size.cx)), 0,
+      source_size.cx - 1);
+  LONG st = std::clamp<LONG> (
+      static_cast<LONG> (std::lround (v0 * source_size.cy)), 0,
+      source_size.cy - 1);
+  LONG sr = std::clamp<LONG> (
+      static_cast<LONG> (std::lround (u1 * source_size.cx)), sl + 1,
+      source_size.cx);
+  LONG sb = std::clamp<LONG> (
+      static_cast<LONG> (std::lround (v1 * source_size.cy)), st + 1,
+      source_size.cy);
+
+  out.visible = true;
+  out.dest_rect = vis;
+  out.src_rect = RECT{sl, st, sr, sb};
+  return out;
+}
+
+bool
+is_rect_fully_covered_by_boxes (const RECT &target,
+                                const std::vector<RECT> &boxes)
+{
+  if (target.right <= target.left || target.bottom <= target.top)
+    return true;
+  for (const RECT &b : boxes) {
+    if (b.left <= target.left && b.top <= target.top &&
+        b.right >= target.right && b.bottom >= target.bottom) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool
+is_rect_overlapping_any_box (const RECT &target,
+                             const std::vector<RECT> &boxes)
+{
+  if (target.right <= target.left || target.bottom <= target.top)
+    return false;
+  for (const RECT &b : boxes) {
+    if (b.right <= b.left || b.bottom <= b.top)
+      continue;
+    if (std::max (target.left, b.left) < std::min (target.right, b.right) &&
+        std::max (target.top, b.top) < std::min (target.bottom, b.bottom)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+RECT
+transform_rect_around_pivot (const RECT &rect, double pivot_x, double pivot_y,
+                             double scale, double translate_y)
+{
+  if (std::abs (scale - 1.0) < 1e-4 && std::abs (translate_y) < 0.25)
+    return rect;
+  RECT out{};
+  out.left = static_cast<LONG> (
+      std::lround (pivot_x + (static_cast<double> (rect.left) - pivot_x) * scale));
+  out.right = static_cast<LONG> (
+      std::lround (pivot_x + (static_cast<double> (rect.right) - pivot_x) * scale));
+  out.top = static_cast<LONG> (
+      std::lround (pivot_y + translate_y +
+                   (static_cast<double> (rect.top) - pivot_y) * scale));
+  out.bottom = static_cast<LONG> (
+      std::lround (pivot_y + translate_y +
+                   (static_cast<double> (rect.bottom) - pivot_y) * scale));
+  return out;
+}
+
+WallpaperDrawRect
+compute_workarea_wallpaper_draw_rect (double card_x, double card_y,
+                                      double card_w, double card_h,
+                                      double tex_w, double tex_h,
+                                      double panel_top_ratio)
+{
+  WallpaperDrawRect out{};
+  if (card_w <= 0.0 || card_h <= 0.0 || tex_w <= 0.0 || tex_h <= 0.0)
+    return out;
+  const double ratio = std::max (panel_top_ratio, 0.0);
+  const double top_off = card_h * ratio;
+  const double mon_x = card_x;
+  const double mon_y = card_y - top_off;
+  const double mon_w = card_w;
+  const double mon_h = card_h + top_off;
+  const double s = std::max (mon_w / tex_w, mon_h / tex_h);
+  out.w = tex_w * s;
+  out.h = tex_h * s;
+  out.x = mon_x + (mon_w - out.w) * 0.5;
+  out.y = mon_y + (mon_h - out.h) * 0.5;
+  return out;
+}
+
 }  // namespace winome

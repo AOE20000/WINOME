@@ -1,5 +1,5 @@
 project('winome', ['c', 'cpp'],
-  version: '0.1.3',
+  version: '0.1.4',
   meson_version: '>= 1.3.0',
   default_options: [
     'cpp_std=c++17',
@@ -18,6 +18,7 @@ winome_root_inc = include_directories('.')
 gtk4_dep = dependency('gtk4', version: '>= 4.0')
 fontconfig_dep = dependency('fontconfig')
 pangoft2_dep = dependency('pangoft2')
+sqlite3_dep = dependency('sqlite3')
 
 cc = meson.get_compiler('cpp')
 

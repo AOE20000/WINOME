@@ -8,6 +8,7 @@
 
 #include <gtk/gtk.h>
 
+#include <cstdint>
 #include <string>
 
 namespace winome {
@@ -35,7 +36,8 @@ AppGridDimensions compute_app_grid_dimensions (int avail_w, int avail_h);
 GtkWidget *app_grid_new (void (*on_launch_done) (void *),
                          void (*on_pins_changed) (void *), void *user_data);
 void app_grid_set_query (GtkWidget *grid, const std::string &query_lower);
-void app_grid_rebuild (GtkWidget *grid, int avail_w, int avail_h);
+void app_grid_rebuild (GtkWidget *grid, int avail_w, int avail_h,
+                       bool refresh_running = true);
 void app_grid_next_page (GtkWidget *grid);
 void app_grid_prev_page (GtkWidget *grid);
 void app_grid_first_page (GtkWidget *grid);
@@ -45,6 +47,8 @@ void app_grid_refresh_running (GtkWidget *grid);
 void app_grid_prewarm (GtkWidget *grid, int avail_w, int avail_h);
 void app_grid_set_transition_opacity (GtkWidget *grid, bool frozen,
                                       double opacity);
+uint64_t app_grid_visual_version (GtkWidget *grid);
+int app_grid_current_page (GtkWidget *grid);
 bool app_grid_launch_first (GtkWidget *grid);
 void app_grid_close_menu (GtkWidget *grid);
 bool app_grid_close_open_folder (GtkWidget *grid);

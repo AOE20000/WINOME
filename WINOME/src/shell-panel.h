@@ -6,6 +6,109 @@
 
 #include <gtk/gtk.h>
 
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
+namespace winome {
+
+// Port of upstream gnome-shell js/ui/panel.js WorkspaceDot / WorkspaceIndicators
+// continuous geometry and opacity math (unit-tested in winome-tests).
+struct WorkspaceDotMetric {
+  double slot_x = 0.0;
+  double slot_w = 0.0;
+  double draw_w = 0.0;
+  double draw_h = 0.0;
+  double opacity = 0.5;
+  double expansion = 0.0;
+};
+
+inline double
+workspace_dot_width_multiplier (int count)
+{
+  if (count <= 2)
+    return 3.625;
+  if (count <= 5)
+    return 3.25;
+  return 2.75;
+}
+
+inline std::vector<WorkspaceDotMetric>
+compute_workspace_dot_metrics (int count, double active_pos, int dot_size,
+                               int spacing, double *out_total_width = nullptr)
+{
+  std::vector<WorkspaceDotMetric> out;
+  if (count < 1)
+    count = 1;
+  if (dot_size < 1)
+    dot_size = 8;
+  if (spacing < 0)
+    spacing = 0;
+
+  const double pos = std::clamp (active_pos, 0.0, static_cast<double> (count - 1));
+  const double mult = workspace_dot_width_multiplier (count);
+  constexpr double kInactiveScale = 0.75;
+  constexpr double kInactiveOpacity = 0.50;
+
+  out.reserve (static_cast<size_t> (count));
+  double x = 0.0;
+  for (int i = 0; i < count; ++i) {
+    const double dist = std::fabs (static_cast<double> (i) - pos);
+    const double exp = std::clamp (1.0 - dist, 0.0, 1.0);
+    const double slot_w = static_cast<double> (dot_size) * (1.0 + (mult - 1.0) * exp);
+    const double scale = kInactiveScale + (1.0 - kInactiveScale) * exp;
+    const double opacity = kInactiveOpacity + (1.0 - kInactiveOpacity) * exp;
+
+    WorkspaceDotMetric m;
+    m.slot_x = x;
+    m.slot_w = slot_w;
+    m.draw_w = slot_w * scale;
+    m.draw_h = static_cast<double> (dot_size) * scale;
+    m.opacity = opacity;
+    m.expansion = exp;
+    out.push_back (m);
+
+    x += slot_w;
+    if (i + 1 < count)
+      x += static_cast<double> (spacing);
+  }
+  if (out_total_width != nullptr)
+    *out_total_width = x;
+  return out;
+}
+
+// Compute exact interpolated top-bar backdrop color (#000000 <-> #222226) and
+// #panelActivities pill highlight alpha matching upstream GNOME _panel.scss:
+//   desktop rest=0.00, hover=0.17; overview rest=0.28, hover=0.32.
+inline void
+compute_panel_overview_colors (double overview_progress,
+                               double hover_progress,
+                               bool pressed,
+                               double *out_bg_r,
+                               double *out_bg_g,
+                               double *out_bg_b,
+                               double *out_activities_alpha)
+{
+  const double p = std::clamp (overview_progress, 0.0, 1.0);
+  const double h = std::clamp (hover_progress, 0.0, 1.0);
+  if (out_bg_r != nullptr)
+    *out_bg_r = (34.0 / 255.0) * p;
+  if (out_bg_g != nullptr)
+    *out_bg_g = (34.0 / 255.0) * p;
+  if (out_bg_b != nullptr)
+    *out_bg_b = (38.0 / 255.0) * p;
+  if (out_activities_alpha != nullptr) {
+    const double rest_a = 0.28 * p;
+    const double hover_a = 0.17 + (0.32 - 0.17) * p;
+    double alpha = rest_a + (hover_a - rest_a) * h;
+    if (pressed)
+      alpha = std::max (alpha, 0.28);
+    *out_activities_alpha = std::clamp (alpha, 0.0, 1.0);
+  }
+}
+
+}  // namespace winome
+
 // Create the full-width top panel window (Activities + clock + quick settings).
 GtkWidget *winome_shell_panel_new (void);
 
@@ -34,6 +137,15 @@ void winome_shell_panel_close_popovers_immediate (void);
 
 // Reload GNOME theme stylesheet, optional developer user-debug.css, and StEngine.
 bool winome_shell_reload_theme (void);
+
+// Lockstep panel overview backdrop (#000000 <-> #222226) and #panelActivities
+// highlight transition driven directly by overview.cpp's anim_tick [0..1].
+void winome_shell_panel_set_overview_progress (double progress);
+
+// Real-time continuous workspace indicator scroll position for #panelActivities
+// (matching upstream panel.js WorkspaceIndicators). Pass position < 0 to release
+// back to virtual-desktop observer sync.
+void winome_shell_panel_set_workspace_scroll (int count, double position);
 
 // Declarative TopBar plugin UI slots (host updates only on GTK main thread).
 typedef void (*WinomePluginTopBarClickCb) (const char *plugin_id,

@@ -13,6 +13,7 @@
 #include "host-utils.h"
 #include "hot-corner.h"
 #include "i18n.h"
+#include "live-wallpaper.h"
 #include "monitor-manager.h"
 #include "notifications.h"
 #include "overview-dash.h"
@@ -24,8 +25,10 @@
 #include "winome-version.h"
 #include "perf-metrics.h"
 #include "plugin-host.h"
+#include "power-modes.h"
 #include "run-dialog.h"
 #include "shell-ipc.h"
+#include "shell-panel.h"
 #include "st-engine.h"
 #include "system-status.h"
 #include "systray.h"
@@ -99,6 +102,8 @@ void test_config_roundtrip() {
   winome::WinomeConfig def;
   CHECK(def.end_session_confirm == true);
   CHECK(def.overview_window_blacklist == true);
+  CHECK(def.live_wallpaper_mode == "live");
+  CHECK(def.dash_isolate_workspaces == false);
   CHECK(def.unify_dark_titlebars == false);
   CHECK(def.unify_rounded_corners == false);
 
@@ -111,6 +116,8 @@ void test_config_roundtrip() {
   src.hot_corner_cooldown_ms = 1250;
   src.win_key_overview = false;
   src.overview_window_blacklist = false;
+  src.live_wallpaper_mode = "snapshot";
+  src.dash_isolate_workspaces = true;
   src.multi_monitor_panels = false;
   src.end_session_confirm = false;
   src.unify_dark_titlebars = true;
@@ -132,6 +139,8 @@ void test_config_roundtrip() {
   CHECK(dst.hot_corner_cooldown_ms == src.hot_corner_cooldown_ms);
   CHECK(dst.win_key_overview == src.win_key_overview);
   CHECK(dst.overview_window_blacklist == src.overview_window_blacklist);
+  CHECK(dst.live_wallpaper_mode == src.live_wallpaper_mode);
+  CHECK(dst.dash_isolate_workspaces == src.dash_isolate_workspaces);
   CHECK(dst.multi_monitor_panels == src.multi_monitor_panels);
   CHECK(dst.end_session_confirm == src.end_session_confirm);
   CHECK(dst.unify_dark_titlebars == src.unify_dark_titlebars);
@@ -143,6 +152,8 @@ void test_config_roundtrip() {
   CHECK(winome::parse_config("{\"language\":\"en\"}", &legacy));
   CHECK(legacy.end_session_confirm == true);
   CHECK(legacy.overview_window_blacklist == true);
+  CHECK(legacy.live_wallpaper_mode == "live");
+  CHECK(legacy.dash_isolate_workspaces == false);
   CHECK(legacy.unify_dark_titlebars == false);
   CHECK(legacy.unify_rounded_corners == false);
 }
@@ -156,6 +167,7 @@ void test_config_sanitization_and_unknown_keys() {
     "future_obj": {"nested": [1, true, null, "x"]},
     "language": "fr",
     "clock_format": "99h",
+    "live_wallpaper_mode": "invalid_mode",
     "hot_corner_cooldown_ms": -50,
     "show_battery_percentage": true,
     "unknown_num": 42,
@@ -164,6 +176,7 @@ void test_config_sanitization_and_unknown_keys() {
   CHECK(winome::parse_config(json, &out));
   CHECK(out.language == "auto");
   CHECK(out.clock_format == "auto");
+  CHECK(out.live_wallpaper_mode == "live");
   CHECK(out.hot_corner_cooldown_ms == 100);
   CHECK(out.show_battery_percentage == true);
   CHECK(out.pinned_apps.size() == 2);
@@ -315,6 +328,116 @@ void test_overview_layout_geometry() {
       CHECK(s.x + sw <= picker.right + 1.5 && s.y + sh <= picker.bottom + 1.5);
       for (size_t j = i + 1; j < slots.size(); ++j)
         CHECK(!rects_overlap(s, slots[j]));
+    }
+  }
+
+  // Mini workspace-thumbnail occlusion clipping (prevents DWM mini-previews
+  // from bleeding through expanding/shrinking workspace backgrounds).
+  {
+    const RECT mini{800, 140, 920, 220};  // 120x80 mini preview
+    const SIZE src{1200, 800};
+
+    // 1. Settled WINDOW_PICKER: workspace box sits cleanly below thumbnails.
+    {
+      std::vector<RECT> boxes = {RECT{335, 240, 1585, 930}};
+      auto res = winome::compute_mini_thumb_clip(mini, src, boxes);
+      CHECK(res.visible);
+      CHECK(res.dest_rect.left == 800 && res.dest_rect.top == 140 &&
+            res.dest_rect.right == 920 && res.dest_rect.bottom == 220);
+      CHECK(res.src_rect.left == 0 && res.src_rect.top == 0 &&
+            res.src_rect.right == 1200 && res.src_rect.bottom == 800);
+    }
+
+    // 2. Fullscreen / early-open / late-close: completely covered -> hidden.
+    {
+      std::vector<RECT> boxes = {RECT{0, 32, 1920, 1080}};
+      auto res = winome::compute_mini_thumb_clip(mini, src, boxes);
+      CHECK(!res.visible);
+    }
+
+    // 3. Mid-open / mid-close: active workspace box cuts across y = 180 ->
+    // only top strip [140..180] and top half of source [0..400] stay visible.
+    {
+      std::vector<RECT> boxes = {RECT{200, 180, 1720, 1000}};
+      auto res = winome::compute_mini_thumb_clip(mini, src, boxes);
+      CHECK(res.visible);
+      CHECK(res.dest_rect.left == 800 && res.dest_rect.top == 140 &&
+            res.dest_rect.right == 920 && res.dest_rect.bottom == 180);
+      CHECK(res.src_rect.left == 0 && res.src_rect.top == 0 &&
+            res.src_rect.right == 1200 && res.src_rect.bottom == 400);
+    }
+
+    // 4. Multi-box occlusion (left/right workspace cards in APP_GRID): disjoint side strip retained.
+    {
+      std::vector<RECT> boxes = {
+          RECT{700, 120, 840, 270},   // covers [800..840]
+          RECT{900, 120, 1060, 270},  // covers [900..920]
+      };
+      auto res = winome::compute_mini_thumb_clip(mini, src, boxes);
+      CHECK(res.visible);
+      CHECK(res.dest_rect.left == 840 && res.dest_rect.right == 900 &&
+            res.dest_rect.top == 140 && res.dest_rect.bottom == 220);
+      CHECK(res.src_rect.left == 400 && res.src_rect.right == 1000);
+    }
+
+    // 5. Unknown source size: unoccluded ok, partially occluded must stay hidden.
+    {
+      std::vector<RECT> below = {RECT{335, 240, 1585, 930}};
+      CHECK(winome::compute_mini_thumb_clip(mini, SIZE{0, 0}, below).visible);
+      std::vector<RECT> overlap = {RECT{200, 180, 1720, 1000}};
+      CHECK(!winome::compute_mini_thumb_clip(mini, SIZE{0, 0}, overlap).visible);
+    }
+
+    // 6. Sub-2px sliver near moving edge is suppressed.
+    {
+      std::vector<RECT> sliver = {RECT{200, 141, 1720, 1000}};
+      CHECK(!winome::compute_mini_thumb_clip(mini, src, sliver).visible);
+    }
+
+    // 7. Coverage & overlap helpers for thumbnails occlusion gating.
+    {
+      const RECT thumbs{740, 130, 1180, 226};
+      std::vector<RECT> full = {RECT{0, 32, 1920, 1080}};
+      std::vector<RECT> mid = {RECT{200, 180, 1720, 1000}};
+      std::vector<RECT> settled = {RECT{335, 240, 1585, 930}};
+      CHECK(winome::is_rect_fully_covered_by_boxes(thumbs, full));
+      CHECK(winome::is_rect_overlapping_any_box(thumbs, full));
+      CHECK(!winome::is_rect_fully_covered_by_boxes(thumbs, mid));
+      CHECK(winome::is_rect_overlapping_any_box(thumbs, mid));
+      CHECK(!winome::is_rect_fully_covered_by_boxes(thumbs, settled));
+      CHECK(!winome::is_rect_overlapping_any_box(thumbs, settled));
+    }
+
+    // 8. Pivot transform matching GNOME Shell ThumbnailsBox APP_GRID animation
+    //    (pivot=(0.5, 0.5), scale=0.5, translate_y=+height/2).
+    {
+      const RECT thumbs{740, 120, 1180, 220};  // center = (960, 170), h = 100
+      const RECT id = winome::transform_rect_around_pivot(thumbs, 960.0, 170.0, 1.0, 0.0);
+      CHECK(EqualRect(&id, &thumbs));
+
+      const RECT shrunk = winome::transform_rect_around_pivot(thumbs, 960.0, 170.0, 0.5, 50.0);
+      CHECK(shrunk.left == 850 && shrunk.right == 1070);
+      CHECK(shrunk.top == 195 && shrunk.bottom == 245);
+    }
+
+    // 9. Workarea wallpaper projection (GNOME shell-workspace-background.c):
+    //    at t=0 (1920x1048 below 32px panel), 1920x1080 wallpaper must land at
+    //    (0, -32, 1920, 1080) with zero vertical shift against live desktop.
+    {
+      const double ratio = 32.0 / 1048.0;
+      const auto full = winome::compute_workarea_wallpaper_draw_rect(
+          0.0, 0.0, 1920.0, 1048.0, 1920.0, 1080.0, ratio);
+      CHECK(std::abs(full.x - 0.0) < 0.01);
+      CHECK(std::abs(full.y - (-32.0)) < 0.01);
+      CHECK(std::abs(full.w - 1920.0) < 0.01);
+      CHECK(std::abs(full.h - 1080.0) < 0.01);
+
+      // Scaled workspace card preserves exact top-panel crop ratio.
+      const auto picker = winome::compute_workarea_wallpaper_draw_rect(
+          274.0, 181.0, 1372.0, 749.0, 1920.0, 1080.0, ratio);
+      const double expected_top = 181.0 - 749.0 * ratio;
+      CHECK(std::abs(picker.y - expected_top) < 0.5);
+      CHECK(picker.w >= 1372.0 - 0.1 && picker.h >= 749.0 * (1.0 + ratio) - 0.1);
     }
   }
 }
@@ -985,7 +1108,7 @@ void test_ipc_dispatch_and_named_pipe_roundtrip() {
   CHECK(ping.find("\"ok\":true") != std::string::npos);
   CHECK(ping.find("\"pong\":true") != std::string::npos);
   CHECK(ping.find(std::string("\"version\":\"") + WINOME_VERSION + "\"") != std::string::npos);
-  CHECK(std::string(WINOME_VERSION) == "0.1.3");
+  CHECK(std::string(WINOME_VERSION) == "0.1.4");
 
   const std::string st = winome::ipc_dispatch_request_json("{\"cmd\":\"status\"}", cbs);
   CHECK(st.find("\"ok\":true") != std::string::npos);
@@ -1906,7 +2029,42 @@ void test_overview_window_blacklist() {
       "   ",
       false));
 
-  // Legitimate Explorer folders, UWP Settings, and regular user windows remain untouched.
+  // Suspended / pre-launched / cloaked UWP "设置" / "Settings" ghost windows.
+  CHECK(winome::is_overview_default_blacklisted_window_info(
+      "ApplicationFrameWindow",
+      "C:\\Windows\\System32\\ApplicationFrameHost.exe",
+      "\xE8\xAE\xBE\xE7\xBD\xAE",
+      true, 0x2u, true));
+  CHECK(winome::is_overview_default_blacklisted_window_info(
+      "ApplicationFrameWindow",
+      "C:\\Windows\\System32\\ApplicationFrameHost.exe",
+      "\xE8\xAE\xBE\xE7\xBD\xAE",
+      true, 0x1u, false));
+  CHECK(winome::is_overview_default_blacklisted_window_info(
+      "ApplicationFrameWindow",
+      "ApplicationFrameHost.exe",
+      "Settings",
+      true, 0x2u, true));
+  CHECK(winome::is_overview_default_blacklisted_window_info(
+      "ApplicationFrameWindow",
+      "ApplicationFrameHost.exe",
+      "\xE8\xA8\xAD\xE5\xAE\x9A",
+      true, 0x2u, true));
+  // Uncloaked but coreless splash-only UWP frame is also blacklisted.
+  CHECK(winome::is_overview_default_blacklisted_window_info(
+      "ApplicationFrameWindow",
+      "C:\\Windows\\System32\\ApplicationFrameHost.exe",
+      "\xE8\xAE\xBE\xE7\xBD\xAE",
+      false, 0u, false));
+  // Any app-cloaked (DWM_CLOAKED_APP = 0x1) UWP app is blacklisted.
+  CHECK(winome::is_overview_default_blacklisted_window_info(
+      "ApplicationFrameWindow",
+      "C:\\Windows\\System32\\ApplicationFrameHost.exe",
+      "Microsoft Store",
+      true, 0x1u, true));
+
+  // Legitimate Explorer folders, live open UWP Settings, other-desktop UWP apps,
+  // and regular user windows remain untouched.
   CHECK(!winome::is_overview_default_blacklisted_window_info(
       "CabinetWClass",
       "C:\\Windows\\explorer.exe",
@@ -1916,7 +2074,12 @@ void test_overview_window_blacklist() {
       "ApplicationFrameWindow",
       "C:\\Windows\\System32\\ApplicationFrameHost.exe",
       "\xE8\xAE\xBE\xE7\xBD\xAE",
-      true));
+      false, 0u, true));
+  CHECK(!winome::is_overview_default_blacklisted_window_info(
+      "ApplicationFrameWindow",
+      "C:\\Windows\\System32\\ApplicationFrameHost.exe",
+      "Calculator",
+      true, 0x2u, true));
   CHECK(!winome::is_overview_default_blacklisted_window_info(
       "Chrome_WidgetWin_1",
       "chrome.exe",
@@ -2369,6 +2532,348 @@ void test_overview_search_helpers() {
     CHECK(winome::is_path_like_query("%USERPROFILE%\\Desktop"));
     CHECK(!winome::is_path_like_query("settings"));
   }
+
+  // 5. Dash workspace scope filtering (All Workspaces vs Current Workspace Only).
+  {
+    // Mode 1: All Workspaces (isolate=false).
+    CHECK(winome::should_include_dash_window(false, true, 0, 0, true, 0));
+    // Shell-cloaked (0x2) window on Workspace 2 MUST appear in All Workspaces mode.
+    CHECK(winome::should_include_dash_window(false, true, 0, 1, false, 0x2u));
+    // Suspended UWP (DWM_CLOAKED_APP = 0x1) or invalid desktop (-1) stays hidden.
+    CHECK(!winome::should_include_dash_window(false, true, 0, 0, false, 0x1u));
+    CHECK(!winome::should_include_dash_window(false, true, 0, -1, false, 0x2u));
+
+    // Mode 2: Current Workspace Only (isolate=true).
+    // On Workspace 1 (active=0): ws0 included, ws1 excluded (even if stale on_current=true).
+    CHECK(winome::should_include_dash_window(true, true, 0, 0, true, 0));
+    CHECK(!winome::should_include_dash_window(true, true, 0, 0, true, 0x1u));
+    CHECK(!winome::should_include_dash_window(true, true, 0, 1, true, 0x2u));
+    // After scrolling to Workspace 2 (active=1): ws1 included, ws0 excluded.
+    CHECK(!winome::should_include_dash_window(true, true, 1, 0, false, 0x2u));
+    CHECK(winome::should_include_dash_window(true, true, 1, 1, false, 0x2u));
+    // Pinned-to-all-desktops window (window_desktop=-1, on_current=true, uncloaked).
+    CHECK(winome::should_include_dash_window(true, true, 1, -1, true, 0));
+  }
+}
+
+void test_live_wallpaper_helpers() {
+  // 1. Mode sanitization.
+  CHECK(winome::sanitize_live_wallpaper_mode("live") == "live");
+  CHECK(winome::sanitize_live_wallpaper_mode("snapshot") == "snapshot");
+  CHECK(winome::sanitize_live_wallpaper_mode("off") == "off");
+  CHECK(winome::sanitize_live_wallpaper_mode("") == "live");
+  CHECK(winome::sanitize_live_wallpaper_mode("auto") == "live");
+
+  // 2. Engine child window detection filter.
+  const RECT mon{0, 0, 1920, 1080};
+  const RECT full{0, 0, 1920, 1080};
+  const RECT small{0, 0, 400, 300};
+  const RECT off_mon{1920, 0, 3840, 1080};
+
+  // Wallpaper Engine / Lively / Sucrose covering monitor -> accepted.
+  CHECK(winome::is_live_wallpaper_candidate(L"WPWindow", L"wallpaper64.exe", full, mon, true));
+  CHECK(winome::is_live_wallpaper_candidate(L"Chrome_WidgetWin_1", L"Lively.Player.exe", full, mon, true));
+  CHECK(winome::is_live_wallpaper_candidate(L"SDL_app", L"Sucrose.Player.exe", full, mon, true));
+
+  // Built-in shell / Explorer / WINOME / hidden / tiny / other-monitor -> rejected.
+  CHECK(!winome::is_live_wallpaper_candidate(L"SHELLDLL_DefView", L"wallpaper64.exe", full, mon, true));
+  CHECK(!winome::is_live_wallpaper_candidate(L"WorkerW", L"wallpaper64.exe", full, mon, true));
+  CHECK(!winome::is_live_wallpaper_candidate(L"WPWindow", L"explorer.exe", full, mon, true));
+  CHECK(!winome::is_live_wallpaper_candidate(L"WPWindow", L"winome.exe", full, mon, true));
+  CHECK(!winome::is_live_wallpaper_candidate(L"WPWindow", L"", full, mon, true));
+  CHECK(!winome::is_live_wallpaper_candidate(L"WPWindow", L"wallpaper64.exe", full, mon, false));
+  CHECK(!winome::is_live_wallpaper_candidate(L"WPWindow", L"wallpaper64.exe", small, mon, true));
+  CHECK(!winome::is_live_wallpaper_candidate(L"WPWindow", L"wallpaper64.exe", off_mon, mon, true));
+
+  // 3. Multi-monitor WGC crop rect computation.
+  // Single monitor: full texture.
+  {
+    RECT c = winome::compute_wgc_crop_rect(RECT{0, 0, 1920, 1080},
+                                           RECT{0, 0, 1920, 1080}, 1920, 1080);
+    CHECK(c.left == 0 && c.top == 0 && c.right == 1920 && c.bottom == 1080);
+  }
+  // Dual monitor with left secondary at [-1920, 0] and primary at [0, 0].
+  {
+    RECT host{-1920, 0, 1920, 1080};
+    RECT c_prim = winome::compute_wgc_crop_rect(host, RECT{0, 0, 1920, 1080}, 3840, 1080);
+    CHECK(c_prim.left == 1920 && c_prim.top == 0 && c_prim.right == 3840 && c_prim.bottom == 1080);
+    RECT c_left = winome::compute_wgc_crop_rect(host, RECT{-1920, 0, 0, 1080}, 3840, 1080);
+    CHECK(c_left.left == 0 && c_left.top == 0 && c_left.right == 1920 && c_left.bottom == 1080);
+  }
+  // Scaled texture (e.g. 2x backing texture vs logical host rect).
+  {
+    RECT c = winome::compute_wgc_crop_rect(RECT{0, 0, 1920, 1080},
+                                           RECT{960, 0, 1920, 1080}, 3840, 2160);
+    CHECK(c.left == 1920 && c.top == 0 && c.right == 3840 && c.bottom == 2160);
+  }
+}
+
+void test_panel_overview_and_workspace_dots() {
+  // 1. Upstream GNOME width-multiplier tiers.
+  CHECK(std::fabs(winome::workspace_dot_width_multiplier(1) - 3.625) < 1e-6);
+  CHECK(std::fabs(winome::workspace_dot_width_multiplier(2) - 3.625) < 1e-6);
+  CHECK(std::fabs(winome::workspace_dot_width_multiplier(3) - 3.25) < 1e-6);
+  CHECK(std::fabs(winome::workspace_dot_width_multiplier(5) - 3.25) < 1e-6);
+  CHECK(std::fabs(winome::workspace_dot_width_multiplier(6) - 2.75) < 1e-6);
+
+  // 2. Continuous morphing preserves invariant total width (zero layout jitter).
+  for (int count : {2, 3, 6}) {
+    double base_total = 0.0;
+    auto m0 = winome::compute_workspace_dot_metrics(count, 0.0, 8, 5, &base_total);
+    CHECK(static_cast<int>(m0.size()) == count);
+    CHECK(std::fabs(m0[0].expansion - 1.0) < 1e-6);
+    CHECK(std::fabs(m0[0].opacity - 1.0) < 1e-6);
+    CHECK(std::fabs(m0[0].draw_h - 8.0) < 1e-6);
+    CHECK(std::fabs(m0[1].expansion - 0.0) < 1e-6);
+    CHECK(std::fabs(m0[1].opacity - 0.5) < 1e-6);
+    CHECK(std::fabs(m0[1].draw_h - 6.0) < 1e-6);  // 8 * 0.75
+
+    for (double pos : {0.25, 0.5, 0.75, 1.0, static_cast<double>(count - 1)}) {
+      double cur_total = 0.0;
+      auto mc = winome::compute_workspace_dot_metrics(count, pos, 8, 5, &cur_total);
+      CHECK(std::fabs(cur_total - base_total) < 1e-6);
+    }
+  }
+
+  // Midpoint between workspace 0 and 1: symmetric expansion/opacity/size.
+  {
+    auto mid = winome::compute_workspace_dot_metrics(2, 0.5, 8, 5);
+    CHECK(std::fabs(mid[0].expansion - 0.5) < 1e-6);
+    CHECK(std::fabs(mid[1].expansion - 0.5) < 1e-6);
+    CHECK(std::fabs(mid[0].opacity - 0.75) < 1e-6);
+    CHECK(std::fabs(mid[1].opacity - 0.75) < 1e-6);
+    CHECK(std::fabs(mid[0].slot_w - mid[1].slot_w) < 1e-6);
+  }
+
+  // 3. Top bar backdrop (#000000 <-> #222226) and #panelActivities pill alpha.
+  {
+    double r = 0, g = 0, b = 0, a = 0;
+    // Desktop resting.
+    winome::compute_panel_overview_colors(0.0, 0.0, false, &r, &g, &b, &a);
+    CHECK(std::fabs(r) < 1e-6 && std::fabs(g) < 1e-6 && std::fabs(b) < 1e-6);
+    CHECK(std::fabs(a - 0.0) < 1e-6);
+
+    // Desktop hovered.
+    winome::compute_panel_overview_colors(0.0, 1.0, false, &r, &g, &b, &a);
+    CHECK(std::fabs(a - 0.17) < 1e-6);
+
+    // Overview resting (#222226 = 34,34,38; alpha = 0.28).
+    winome::compute_panel_overview_colors(1.0, 0.0, false, &r, &g, &b, &a);
+    CHECK(std::fabs(r - 34.0 / 255.0) < 1e-6);
+    CHECK(std::fabs(g - 34.0 / 255.0) < 1e-6);
+    CHECK(std::fabs(b - 38.0 / 255.0) < 1e-6);
+    CHECK(std::fabs(a - 0.28) < 1e-6);
+
+    // Overview hovered (alpha = 0.32).
+    winome::compute_panel_overview_colors(1.0, 1.0, false, &r, &g, &b, &a);
+    CHECK(std::fabs(a - 0.32) < 1e-6);
+
+    // Mid-transition (p=0.5, no hover): smooth midpoint.
+    winome::compute_panel_overview_colors(0.5, 0.0, false, &r, &g, &b, &a);
+    CHECK(std::fabs(r - 17.0 / 255.0) < 1e-6);
+    CHECK(std::fabs(b - 19.0 / 255.0) < 1e-6);
+    CHECK(std::fabs(a - 0.14) < 1e-6);
+  }
+}
+
+void test_wpn_notifications_and_wifi_bt_sorting() {
+  // 1. WPN toast XML parsing + entity decoding + attribution skip.
+  {
+    const std::string xml =
+        "<toast><visual><binding template=\"ToastGeneric\">"
+        "<text>Antigravity &amp; Build</text>"
+        "<text>Done &lt;OK&gt; &#x4E2D;&#65;</text>"
+        "<text placement=\"attribution\">via Windows</text>"
+        "<text>Line 2 &quot;ready&quot;</text>"
+        "</binding></visual></toast>";
+    std::string title, body;
+    CHECK(winome::parse_wpn_toast_xml(xml, &title, &body));
+    CHECK(title == "Antigravity & Build");
+    CHECK(body == "Done <OK> \xE4\xB8\xAD" "A\nLine 2 \"ready\"");
+
+    std::string empty_t, empty_b;
+    CHECK(!winome::parse_wpn_toast_xml("<toast><visual/></toast>", &empty_t, &empty_b));
+  }
+
+  // 2. WPN handler PrimaryId -> friendly app name formatting.
+  {
+    CHECK(winome::friendly_app_name_from_wpn_id("electron.app.Antigravity") == "Antigravity");
+    CHECK(winome::friendly_app_name_from_wpn_id(
+              "Microsoft.OutlookForWindows_8wekyb3d8bbwe!Microsoft.OutlookforWindows") ==
+          "Outlook");
+    CHECK(winome::friendly_app_name_from_wpn_id("C:\\Program Files\\WeChat\\WeChat.exe") ==
+          "WeChat");
+    CHECK(winome::friendly_app_name_from_wpn_id("") == "Windows");
+  }
+
+  // 3. Wi-Fi network sorting: connected first, then signal descending, then SSID.
+  {
+    WinomeWifiNetwork nets[4] = {};
+    std::strcpy(nets[0].ssid, "Bravo");
+    nets[0].signal_quality = 80;
+    nets[0].connected = FALSE;
+
+    std::strcpy(nets[1].ssid, "Alpha");
+    nets[1].signal_quality = 80;
+    nets[1].connected = FALSE;
+
+    std::strcpy(nets[2].ssid, "WeakHome");
+    nets[2].signal_quality = 45;
+    nets[2].connected = TRUE;
+
+    std::strcpy(nets[3].ssid, "StrongCafe");
+    nets[3].signal_quality = 95;
+    nets[3].connected = FALSE;
+
+    winome_wifi_sort_networks(nets, 4);
+    CHECK(std::strcmp(nets[0].ssid, "WeakHome") == 0);
+    CHECK(std::strcmp(nets[1].ssid, "StrongCafe") == 0);
+    CHECK(std::strcmp(nets[2].ssid, "Alpha") == 0);
+    CHECK(std::strcmp(nets[3].ssid, "Bravo") == 0);
+  }
+
+  // 4. Bluetooth device sorting: connected first, then paired, then nearby.
+  {
+    winome::BluetoothDevice devs[4] = {};
+    std::strcpy(devs[0].name, "Nearby Speaker");
+    devs[0].connected = false;
+    devs[0].paired = false;
+
+    std::strcpy(devs[1].name, "Paired Keyboard");
+    devs[1].connected = false;
+    devs[1].paired = true;
+
+    std::strcpy(devs[2].name, "AirPods");
+    devs[2].connected = true;
+    devs[2].paired = true;
+
+    std::strcpy(devs[3].name, "Alpha Mouse");
+    devs[3].connected = false;
+    devs[3].paired = true;
+
+    winome::sort_bluetooth_devices(devs, 4);
+    CHECK(std::strcmp(devs[0].name, "AirPods") == 0);
+    CHECK(std::strcmp(devs[1].name, "Alpha Mouse") == 0);
+    CHECK(std::strcmp(devs[2].name, "Paired Keyboard") == 0);
+    CHECK(std::strcmp(devs[3].name, "Nearby Speaker") == 0);
+  }
+}
+
+void test_power_modes_overlay_and_legacy() {
+  const char* kBalanced = "381b4222-f694-41f0-9685-ff5bb260df2e";
+  const char* kBalancedRand = "b9a9a03a-5b6d-40a4-8656-132d3c462975";
+  const char* kLegacySaver = "a1841308-3541-4fab-bc81-f71556f20b4a";
+  const char* kLegacyPerf = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
+  const char* kLegacyUltimate = "e9a42b02-d5df-448d-aa00-03f14749eb61";
+  const char* kOverlaySaver = "961cc777-2547-4f9d-8174-7d86181b8a7a";
+  const char* kOverlayNull = "00000000-0000-0000-0000-000000000000";
+  const char* kOverlayBetterPerf = "3af9b8d9-7c97-431d-ad78-34a85fe439fb";
+  const char* kOverlayBestPerf = "ded574b5-45a0-4f42-8737-46345c09c238";
+
+  // 1. Modern Windows 10/11 Balanced base + overlay power modes.
+  CHECK(winome_power_mode_from_guid_strings(kBalanced, kOverlaySaver) ==
+        WINOME_POWER_SAVER);
+  CHECK(winome_power_mode_from_guid_strings(kBalanced, kOverlayNull) ==
+        WINOME_POWER_BALANCED);
+  CHECK(winome_power_mode_from_guid_strings(kBalanced, kBalanced) ==
+        WINOME_POWER_BALANCED);
+  CHECK(winome_power_mode_from_guid_strings(kBalanced, kOverlayBestPerf) ==
+        WINOME_POWER_PERFORMANCE);
+  CHECK(winome_power_mode_from_guid_strings(kBalanced, kOverlayBetterPerf) ==
+        WINOME_POWER_PERFORMANCE);
+  CHECK(winome_power_mode_from_guid_strings(kBalancedRand, kOverlayBestPerf) ==
+        WINOME_POWER_PERFORMANCE);
+  CHECK(winome_power_mode_from_guid_strings(kBalanced, nullptr) ==
+        WINOME_POWER_BALANCED);
+
+  // 2. Explicit legacy non-Balanced schemes override null/balanced overlay.
+  CHECK(winome_power_mode_from_guid_strings(kLegacySaver, kOverlayNull) ==
+        WINOME_POWER_SAVER);
+  CHECK(winome_power_mode_from_guid_strings(kLegacyPerf, kOverlayNull) ==
+        WINOME_POWER_PERFORMANCE);
+  CHECK(winome_power_mode_from_guid_strings(kLegacyUltimate, nullptr) ==
+        WINOME_POWER_PERFORMANCE);
+
+  // 3. Invalid base GUID returns sentinel; unknown OEM GUID falls back safely.
+  CHECK(winome_power_mode_from_guid_strings("not-a-guid", kOverlayNull) ==
+        WINOME_POWER_MODE_COUNT);
+  CHECK(winome_power_mode_from_guid_strings(
+            "11111111-2222-3333-4444-555555555555", nullptr) ==
+        WINOME_POWER_BALANCED);
+
+  // 4. Read-only host sanity: active mode is valid and all 3 modes have icons.
+  WinomePowerMode active = winome_power_get_active();
+  CHECK(active < WINOME_POWER_MODE_COUNT);
+  CHECK(winome_power_mode_available(WINOME_POWER_BALANCED) == TRUE);
+  CHECK(std::strcmp(winome_power_mode_icon(WINOME_POWER_SAVER),
+                    "power-profile-power-saver-symbolic") == 0);
+  CHECK(std::strcmp(winome_power_mode_icon(WINOME_POWER_BALANCED),
+                    "power-profile-balanced-symbolic") == 0);
+  CHECK(std::strcmp(winome_power_mode_icon(WINOME_POWER_PERFORMANCE),
+                    "power-profile-performance-symbolic") == 0);
+}
+
+void test_notification_activation_xml_and_theme_modes() {
+  // 1. Protocol toast XML parsing.
+  {
+    const std::string xml =
+        "<toast launch=\"ms-settings:windowsupdate\" activationType=\"protocol\">"
+        "<visual><binding template=\"ToastGeneric\">"
+        "<text>Windows Update</text>"
+        "<text>Restart required</text>"
+        "</binding></visual></toast>";
+    winome::WinomeSystemNotification parsed;
+    CHECK(winome::parse_wpn_toast_xml_full(xml, &parsed));
+    CHECK(parsed.title == "Windows Update");
+    CHECK(parsed.body == "Restart required");
+    CHECK(parsed.launch_args == "ms-settings:windowsupdate");
+    CHECK(parsed.activation_type == "protocol");
+    CHECK(parsed.url == "ms-settings:windowsupdate");
+    CHECK(parsed.actions.empty());
+  }
+
+  // 2. Foreground toast with action buttons, entity unescaping, and filtering.
+  {
+    const std::string xml =
+        "<toast launch=\"action=view&amp;id=42\" activationType=\"foreground\">"
+        "<visual><binding template=\"ToastGeneric\">"
+        "<text>Mail</text>"
+        "<text>Check https://example.com/msg?a=1&amp;b=2.</text>"
+        "</binding></visual>"
+        "<actions>"
+        "<action content=\"Open Link\" arguments=\"https://example.com/open\" activationType=\"protocol\"/>"
+        "<action content=\"Reply\" arguments=\"reply=42\" activationType=\"foreground\"/>"
+        "<action content=\"Snooze\" arguments=\"snooze\" activationType=\"system\"/>"
+        "<action content=\"Settings\" arguments=\"cfg\" placement=\"contextMenu\"/>"
+        "</actions></toast>";
+    winome::WinomeSystemNotification parsed;
+    CHECK(winome::parse_wpn_toast_xml_full(xml, &parsed));
+    CHECK(parsed.launch_args == "action=view&id=42");
+    CHECK(parsed.activation_type == "foreground");
+    CHECK(parsed.url == "https://example.com/msg?a=1&b=2");
+    CHECK(parsed.actions.size() == 2);
+    CHECK(parsed.actions[0].label == "Open Link");
+    CHECK(parsed.actions[0].arguments == "https://example.com/open");
+    CHECK(parsed.actions[0].activation_type == "protocol");
+    CHECK(parsed.actions[1].label == "Reply");
+    CHECK(parsed.actions[1].arguments == "reply=42");
+    CHECK(parsed.actions[1].activation_type == "foreground");
+  }
+
+  // 3. Protocol URI validation blocks unsafe schemes and non-URI launch args.
+  CHECK(winome::is_safe_protocol_uri("https://gnome.org", ""));
+  CHECK(winome::is_safe_protocol_uri("ms-settings:colors", ""));
+  CHECK(winome::is_safe_protocol_uri("vscode://file/test", ""));
+  CHECK(winome::is_safe_protocol_uri("myapp:open?id=1", "protocol"));
+  CHECK(!winome::is_safe_protocol_uri("file:///C:/Windows/win.ini", "protocol"));
+  CHECK(!winome::is_safe_protocol_uri("javascript:alert(1)", "protocol"));
+  CHECK(!winome::is_safe_protocol_uri("powershell:calc", "protocol"));
+  CHECK(!winome::is_safe_protocol_uri("conversationId=9813", "foreground"));
+
+  // 4. Fine-grained App / System dark mode query works read-only.
+  bool apps_dark = false;
+  bool sys_dark = false;
+  CHECK(winome::get_theme_modes(&apps_dark, &sys_dark));
 }
 
 }  // namespace
@@ -2410,6 +2915,11 @@ int main() {
   test_workarea_clamp_guard_and_fullscreen_hysteresis();
   test_hook_watchdog_and_lockfree_ring();
   test_overview_search_helpers();
+  test_live_wallpaper_helpers();
+  test_panel_overview_and_workspace_dots();
+  test_wpn_notifications_and_wifi_bt_sorting();
+  test_power_modes_overlay_and_legacy();
+  test_notification_activation_xml_and_theme_modes();
 
   if (g_failures == 0)
     std::printf("ALL WINOME UNIT TESTS PASSED\n");

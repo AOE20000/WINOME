@@ -128,61 +128,465 @@ workspace_dot_size (void)
   return 8;
 }
 
-// --- Workspace dot ----------------------------------------------------------
+// --- Activities button & continuous workspace indicators --------------------
 //
-// In gnome-shell a WorkspaceDot is a Clutter.Actor (no CSS node) wrapping a
-// .workspace-dot St.Widget. The active workspace stretches the dot into a wide
-// capsule (width = dot size * width-multiplier, 3.625 for <= 2 workspaces).
-// GtkBox is deliberately not used here: the mapped selector
-// "#panel .panel-button#panelActivities box" would otherwise apply its padding
-// to the dot too. A plain GtkWidget subclass paints its CSS background (like
-// St.Widget) and does not match element selector "box".
+// Faithful port of gnome-shell js/ui/panel.js WorkspaceDot + WorkspaceIndicators
+// + ActivitiesButton:
+//   - Draws the rounded pill highlight (inset 3px) driven in lockstep with
+//     overview.cpp's eased overview_progress [0..1] plus 150ms ease-out hover.
+//   - Draws continuous morphing workspace dots using the exact upstream
+//     expansion = clamp(1 - |i - active_pos|, 0, 1) formula: width morphs
+//     between 1.0x and widthMultiplier (3.625 / 3.25 / 2.75), scale between
+//     0.75 and 1.0, opacity between 0.50 and 1.0. Total width is invariant
+//     across transitions so switching workspaces causes zero layout jitter.
+
+constexpr int kActivitiesDotSpacing = 5;
+constexpr int kActivitiesPadX = 18;  // 3px border + 12px hpadding + 3px box pad
+constexpr double kActivitiesPillInset = 3.0;
+constexpr double kActivitiesHoverMs = 150.0;
+constexpr double kActivitiesWsSwitchMs = 250.0;
+constexpr double kActivitiesDotScaleInMs = 300.0;
 
 typedef struct {
   GtkWidget parent_instance;
-} WinomeDot;
+  int dot_count;
+  bool initialized;
+  double display_pos;
+  double target_pos;
+  double pos_anim_from;
+  gint64 pos_anim_start_us;
+  bool pos_anim_active;
+  bool external_scroll;
+
+  double overview_progress;
+  double hover_progress;
+  double hover_from;
+  double hover_to;
+  gint64 hover_start_us;
+  bool hover_anim_active;
+  bool pressed;
+
+  int prev_dot_count;
+  double count_appear_progress;
+  gint64 count_appear_start_us;
+  bool count_appear_active;
+
+  guint tick_id;
+} WinomeActivitiesBtn;
 
 typedef struct {
   GtkWidgetClass parent_class;
-} WinomeDotClass;
+} WinomeActivitiesBtnClass;
 
-#define WINOME_DOT(obj) (G_TYPE_CHECK_INSTANCE_CAST ((obj), \
-                          WINOME_TYPE_DOT, WinomeDot))
+#define WINOME_TYPE_ACTIVITIES_BTN (winome_activities_btn_get_type ())
+#define WINOME_ACTIVITIES_BTN(obj) (G_TYPE_CHECK_INSTANCE_CAST ((obj), \
+                                     WINOME_TYPE_ACTIVITIES_BTN, WinomeActivitiesBtn))
 
-G_DEFINE_TYPE (WinomeDot, winome_dot, GTK_TYPE_WIDGET)
+G_DEFINE_TYPE (WinomeActivitiesBtn, winome_activities_btn, GTK_TYPE_WIDGET)
 
-static void
-winome_dot_init (WinomeDot *self G_GNUC_UNUSED)
+static gboolean
+winome_activities_btn_tick (GtkWidget *widget, GdkFrameClock *clock,
+                            gpointer user_data G_GNUC_UNUSED)
 {
+  WinomeActivitiesBtn *self = WINOME_ACTIVITIES_BTN (widget);
+  const gint64 now_us = gdk_frame_clock_get_frame_time (clock);
+  bool keep_running = false;
+
+  if (self->hover_anim_active) {
+    const double t = std::clamp (
+        (now_us - self->hover_start_us) / 1000.0 / kActivitiesHoverMs,
+        0.0, 1.0);
+    const double e = winome::ease_sample (winome::Ease::ease_out_quad, t);
+    self->hover_progress =
+        self->hover_from + (self->hover_to - self->hover_from) * e;
+    if (t >= 1.0) {
+      self->hover_progress = self->hover_to;
+      self->hover_anim_active = false;
+    } else {
+      keep_running = true;
+    }
+  }
+
+  if (self->pos_anim_active && !self->external_scroll) {
+    const double t = std::clamp (
+        (now_us - self->pos_anim_start_us) / 1000.0 / kActivitiesWsSwitchMs,
+        0.0, 1.0);
+    const double e = winome::ease_sample (winome::Ease::ease_out_cubic, t);
+    self->display_pos =
+        self->pos_anim_from + (self->target_pos - self->pos_anim_from) * e;
+    if (t >= 1.0) {
+      self->display_pos = self->target_pos;
+      self->pos_anim_active = false;
+    } else {
+      keep_running = true;
+    }
+  } else if (self->external_scroll) {
+    self->pos_anim_active = false;
+  }
+
+  if (self->count_appear_active) {
+    const double t = std::clamp (
+        (now_us - self->count_appear_start_us) / 1000.0 / kActivitiesDotScaleInMs,
+        0.0, 1.0);
+    self->count_appear_progress =
+        winome::ease_sample (winome::Ease::ease_out_cubic, t);
+    if (t >= 1.0) {
+      self->count_appear_progress = 1.0;
+      self->count_appear_active = false;
+    } else {
+      keep_running = true;
+    }
+  }
+
+  gtk_widget_queue_draw (widget);
+  if (!keep_running) {
+    self->tick_id = 0;
+    return G_SOURCE_REMOVE;
+  }
+  return G_SOURCE_CONTINUE;
 }
 
 static void
-winome_dot_class_init (WinomeDotClass *klass G_GNUC_UNUSED)
+winome_activities_btn_ensure_tick (WinomeActivitiesBtn *self)
 {
+  if (self->tick_id == 0) {
+    self->tick_id = gtk_widget_add_tick_callback (
+        GTK_WIDGET (self), winome_activities_btn_tick, nullptr, nullptr);
+  }
 }
-
-static GtkWidget *
-create_workspace_dot (void)
-{
-  GtkWidget *dot = GTK_WIDGET (g_object_new (winome_dot_get_type (), NULL));
-  gtk_widget_add_css_class (dot, "workspace-dot");
-  gtk_widget_set_valign (dot, GTK_ALIGN_CENTER);
-
-  int size = workspace_dot_size ();
-  // width-multiplier for a single workspace (nIndicators <= 2 -> 3.625).
-  int width = (int)(size * 3.625 + 0.5);
-  gtk_widget_set_size_request (dot, width, size);
-
-  return dot;
-}
-
-// --- Activities button ------------------------------------------------------
 
 static void
-on_activities_clicked (GtkButton *button G_GNUC_UNUSED,
-                       gpointer user_data G_GNUC_UNUSED)
+winome_activities_btn_measure (GtkWidget *widget,
+                               GtkOrientation orientation,
+                               int for_size G_GNUC_UNUSED,
+                               int *minimum, int *natural,
+                               int *minimum_baseline, int *natural_baseline)
 {
-  winome::toggle_overview ("activities-button");
+  WinomeActivitiesBtn *self = WINOME_ACTIVITIES_BTN (widget);
+  const int dot_size = workspace_dot_size ();
+  if (orientation == GTK_ORIENTATION_HORIZONTAL) {
+    double dots_w = 0.0;
+    winome::compute_workspace_dot_metrics (
+        std::max (self->dot_count, 1), 0.0, dot_size, kActivitiesDotSpacing,
+        &dots_w);
+    const int total = static_cast<int> (std::lround (dots_w)) + 2 * kActivitiesPadX;
+    *minimum = total;
+    *natural = total;
+  } else {
+    const int h = panel_height ();
+    *minimum = std::min (dot_size + 6, h);
+    *natural = h;
+  }
+  if (minimum_baseline)
+    *minimum_baseline = -1;
+  if (natural_baseline)
+    *natural_baseline = -1;
+}
+
+static void
+winome_activities_btn_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
+{
+  WinomeActivitiesBtn *self = WINOME_ACTIVITIES_BTN (widget);
+  const int w = gtk_widget_get_width (widget);
+  const int h = gtk_widget_get_height (widget);
+  if (w <= 0 || h <= 0)
+    return;
+
+  double pill_alpha = 0.0;
+  winome::compute_panel_overview_colors (self->overview_progress,
+                                         self->hover_progress,
+                                         self->pressed,
+                                         nullptr, nullptr, nullptr,
+                                         &pill_alpha);
+  if (pill_alpha > 0.002 && w > 6 && h > 6) {
+    const float inset = static_cast<float> (kActivitiesPillInset);
+    const float pw = static_cast<float> (w) - 2.0f * inset;
+    const float ph = static_cast<float> (h) - 2.0f * inset;
+    graphene_rect_t prect;
+    graphene_rect_init (&prect, inset, inset, pw, ph);
+    GskRoundedRect pill_clip;
+    gsk_rounded_rect_init_from_rect (&pill_clip, &prect, ph * 0.5f);
+    gtk_snapshot_push_rounded_clip (snapshot, &pill_clip);
+    GdkRGBA fill = {250.0f / 255.0f, 250.0f / 255.0f, 251.0f / 255.0f,
+                    static_cast<float> (pill_alpha)};
+    gtk_snapshot_append_color (snapshot, &fill, &prect);
+    gtk_snapshot_pop (snapshot);
+  }
+
+  const int count = std::max (self->dot_count, 1);
+  const int dot_size = workspace_dot_size ();
+  double dots_w = 0.0;
+  const auto metrics = winome::compute_workspace_dot_metrics (
+      count, self->display_pos, dot_size, kActivitiesDotSpacing, &dots_w);
+  const double start_x = (static_cast<double> (w) - dots_w) * 0.5;
+  const double cy = static_cast<double> (h) * 0.5;
+
+  for (int i = 0; i < static_cast<int> (metrics.size ()); ++i) {
+    const auto &m = metrics[static_cast<size_t> (i)];
+    const double appear =
+        (self->count_appear_active && i >= self->prev_dot_count)
+            ? self->count_appear_progress
+            : 1.0;
+    const double dw = m.draw_w * appear;
+    const double dh = m.draw_h * appear;
+    if (dw < 0.5 || dh < 0.5)
+      continue;
+    const double cx = start_x + m.slot_x + m.slot_w * 0.5;
+    graphene_rect_t drect;
+    graphene_rect_init (&drect,
+                        static_cast<float> (cx - dw * 0.5),
+                        static_cast<float> (cy - dh * 0.5),
+                        static_cast<float> (dw),
+                        static_cast<float> (dh));
+    GskRoundedRect dclip;
+    gsk_rounded_rect_init_from_rect (&dclip, &drect,
+                                     static_cast<float> (dh * 0.5));
+    gtk_snapshot_push_rounded_clip (snapshot, &dclip);
+    GdkRGBA dot_col = {1.0f, 1.0f, 1.0f,
+                       static_cast<float> (m.opacity * appear)};
+    gtk_snapshot_append_color (snapshot, &dot_col, &drect);
+    gtk_snapshot_pop (snapshot);
+  }
+}
+
+static void
+winome_activities_btn_dispose (GObject *obj)
+{
+  WinomeActivitiesBtn *self = WINOME_ACTIVITIES_BTN (obj);
+  if (self->tick_id != 0) {
+    gtk_widget_remove_tick_callback (GTK_WIDGET (self), self->tick_id);
+    self->tick_id = 0;
+  }
+  G_OBJECT_CLASS (winome_activities_btn_parent_class)->dispose (obj);
+}
+
+static void
+winome_activities_btn_init (WinomeActivitiesBtn *self)
+{
+  self->dot_count = 1;
+  self->initialized = false;
+  self->display_pos = 0.0;
+  self->target_pos = 0.0;
+  self->pos_anim_from = 0.0;
+  self->pos_anim_start_us = 0;
+  self->pos_anim_active = false;
+  self->external_scroll = false;
+  self->overview_progress = 0.0;
+  self->hover_progress = 0.0;
+  self->hover_from = 0.0;
+  self->hover_to = 0.0;
+  self->hover_start_us = 0;
+  self->hover_anim_active = false;
+  self->pressed = false;
+  self->prev_dot_count = 1;
+  self->count_appear_progress = 1.0;
+  self->count_appear_start_us = 0;
+  self->count_appear_active = false;
+  self->tick_id = 0;
+}
+
+static void
+winome_activities_btn_class_init (WinomeActivitiesBtnClass *klass)
+{
+  GObjectClass *obj_class = G_OBJECT_CLASS (klass);
+  GtkWidgetClass *widget_class = GTK_WIDGET_CLASS (klass);
+  obj_class->dispose = winome_activities_btn_dispose;
+  widget_class->measure = winome_activities_btn_measure;
+  widget_class->snapshot = winome_activities_btn_snapshot;
+}
+
+static void
+winome_activities_btn_set_hover (WinomeActivitiesBtn *self, bool hovered)
+{
+  const double want = hovered ? 1.0 : 0.0;
+  if (std::fabs (self->hover_to - want) < 1e-4 &&
+      (self->hover_anim_active || std::fabs (self->hover_progress - want) < 1e-4)) {
+    return;
+  }
+  self->hover_from = self->hover_progress;
+  self->hover_to = want;
+  GdkFrameClock *clock = gtk_widget_get_frame_clock (GTK_WIDGET (self));
+  self->hover_start_us = clock ? gdk_frame_clock_get_frame_time (clock)
+                               : g_get_monotonic_time ();
+  self->hover_anim_active = true;
+  winome_activities_btn_ensure_tick (self);
+}
+
+static void
+winome_activities_btn_set_overview_progress (GtkWidget *widget, double progress)
+{
+  if (widget == nullptr)
+    return;
+  WinomeActivitiesBtn *self = WINOME_ACTIVITIES_BTN (widget);
+  const double p = std::clamp (progress, 0.0, 1.0);
+  if (std::fabs (self->overview_progress - p) < 1e-4)
+    return;
+  self->overview_progress = p;
+  gtk_widget_queue_draw (widget);
+}
+
+static void
+winome_activities_btn_set_desktop (GtkWidget *widget, int count, int active)
+{
+  if (widget == nullptr)
+    return;
+  WinomeActivitiesBtn *self = WINOME_ACTIVITIES_BTN (widget);
+  if (count < 1)
+    count = 1;
+  if (active < 0 || active >= count)
+    active = 0;
+
+  const bool count_changed = (self->dot_count != count);
+  if (count_changed) {
+    if (self->initialized && count > self->dot_count) {
+      self->prev_dot_count = self->dot_count;
+      self->count_appear_progress = 0.0;
+      GdkFrameClock *clock = gtk_widget_get_frame_clock (widget);
+      self->count_appear_start_us = clock ? gdk_frame_clock_get_frame_time (clock)
+                                          : g_get_monotonic_time ();
+      self->count_appear_active = true;
+      winome_activities_btn_ensure_tick (self);
+    } else {
+      self->prev_dot_count = count;
+      self->count_appear_active = false;
+      self->count_appear_progress = 1.0;
+    }
+    self->dot_count = count;
+    self->display_pos =
+        std::clamp (self->display_pos, 0.0, static_cast<double> (count - 1));
+    gtk_widget_queue_resize (widget);
+  }
+
+  const double target = static_cast<double> (active);
+  if (!self->initialized) {
+    self->initialized = true;
+    self->display_pos = target;
+    self->target_pos = target;
+    self->pos_anim_active = false;
+    gtk_widget_queue_draw (widget);
+    return;
+  }
+
+  if (self->external_scroll) {
+    self->target_pos = target;
+    if (count_changed)
+      gtk_widget_queue_draw (widget);
+    return;
+  }
+
+  if (std::fabs (self->target_pos - target) > 1e-4 ||
+      (!self->pos_anim_active && std::fabs (self->display_pos - target) > 1e-4)) {
+    self->pos_anim_from = self->display_pos;
+    self->target_pos = target;
+    GdkFrameClock *clock = gtk_widget_get_frame_clock (widget);
+    self->pos_anim_start_us = clock ? gdk_frame_clock_get_frame_time (clock)
+                                    : g_get_monotonic_time ();
+    self->pos_anim_active = true;
+    winome_activities_btn_ensure_tick (self);
+  } else if (count_changed) {
+    gtk_widget_queue_draw (widget);
+  }
+}
+
+static void
+winome_activities_btn_set_scroll (GtkWidget *widget, int count, double position)
+{
+  if (widget == nullptr)
+    return;
+  WinomeActivitiesBtn *self = WINOME_ACTIVITIES_BTN (widget);
+  if (position < 0.0) {
+    self->external_scroll = false;
+    const auto snap = winome::vd::cached_snapshot ();
+    winome_activities_btn_set_desktop (
+        widget, snap.valid ? snap.count : self->dot_count,
+        snap.valid ? snap.active_index : static_cast<int> (std::lround (self->target_pos)));
+    return;
+  }
+
+  if (count < 1)
+    count = 1;
+  const bool count_changed = (self->dot_count != count);
+  if (count_changed) {
+    if (self->initialized && count > self->dot_count) {
+      self->prev_dot_count = self->dot_count;
+      self->count_appear_progress = 0.0;
+      GdkFrameClock *clock = gtk_widget_get_frame_clock (widget);
+      self->count_appear_start_us = clock ? gdk_frame_clock_get_frame_time (clock)
+                                          : g_get_monotonic_time ();
+      self->count_appear_active = true;
+      winome_activities_btn_ensure_tick (self);
+    } else {
+      self->prev_dot_count = count;
+      self->count_appear_active = false;
+      self->count_appear_progress = 1.0;
+    }
+    self->dot_count = count;
+    gtk_widget_queue_resize (widget);
+  }
+
+  self->initialized = true;
+  self->external_scroll = true;
+  self->pos_anim_active = false;
+  const double clamped =
+      std::clamp (position, 0.0, static_cast<double> (count - 1));
+  if (count_changed || std::fabs (self->display_pos - clamped) > 1e-4) {
+    self->display_pos = clamped;
+    self->target_pos = clamped;
+    gtk_widget_queue_draw (widget);
+  }
+}
+
+static void
+on_activities_pressed (GtkGestureClick *gesture G_GNUC_UNUSED,
+                       int n_press G_GNUC_UNUSED,
+                       double x G_GNUC_UNUSED, double y G_GNUC_UNUSED,
+                       gpointer user_data)
+{
+  WinomeActivitiesBtn *self = WINOME_ACTIVITIES_BTN (user_data);
+  self->pressed = true;
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+}
+
+static void
+on_activities_released (GtkGestureClick *gesture G_GNUC_UNUSED,
+                        int n_press G_GNUC_UNUSED,
+                        double x, double y,
+                        gpointer user_data)
+{
+  WinomeActivitiesBtn *self = WINOME_ACTIVITIES_BTN (user_data);
+  const bool was_pressed = self->pressed;
+  self->pressed = false;
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+  const int w = gtk_widget_get_width (GTK_WIDGET (self));
+  const int h = gtk_widget_get_height (GTK_WIDGET (self));
+  if (was_pressed && x >= 0.0 && x <= w && y >= 0.0 && y <= h)
+    winome::toggle_overview ("activities-button");
+}
+
+static void
+on_activities_stopped (GtkGestureClick *gesture G_GNUC_UNUSED,
+                       gpointer user_data)
+{
+  WinomeActivitiesBtn *self = WINOME_ACTIVITIES_BTN (user_data);
+  if (self->pressed) {
+    self->pressed = false;
+    gtk_widget_queue_draw (GTK_WIDGET (self));
+  }
+}
+
+static void
+on_activities_enter (GtkEventControllerMotion *ctrl G_GNUC_UNUSED,
+                     double x G_GNUC_UNUSED, double y G_GNUC_UNUSED,
+                     gpointer user_data)
+{
+  winome_activities_btn_set_hover (WINOME_ACTIVITIES_BTN (user_data), true);
+}
+
+static void
+on_activities_leave (GtkEventControllerMotion *ctrl G_GNUC_UNUSED,
+                     gpointer user_data)
+{
+  winome_activities_btn_set_hover (WINOME_ACTIVITIES_BTN (user_data), false);
 }
 
 static gint64 g_last_activities_scroll_us = 0;
@@ -214,33 +618,30 @@ on_activities_scroll (GtkEventControllerScroll *ctrl G_GNUC_UNUSED,
 static GtkWidget *
 create_activities_button (GtkWidget **out_indicators)
 {
-  GtkWidget *button;
-  GtkWidget *indicators;
-  GtkWidget *dot;
-
-  button = gtk_button_new ();
+  GtkWidget *button =
+      GTK_WIDGET (g_object_new (WINOME_TYPE_ACTIVITIES_BTN, NULL));
   gtk_widget_add_css_class (button, "panel-button");
   gtk_widget_set_name (button, "panelActivities");
   gtk_widget_set_focus_on_click (button, FALSE);
   gtk_widget_set_vexpand (button, TRUE);
 
-  // WorkspaceIndicators: a plain St.BoxLayout; the stylesheet's
-  // "#panel .panel-button#panelActivities box" rule adds the em padding and
-  // the spacing is set here (the St `spacing` property is dropped in the
-  // GTK4 conversion). Like native, the box keeps its natural (8px) height and
-  // is centered in the full-height button, so the dot is not stretched.
-  indicators = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 5);
-  gtk_widget_set_valign (indicators, GTK_ALIGN_CENTER);
-  dot = create_workspace_dot ();
-  gtk_box_append (GTK_BOX (indicators), dot);
-
   if (out_indicators != nullptr)
-    *out_indicators = indicators;
+    *out_indicators = button;
 
-  gtk_button_set_child (GTK_BUTTON (button), indicators);
+  GtkGesture *click = gtk_gesture_click_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), GDK_BUTTON_PRIMARY);
+  g_signal_connect (click, "pressed", G_CALLBACK (on_activities_pressed),
+                    button);
+  g_signal_connect (click, "released", G_CALLBACK (on_activities_released),
+                    button);
+  g_signal_connect (click, "stopped", G_CALLBACK (on_activities_stopped),
+                    button);
+  gtk_widget_add_controller (button, GTK_EVENT_CONTROLLER (click));
 
-  g_signal_connect (button, "clicked", G_CALLBACK (on_activities_clicked),
-                    nullptr);
+  GtkEventController *motion = gtk_event_controller_motion_new ();
+  g_signal_connect (motion, "enter", G_CALLBACK (on_activities_enter), button);
+  g_signal_connect (motion, "leave", G_CALLBACK (on_activities_leave), button);
+  gtk_widget_add_controller (button, motion);
 
   GtkEventController *scroll = gtk_event_controller_scroll_new (
       GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
@@ -263,6 +664,7 @@ typedef struct {
   GtkWidget *start;
   GtkWidget *center;
   GtkWidget *end;
+  double overview_progress;
 } WinomePanelLayout;
 
 typedef struct {
@@ -369,8 +771,29 @@ winome_panel_layout_size_allocate (GtkWidget *widget,
 }
 
 static void
-winome_panel_layout_init (WinomePanelLayout *self G_GNUC_UNUSED)
+winome_panel_layout_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
 {
+  WinomePanelLayout *self = WINOME_PANEL_LAYOUT (widget);
+  const int w = gtk_widget_get_width (widget);
+  const int h = gtk_widget_get_height (widget);
+  if (w > 0 && h > 0) {
+    double r = 0.0, g = 0.0, b = 0.0;
+    winome::compute_panel_overview_colors (self->overview_progress, 0.0, false,
+                                           &r, &g, &b, nullptr);
+    graphene_rect_t rect;
+    graphene_rect_init (&rect, 0.0f, 0.0f, static_cast<float> (w),
+                        static_cast<float> (h));
+    GdkRGBA bg = {static_cast<float> (r), static_cast<float> (g),
+                  static_cast<float> (b), 1.0f};
+    gtk_snapshot_append_color (snapshot, &bg, &rect);
+  }
+  GTK_WIDGET_CLASS (winome_panel_layout_parent_class)->snapshot (widget, snapshot);
+}
+
+static void
+winome_panel_layout_init (WinomePanelLayout *self)
+{
+  self->overview_progress = 0.0;
 }
 
 static void
@@ -380,6 +803,7 @@ winome_panel_layout_class_init (WinomePanelLayoutClass *klass)
 
   widget_class->measure = winome_panel_layout_measure;
   widget_class->size_allocate = winome_panel_layout_size_allocate;
+  widget_class->snapshot = winome_panel_layout_snapshot;
 }
 
 static void
@@ -1117,35 +1541,35 @@ ensure_popover_mouse_hook (void)
                                               nullptr, 0);
 }
 
-// When the Activities overview opens it takes over the screen: make all panels
-// transparent (GNOME style) and close any open popover so it does not float
-// over the overview.
+// When the Activities overview opens it takes over the screen: close any open
+// popover immediately, while overview.cpp drives the panel backdrop (#000000
+// <-> #222226) and #panelActivities pill highlight frame-locked via
+// winome_shell_panel_set_overview_progress().
 static std::vector<GtkWidget *> g_registered_panels;
+static double g_panel_overview_progress = 0.0;
+static bool g_panel_scroll_active = false;
+static int g_panel_scroll_count = 1;
+static double g_panel_scroll_pos = 0.0;
 
 static void
-apply_panel_overview_css (GtkWidget *panel, bool active)
+apply_panel_overview_progress (GtkWidget *panel, double progress)
 {
   if (panel == nullptr)
     return;
-  GtkWidget *act_btn = static_cast<GtkWidget *> (
-      g_object_get_data (G_OBJECT (panel), "activities-button"));
-  if (active) {
-    gtk_widget_add_css_class (panel, "overview");
-    if (act_btn != nullptr) {
-      gtk_widget_add_css_class (act_btn, "overview");
-      gtk_widget_add_css_class (act_btn, "open");
-      gtk_widget_queue_draw (act_btn);
-    }
-  } else {
-    gtk_widget_remove_css_class (panel, "overview");
-    if (act_btn != nullptr) {
-      gtk_widget_remove_css_class (act_btn, "overview");
-      gtk_widget_remove_css_class (act_btn, "open");
-      gtk_widget_unset_state_flags (act_btn, GTK_STATE_FLAG_PRELIGHT);
-      gtk_widget_queue_draw (act_btn);
+  const double p = std::clamp (progress, 0.0, 1.0);
+  GtkWidget *layout = static_cast<GtkWidget *> (
+      g_object_get_data (G_OBJECT (panel), "panel-layout"));
+  if (layout != nullptr) {
+    WinomePanelLayout *pl = WINOME_PANEL_LAYOUT (layout);
+    if (std::fabs (pl->overview_progress - p) > 1e-4) {
+      pl->overview_progress = p;
+      gtk_widget_queue_draw (layout);
     }
   }
-  gtk_widget_queue_draw (panel);
+  GtkWidget *act_btn = static_cast<GtkWidget *> (
+      g_object_get_data (G_OBJECT (panel), "activities-button"));
+  if (act_btn != nullptr)
+    winome_activities_btn_set_overview_progress (act_btn, p);
 }
 
 static void
@@ -1154,11 +1578,9 @@ on_overview_state_changed (bool active, void *user_data G_GNUC_UNUSED)
   g_print ("[panel] overview state -> %d\n", (int)active);
   if (active)
     winome_shell_panel_close_popovers ();
-  for (GtkWidget *panel : g_registered_panels)
-    apply_panel_overview_css (panel, active);
 }
 
-// Register a panel window in the shared overview CSS state tracker.
+// Register a panel window in the shared overview state tracker.
 static void
 connect_overview_state (GtkWidget *panel)
 {
@@ -1170,7 +1592,57 @@ connect_overview_state (GtkWidget *panel)
     g_overview_hooked = TRUE;
     winome::set_overview_change_callback (on_overview_state_changed, nullptr);
   }
-  apply_panel_overview_css (panel, winome::overview_active ());
+  apply_panel_overview_progress (panel, g_panel_overview_progress);
+  if (g_panel_scroll_active) {
+    GtkWidget *act_btn = static_cast<GtkWidget *> (
+        g_object_get_data (G_OBJECT (panel), "activities-button"));
+    if (act_btn != nullptr) {
+      winome_activities_btn_set_scroll (act_btn, g_panel_scroll_count,
+                                        g_panel_scroll_pos);
+    }
+  }
+}
+
+void
+winome_shell_panel_set_overview_progress (double progress)
+{
+  const double p = std::clamp (progress, 0.0, 1.0);
+  if (std::fabs (g_panel_overview_progress - p) < 1e-4)
+    return;
+  g_panel_overview_progress = p;
+  for (GtkWidget *panel : g_registered_panels)
+    apply_panel_overview_progress (panel, p);
+}
+
+void
+winome_shell_panel_set_workspace_scroll (int count, double position)
+{
+  if (position < 0.0) {
+    if (!g_panel_scroll_active)
+      return;
+    g_panel_scroll_active = false;
+    for (GtkWidget *panel : g_registered_panels) {
+      GtkWidget *act_btn = static_cast<GtkWidget *> (
+          g_object_get_data (G_OBJECT (panel), "activities-button"));
+      if (act_btn != nullptr)
+        winome_activities_btn_set_scroll (act_btn, -1, -1.0);
+    }
+    return;
+  }
+
+  if (count < 1)
+    count = 1;
+  g_panel_scroll_active = true;
+  g_panel_scroll_count = count;
+  g_panel_scroll_pos = std::clamp (position, 0.0, static_cast<double> (count - 1));
+  for (GtkWidget *panel : g_registered_panels) {
+    GtkWidget *act_btn = static_cast<GtkWidget *> (
+        g_object_get_data (G_OBJECT (panel), "activities-button"));
+    if (act_btn != nullptr) {
+      winome_activities_btn_set_scroll (act_btn, g_panel_scroll_count,
+                                        g_panel_scroll_pos);
+    }
+  }
 }
 
 // A popover anchored to the given panel button: a borderless toplevel card
@@ -1293,39 +1765,9 @@ apply_activities_dots (PanelStatus *st, int count, int active)
   if (active < 0 || active >= count)
     active = 0;
 
-  if (st->desktop_count == count && st->active_desktop == active)
-    return;
-
-  const bool count_changed = st->desktop_count != count;
   st->desktop_count = count;
   st->active_desktop = active;
-
-  if (count_changed) {
-    GtkWidget *child = gtk_widget_get_first_child (st->activities_indicators);
-    while (child != nullptr) {
-      GtkWidget *next = gtk_widget_get_next_sibling (child);
-      gtk_box_remove (GTK_BOX (st->activities_indicators), child);
-      child = next;
-    }
-    for (int i = 0; i < count; ++i)
-      gtk_box_append (GTK_BOX (st->activities_indicators), create_workspace_dot ());
-  }
-
-  const int size = workspace_dot_size ();
-  const double mult = (count <= 2) ? 3.625 : (count <= 5) ? 3.25 : 2.75;
-  int idx = 0;
-  for (GtkWidget *dot = gtk_widget_get_first_child (st->activities_indicators);
-       dot != nullptr;
-       dot = gtk_widget_get_next_sibling (dot), ++idx) {
-    const bool is_active = (idx == active);
-    if (is_active) {
-      gtk_widget_remove_css_class (dot, "inactive");
-      gtk_widget_set_size_request (dot, (int)(size * mult + 0.5), size);
-    } else {
-      gtk_widget_add_css_class (dot, "inactive");
-      gtk_widget_set_size_request (dot, size, size);
-    }
-  }
+  winome_activities_btn_set_desktop (st->activities_indicators, count, active);
 }
 
 static void
@@ -2389,6 +2831,7 @@ build_shell_panel (bool primary)
   gtk_widget_set_name (panel, "panel");
 
   layout = GTK_WIDGET (g_object_new (winome_panel_layout_get_type (), NULL));
+  g_object_set_data (G_OBJECT (panel), "panel-layout", layout);
   gtk_window_set_child (GTK_WINDOW (panel), layout);
 
   left_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);

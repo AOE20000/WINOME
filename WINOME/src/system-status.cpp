@@ -529,21 +529,87 @@ bool set_brightness(double fraction) {
   return ok;
 }
 
+bool get_theme_modes(bool* apps_dark, bool* system_dark) {
+  DWORD apps_val = 1;
+  DWORD apps_size = sizeof(apps_val);
+  const bool have_apps =
+      RegGetValueW(HKEY_CURRENT_USER, kPersonalizeKey, L"AppsUseLightTheme",
+                   RRF_RT_REG_DWORD, nullptr, &apps_val,
+                   &apps_size) == ERROR_SUCCESS;
+
+  DWORD sys_val = apps_val;
+  DWORD sys_size = sizeof(sys_val);
+  const bool have_sys =
+      RegGetValueW(HKEY_CURRENT_USER, kPersonalizeKey, L"SystemUsesLightTheme",
+                   RRF_RT_REG_DWORD, nullptr, &sys_val,
+                   &sys_size) == ERROR_SUCCESS;
+
+  if (!have_apps && !have_sys)
+    return false;
+  if (apps_dark != nullptr)
+    *apps_dark = have_apps ? (apps_val == 0) : (sys_val == 0);
+  if (system_dark != nullptr)
+    *system_dark = have_sys ? (sys_val == 0) : (apps_val == 0);
+  return true;
+}
+
+bool set_single_personalize_theme_flag(const wchar_t* value_name, bool dark) {
+  const DWORD desired = dark ? 0u : 1u;
+  DWORD current = desired;
+  DWORD size = sizeof(current);
+  if (RegGetValueW(HKEY_CURRENT_USER, kPersonalizeKey, value_name,
+                   RRF_RT_REG_DWORD, nullptr, &current,
+                   &size) == ERROR_SUCCESS &&
+      current == desired) {
+    return true;
+  }
+
+  HKEY key = nullptr;
+  LSTATUS status = RegCreateKeyExW(HKEY_CURRENT_USER, kPersonalizeKey, 0,
+                                   nullptr, 0, KEY_SET_VALUE, nullptr, &key,
+                                   nullptr);
+  if (status != ERROR_SUCCESS)
+    return false;
+
+  const bool ok = RegSetValueExW(
+      key, value_name, 0, REG_DWORD,
+      reinterpret_cast<const BYTE*>(&desired), sizeof(desired)) == ERROR_SUCCESS;
+  RegCloseKey(key);
+
+  if (ok) {
+    SendNotifyMessageW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                       reinterpret_cast<LPARAM>(L"ImmersiveColorSet"));
+  }
+  return ok;
+}
+
+bool set_app_dark_mode(bool dark) {
+  return set_single_personalize_theme_flag(L"AppsUseLightTheme", dark);
+}
+
+bool set_system_dark_mode(bool dark) {
+  return set_single_personalize_theme_flag(L"SystemUsesLightTheme", dark);
+}
+
 bool get_dark_mode(bool* out) {
   if (out == nullptr)
     return false;
-  DWORD val = 1;
-  DWORD size = sizeof(val);
-  LSTATUS status = RegGetValueW(HKEY_CURRENT_USER, kPersonalizeKey,
-                                L"AppsUseLightTheme", RRF_RT_REG_DWORD,
-                                nullptr, &val, &size);
-  if (status != ERROR_SUCCESS)
+  bool apps_dark = false;
+  bool sys_dark = false;
+  if (!get_theme_modes(&apps_dark, &sys_dark))
     return false;
-  *out = (val == 0);
+  *out = apps_dark;
   return true;
 }
 
 bool set_dark_mode(bool dark) {
+  bool cur_apps = !dark;
+  bool cur_sys = !dark;
+  if (get_theme_modes(&cur_apps, &cur_sys) &&
+      cur_apps == dark && cur_sys == dark) {
+    return true;
+  }
+
   HKEY key = nullptr;
   LSTATUS status = RegCreateKeyExW(HKEY_CURRENT_USER, kPersonalizeKey, 0,
                                    nullptr, 0, KEY_SET_VALUE, nullptr, &key,
@@ -720,7 +786,21 @@ bool set_bluetooth_enabled(bool enabled) {
   return false;
 }
 
-int get_bluetooth_devices(BluetoothDevice* out, int max_count) {
+void sort_bluetooth_devices(BluetoothDevice* devs, int count) {
+  if (devs == nullptr || count <= 1)
+    return;
+  std::sort(devs, devs + count,
+            [](const BluetoothDevice& a, const BluetoothDevice& b) {
+              if (a.connected != b.connected)
+                return a.connected;
+              if (a.paired != b.paired)
+                return a.paired;
+              return _stricmp(a.name, b.name) < 0;
+            });
+}
+
+int get_bluetooth_devices_ex(BluetoothDevice* out, int max_count,
+                             bool issue_inquiry) {
   if (out == nullptr || max_count <= 0)
     return 0;
 
@@ -736,15 +816,16 @@ int get_bluetooth_devices(BluetoothDevice* out, int max_count) {
     return 0;
 
   int count = 0;
+  std::vector<ULONGLONG> seen_addrs;
   if (radio != nullptr) {
     BLUETOOTH_DEVICE_SEARCH_PARAMS sp{};
     sp.dwSize = sizeof(sp);
     sp.fReturnAuthenticated = TRUE;
     sp.fReturnRemembered = TRUE;
     sp.fReturnConnected = TRUE;
-    sp.fReturnUnknown = FALSE;
-    sp.fIssueInquiry = FALSE;
-    sp.cTimeoutMultiplier = 0;
+    sp.fReturnUnknown = issue_inquiry ? TRUE : FALSE;
+    sp.fIssueInquiry = issue_inquiry ? TRUE : FALSE;
+    sp.cTimeoutMultiplier = issue_inquiry ? 2 : 0;
     sp.hRadio = radio;
 
     BLUETOOTH_DEVICE_INFO dev{};
@@ -753,11 +834,20 @@ int get_bluetooth_devices(BluetoothDevice* out, int max_count) {
     if (dfind != nullptr) {
       do {
         if (dev.szName[0] != L'\0') {
-          BluetoothDevice &dst = out[count];
-          wide_to_utf8(dev.szName, dst.name, static_cast<int>(sizeof(dst.name)));
-          dst.connected = (dev.fConnected != 0);
-          dst.paired = (dev.fRemembered != 0 || dev.fAuthenticated != 0);
-          ++count;
+          const ULONGLONG addr = dev.Address.ullLong;
+          const bool dup =
+              addr != 0 &&
+              std::find(seen_addrs.begin(), seen_addrs.end(), addr) !=
+                  seen_addrs.end();
+          if (!dup) {
+            if (addr != 0)
+              seen_addrs.push_back(addr);
+            BluetoothDevice &dst = out[count];
+            wide_to_utf8(dev.szName, dst.name, static_cast<int>(sizeof(dst.name)));
+            dst.connected = (dev.fConnected != 0);
+            dst.paired = (dev.fRemembered != 0 || dev.fAuthenticated != 0);
+            ++count;
+          }
         }
         dev.dwSize = sizeof(dev);
       } while (count < max_count && api.find_next_dev(dfind, &dev));
@@ -766,7 +856,12 @@ int get_bluetooth_devices(BluetoothDevice* out, int max_count) {
     CloseHandle(radio);
   }
   api.find_radio_close(rfind);
+  sort_bluetooth_devices(out, count);
   return count;
+}
+
+int get_bluetooth_devices(BluetoothDevice* out, int max_count) {
+  return get_bluetooth_devices_ex(out, max_count, false);
 }
 
 bool get_night_light(bool* out) {
