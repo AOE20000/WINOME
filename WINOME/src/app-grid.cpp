@@ -326,6 +326,8 @@ struct WinomeAppGrid {
   void *user_data = nullptr;
   void (*on_folder_toggled) (bool, void *) = nullptr;
   void *folder_toggled_data = nullptr;
+  void (*on_menu_closed) (void *) = nullptr;
+  void *menu_closed_data = nullptr;
 };
 
 struct WinomeAppGridClass {
@@ -550,10 +552,11 @@ show_tile_context_menu (GtkWidget *tile, WinomeAppGrid *self,
   install_bundled_fonts (popover);
   gtk_widget_add_css_class (popover, "winome-context-popover");
   gtk_widget_set_parent (popover, tile);
-  gtk_popover_set_has_arrow (GTK_POPOVER (popover), TRUE);
-  // AppIcon._init (appDisplay.js:2929): popupMenuSide defaults to St.Side.LEFT
-  // (arrow on left edge of menu -> menu opens to the right of the tile).
+  gtk_popover_set_has_arrow (GTK_POPOVER (popover), FALSE);
+  // AppIcon._init (appDisplay.js:2929): popupMenuSide defaults to St.Side.LEFT;
+  // in GNOME 42+ BoxPointer drops its triangle beak while keeping 6px spacing.
   gtk_popover_set_position (GTK_POPOVER (popover), GTK_POS_RIGHT);
+  gtk_popover_set_offset (GTK_POPOVER (popover), 6, 0);
   gtk_popover_set_autohide (GTK_POPOVER (popover), TRUE);
 
   GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
@@ -658,6 +661,8 @@ show_tile_context_menu (GtkWidget *tile, WinomeAppGrid *self,
         clear_menu_tile_highlight (g);
         if (gtk_widget_get_parent (GTK_WIDGET (p)) != nullptr)
           gtk_widget_unparent (GTK_WIDGET (p));
+        if (g->folder_window == nullptr && g->on_menu_closed != nullptr)
+          g->on_menu_closed (g->menu_closed_data);
       }),
       self);
 
@@ -2273,6 +2278,27 @@ app_grid_close_menu (GtkWidget *grid)
       gtk_widget_unparent (m);
     g_object_unref (m);
   }
+}
+
+bool
+app_grid_has_open_menu (GtkWidget *grid)
+{
+  if (grid == nullptr)
+    return false;
+  WinomeAppGrid *self = WINOME_APP_GRID (grid);
+  return self->active_menu != nullptr && gtk_widget_get_visible (self->active_menu);
+}
+
+void
+app_grid_set_menu_closed_cb (GtkWidget *grid,
+                             void (*on_menu_closed) (void *),
+                             void *user_data)
+{
+  if (grid == nullptr)
+    return;
+  WinomeAppGrid *self = WINOME_APP_GRID (grid);
+  self->on_menu_closed = on_menu_closed;
+  self->menu_closed_data = user_data;
 }
 
 bool

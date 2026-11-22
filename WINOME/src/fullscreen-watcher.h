@@ -62,12 +62,18 @@ struct WorkareaAssertGuard {
   static constexpr int64_t kBurstWindowMs = 3000;
   static constexpr int kMaxBurstApplies = 8;
   static constexpr int64_t kBackoffDurationMs = 1000;
+  static constexpr int64_t kWorkareaSettleGraceMs = 600;
 
   int64_t last_apply_ms = -1;
   int64_t burst_window_start_ms = -1;
   int64_t backoff_until_ms = 0;
+  int64_t workarea_settle_until_ms = 0;
   int burst_count = 0;
   bool pending_after_defer = false;
+
+  bool in_settle_grace(int64_t now_ms) const {
+    return now_ms < workarea_settle_until_ms;
+  }
 
   static bool rects_equal(const RECT& a, const RECT& b) {
     return a.left == b.left && a.top == b.top &&
@@ -126,6 +132,8 @@ struct WorkareaAssertGuard {
     }
 
     last_apply_ms = now_ms;
+    if (desired.top > current.top)
+      workarea_settle_until_ms = now_ms + kWorkareaSettleGraceMs;
     pending_after_defer = false;
     return WorkareaAssertAction::Apply;
   }
@@ -149,7 +157,9 @@ inline bool is_fullscreen_bounds_for_monitor(const RECT& window_rect,
                                              const RECT& monitor_rect,
                                              const RECT& work_rect,
                                              bool is_zoomed,
-                                             int tolerance_px = 2) {
+                                             int tolerance_px = 2,
+                                             bool has_caption = false,
+                                             bool suppress_zoomed = false) {
   if (monitor_rect.right <= monitor_rect.left ||
       monitor_rect.bottom <= monitor_rect.top) {
     return false;
@@ -167,6 +177,12 @@ inline bool is_fullscreen_bounds_for_monitor(const RECT& window_rect,
     return false;
 
   if (is_zoomed) {
+    // Decorated maximized windows (WS_CAPTION + IsZoomed) are normal maximized
+    // desktop windows, never true fullscreen. Also suppress captionless zoomed
+    // checks right after SPI_SETWORKAREA raises work_rect.top so async window
+    // re-layout never produces a 1-tick false fullscreen hide.
+    if (has_caption || suppress_zoomed)
+      return false;
     // Normal maximized windows fill mi.rcMonitor if top workarea wasn't
     // reserved yet; only treat zoomed windows as fullscreen when top workarea
     // is reserved and the window still intentionally covers monitor_rect.top.
@@ -181,6 +197,7 @@ struct FullscreenEvalInput {
   int64_t now_ms = 0;
   bool session_locked = false;
   bool overview_open = false;
+  bool popover_open = false;
   bool currently_hidden = false;
   HMONITOR raw_fullscreen_mon = nullptr;
   bool fg_is_transient_or_null = false;
@@ -195,6 +212,9 @@ struct FullscreenEvalResult {
   bool schedule_unhide_timer = false;
   int unhide_delay_ms = 0;
   bool cancel_unhide_timer = false;
+  bool schedule_hide_timer = false;
+  int hide_delay_ms = 0;
+  bool cancel_hide_timer = false;
 };
 
 // Stabilizes fullscreen detection against transient focus drops, IME/tooltip
@@ -202,30 +222,65 @@ struct FullscreenEvalResult {
 struct FullscreenHysteresisTracker {
   static constexpr int64_t kUnhideDebounceMs = 160;
 
+  int64_t hide_debounce_ms = 0;
   int64_t pending_unhide_deadline_ms = -1;
+  int64_t pending_hide_deadline_ms = -1;
+  HMONITOR pending_hide_mon = nullptr;
+
+  FullscreenHysteresisTracker() = default;
+  explicit FullscreenHysteresisTracker(int64_t enter_debounce_ms)
+      : hide_debounce_ms(enter_debounce_ms > 0 ? enter_debounce_ms : 0) {}
 
   FullscreenEvalResult step(const FullscreenEvalInput& in) {
     FullscreenEvalResult out{};
     if (in.session_locked) {
       pending_unhide_deadline_ms = -1;
+      pending_hide_deadline_ms = -1;
+      pending_hide_mon = nullptr;
       out.hide_all_locked = true;
       out.cancel_unhide_timer = true;
+      out.cancel_hide_timer = true;
       return out;
     }
 
-    if (in.overview_open) {
+    if (in.overview_open || in.popover_open) {
       pending_unhide_deadline_ms = -1;
+      pending_hide_deadline_ms = -1;
+      pending_hide_mon = nullptr;
       out.effective_fullscreen_mon = nullptr;
       out.cancel_unhide_timer = true;
+      out.cancel_hide_timer = true;
       return out;
     }
 
     if (in.raw_fullscreen_mon != nullptr) {
       pending_unhide_deadline_ms = -1;
-      out.effective_fullscreen_mon = in.raw_fullscreen_mon;
       out.cancel_unhide_timer = true;
+      if (!in.currently_hidden && hide_debounce_ms > 0) {
+        if (pending_hide_deadline_ms < 0 ||
+            pending_hide_mon != in.raw_fullscreen_mon) {
+          pending_hide_mon = in.raw_fullscreen_mon;
+          pending_hide_deadline_ms = in.now_ms + hide_debounce_ms;
+          out.effective_fullscreen_mon = nullptr;
+          out.schedule_hide_timer = true;
+          out.hide_delay_ms = static_cast<int>(hide_debounce_ms);
+          return out;
+        }
+        if (in.now_ms < pending_hide_deadline_ms) {
+          out.effective_fullscreen_mon = nullptr;
+          return out;
+        }
+      }
+      pending_hide_deadline_ms = -1;
+      pending_hide_mon = nullptr;
+      out.effective_fullscreen_mon = in.raw_fullscreen_mon;
+      out.cancel_hide_timer = true;
       return out;
     }
+
+    pending_hide_deadline_ms = -1;
+    pending_hide_mon = nullptr;
+    out.cancel_hide_timer = true;
 
     if (in.currently_hidden && in.tracked_fs_mon != nullptr &&
         in.tracked_fs_still_covering &&

@@ -886,7 +886,7 @@ update_clock (gpointer data)
 // (clicks on the anchor button itself are left to its toggle handler), and
 // they are raised above the Activities overview.
 
-#define POPOVER_TOP_GAP    8    // gap below the panel
+#define POPOVER_TOP_GAP    2    // small safety gap below panel; shadow-wrap adds 6px padding (~8px visual gap, matching GNOME 42+ BoxPointer)
 #define POPOVER_SIDE_GAP   12   // gap from the right screen edge
 #define POPOVER_SCREEN_GAP 8    // minimum gap from the other screen edges
 
@@ -1031,10 +1031,11 @@ panel_popover_anchor_rect (PanelPopover *pp)
 
 struct BoxPointerTheme {
   double arrow_rise = 6.0;
-  double arrow_base = 20.0;
-  double arrow_border_radius = 22.0;
-  double arrow_border_width = 1.0;
+  double arrow_base = 0.0;
+  double arrow_border_radius = 20.0;
+  double arrow_border_width = 0.0;
   double gap = BOXPOINTER_GAP;
+  bool draw_arrow = false;
   GdkRGBA panel_bg = {0x36 / 255.0f, 0x36 / 255.0f, 0x3a / 255.0f, 1.0f};
   GdkRGBA border_color = {0x42 / 255.0f, 0x42 / 255.0f, 0x47 / 255.0f, 1.0f};
   bool resolved = false;
@@ -1052,30 +1053,46 @@ boxpointer_theme (void)
   if (e == nullptr)
     return t;
 
+  // Match upstream GNOME 42+ BoxPointer._drawBorder() + _popovers.scss:
+  // .popup-menu-boxpointer only sets `-arrow-rise: 6px` for panel/edge spacing;
+  // it omits `-arrow-background-color` and `-arrow-border-width`, so panel
+  // popovers float without a triangular beak unless a theme explicitly defines
+  // them on .popup-menu-boxpointer itself.
   winome::StEngine::Node bp (*e, nullptr, "", "popup-menu-boxpointer", "");
-  winome::StEngine::Node sub (*e, nullptr, "", "keyboard-subkeys-boxpointer", "");
-  auto lookup_bp = [&] (const char *prop, double *out) {
-    double v = 0.0;
-    if (bp.lookup_length (prop, &v) || sub.lookup_length (prop, &v))
-      *out = v;
-  };
-  lookup_bp ("-arrow-rise", &t.arrow_rise);
+  bp.lookup_length ("-arrow-rise", &t.arrow_rise);
   if (t.arrow_rise <= 0.0)
     t.arrow_rise = 6.0;
-  lookup_bp ("-arrow-base", &t.arrow_base);
-  lookup_bp ("-arrow-border-radius", &t.arrow_border_radius);
-  lookup_bp ("-arrow-border-width", &t.arrow_border_width);
-  lookup_bp ("-boxpointer-gap", &t.gap);
+  bp.lookup_length ("-arrow-base", &t.arrow_base);
+  bp.lookup_length ("-arrow-border-radius", &t.arrow_border_radius);
+  bp.lookup_length ("-arrow-border-width", &t.arrow_border_width);
+  bp.lookup_length ("-boxpointer-gap", &t.gap);
 
-  std::string hex;
+  std::string arrow_bg;
+  std::string arrow_bc;
   GdkRGBA rgba{};
-  winome::StEngine::Node content (*e, nullptr, "", "popup-menu-content", "");
-  if (content.lookup_color ("background-color", &hex) &&
-      gdk_rgba_parse (&rgba, hex.c_str ()))
+  const bool has_arrow_bg =
+      bp.lookup_color ("-arrow-background-color", &arrow_bg) &&
+      gdk_rgba_parse (&rgba, arrow_bg.c_str ());
+  if (has_arrow_bg)
     t.panel_bg = rgba;
-  if (content.lookup_color ("border-color", &hex) &&
-      gdk_rgba_parse (&rgba, hex.c_str ()))
+  const bool has_arrow_bc =
+      bp.lookup_color ("-arrow-border-color", &arrow_bc) &&
+      gdk_rgba_parse (&rgba, arrow_bc.c_str ());
+  if (has_arrow_bc)
     t.border_color = rgba;
+
+  t.draw_arrow = (has_arrow_bg || t.arrow_border_width > 0.0) &&
+                 t.arrow_rise > 0.0 && t.arrow_base > 0.0;
+  if (t.draw_arrow && !has_arrow_bg) {
+    winome::StEngine::Node content (*e, nullptr, "", "popup-menu-content", "");
+    std::string hex;
+    if (content.lookup_color ("background-color", &hex) &&
+        gdk_rgba_parse (&rgba, hex.c_str ()))
+      t.panel_bg = rgba;
+    if (!has_arrow_bc && content.lookup_color ("border-color", &hex) &&
+        gdk_rgba_parse (&rgba, hex.c_str ()))
+      t.border_color = rgba;
+  }
 
   return t;
 }
@@ -1180,6 +1197,9 @@ panel_popover_hide_now (PanelPopover *pp)
   if (hwnd != nullptr)
     SetWindowPos (hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
                   SWP_NOMOVE | SWP_NOSIZE);
+  winome::evaluate_fullscreen_state ();
+  if (g_open_popovers == nullptr && winome::overview_active ())
+    winome::overview_restore_focus_if_active ();
 }
 
 static void
@@ -1415,6 +1435,7 @@ panel_popover_open (PanelPopover *pp)
 
   g_open_popovers = g_list_append (g_open_popovers, pp);
   ensure_popover_mouse_hook ();
+  winome::evaluate_fullscreen_state ();
 }
 
 static void
@@ -1666,13 +1687,16 @@ make_panel_popover (GtkWidget *button, GtkWidget *child, gboolean centered)
   GtkWidget *wrap = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class (wrap, "quick-settings-popover-shadow-wrap");
   pp->wrap = wrap;
-  pp->arrow_area = gtk_drawing_area_new ();
-  gtk_drawing_area_set_content_height (
-      GTK_DRAWING_AREA (pp->arrow_area),
-      (int)(boxpointer_theme ().arrow_rise + 0.5));
-  gtk_drawing_area_set_draw_func (GTK_DRAWING_AREA (pp->arrow_area),
-                                  draw_popover_arrow, pp, nullptr);
-  gtk_box_append (GTK_BOX (wrap), pp->arrow_area);
+  const BoxPointerTheme &bp_theme = boxpointer_theme ();
+  if (bp_theme.draw_arrow) {
+    pp->arrow_area = gtk_drawing_area_new ();
+    gtk_drawing_area_set_content_height (
+        GTK_DRAWING_AREA (pp->arrow_area),
+        (int)(bp_theme.arrow_rise + 0.5));
+    gtk_drawing_area_set_draw_func (GTK_DRAWING_AREA (pp->arrow_area),
+                                    draw_popover_arrow, pp, nullptr);
+    gtk_box_append (GTK_BOX (wrap), pp->arrow_area);
+  }
 
   pp->card = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class (pp->card, "quick-settings-popover-card");

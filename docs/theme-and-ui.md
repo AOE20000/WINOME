@@ -111,7 +111,7 @@ GTK4 没有内置动画框架（无 `GtkAnimation`），而上游广泛依赖 `C
   - Wi-Fi 密码对话框按钮应用 `modal-dialog-linked-button`；`calendar.cpp` 为选中日期应用 `GTK_STATE_FLAG_SELECTED`，`dnd_switch` 启用 `toggle-switch` 与 `set_focus_on_click(FALSE)`。
 - **全壳 `StEngine` 运行时指标与 `BoxPointer` 箭头**：
   - `shell-panel`、`quick-settings`（`.slider` 与 `.quick-settings-grid`）、`calendar`、`notifications`、`app-grid`（`.icon-grid` 与 `.page-indicator-icon`）、`ws-osd`（`.workspace-switcher` 与 `.ws-switcher-indicator`）及 `overview` / `overview-dash` / `overview-thumbs`（包含 `.window-close` 与 `.window-picker`）均已接入 `StEngine::get()`；因 `StEngine::Node` 以 `G_TYPE_OBJECT` 匹配，含 `StIcon` 等类型选择器的规则（如 `.window-close StIcon`）保留上游常量 fallback。
-  - `shell-panel.cpp` 读取 `-arrow-rise`、`-arrow-base`、`-arrow-border-radius`、`-arrow-border-width`、`-boxpointer-gap` 及菜单背景/边框色，通过 `draw_popover_arrow()` 以 Cairo 绘制 `BoxPointer` 箭头。
+  - `shell-panel.cpp` 按 GNOME 42+ 上游 `BoxPointer._drawBorder()` 与 `_popovers.scss` 规则解析 `.popup-menu-boxpointer` 指标（仅当样式规则显式定义了 `-arrow-background-color` 或 `-arrow-border-width > 0` 时才绘制三角形指示角；上游默认值下顶栏快速设置/日历/托盘弹出卡保持无指示角的纯圆角悬浮外观）。
   - `tests/test-main.cpp` 通过 `test_st_engine_theme_metrics()` 验证 `#panel`、`.quick-settings-grid`、`.slider`、`.window-close`、`.workspace-switcher` 与 `.popup-menu-content` 的主题指标解析。
 
 ## 6. 视觉对齐与应用网格迭代（Post-Phase 11 汇总）

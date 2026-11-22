@@ -51,6 +51,10 @@ uint64_t app_grid_visual_version (GtkWidget *grid);
 int app_grid_current_page (GtkWidget *grid);
 bool app_grid_launch_first (GtkWidget *grid);
 void app_grid_close_menu (GtkWidget *grid);
+bool app_grid_has_open_menu (GtkWidget *grid);
+void app_grid_set_menu_closed_cb (GtkWidget *grid,
+                                  void (*on_menu_closed) (void *),
+                                  void *user_data);
 bool app_grid_close_open_folder (GtkWidget *grid);
 void app_grid_set_folder_toggled_cb (GtkWidget *grid,
                                      void (*on_folder_toggled) (bool open, void *),

@@ -4,6 +4,7 @@
 # Regression tests for tools/convert-st-css.py.
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -196,11 +197,46 @@ def verify_full_theme_with_gtk4(converter):
             'filter: drop-shadow(',
             '.tray-popover-card',
             '.message-expand-button.expanded image',
-            'popover.background.winome-context-popover > arrow',
+            'entry.search-entry.search-dormant:hover',
+            'entry.search-entry:focus-within:not(.search-dormant)',
+            'entry.search-entry.search-dormant text',
+            'window#winomeAppFolderWindow popover.background.winome-context-popover',
+            'font: 11pt "Cantarell";',
+            'font-size: 11pt;',
+            'font-weight: 500;',
             'resource:///org/winome/theme/calendar-today.svg',
         ):
             assert expected_rule in full_text, (
                 f'missing GTK4 override rule: {expected_rule}')
+
+        dormant_text_rule = re.search(
+            r'entry\.search-entry\.search-dormant\s+text\s*\{([^}]*)\}',
+            full_text,
+        )
+        assert dormant_text_rule is not None and 'caret-color: transparent;' in dormant_text_rule.group(1), \
+            'dormant search-entry text rule must hide caret via caret-color: transparent'
+
+        ctx_popover_rule = re.search(
+            r'window\.winome-overview\s+popover\.background\.winome-context-popover[^{]*\{([^}]*)\}',
+            full_text,
+        )
+        assert ctx_popover_rule is not None and 'font: 11pt "Cantarell";' in ctx_popover_rule.group(1), \
+            'winome-context-popover rule must override GTK4 default font: initial'
+
+        overview_arrow_rule = re.search(
+            r'window\.winome-overview\s+popover\.background\s*>\s*arrow,\s*'
+            r'window#winomeAppFolderWindow\s+popover\.background\s*>\s*arrow\s*\{([^}]*)\}',
+            full_text,
+        )
+        assert overview_arrow_rule is not None and 'background-color: transparent;' in overview_arrow_rule.group(1), \
+            'expected transparent > arrow rule for Overview and AppFolder popovers'
+
+        for body in re.findall(
+            r'[^{}]*(?:winome-overview|winomeAppFolderWindow|winome-context-popover)[^{}]*>\s*arrow[^{}]*\{([^}]*)\}',
+            full_text,
+        ):
+            assert 'background-color: #36363a;' not in body, \
+                f'unexpected opaque arrow background in context popover: {body}'
 
         gresource_xml = os.path.join(theme_dir, 'winome.gresource.xml')
         tree = ET.parse(gresource_xml)

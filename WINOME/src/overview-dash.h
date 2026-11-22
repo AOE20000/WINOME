@@ -103,6 +103,7 @@ void overview_dash_set_apps_active (GtkWidget *dash, bool active);
 void overview_dash_set_changed_cb (GtkWidget *dash, void (*cb) (void *),
                                    void *user_data);
 void overview_dash_close_menu (GtkWidget *dash);
+bool overview_dash_has_open_menu (GtkWidget *dash);
 
 // Natural size in LOGICAL px, valid after repopulate(). Width includes the
 // #dash side padding; height includes the 12px bottom margin.

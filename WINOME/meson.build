@@ -1,5 +1,5 @@
 project('winome', ['c', 'cpp'],
-  version: '0.1.4',
+  version: '0.1.5',
   meson_version: '>= 1.3.0',
   default_options: [
     'cpp_std=c++17',

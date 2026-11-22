@@ -446,16 +446,19 @@ entry.search-entry image {
   padding: 0 4px;
   color: rgba(250, 250, 251, 0.65);
 }
-entry.search-entry:hover:not(:focus-within) {
+entry.search-entry:hover:not(:focus-within),
+entry.search-entry.search-dormant:hover {
   background-color: #3f3f45;
   color: #fafafb;
 }
 entry.search-entry:hover:not(:focus-within) placeholder,
-entry.search-entry:hover:not(:focus-within) image {
+entry.search-entry:hover:not(:focus-within) image,
+entry.search-entry.search-dormant:hover placeholder,
+entry.search-entry.search-dormant:hover image {
   color: rgba(250, 250, 251, 0.88);
 }
-entry.search-entry:focus,
-entry.search-entry:focus-within,
+entry.search-entry:focus:not(.search-dormant),
+entry.search-entry:focus-within:not(.search-dormant),
 entry.search-entry.search-active {
   background-color: #3e4048;
   color: #fafafb;
@@ -463,14 +466,17 @@ entry.search-entry.search-active {
   outline: none;
   box-shadow: inset 0 0 0 2px rgba(133, 181, 238, 0.800);
 }
-entry.search-entry:focus image,
-entry.search-entry:focus-within image,
+entry.search-entry:focus:not(.search-dormant) image,
+entry.search-entry:focus-within:not(.search-dormant) image,
 entry.search-entry.search-active image {
   color: #fafafb;
 }
-entry.search-entry:focus placeholder,
-entry.search-entry:focus-within placeholder {
+entry.search-entry:focus:not(.search-dormant) placeholder,
+entry.search-entry:focus-within:not(.search-dormant) placeholder {
   color: rgba(250, 250, 251, 0.55);
+}
+entry.search-entry.search-dormant text {
+  caret-color: transparent;
 }
 
 /* .panel-button horizontal padding mirrors -natural-hpadding: 12px (the St
@@ -679,67 +685,84 @@ window.winome-overview scrollbar slider:active {
   background-color: #868689;
 }
 
-/* Overview context GtkPopovers render a unified .popup-menu-content surface
-   directly on > contents so > arrow connects seamlessly without a gap, while
-   keeping fallback popovers transparent around nested .popup-menu-content. */
-window.winome-overview popover.background > contents {
+/* Overview & AppFolder context GtkPopovers float cleanly without an arrow beak
+   (GNOME 42+ BoxPointer) and re-assert 11pt Cantarell to override GTK4's
+   built-in `popover.background { font: initial; }`. */
+window.winome-overview popover.background > contents,
+window#winomeAppFolderWindow popover.background > contents {
   background: transparent;
   background-color: transparent;
   border: none;
   box-shadow: none;
   padding: 0;
 }
-window.winome-overview popover.background > arrow {
+window.winome-overview popover.background > arrow,
+window#winomeAppFolderWindow popover.background > arrow {
   background: transparent;
   background-color: transparent;
   border: none;
   box-shadow: none;
 }
-window.winome-overview popover.background.winome-context-popover > contents {
+window.winome-overview popover.background.winome-context-popover,
+window#winomeAppFolderWindow popover.background.winome-context-popover {
+  background-color: transparent;
+  font: 11pt "Cantarell";
+}
+window.winome-overview popover.background.winome-context-popover > contents,
+window#winomeAppFolderWindow popover.background.winome-context-popover > contents {
   background-color: #36363a;
   color: #ffffff;
+  font: 11pt "Cantarell";
   border-radius: 20px;
   border: 1px solid rgba(255, 255, 255, 0.07);
   box-shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.2);
   padding: 6px;
   margin: 0;
 }
-window.winome-overview popover.background.winome-context-popover > arrow {
-  background-color: #36363a;
-  border: 1px solid rgba(255, 255, 255, 0.07);
-  box-shadow: none;
-}
 window.winome-overview popover.winome-context-popover button.popup-menu-item,
-window.winome-overview popover.winome-context-popover button.popup-menu-item label {
+window.winome-overview popover.winome-context-popover button.popup-menu-item label,
+window#winomeAppFolderWindow popover.winome-context-popover button.popup-menu-item,
+window#winomeAppFolderWindow popover.winome-context-popover button.popup-menu-item label {
   color: #ffffff;
   background-color: transparent;
   background-image: none;
   border: none;
   box-shadow: none;
   text-shadow: none;
-  font-weight: 400;
+  font-family: "Cantarell";
+  font-size: 11pt;
+  font-weight: 500;
 }
-window.winome-overview popover.winome-context-popover button.popup-menu-item {
+window.winome-overview popover.winome-context-popover button.popup-menu-item,
+window#winomeAppFolderWindow popover.winome-context-popover button.popup-menu-item {
   border-radius: 10px;
   padding: 6px 12px;
   min-height: 28px;
 }
 window.winome-overview popover.winome-context-popover button.popup-menu-item:hover,
-window.winome-overview popover.winome-context-popover button.popup-menu-item:focus-visible {
+window.winome-overview popover.winome-context-popover button.popup-menu-item:focus-visible,
+window#winomeAppFolderWindow popover.winome-context-popover button.popup-menu-item:hover,
+window#winomeAppFolderWindow popover.winome-context-popover button.popup-menu-item:focus-visible {
   background-color: rgba(255, 255, 255, 0.12);
   color: #ffffff;
 }
 window.winome-overview popover.winome-context-popover button.popup-menu-item:hover label,
-window.winome-overview popover.winome-context-popover button.popup-menu-item:focus-visible label {
+window.winome-overview popover.winome-context-popover button.popup-menu-item:focus-visible label,
+window#winomeAppFolderWindow popover.winome-context-popover button.popup-menu-item:hover label,
+window#winomeAppFolderWindow popover.winome-context-popover button.popup-menu-item:focus-visible label {
   color: #ffffff;
 }
 window.winome-overview popover.winome-context-popover button.popup-menu-item:active,
-window.winome-overview popover.winome-context-popover button.popup-menu-item:active:hover {
+window.winome-overview popover.winome-context-popover button.popup-menu-item:active:hover,
+window#winomeAppFolderWindow popover.winome-context-popover button.popup-menu-item:active,
+window#winomeAppFolderWindow popover.winome-context-popover button.popup-menu-item:active:hover {
   background-color: rgba(255, 255, 255, 0.18);
   color: #ffffff;
 }
 window.winome-overview popover.winome-context-popover button.popup-menu-item:disabled,
-window.winome-overview popover.winome-context-popover button.popup-menu-item:disabled label {
+window.winome-overview popover.winome-context-popover button.popup-menu-item:disabled label,
+window#winomeAppFolderWindow popover.winome-context-popover button.popup-menu-item:disabled,
+window#winomeAppFolderWindow popover.winome-context-popover button.popup-menu-item:disabled label {
   background-color: transparent;
   color: rgba(255, 255, 255, 0.45);
 }

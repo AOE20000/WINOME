@@ -58,4 +58,8 @@ bool overview_can_shift_to_app_grid();
 // before launching or activating a target outside the overview.
 void overview_discard_restore_focus();
 
+// Re-acquire Win32 foreground and restore search-ready keyboard/IME focus
+// when an overlaid panel popover or menu closes while overview remains active.
+void overview_restore_focus_if_active();
+
 }  // namespace winome

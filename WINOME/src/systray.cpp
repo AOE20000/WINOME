@@ -1447,6 +1447,10 @@ std::vector<TrayIconEntry> collect_tray_snapshot(
         std::lock_guard<std::mutex> lock(g_tray.mu);
         g_tray.last_xo_items = std::move(xo_only);
         g_tray.last_xo_probe = std::chrono::steady_clock::now();
+      } else if (allow_cloak_probe || xo_visible) {
+        std::lock_guard<std::mutex> lock(g_tray.mu);
+        g_tray.last_xo_items.clear();
+        g_tray.last_xo_probe = std::chrono::steady_clock::now();
       } else if (!xo_visible && !allow_cloak_probe) {
         // Keep last known overflow items when TopLevelWindowForOverflowXamlIsland
         // stays hidden on routine scans so menu entries do not flicker out.

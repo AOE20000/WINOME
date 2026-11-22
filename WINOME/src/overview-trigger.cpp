@@ -296,6 +296,7 @@ handle_unfocused_esc_idle (gpointer user_data G_GNUC_UNUSED)
     const char *txt = gtk_editable_get_text (GTK_EDITABLE (search_entry));
     if (txt != nullptr && txt[0] != '\0') {
       gtk_editable_set_text (GTK_EDITABLE (search_entry), "");
+      overview_restore_focus_if_active ();
       return G_SOURCE_REMOVE;
     }
   }

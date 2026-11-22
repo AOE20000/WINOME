@@ -924,6 +924,11 @@ on_activate (GtkApplication      *app,
              gpointer G_GNUC_UNUSED user_data)
 {
   g_gtk_app = app;
+  // Match GNOME Shell / Mutter behavior on Windows: prevent GtkText boundary
+  // edits (e.g. Backspace on empty search, arrow bounds, keynav-failed) from
+  // invoking gdk_surface_beep() -> Windows MessageBeep(-1) warning chimes.
+  if (GtkSettings *settings = gtk_settings_get_default ())
+    g_object_set (settings, "gtk-error-bell", FALSE, nullptr);
   create_control_window ();
 
   const gint64 panel_t0 = g_get_monotonic_time ();
@@ -1473,7 +1478,7 @@ main (int argc, char **argv)
   GtkApplication *app;
 
   app = gtk_application_new ("org.winome.Shell",
-                             G_APPLICATION_DEFAULT_FLAGS);
+                             G_APPLICATION_NON_UNIQUE);
 
   g_signal_connect (app, "activate",
                     G_CALLBACK (on_activate), NULL);

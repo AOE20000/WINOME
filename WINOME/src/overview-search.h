@@ -57,6 +57,54 @@ bool try_eval_search_math (const std::string &raw_query,
 bool is_url_like_query (const std::string &trimmed);
 bool is_path_like_query (const std::string &trimmed);
 
+// Returns true for Win32 messages that begin or advance Windows IME
+// composition so the search entry can reveal focus without disturbing IMM.
+inline bool
+is_overview_ime_activation_message (UINT msg, WPARAM wParam)
+{
+  return msg == WM_IME_STARTCOMPOSITION || msg == WM_IME_COMPOSITION ||
+         (msg == WM_KEYDOWN && wParam == VK_PROCESSKEY);
+}
+
+// Returns true when a key press arriving outside an editable widget should
+// focus the overview search entry and be forwarded to it.
+inline bool
+should_overview_capture_search_key (guint keyval, GdkModifierType state,
+                                    bool search_has_text, bool preedit_active)
+{
+  const guint mods = static_cast<guint> (state) &
+                     (GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK);
+  if (mods == GDK_CONTROL_MASK &&
+      (keyval == GDK_KEY_v || keyval == GDK_KEY_V)) {
+    return true;
+  }
+  if (mods != 0)
+    return false;
+  const gunichar uc = gdk_keyval_to_unicode (keyval);
+  if (uc < 0x20 || uc == 0x7f)
+    return false;
+  if (uc == ' ' && !search_has_text && !preedit_active)
+    return false;
+  return true;
+}
+
+// Returns true when an empty, dormant search entry should silently ignore
+// stray space/backspace/delete keys instead of entering whitespace or beeping.
+inline bool
+should_overview_consume_dormant_key (guint keyval, GdkModifierType state,
+                                     bool search_dormant, bool search_has_text,
+                                     bool preedit_active)
+{
+  if (!search_dormant || search_has_text || preedit_active)
+    return false;
+  const guint mods = static_cast<guint> (state) &
+                     (GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK);
+  if (mods != 0)
+    return false;
+  return keyval == GDK_KEY_space || keyval == GDK_KEY_BackSpace ||
+         keyval == GDK_KEY_Delete;
+}
+
 // --- SearchResultsView widget lifecycle & control ----------------------------
 
 GtkWidget *overview_search_view_new (const OverviewSearchCallbacks &cbs);

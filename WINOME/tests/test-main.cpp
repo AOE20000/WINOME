@@ -919,6 +919,19 @@ void test_st_engine_theme_metrics() {
     CHECK(node.lookup_color("background-color", &color));
     CHECK(color == "#36363a");
   }
+
+  // Upstream GNOME 42+ panel popovers float without a BoxPointer arrow triangle:
+  // .popup-menu-boxpointer only provides -arrow-rise spacing (no fill/border/base).
+  {
+    winome::StEngine::Node bp(engine, nullptr, "", "popup-menu-boxpointer", "");
+    double rise = -1.0;
+    CHECK(bp.lookup_length("-arrow-rise", &rise));
+    CHECK(std::abs(rise - 6.0) < 0.5);
+    std::string arrow_bg;
+    double arrow_bw = -1.0;
+    CHECK(!bp.lookup_color("-arrow-background-color", &arrow_bg));
+    CHECK(!bp.lookup_length("-arrow-border-width", &arrow_bw));
+  }
 }
 
 void test_perf_metrics_and_isolated_fontmap() {
@@ -1108,7 +1121,7 @@ void test_ipc_dispatch_and_named_pipe_roundtrip() {
   CHECK(ping.find("\"ok\":true") != std::string::npos);
   CHECK(ping.find("\"pong\":true") != std::string::npos);
   CHECK(ping.find(std::string("\"version\":\"") + WINOME_VERSION + "\"") != std::string::npos);
-  CHECK(std::string(WINOME_VERSION) == "0.1.4");
+  CHECK(std::string(WINOME_VERSION) == "0.1.5");
 
   const std::string st = winome::ipc_dispatch_request_json("{\"cmd\":\"status\"}", cbs);
   CHECK(st.find("\"ok\":true") != std::string::npos);
@@ -2324,6 +2337,11 @@ void test_workarea_clamp_guard_and_fullscreen_hysteresis() {
         winome::WorkareaAssertAction::SkipUnchanged);
   CHECK(guard.evaluate(6700, want, reset, true, false, false) ==
         winome::WorkareaAssertAction::Apply);
+  // Lifting workarea top enters 600ms settle grace so async window resize never
+  // triggers false zoomed fullscreen hides.
+  CHECK(guard.in_settle_grace(6700));
+  CHECK(guard.in_settle_grace(7299));
+  CHECK(!guard.in_settle_grace(7300));
 
   // Fullscreen bounds check: rejects near-edge undersized windows & unreserved zoomed windows.
   const RECT reserved_wa{0, 32, 1920, 1080};
@@ -2340,6 +2358,12 @@ void test_workarea_clamp_guard_and_fullscreen_hysteresis() {
   // Zoomed window when workarea top was reset to 0 -> still NOT fullscreen.
   CHECK(!winome::is_fullscreen_bounds_for_monitor(
       RECT{0, 0, 1920, 1080}, mon, unreserved_wa, true));
+  // Decorated maximized window (WS_CAPTION + IsZoomed) even if touching top=0 -> NOT fullscreen.
+  CHECK(!winome::is_fullscreen_bounds_for_monitor(
+      RECT{0, 0, 1920, 1080}, mon, reserved_wa, true, 2, true, false));
+  // Undecorated zoomed window during post-workarea settle grace -> NOT fullscreen yet.
+  CHECK(!winome::is_fullscreen_bounds_for_monitor(
+      RECT{0, 0, 1920, 1080}, mon, reserved_wa, true, 2, false, true));
   // Zoomed borderless fullscreen explicitly extending above reserved top (32 -> 0) -> fullscreen.
   CHECK(winome::is_fullscreen_bounds_for_monitor(
       RECT{0, 0, 1920, 1080}, mon, reserved_wa, true));
@@ -2392,6 +2416,45 @@ void test_workarea_clamp_guard_and_fullscreen_hysteresis() {
   res = tracker.step(in);
   CHECK(res.effective_fullscreen_mon == nullptr);
   CHECK(res.cancel_unhide_timer);
+
+  // Opening a top-bar Popover unhides immediately and never allows fullscreen re-hide.
+  in = {};
+  in.now_ms = 3500;
+  in.currently_hidden = true;
+  in.popover_open = true;
+  in.raw_fullscreen_mon = fake_mon;
+  in.tracked_fs_mon = fake_mon;
+  res = tracker.step(in);
+  CHECK(res.effective_fullscreen_mon == nullptr);
+  CHECK(res.cancel_unhide_timer);
+  CHECK(res.cancel_hide_timer);
+
+  // Runtime enter-fullscreen debounce (80ms) suppresses transient 1-frame flash hides.
+  winome::FullscreenHysteresisTracker debounced_tracker(80);
+  in = {};
+  in.now_ms = 4000;
+  in.raw_fullscreen_mon = fake_mon;
+  res = debounced_tracker.step(in);
+  CHECK(res.effective_fullscreen_mon == nullptr);
+  CHECK(res.schedule_hide_timer);
+  CHECK(res.hide_delay_ms == 80);
+
+  // If transient fullscreen vanishes at 40ms, panel never blinked hidden.
+  in = {};
+  in.now_ms = 4040;
+  res = debounced_tracker.step(in);
+  CHECK(res.effective_fullscreen_mon == nullptr);
+  CHECK(res.cancel_hide_timer);
+
+  // Sustained fullscreen for >=80ms hides cleanly.
+  in = {};
+  in.now_ms = 5000;
+  in.raw_fullscreen_mon = fake_mon;
+  res = debounced_tracker.step(in);
+  CHECK(res.effective_fullscreen_mon == nullptr);
+  in.now_ms = 5080;
+  res = debounced_tracker.step(in);
+  CHECK(res.effective_fullscreen_mon == fake_mon);
 }
 
 void test_hook_watchdog_and_lockfree_ring() {
@@ -2553,6 +2616,56 @@ void test_overview_search_helpers() {
     CHECK(winome::should_include_dash_window(true, true, 1, 1, false, 0x2u));
     // Pinned-to-all-desktops window (window_desktop=-1, on_current=true, uncloaked).
     CHECK(winome::should_include_dash_window(true, true, 1, -1, true, 0));
+  }
+
+  // 6. Overview type-to-search & IME composition routing helpers.
+  {
+    CHECK(winome::is_overview_ime_activation_message(WM_IME_STARTCOMPOSITION, 0));
+    CHECK(winome::is_overview_ime_activation_message(WM_IME_COMPOSITION, 0));
+    CHECK(winome::is_overview_ime_activation_message(WM_KEYDOWN, VK_PROCESSKEY));
+    CHECK(!winome::is_overview_ime_activation_message(WM_IME_SETCONTEXT, 0));
+    CHECK(!winome::is_overview_ime_activation_message(WM_KEYDOWN, 'A'));
+    CHECK(!winome::is_overview_ime_activation_message(WM_KEYUP, VK_PROCESSKEY));
+
+    const GdkModifierType none = static_cast<GdkModifierType>(0);
+    CHECK(winome::should_overview_capture_search_key(GDK_KEY_a, none, false, false));
+    CHECK(winome::should_overview_capture_search_key(
+        GDK_KEY_A, GDK_SHIFT_MASK, false, false));
+    CHECK(winome::should_overview_capture_search_key(
+        gdk_unicode_to_keyval(0x4E2D), none, false, false));
+    CHECK(winome::should_overview_capture_search_key(
+        GDK_KEY_v, GDK_CONTROL_MASK, false, false));
+    CHECK(winome::should_overview_capture_search_key(
+        GDK_KEY_space, none, true, false));
+    CHECK(!winome::should_overview_capture_search_key(
+        GDK_KEY_space, none, false, false));
+    CHECK(!winome::should_overview_capture_search_key(
+        GDK_KEY_Escape, none, false, false));
+    CHECK(!winome::should_overview_capture_search_key(
+        GDK_KEY_Return, none, false, false));
+    CHECK(!winome::should_overview_capture_search_key(
+        GDK_KEY_Tab, none, false, false));
+    CHECK(!winome::should_overview_capture_search_key(
+        GDK_KEY_f, GDK_CONTROL_MASK, false, false));
+    CHECK(!winome::should_overview_capture_search_key(
+        GDK_KEY_a, GDK_ALT_MASK, false, false));
+
+    CHECK(winome::should_overview_consume_dormant_key(
+        GDK_KEY_space, none, true, false, false));
+    CHECK(winome::should_overview_consume_dormant_key(
+        GDK_KEY_BackSpace, none, true, false, false));
+    CHECK(winome::should_overview_consume_dormant_key(
+        GDK_KEY_Delete, none, true, false, false));
+    CHECK(!winome::should_overview_consume_dormant_key(
+        GDK_KEY_a, none, true, false, false));
+    CHECK(!winome::should_overview_consume_dormant_key(
+        GDK_KEY_Tab, none, true, false, false));
+    CHECK(!winome::should_overview_consume_dormant_key(
+        GDK_KEY_space, none, false, false, false));
+    CHECK(!winome::should_overview_consume_dormant_key(
+        GDK_KEY_space, none, true, true, false));
+    CHECK(!winome::should_overview_consume_dormant_key(
+        GDK_KEY_BackSpace, none, true, false, true));
   }
 }
 

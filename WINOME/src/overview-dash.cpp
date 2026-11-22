@@ -793,10 +793,10 @@ show_dash_context_menu (WinomeDash *self, int index)
   install_bundled_fonts (popover);
   gtk_widget_add_css_class (popover, "winome-context-popover");
   gtk_widget_set_parent (popover, GTK_WIDGET (self));
-  gtk_popover_set_has_arrow (GTK_POPOVER (popover), TRUE);
+  gtk_popover_set_has_arrow (GTK_POPOVER (popover), FALSE);
   gtk_popover_set_position (GTK_POPOVER (popover), GTK_POS_TOP);
   gtk_popover_set_autohide (GTK_POPOVER (popover), TRUE);
-  GdkRectangle target = {(int)r.x, (int)r.y, (int)r.w, (int)r.h};
+  GdkRectangle target = {(int)r.x, (int)r.y - 6, (int)r.w, (int)r.h};
   gtk_popover_set_pointing_to (GTK_POPOVER (popover), &target);
 
   GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
@@ -915,6 +915,7 @@ show_dash_context_menu (WinomeDash *self, int index)
           dash->active_menu = nullptr;
         if (gtk_widget_get_parent (GTK_WIDGET (p)) != nullptr)
           gtk_widget_unparent (GTK_WIDGET (p));
+        overview_restore_focus_if_active ();
       }),
       self);
   g_signal_connect (
@@ -1010,10 +1011,10 @@ show_dash_scope_menu (WinomeDash *self, double x, double y)
   install_bundled_fonts (popover);
   gtk_widget_add_css_class (popover, "winome-context-popover");
   gtk_widget_set_parent (popover, GTK_WIDGET (self));
-  gtk_popover_set_has_arrow (GTK_POPOVER (popover), TRUE);
+  gtk_popover_set_has_arrow (GTK_POPOVER (popover), FALSE);
   gtk_popover_set_position (GTK_POPOVER (popover), GTK_POS_TOP);
   gtk_popover_set_autohide (GTK_POPOVER (popover), TRUE);
-  GdkRectangle target = {(int)x - 4, (int)y - 4, 8, 8};
+  GdkRectangle target = {(int)x - 4, (int)y - 10, 8, 8};
   gtk_popover_set_pointing_to (GTK_POPOVER (popover), &target);
 
   GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
@@ -1055,6 +1056,7 @@ show_dash_scope_menu (WinomeDash *self, double x, double y)
           dash->active_menu = nullptr;
         if (gtk_widget_get_parent (GTK_WIDGET (p)) != nullptr)
           gtk_widget_unparent (GTK_WIDGET (p));
+        overview_restore_focus_if_active ();
       }),
       self);
   g_signal_connect (
@@ -1484,6 +1486,15 @@ overview_dash_close_menu (GtkWidget *dash)
       gtk_widget_unparent (m);
     g_object_unref (m);
   }
+}
+
+bool
+overview_dash_has_open_menu (GtkWidget *dash)
+{
+  if (dash == nullptr)
+    return false;
+  WinomeDash *self = WINOME_DASH (dash);
+  return self->active_menu != nullptr && gtk_widget_get_visible (self->active_menu);
 }
 
 void

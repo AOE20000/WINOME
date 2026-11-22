@@ -251,6 +251,7 @@ guint g_dyn_ws_startup_timer = 0;
 guint g_dash_resync_timer = 0;
 std::string g_search_query;       // trimmed lowercased query for active checks
 std::string g_search_raw_text;    // case-preserving raw search text
+bool g_search_preedit_active = false;  // true while IME composition preedit is non-empty
 
 // Smooth 200ms cross-fade between Overview/AppGrid and #searchResults
 // (upstream overviewControls.js:623-643 _onSearchChanged).
@@ -281,6 +282,7 @@ guint g_idle_trim_timer = 0;
 guint g_prewarm_timer = 0;
 int g_prewarm_step = 0;
 guint g_settle_hover_timer = 0;
+guint g_focus_verify_timer = 0;
 guint g_post_hide_workarea_timer = 0;
 guint g_app_index_defer_timer = 0;
 std::shared_ptr<std::atomic<bool>> g_overview_alive;
@@ -535,7 +537,16 @@ static void cancel_post_hide_workarea (void);
 static void schedule_post_hide_workarea (guint delay_ms);
 static void refresh_dash_in_place (void);
 static void restack_locked (void);
+static GtkWidget *search_focus_target (void);
+static bool is_search_focused (void);
+static void set_search_dormant (bool dormant);
+static void ensure_search_entry_focus (void);
+static bool has_visible_overview_popover (void);
+static bool can_auto_focus_overview_search (void);
 static void focus_overview_window (bool focus_search);
+static void cancel_focus_verify (void);
+static void schedule_focus_verify (void);
+static void recheck_overview_search_focus_on_settle (const char *tag);
 static void chrome_hide (void);
 static void icon_hide (void);
 static void caption_hide (void);
@@ -1749,6 +1760,94 @@ is_visible_hwnd (HWND hwnd)
   return hwnd != nullptr && IsWindow (hwnd) && IsWindowVisible (hwnd);
 }
 
+static constexpr const wchar_t *kChromeOrigProcProp =
+    L"WinomeChromeOrigWndProc";
+
+static std::string
+hwnd_class_utf8_diag (HWND h)
+{
+  if (h == nullptr || !IsWindow (h))
+    return "<null>";
+  wchar_t cls[96] = L"";
+  if (GetClassNameW (h, cls, 96) <= 0)
+    return "<unknown>";
+  std::string u8 = wide_to_utf8 (cls);
+  return u8.empty () ? "<empty>" : u8;
+}
+
+static bool
+is_overview_chrome_or_panel_hwnd (HWND h)
+{
+  return h != nullptr &&
+         (h == g_chrome_hwnd || h == g_icon_hwnd || h == g_caption_hwnd ||
+          h == g_panel_hwnd);
+}
+
+static LRESULT CALLBACK
+chrome_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+  WNDPROC orig = reinterpret_cast<WNDPROC> (
+      GetPropW (hwnd, kChromeOrigProcProp));
+  if (msg == WM_MOUSEACTIVATE)
+    return MA_NOACTIVATE;
+  if (msg == WM_NCACTIVATE && wParam != FALSE)
+    return FALSE;
+  if (msg == WM_STYLECHANGING && wParam == static_cast<WPARAM> (GWL_EXSTYLE) &&
+      lParam != 0) {
+    auto *ss = reinterpret_cast<STYLESTRUCT *> (lParam);
+    ss->styleNew = (ss->styleNew | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) &
+                   ~WS_EX_APPWINDOW;
+  }
+  if (msg == WM_WINDOWPOSCHANGING && lParam != 0) {
+    auto *wp = reinterpret_cast<WINDOWPOS *> (lParam);
+    wp->flags |= SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+  }
+  if ((msg == WM_ACTIVATE && LOWORD (wParam) != WA_INACTIVE) ||
+      msg == WM_SETFOCUS) {
+    if (can_auto_focus_overview_search () &&
+        g_overview_hwnd != nullptr && IsWindow (g_overview_hwnd)) {
+      g_print ("[ov-focus] blocked chrome activation hwnd=%p msg=0x%x\n",
+               static_cast<void *> (hwnd), msg);
+      if (GetForegroundWindow () != g_overview_hwnd)
+        SetForegroundWindow (g_overview_hwnd);
+      else if (GetFocus () != g_overview_hwnd)
+        SetFocus (g_overview_hwnd);
+      return 0;
+    }
+  }
+  if (msg == WM_NCDESTROY)
+    RemovePropW (hwnd, kChromeOrigProcProp);
+  return orig != nullptr ? CallWindowProcW (orig, hwnd, msg, wParam, lParam)
+                         : DefWindowProcW (hwnd, msg, wParam, lParam);
+}
+
+static void
+ensure_chrome_subclass (HWND hwnd)
+{
+  if (hwnd == nullptr || !IsWindow (hwnd))
+    return;
+  WNDPROC cur = reinterpret_cast<WNDPROC> (
+      GetWindowLongPtrW (hwnd, GWLP_WNDPROC));
+  if (cur != nullptr && cur != chrome_subclass_wndproc) {
+    SetPropW (hwnd, kChromeOrigProcProp, reinterpret_cast<HANDLE> (cur));
+    SetWindowLongPtrW (hwnd, GWLP_WNDPROC,
+                       reinterpret_cast<LONG_PTR> (chrome_subclass_wndproc));
+  }
+}
+
+static void
+chrome_present_window (GtkWidget *win, void (*apply_want) (void))
+{
+  if (win == nullptr)
+    return;
+  if (!gtk_widget_get_realized (win))
+    gtk_widget_realize (win);
+  if (!gtk_widget_get_visible (win))
+    gtk_widget_set_visible (win, TRUE);
+  if (apply_want != nullptr)
+    apply_want ();
+}
+
 static void
 chrome_apply_base_ex_styles (HWND hwnd)
 {
@@ -1899,6 +1998,7 @@ on_chrome_window_realize (GtkWidget *widget, gpointer user_data)
   HWND hwnd = static_cast<HWND> (gdk_win32_surface_get_handle (surface));
   *hooks->hwnd = hwnd;
   chrome_apply_base_ex_styles (hwnd);
+  ensure_chrome_subclass (hwnd);
   chrome_bind_owner (hwnd);
   ensure_hwnd_topmost (hwnd);
   g_signal_connect (surface, "layout", G_CALLBACK (on_chrome_surface_layout),
@@ -1919,6 +2019,7 @@ make_chrome_toplevel (ChromeSurfaceHooks *hooks)
   gtk_window_set_decorated (GTK_WINDOW (win), FALSE);
   gtk_window_set_resizable (GTK_WINDOW (win), FALSE);
   gtk_window_set_hide_on_close (GTK_WINDOW (win), TRUE);
+  gtk_widget_set_focusable (win, FALSE);
   gtk_widget_add_css_class (win, "winome-overview-chrome");
   install_bundled_fonts (win);
   g_signal_connect (win, "realize", G_CALLBACK (on_chrome_window_realize),
@@ -2111,9 +2212,7 @@ chrome_show_at (const RECT &preview_rect)
   g_chrome_want.bottom = g_chrome_want.top + h;
 
   gtk_widget_set_opacity (g_chrome_button, g_overlay_opacity);
-  if (!gtk_widget_get_visible (g_chrome_window))
-    gtk_widget_set_visible (g_chrome_window, TRUE);
-  chrome_apply_want ();
+  chrome_present_window (g_chrome_window, chrome_apply_want);
 }
 
 // --- app-icon chrome window -----------------------------------------------------
@@ -2218,9 +2317,7 @@ icon_show_at (const RECT &preview_rect, HWND target)
   }
 
   gtk_widget_set_opacity (g_icon_picture, g_overlay_opacity);
-  if (!gtk_widget_get_visible (g_icon_window))
-    gtk_widget_set_visible (g_icon_window, TRUE);
-  icon_chrome_apply_want ();
+  chrome_present_window (g_icon_window, icon_chrome_apply_want);
 }
 
 // --- window-caption chrome window -----------------------------------------------
@@ -2365,9 +2462,7 @@ caption_show_at (const RECT &preview_rect)
   g_caption_want.bottom = top_px + h;
 
   gtk_widget_set_opacity (g_caption, g_overlay_opacity);
-  if (!gtk_widget_get_visible (g_caption_window))
-    gtk_widget_set_visible (g_caption_window, TRUE);
-  caption_chrome_apply_want ();
+  chrome_present_window (g_caption_window, caption_chrome_apply_want);
 }
 
 // --- hover (caption + close button + icon) ---------------------------------------
@@ -3684,6 +3779,7 @@ settle_hover_cb (gpointer user_data G_GNUC_UNUSED)
     return G_SOURCE_REMOVE;
   }
   set_hover (slot_at_cursor ());
+  recheck_overview_search_focus_on_settle ("settle-hover");
   return G_SOURCE_REMOVE;
 }
 
@@ -3955,12 +4051,58 @@ overview_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
       }
     }
   }
+  if (is_overview_ime_activation_message (msg, wParam) &&
+      can_auto_focus_overview_search ()) {
+    const bool was_dormant =
+        g_search != nullptr &&
+        gtk_widget_has_css_class (g_search, "search-dormant");
+    const bool was_focused = is_search_focused ();
+    set_search_dormant (false);
+    if (msg == WM_KEYDOWN && wParam == VK_PROCESSKEY &&
+        !is_search_focused () && !g_search_preedit_active) {
+      ensure_search_entry_focus ();
+    }
+    if (was_dormant || !was_focused) {
+      g_print ("[ov-ime] msg=0x%x wp=0x%llx was_dormant=%d was_focus=%d now_focus=%d\n",
+               msg, static_cast<unsigned long long> (wParam),
+               was_dormant ? 1 : 0, was_focused ? 1 : 0,
+               is_search_focused () ? 1 : 0);
+    }
+  }
+  if ((msg == WM_SYSCHAR || msg == WM_MENUCHAR) && overview_active () &&
+      g_target_state != ControlsState::HIDDEN) {
+    // Borderless Overview has no Win32 menu bar; prevent DefWindowProcW from
+    // ringing MessageBeep on Alt+<key> or stray menu-char lookups.
+    return (msg == WM_MENUCHAR) ? MAKELRESULT (0, MNC_CLOSE) : 0;
+  }
   WNDPROC orig = g_orig_overview_wndproc;
   LRESULT res = orig != nullptr
                     ? CallWindowProcW (orig, hwnd, msg, wParam, lParam)
                     : DefWindowProcW (hwnd, msg, wParam, lParam);
-  if (msg == WM_ACTIVATE && LOWORD (wParam) != WA_INACTIVE) {
+  const bool focus_lost_msg =
+      (msg == WM_KILLFOCUS) ||
+      (msg == WM_ACTIVATE && LOWORD (wParam) == WA_INACTIVE);
+  if (focus_lost_msg && overview_active () && g_placed &&
+      g_target_state != ControlsState::HIDDEN) {
+    HWND other = (msg == WM_KILLFOCUS) ? reinterpret_cast<HWND> (wParam)
+                                       : reinterpret_cast<HWND> (lParam);
+    HWND cur_fg = GetForegroundWindow ();
+    g_print ("[ov-focus] lost msg=0x%x state=%d other=%p(%s) fg=%p(%s)\n",
+             msg, static_cast<int> (g_target_state),
+             static_cast<void *> (other),
+             hwnd_class_utf8_diag (other).c_str (),
+             static_cast<void *> (cur_fg),
+             hwnd_class_utf8_diag (cur_fg).c_str ());
+    if (can_auto_focus_overview_search () &&
+        (is_overview_chrome_or_panel_hwnd (other) ||
+         is_overview_chrome_or_panel_hwnd (cur_fg))) {
+      schedule_focus_verify ();
+    }
+  } else if ((msg == WM_ACTIVATE && LOWORD (wParam) != WA_INACTIVE) ||
+             msg == WM_SETFOCUS) {
     restack_locked ();
+    if (can_auto_focus_overview_search ())
+      ensure_search_entry_focus ();
   }
   return res;
 }
@@ -4384,6 +4526,12 @@ place_overview_locked (bool opening, int switch_dir)
                    had_reused_slots && !g_mini_slots.empty ());
 
   g_placed = true;
+  if (opening && can_auto_focus_overview_search ()) {
+    if (GetForegroundWindow () == g_overview_hwnd)
+      ensure_search_entry_focus ();
+    else
+      schedule_focus_verify ();
+  }
   g_print ("[ov] placed %dx%d slots=%zu ws=%ldx%ld grid=%dx%d@(%d,%d) dash=%d\n",
            w, h, g_slots.size (), (long)(g_ws_box.right - g_ws_box.left),
            (long)(g_ws_box.bottom - g_ws_box.top), g_grid_w, g_grid_h, g_grid_x,
@@ -4893,6 +5041,7 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
       g_grid_cur_slide_y = 0.0;
       live_wallpaper_set_paused (false);
       apply_pending_desktop_sync_if_any ();
+      recheck_overview_search_focus_on_settle ("app-grid");
       return G_SOURCE_REMOVE;
     }
     // Settled on WINDOW_PICKER.
@@ -4926,6 +5075,7 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
       schedule_settle_hover (140);
     if (g_anim.source == 0 && g_switch_source == 0)
       live_wallpaper_set_paused (false);
+    recheck_overview_search_focus_on_settle ("picker");
     return G_SOURCE_REMOVE;
   }
   return G_SOURCE_CONTINUE;
@@ -5266,6 +5416,8 @@ start_state_transition (ControlsState to_state, guint duration_ms)
     g_anim.source = 0;
   }
   cancel_search_fade ();
+  if (to_state == ControlsState::HIDDEN)
+    cancel_focus_verify ();
   cancel_settle_hover ();
   cancel_post_hide_workarea ();
   set_hover (-1, true);
@@ -5451,6 +5603,7 @@ finish_hide (void)
   winome_shell_panel_set_workspace_scroll (-1, -1.0);
   live_wallpaper_stop ();
   clear_pending_dwm_frame ();
+  cancel_focus_verify ();
   cancel_settle_hover ();
   set_hover (-1, true);
   cancel_pending_place_idles ();
@@ -5498,8 +5651,12 @@ finish_hide (void)
   g_search_fade_from = 0.0;
   g_search_fade_to = 0.0;
   g_search_mode = false;
+  g_search_preedit_active = false;
   if (g_search != nullptr) {
+    if (gtk_widget_get_realized (g_search))
+      gtk_entry_reset_im_context (GTK_ENTRY (g_search));
     gtk_widget_remove_css_class (g_search, "search-active");
+    set_search_dormant (true);
     gtk_widget_set_opacity (g_search, 1.0);
     gtk_widget_set_can_target (g_search, TRUE);
   }
@@ -5563,6 +5720,7 @@ finish_hide (void)
     SetForegroundWindow (restore_hwnd);
   }
   schedule_post_hide_workarea (180);
+  winome::evaluate_fullscreen_state ();
 }
 
 static void
@@ -5985,13 +6143,106 @@ acquire_overview_foreground (HWND hwnd)
         DWORD cur_tid = GetCurrentThreadId ();
         if (fg_tid != 0 && fg_tid != cur_tid &&
             AttachThreadInput (cur_tid, fg_tid, TRUE)) {
+          BringWindowToTop (hwnd);
           SetForegroundWindow (hwnd);
+          SetActiveWindow (hwnd);
           AttachThreadInput (cur_tid, fg_tid, FALSE);
         }
       }
+      if (GetForegroundWindow () != hwnd) {
+        INPUT pair[2] = {};
+        pair[0].type = INPUT_KEYBOARD;
+        pair[0].ki.wVk = 0xFF;
+        pair[0].ki.dwExtraInfo = 0x574E4F31;
+        pair[1].type = INPUT_KEYBOARD;
+        pair[1].ki.wVk = 0xFF;
+        pair[1].ki.dwExtraInfo = 0x574E4F31;
+        pair[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput (2, pair, sizeof (INPUT));
+        AllowSetForegroundWindow (ASFW_ANY);
+        BringWindowToTop (hwnd);
+        SetForegroundWindow (hwnd);
+      }
     }
   }
+  if (GetForegroundWindow () == hwnd && GetFocus () != hwnd)
+    SetFocus (hwnd);
+  if (GetForegroundWindow () != hwnd) {
+    HWND cur_fg = GetForegroundWindow ();
+    g_print ("[ov-focus] acquire_foreground failed target=%p fg=%p(%s)\n",
+             static_cast<void *> (hwnd), static_cast<void *> (cur_fg),
+             hwnd_class_utf8_diag (cur_fg).c_str ());
+  }
   restack_locked ();
+}
+
+static GtkWidget *
+search_focus_target (void)
+{
+  if (g_search == nullptr)
+    return nullptr;
+  GtkWidget *delegate =
+      GTK_WIDGET (gtk_editable_get_delegate (GTK_EDITABLE (g_search)));
+  return delegate != nullptr ? delegate : g_search;
+}
+
+static bool
+is_search_focused (void)
+{
+  if (g_window == nullptr || g_search == nullptr)
+    return false;
+  GtkWidget *focus = gtk_window_get_focus (GTK_WINDOW (g_window));
+  GtkWidget *target = search_focus_target ();
+  return focus != nullptr &&
+         (focus == target || focus == g_search ||
+          gtk_widget_is_ancestor (focus, g_search));
+}
+
+static void
+set_search_dormant (bool dormant)
+{
+  if (g_search == nullptr)
+    return;
+  const bool keep_dormant =
+      dormant && g_search_raw_text.empty () && !g_search_preedit_active;
+  if (keep_dormant)
+    gtk_widget_add_css_class (g_search, "search-dormant");
+  else
+    gtk_widget_remove_css_class (g_search, "search-dormant");
+}
+
+static void
+ensure_search_entry_focus (void)
+{
+  if (g_window == nullptr || g_search == nullptr)
+    return;
+  if (!is_search_focused ()) {
+    gboolean ok = gtk_entry_grab_focus_without_selecting (GTK_ENTRY (g_search));
+    if (!is_search_focused ()) {
+      GtkWidget *cur = gtk_window_get_focus (GTK_WINDOW (g_window));
+      g_print ("[ov-focus] ensure_search_entry_focus failed ok=%d focus=%p\n",
+               ok ? 1 : 0, static_cast<void *> (cur));
+    }
+  }
+}
+
+static bool
+has_visible_overview_popover (void)
+{
+  if (g_app_grid != nullptr && app_grid_has_open_menu (g_app_grid))
+    return true;
+  if (g_dash != nullptr && overview_dash_has_open_menu (g_dash))
+    return true;
+  return false;
+}
+
+static bool
+can_auto_focus_overview_search (void)
+{
+  return g_window != nullptr && g_search != nullptr && g_placed &&
+         g_target_state != ControlsState::HIDDEN && !g_folder_dialog_open &&
+         winome_shell_panel_top_popover_hwnd () == nullptr &&
+         !has_visible_overview_popover ();
 }
 
 static void
@@ -6000,14 +6251,91 @@ focus_overview_window (bool focus_search)
   acquire_overview_foreground (g_overview_hwnd);
   if (g_window == nullptr)
     return;
-  if (focus_search) {
-    if (g_search != nullptr)
-      gtk_widget_grab_focus (g_search);
-  } else if (g_focus_sink != nullptr) {
+  // Keep GTK/IME focus armed on g_search's GtkText at all times while overview
+  // is open so Windows IME (VK_PROCESSKEY / WM_IME_*) binds before key 1;
+  // `.search-dormant` hides the blue focus ring & caret when not active.
+  if (g_search != nullptr) {
+    set_search_dormant (!focus_search);
+    ensure_search_entry_focus ();
+  } else if (g_focus_sink != nullptr &&
+             gtk_widget_get_focusable (g_focus_sink)) {
     gtk_window_set_focus (GTK_WINDOW (g_window), g_focus_sink);
   } else if (g_root != nullptr) {
     gtk_widget_grab_focus (g_root);
   }
+  HWND cur_fg = GetForegroundWindow ();
+  g_print ("[ov-focus] focus_overview search=%d fg_ok=%d(%s) active=%d search_focus=%d\n",
+           focus_search ? 1 : 0, cur_fg == g_overview_hwnd ? 1 : 0,
+           hwnd_class_utf8_diag (cur_fg).c_str (),
+           gtk_window_is_active (GTK_WINDOW (g_window)) ? 1 : 0,
+           is_search_focused () ? 1 : 0);
+}
+
+static void
+cancel_focus_verify (void)
+{
+  if (g_focus_verify_timer != 0) {
+    g_source_remove (g_focus_verify_timer);
+    g_focus_verify_timer = 0;
+  }
+}
+
+static gboolean
+focus_verify_cb (gpointer user_data G_GNUC_UNUSED)
+{
+  g_focus_verify_timer = 0;
+  if (!can_auto_focus_overview_search ())
+    return G_SOURCE_REMOVE;
+  HWND fg = GetForegroundWindow ();
+  if (fg != g_overview_hwnd &&
+      (is_overview_chrome_or_panel_hwnd (fg) || fg == nullptr ||
+       fg == g_prev_foreground_hwnd)) {
+    acquire_overview_foreground (g_overview_hwnd);
+  }
+  if (GetForegroundWindow () == g_overview_hwnd)
+    ensure_search_entry_focus ();
+  HWND after_fg = GetForegroundWindow ();
+  g_print ("[ov-focus] verify fg_ok=%d(%s) active=%d search_focus=%d dormant=%d\n",
+           after_fg == g_overview_hwnd ? 1 : 0,
+           hwnd_class_utf8_diag (after_fg).c_str (),
+           gtk_window_is_active (GTK_WINDOW (g_window)) ? 1 : 0,
+           is_search_focused () ? 1 : 0,
+           (g_search != nullptr &&
+            gtk_widget_has_css_class (g_search, "search-dormant"))
+               ? 1
+               : 0);
+  return G_SOURCE_REMOVE;
+}
+
+static void
+schedule_focus_verify (void)
+{
+  if (g_focus_verify_timer == 0) {
+    g_focus_verify_timer = g_idle_add_full (G_PRIORITY_DEFAULT_IDLE,
+                                            focus_verify_cb, nullptr, nullptr);
+  }
+}
+
+static void
+recheck_overview_search_focus_on_settle (const char *tag)
+{
+  if (!can_auto_focus_overview_search ())
+    return;
+  HWND fg = GetForegroundWindow ();
+  if (is_overview_chrome_or_panel_hwnd (fg))
+    acquire_overview_foreground (g_overview_hwnd);
+  if (GetForegroundWindow () == g_overview_hwnd)
+    ensure_search_entry_focus ();
+  HWND after_fg = GetForegroundWindow ();
+  g_print ("[ov-focus] settle(%s) fg_ok=%d(%s) active=%d search_focus=%d dormant=%d\n",
+           tag != nullptr ? tag : "?", after_fg == g_overview_hwnd ? 1 : 0,
+           hwnd_class_utf8_diag (after_fg).c_str (),
+           gtk_window_is_active (GTK_WINDOW (g_window)) ? 1 : 0,
+           is_search_focused () ? 1 : 0,
+           (g_search != nullptr &&
+            gtk_widget_has_css_class (g_search, "search-dormant"))
+               ? 1
+               : 0);
 }
 
 static void
@@ -6060,8 +6388,9 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
   const bool in_search_rect =
       (px >= g_search_rect.left && px < g_search_rect.right &&
        py >= g_search_rect.top && py < g_search_rect.bottom);
-  if (!in_search_rect && g_search_query.empty () && g_focus_sink != nullptr) {
-    gtk_window_set_focus (GTK_WINDOW (g_window), g_focus_sink);
+  if (!in_search_rect && g_search_query.empty () && !g_search_preedit_active) {
+    set_search_dormant (true);
+    ensure_search_entry_focus ();
   }
 
   if (g_search_mode) {
@@ -6603,6 +6932,10 @@ shift_app_grid_idle (gpointer user_data)
     start_state_transition (ControlsState::APP_GRID, kOpenMs);
   }
   restack_locked ();
+  if (can_auto_focus_overview_search () &&
+      GetForegroundWindow () == g_overview_hwnd) {
+    ensure_search_entry_focus ();
+  }
   return G_SOURCE_REMOVE;
 }
 
@@ -6875,6 +7208,12 @@ on_app_grid_folder_toggled (bool open, void *user_data G_GNUC_UNUSED)
       apply_thumb_rect (s, s.grid_rect, op, true);
     }
   }
+  if (!open && overview_active () && g_window != nullptr &&
+      gtk_widget_get_visible (g_window) &&
+      g_target_state != ControlsState::HIDDEN) {
+    focus_overview_window (!g_search_raw_text.empty () || g_search_preedit_active);
+    return;
+  }
   restack_locked ();
 }
 
@@ -6883,6 +7222,8 @@ on_search_changed (GtkEditable *editable, gpointer user_data G_GNUC_UNUSED)
 {
   const char *text = gtk_editable_get_text (editable);
   std::string raw = text != nullptr ? text : "";
+  if (!raw.empty ())
+    set_search_dormant (false);
   std::vector<std::string> terms = split_search_terms (raw);
   std::string norm;
   for (size_t i = 0; i < terms.size (); ++i) {
@@ -6919,6 +7260,8 @@ void
 on_search_activate (GtkEntry *entry G_GNUC_UNUSED,
                     gpointer user_data G_GNUC_UNUSED)
 {
+  if (g_search_preedit_active)
+    return;
   if (g_search_mode) {
     if (g_search_view != nullptr)
       overview_search_view_activate_selected (g_search_view, false);
@@ -6945,6 +7288,34 @@ on_search_activate (GtkEntry *entry G_GNUC_UNUSED,
   }
 }
 
+static bool
+handle_overview_nav_key (guint keyval, GdkModifierType state)
+{
+  if (g_search_mode && g_search_view != nullptr) {
+    // Ctrl+Enter launches a new instance of the selected app
+    // (upstream search.js SearchEntry activate-new-instance).
+    if ((state & GDK_CONTROL_MASK) &&
+        (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter)) {
+      if (overview_search_view_activate_selected (g_search_view, true))
+        return true;
+    }
+    if (overview_search_view_navigate (g_search_view, keyval,
+                                       is_search_entry_caret_at_end ())) {
+      return true;
+    }
+  }
+  if (g_app_grid_mode && g_app_grid != nullptr && g_search_raw_text.empty () &&
+      !g_search_preedit_active &&
+      (keyval == GDK_KEY_Home || keyval == GDK_KEY_End)) {
+    if (keyval == GDK_KEY_Home)
+      app_grid_first_page (g_app_grid);
+    else
+      app_grid_last_page (g_app_grid);
+    return true;
+  }
+  return false;
+}
+
 gboolean
 on_overview_key_pressed (GtkEventControllerKey *controller,
                          guint keyval,
@@ -6952,7 +7323,11 @@ on_overview_key_pressed (GtkEventControllerKey *controller,
                          GdkModifierType state,
                          gpointer user_data G_GNUC_UNUSED)
 {
+  if (has_visible_overview_popover ())
+    return GDK_EVENT_PROPAGATE;
   if (keyval == GDK_KEY_Escape) {
+    if (g_search_preedit_active)
+      return GDK_EVENT_PROPAGATE;
     if (!g_search_raw_text.empty () || !g_search_query.empty ()) {
       gtk_editable_set_text (GTK_EDITABLE (g_search), "");
       focus_overview_window (false);
@@ -6967,32 +7342,15 @@ on_overview_key_pressed (GtkEventControllerKey *controller,
     close_overview ("escape");
     return GDK_EVENT_STOP;
   }
-  if (g_search_mode && g_search_view != nullptr) {
-    if ((state & GDK_CONTROL_MASK) &&
-        (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter)) {
-      if (overview_search_view_activate_selected (g_search_view, true))
-        return GDK_EVENT_STOP;
-    }
-    if (overview_search_view_navigate (g_search_view, keyval,
-                                       is_search_entry_caret_at_end ())) {
-      return GDK_EVENT_STOP;
-    }
-  }
+  if (handle_overview_nav_key (keyval, state))
+    return GDK_EVENT_STOP;
   if ((state & GDK_CONTROL_MASK) && (state & GDK_SHIFT_MASK) &&
       (keyval == GDK_KEY_n || keyval == GDK_KEY_N)) {
     on_thumb_add_desktop (nullptr);
     return GDK_EVENT_STOP;
   }
-  if (g_app_grid_mode && g_app_grid != nullptr && g_search_query.empty () &&
-      (keyval == GDK_KEY_Home || keyval == GDK_KEY_End)) {
-    if (keyval == GDK_KEY_Home)
-      app_grid_first_page (g_app_grid);
-    else
-      app_grid_last_page (g_app_grid);
-    return GDK_EVENT_STOP;
-  }
   if (keyval == GDK_KEY_Page_Up || keyval == GDK_KEY_Page_Down) {
-    if (g_search_mode)
+    if (g_search_mode || g_search_preedit_active)
       return GDK_EVENT_PROPAGATE;
     if (g_app_grid_mode && g_app_grid != nullptr) {
       if (keyval == GDK_KEY_Page_Up)
@@ -7016,20 +7374,33 @@ on_overview_key_pressed (GtkEventControllerKey *controller,
     return GDK_EVENT_STOP;
   }
   if (g_placed && g_target_state != ControlsState::HIDDEN &&
-      g_search != nullptr &&
-      (state & (GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK)) == 0) {
-    GtkWidget *focus =
-        g_window != nullptr ? gtk_window_get_focus (GTK_WINDOW (g_window))
-                            : nullptr;
-    if (focus == nullptr || !GTK_IS_EDITABLE (focus)) {
-      const gunichar uc = gdk_keyval_to_unicode (keyval);
-      if (uc >= 0x20 && uc != 0x7f &&
-          !(uc == ' ' && g_search_query.empty ())) {
+      g_search != nullptr) {
+    const bool has_text = !g_search_raw_text.empty ();
+    if (!is_search_focused ()) {
+      if (should_overview_capture_search_key (keyval, state, has_text,
+                                              g_search_preedit_active)) {
+        g_print ("[ov-key] capture_refocus key=0x%x state=%d fg_ok=%d\n",
+                 keyval, static_cast<int> (g_target_state),
+                 GetForegroundWindow () == g_overview_hwnd ? 1 : 0);
         focus_overview_for_search ();
-        GtkWidget *search_focus = gtk_window_get_focus (GTK_WINDOW (g_window));
-        if (controller != nullptr && search_focus != nullptr)
-          gtk_event_controller_key_forward (controller, search_focus);
+        GtkWidget *target = search_focus_target ();
+        if (controller != nullptr && target != nullptr)
+          gtk_event_controller_key_forward (controller, target);
         return GDK_EVENT_STOP;
+      }
+    } else {
+      const bool dormant =
+          gtk_widget_has_css_class (g_search, "search-dormant");
+      if (should_overview_consume_dormant_key (keyval, state, dormant, has_text,
+                                               g_search_preedit_active)) {
+        return GDK_EVENT_STOP;
+      }
+      if (dormant &&
+          should_overview_capture_search_key (keyval, state, has_text,
+                                              g_search_preedit_active)) {
+        g_print ("[ov-key] dormant_unlock key=0x%x state=%d\n", keyval,
+                 static_cast<int> (g_target_state));
+        set_search_dormant (false);
       }
     }
   }
@@ -7121,7 +7492,7 @@ overview_init (HWND panel_hwnd)
   // active without auto-focusing .search-entry (prevents stray focus ring).
   g_focus_sink = gtk_drawing_area_new ();
   gtk_widget_set_size_request (g_focus_sink, 0, 0);
-  gtk_widget_set_focusable (g_focus_sink, TRUE);
+  gtk_widget_set_focusable (g_focus_sink, FALSE);
   gtk_widget_set_can_target (g_focus_sink, FALSE);
   gtk_fixed_put (GTK_FIXED (g_root), g_focus_sink, 0, 0);
 
@@ -7130,47 +7501,43 @@ overview_init (HWND panel_hwnd)
   // localized.
   g_search = gtk_entry_new ();
   gtk_widget_add_css_class (g_search, "search-entry");
+  gtk_widget_add_css_class (g_search, "search-dormant");
   gtk_entry_set_icon_from_icon_name (GTK_ENTRY (g_search),
                                      GTK_ENTRY_ICON_PRIMARY,
                                      "edit-find-symbolic");
   gtk_entry_set_placeholder_text (
       GTK_ENTRY (g_search),
       winome::tr ("Type to search", "输入以搜索"));
-  GtkEventController *search_nav_keys = gtk_event_controller_key_new ();
-  gtk_event_controller_set_propagation_phase (search_nav_keys,
-                                              GTK_PHASE_CAPTURE);
+  GtkGesture *search_press = gtk_gesture_click_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (search_press), 0);
+  gtk_event_controller_set_propagation_phase (
+      GTK_EVENT_CONTROLLER (search_press), GTK_PHASE_CAPTURE);
   g_signal_connect (
-      search_nav_keys, "key-pressed",
-      G_CALLBACK (+[] (GtkEventControllerKey *c G_GNUC_UNUSED, guint keyval,
-                       guint keycode G_GNUC_UNUSED,
-                       GdkModifierType state,
-                       gpointer ud G_GNUC_UNUSED) -> gboolean {
-        if (g_search_mode && g_search_view != nullptr) {
-          // Ctrl+Enter launches a new instance of the selected app
-          // (upstream search.js SearchEntry activate-new-instance).
-          if ((state & GDK_CONTROL_MASK) &&
-              (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter)) {
-            if (overview_search_view_activate_selected (g_search_view, true))
-              return GDK_EVENT_STOP;
-          }
-          if (overview_search_view_navigate (
-                  g_search_view, keyval, is_search_entry_caret_at_end ())) {
-            return GDK_EVENT_STOP;
-          }
-        }
-        if (g_app_grid_mode && g_app_grid != nullptr &&
-            g_search_query.empty () &&
-            (keyval == GDK_KEY_Home || keyval == GDK_KEY_End)) {
-          if (keyval == GDK_KEY_Home)
-            app_grid_first_page (g_app_grid);
-          else
-            app_grid_last_page (g_app_grid);
-          return GDK_EVENT_STOP;
-        }
-        return GDK_EVENT_PROPAGATE;
+      search_press, "pressed",
+      G_CALLBACK (+[] (GtkGestureClick *g G_GNUC_UNUSED, int n_press G_GNUC_UNUSED,
+                       double x G_GNUC_UNUSED, double y G_GNUC_UNUSED,
+                       gpointer ud G_GNUC_UNUSED) {
+        set_search_dormant (false);
       }),
       nullptr);
-  gtk_widget_add_controller (g_search, search_nav_keys);
+  gtk_widget_add_controller (g_search, GTK_EVENT_CONTROLLER (search_press));
+  if (GtkEditable *delegate = gtk_editable_get_delegate (GTK_EDITABLE (g_search))) {
+    g_signal_connect (
+        delegate, "preedit-changed",
+        G_CALLBACK (+[] (GtkText *t G_GNUC_UNUSED, const char *preedit,
+                         gpointer ud G_GNUC_UNUSED) {
+          const bool active = (preedit != nullptr && preedit[0] != '\0');
+          if (active == g_search_preedit_active)
+            return;
+          g_search_preedit_active = active;
+          if (active) {
+            set_search_dormant (false);
+            if (g_folder_dialog_open && g_app_grid != nullptr)
+              app_grid_close_open_folder (g_app_grid);
+          }
+        }),
+        nullptr);
+  }
   g_signal_connect (g_search, "changed", G_CALLBACK (on_search_changed),
                     nullptr);
   g_signal_connect (g_search, "icon-press", G_CALLBACK (on_search_icon_press),
@@ -7206,6 +7573,9 @@ overview_init (HWND panel_hwnd)
                              on_app_grid_pins_changed, nullptr);
   app_grid_set_folder_toggled_cb (g_app_grid, on_app_grid_folder_toggled,
                                   nullptr);
+  app_grid_set_menu_closed_cb (
+      g_app_grid, +[] (void *) { overview_restore_focus_if_active (); },
+      nullptr);
   g_app_grid_clip = app_grid_clip_new (g_app_grid);
   gtk_fixed_put (GTK_FIXED (g_root), g_app_grid_clip, 0, 0);
   sync_app_grid_visible (false);
@@ -7251,10 +7621,12 @@ overview_init (HWND panel_hwnd)
 
   g_signal_connect (
       g_window, "notify::is-active",
-      G_CALLBACK (+[] (GtkWindow *win G_GNUC_UNUSED,
+      G_CALLBACK (+[] (GtkWindow *win,
                        GParamSpec *pspec G_GNUC_UNUSED,
                        gpointer user_data G_GNUC_UNUSED) {
         restack_locked ();
+        if (gtk_window_is_active (win) && can_auto_focus_overview_search ())
+          ensure_search_entry_focus ();
       }),
       nullptr);
 
@@ -7275,6 +7647,7 @@ overview_init (HWND panel_hwnd)
   gtk_widget_add_controller (g_window, GTK_EVENT_CONTROLLER (click));
 
   GtkEventController *keys = gtk_event_controller_key_new ();
+  gtk_event_controller_set_propagation_phase (keys, GTK_PHASE_CAPTURE);
   g_signal_connect (keys, "key-pressed", G_CALLBACK (on_overview_key_pressed),
                     nullptr);
   gtk_widget_add_controller (g_window, keys);
@@ -7315,6 +7688,7 @@ overview_init (HWND panel_hwnd)
         cancel_pending_place_idles ();
         cancel_delayed_rebuild ();
         cancel_hover_idle ();
+        cancel_focus_verify ();
         cancel_settle_hover ();
         cancel_post_hide_workarea ();
         if (g_overview_alive)
@@ -7415,6 +7789,7 @@ overview_init (HWND panel_hwnd)
         g_search_fade_from = 0.0;
         g_search_fade_to = 0.0;
         g_search_mode = false;
+        g_search_preedit_active = false;
         g_folder_dialog_open = false;
         g_ws_bg = nullptr;
         g_app_grid_clip = nullptr;
@@ -7471,6 +7846,7 @@ overview_show (void)
     g_source_remove (g_prewarm_timer);
     g_prewarm_timer = 0;
   }
+  cancel_focus_verify ();
   cancel_settle_hover ();
   cancel_post_hide_workarea ();
   cancel_delayed_rebuild ();
@@ -7479,7 +7855,10 @@ overview_show (void)
   g_search_fade_cur = 0.0;
   g_search_fade_from = 0.0;
   g_search_fade_to = 0.0;
+  g_search_preedit_active = false;
   if (g_search != nullptr) {
+    if (gtk_widget_get_realized (g_search))
+      gtk_entry_reset_im_context (GTK_ENTRY (g_search));
     const char *cur_text = gtk_editable_get_text (GTK_EDITABLE (g_search));
     if (!g_search_query.empty () || !g_search_raw_text.empty () ||
         (cur_text != nullptr && cur_text[0] != '\0')) {
@@ -7490,6 +7869,7 @@ overview_show (void)
                                          GTK_ENTRY_ICON_SECONDARY, nullptr);
     }
     gtk_widget_remove_css_class (g_search, "search-active");
+    set_search_dormant (true);
     gtk_widget_set_opacity (g_search, 1.0);
     gtk_widget_set_can_target (g_search, TRUE);
   }
@@ -7529,6 +7909,7 @@ overview_show (void)
     g_app_grid_mode = false;
     g_print ("[ov] show (requesting map)\n");
     gtk_widget_set_visible (g_window, TRUE);
+    winome::evaluate_fullscreen_state ();
     if (!g_placed) {
       place_overview_locked (true);
     }
@@ -7540,6 +7921,7 @@ overview_show (void)
     }
   } else if (g_placed && g_target_state == ControlsState::HIDDEN) {
     // Closing animation was mid-flight; reverse seamlessly back to picker or grid.
+    winome::evaluate_fullscreen_state ();
     start_state_transition (g_pending_show_state, kOpenMs);
     if (winome_shell_panel_top_popover_hwnd () == nullptr)
       focus_overview_window (false);
@@ -7598,6 +7980,18 @@ overview_discard_restore_focus (void)
   g_restore_focus_discarded.store (true, std::memory_order_release);
   g_prev_foreground_hwnd = nullptr;
   AllowSetForegroundWindow (ASFW_ANY);
+}
+
+void
+overview_restore_focus_if_active (void)
+{
+  if (!overview_active () || g_window == nullptr ||
+      !gtk_widget_get_visible (g_window) ||
+      g_target_state == ControlsState::HIDDEN || g_folder_dialog_open ||
+      winome_shell_panel_top_popover_hwnd () != nullptr) {
+    return;
+  }
+  focus_overview_window (!g_search_raw_text.empty () || g_search_preedit_active);
 }
 
 void
