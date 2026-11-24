@@ -142,6 +142,11 @@ bool winome_shell_reload_theme (void);
 // highlight transition driven directly by overview.cpp's anim_tick [0..1].
 void winome_shell_panel_set_overview_progress (double progress);
 
+// Per-monitor variant: updates only the panel hosted on @hmonitor (or all
+// panels when @hmonitor == nullptr).
+void winome_shell_panel_set_overview_progress_for_monitor (void *hmonitor,
+                                                           double progress);
+
 // Real-time continuous workspace indicator scroll position for #panelActivities
 // (matching upstream panel.js WorkspaceIndicators). Pass position < 0 to release
 // back to virtual-desktop observer sync.

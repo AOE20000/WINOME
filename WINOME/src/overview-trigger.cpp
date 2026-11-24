@@ -23,10 +23,13 @@
 #include "config.h"
 #include "debug-runtime.h"
 #include "overview-dash.h"
+#include "overview-secondary.h"
 #include "overview.h"
 #include "run-dialog.h"
 #include "shell-panel.h"
+#include "monitor-manager.h"
 #include "virtual-desktop.h"
+#include "workspace-manager.h"
 
 #include <gtk/gtk.h>
 #include <gdk/win32/gdkwin32.h>
@@ -117,10 +120,18 @@ std::array<std::atomic<HWND>, kMaxCachedPanels> g_cached_panel_hwnds{};
 OverviewStateCallback g_state_cb = nullptr;
 void *g_state_cb_data = nullptr;
 
+enum class OverviewQueueOp {
+  Open,
+  Toggle,
+  CloseMainOrAll,
+  CloseAll,
+};
+
 struct OverviewStateData {
-  gboolean active;
-  uint64_t seq;
-  const char *source;
+  OverviewQueueOp op = OverviewQueueOp::Toggle;
+  uint64_t seq = 0;
+  const char *source = nullptr;
+  HMONITOR monitor = nullptr;
 };
 
 std::queue<OverviewStateData> g_pending_events;
@@ -232,6 +243,20 @@ handle_unfocused_esc_idle (gpointer user_data G_GNUC_UNUSED)
     return G_SOURCE_REMOVE;
   }
 
+  // In unlinked mode, if the cursor monitor has a Secondary Overview open
+  // (or no main Overview is open at all), dismiss that Secondary Overview.
+  if (!get_config ().multi_monitor_overview_linked) {
+    HMONITOR cursor_mon = monitor_manager_active_monitor ();
+    if (overview_secondary_is_open_for_monitor (cursor_mon)) {
+      overview_close_secondary_for_monitor (cursor_mon);
+      return G_SOURCE_REMOVE;
+    }
+    if (!overview_is_main_open () && overview_secondary_any_open ()) {
+      overview_close_all_secondary ();
+      return G_SOURCE_REMOVE;
+    }
+  }
+
   if (!gtk_is_initialized ()) {
     close_overview ("esc");
     return G_SOURCE_REMOVE;
@@ -340,20 +365,105 @@ dispatch_overview_events_idle (gpointer data G_GNUC_UNUSED)
     }
 
     saw_transition = true;
-    if (ev.active != FALSE) {
-      g_print ("[trig] open_overview (%s)\n",
-               ev.source != nullptr ? ev.source : "?");
-      if (cb != nullptr)
-        cb (true, cb_data);
-      overview_show_async ();
-      refresh_cached_window_handles ();
+    const bool linked = get_config ().multi_monitor_overview_linked;
+    HMONITOR target =
+        (ev.monitor != nullptr) ? ev.monitor : monitor_manager_active_monitor ();
+    const bool main_open = overview_is_main_open ();
+    HMONITOR main_mon = overview_main_monitor ();
+    const bool target_has_sec = overview_secondary_is_open_for_monitor (target);
+    const bool any_sec = overview_secondary_any_open ();
+
+    OverviewDispatchAction act = OverviewDispatchAction::None;
+    if (ev.op == OverviewQueueOp::CloseAll) {
+      act = (main_open || any_sec) ? OverviewDispatchAction::CloseAll
+                                   : OverviewDispatchAction::None;
+    } else if (ev.op == OverviewQueueOp::CloseMainOrAll) {
+      if (linked) {
+        act = (main_open || any_sec) ? OverviewDispatchAction::CloseAll
+                                     : OverviewDispatchAction::None;
+      } else if (main_open) {
+        act = OverviewDispatchAction::CloseMainOnly;
+      } else if (target_has_sec) {
+        act = OverviewDispatchAction::CloseSecondaryOnly;
+      } else if (any_sec) {
+        act = OverviewDispatchAction::CloseAll;
+      }
     } else {
-      g_print ("[trig] close_overview (%s)\n",
-               ev.source != nullptr ? ev.source : "?");
-      overview_hide_async ();
-      refresh_cached_window_handles ();
-      if (cb != nullptr)
-        cb (false, cb_data);
+      act = decide_multi_monitor_overview_action (
+          linked, ev.op == OverviewQueueOp::Toggle,
+          reinterpret_cast<uintptr_t> (target), main_open,
+          reinterpret_cast<uintptr_t> (main_mon), target_has_sec, any_sec);
+    }
+
+    switch (act) {
+      case OverviewDispatchAction::None:
+        break;
+      case OverviewDispatchAction::OpenMain:
+      case OverviewDispatchAction::OpenLinkedAll: {
+        g_running.store (true, std::memory_order_release);
+        g_print ("[trig] open_overview (%s mon=%p linked=%d)\n",
+                 ev.source != nullptr ? ev.source : "?",
+                 static_cast<void *> (target), linked ? 1 : 0);
+        if (cb != nullptr)
+          cb (true, cb_data);
+        overview_set_target_monitor (target);
+        overview_show ();
+        refresh_cached_window_handles ();
+        break;
+      }
+      case OverviewDispatchAction::OpenSecondary: {
+        g_running.store (true, std::memory_order_release);
+        g_last_win_press_us.store (0, std::memory_order_release);
+        g_print ("[trig] open_secondary_overview (%s mon=%p)\n",
+                 ev.source != nullptr ? ev.source : "?",
+                 static_cast<void *> (target));
+        if (cb != nullptr)
+          cb (true, cb_data);
+        overview_open_secondary_for_monitor (target);
+        refresh_cached_window_handles ();
+        break;
+      }
+      case OverviewDispatchAction::CloseMainOnly: {
+        g_last_win_press_us.store (0, std::memory_order_release);
+        g_print ("[trig] close_overview (%s main-only)\n",
+                 ev.source != nullptr ? ev.source : "?");
+        overview_hide ();
+        refresh_cached_window_handles ();
+        if (!any_sec) {
+          g_running.store (false, std::memory_order_release);
+          if (cb != nullptr)
+            cb (false, cb_data);
+        }
+        break;
+      }
+      case OverviewDispatchAction::CloseSecondaryOnly: {
+        g_last_win_press_us.store (0, std::memory_order_release);
+        g_print ("[trig] close_secondary_overview (%s mon=%p)\n",
+                 ev.source != nullptr ? ev.source : "?",
+                 static_cast<void *> (target));
+        overview_close_secondary_for_monitor (target);
+        refresh_cached_window_handles ();
+        if (!main_open && !overview_secondary_any_open ()) {
+          g_running.store (false, std::memory_order_release);
+          if (cb != nullptr)
+            cb (false, cb_data);
+        }
+        break;
+      }
+      case OverviewDispatchAction::CloseAll: {
+        g_last_win_press_us.store (0, std::memory_order_release);
+        g_running.store (false, std::memory_order_release);
+        g_print ("[trig] close_overview (%s all)\n",
+                 ev.source != nullptr ? ev.source : "?");
+        if (main_open)
+          overview_hide ();
+        if (any_sec && !linked)
+          overview_close_all_secondary ();
+        refresh_cached_window_handles ();
+        if (cb != nullptr)
+          cb (false, cb_data);
+        break;
+      }
     }
   }
 }
@@ -537,8 +647,15 @@ void hotkey_worker_main() {
       g_hotkey_worker.queue.pop();
     }
 
-    const int count = vd::count();
-    const int cur = vd::current_index();
+    HWND fg = GetForegroundWindow();
+    HMONITOR target_mon = nullptr;
+    if (task.move_fg && is_eligible_window_for_move(fg))
+      target_mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+    if (target_mon == nullptr)
+      target_mon = monitor_manager_active_monitor();
+
+    const int count = ws::count_for_monitor(target_mon);
+    const int cur = ws::active_for_monitor(target_mon);
     if (count <= 0 || cur < 0)
       continue;
 
@@ -546,14 +663,10 @@ void hotkey_worker_main() {
     if (target == cur)
       continue;
 
-    if (task.move_fg) {
-      HWND fg = GetForegroundWindow();
-      if (is_eligible_window_for_move(fg))
-        vd::move_window_to_desktop(fg, target);
-    }
+    if (task.move_fg && is_eligible_window_for_move(fg))
+      ws::move_window_to_workspace(fg, target_mon, target);
 
-    if (vd::switch_to(target))
-      vd::notify_change_hint_async();
+    ws::switch_to(target_mon, target);
   }
 }
 
@@ -592,22 +705,21 @@ void dispatch_worker_main() {
     while (g_trigger_ring.try_pop(&act)) {
       switch (act.kind) {
         case TriggerActionKind::BareWinUp: {
-          if (!g_running.load(std::memory_order_acquire)) {
-            if (is_start_menu_foreground()) {
-              open_start_menu();
-            } else {
-              g_last_win_press_us.store(act.timestamp_us,
-                                        std::memory_order_release);
-              open_overview("win-key");
-            }
+          if (!g_running.load(std::memory_order_acquire) &&
+              is_start_menu_foreground()) {
+            open_start_menu();
+            break;
+          }
+          const gint64 prev =
+              g_last_win_press_us.exchange(0, std::memory_order_acq_rel);
+          if (g_running.load(std::memory_order_acquire) && prev > 0 &&
+              (act.timestamp_us - prev) <= 550000 &&
+              overview_can_shift_to_app_grid()) {
+            overview_shift_to_app_grid_async();
           } else {
-            const gint64 prev =
-                g_last_win_press_us.exchange(0, std::memory_order_acq_rel);
-            if (prev > 0 && (act.timestamp_us - prev) <= 550000) {
-              overview_shift_to_app_grid_async();
-            } else {
-              close_overview("win-key");
-            }
+            g_last_win_press_us.store(act.timestamp_us,
+                                      std::memory_order_release);
+            toggle_overview_for_monitor("win-key", nullptr);
           }
           break;
         }
@@ -973,6 +1085,21 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         }
 
         case WinKeyComboAction::PassthroughWithVdHint: {
+          // In Independent per-monitor workspace mode, intercept
+          // Win+Ctrl+Left/Right so switching stays per-monitor instead of
+          // jumping Windows onto the hidden parking desktop.
+          if (!g_win_injected &&
+              (state->vkCode == VK_LEFT || state->vkCode == VK_RIGHT) &&
+              ws::is_independent_active()) {
+            g_swallowed_combo_vk = state->vkCode;
+            g_combo_swallow_tick = GetTickCount64();
+            TriggerAction act{};
+            act.kind = TriggerActionKind::WorkspaceMove;
+            act.delta = (state->vkCode == VK_LEFT) ? -1 : 1;
+            act.move_fg = false;
+            enqueue_trigger_action(act);
+            return 1;
+          }
           TriggerAction act{};
           act.kind = TriggerActionKind::NotifyVdHint;
           enqueue_trigger_action(act);
@@ -1085,29 +1212,13 @@ void stop_overview_trigger() {
 namespace {
 
 // Must be called with g_state_mu held.
-uint64_t open_overview_locked(const char *source, bool *out_schedule) {
-  if (g_running.load(std::memory_order_acquire))
-    return 0;
-  g_running.store(true, std::memory_order_release);
+uint64_t enqueue_overview_op_locked(OverviewQueueOp op,
+                                    const char *source,
+                                    HMONITOR monitor,
+                                    bool *out_schedule) {
   const uint64_t seq = g_state_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
-  g_pending_events.push(
-      OverviewStateData{TRUE, seq, source != nullptr ? source : "?"});
-  if (!g_dispatch_scheduled) {
-    g_dispatch_scheduled = true;
-    *out_schedule = true;
-  }
-  return seq;
-}
-
-// Must be called with g_state_mu held.
-uint64_t close_overview_locked(const char *source, bool *out_schedule) {
-  if (!g_running.load(std::memory_order_acquire))
-    return 0;
-  g_running.store(false, std::memory_order_release);
-  const uint64_t seq = g_state_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
-  g_last_win_press_us.store(0, std::memory_order_release);
-  g_pending_events.push(
-      OverviewStateData{FALSE, seq, source != nullptr ? source : "?"});
+  g_pending_events.push(OverviewStateData{
+      op, seq, source != nullptr ? source : "?", monitor});
   if (!g_dispatch_scheduled) {
     g_dispatch_scheduled = true;
     *out_schedule = true;
@@ -1117,41 +1228,53 @@ uint64_t close_overview_locked(const char *source, bool *out_schedule) {
 
 }  // namespace
 
-void open_overview(const char *source) {
+void open_overview_for_monitor(const char *source, HMONITOR monitor) {
   bool schedule = false;
   {
     std::lock_guard<std::mutex> lk(g_state_mu);
-    open_overview_locked(source, &schedule);
+    enqueue_overview_op_locked(OverviewQueueOp::Open, source, monitor,
+                               &schedule);
   }
   if (schedule)
     schedule_overview_dispatch();
+}
+
+void open_overview(const char *source) {
+  open_overview_for_monitor(source, nullptr);
 }
 
 void close_overview(const char *source) {
   bool schedule = false;
   {
     std::lock_guard<std::mutex> lk(g_state_mu);
-    close_overview_locked(source, &schedule);
+    enqueue_overview_op_locked(OverviewQueueOp::CloseMainOrAll, source, nullptr,
+                               &schedule);
+  }
+  if (schedule)
+    schedule_overview_dispatch();
+}
+
+void toggle_overview_for_monitor(const char *source, HMONITOR monitor) {
+  bool schedule = false;
+  {
+    std::lock_guard<std::mutex> lk(g_state_mu);
+    enqueue_overview_op_locked(OverviewQueueOp::Toggle, source, monitor,
+                               &schedule);
   }
   if (schedule)
     schedule_overview_dispatch();
 }
 
 void toggle_overview(const char *source) {
-  bool schedule = false;
-  {
-    std::lock_guard<std::mutex> lk(g_state_mu);
-    if (!g_running.load(std::memory_order_acquire))
-      open_overview_locked(source, &schedule);
-    else
-      close_overview_locked(source, &schedule);
-  }
-  if (schedule)
-    schedule_overview_dispatch();
+  toggle_overview_for_monitor(source, nullptr);
 }
 
 bool overview_active() {
   return g_running.load(std::memory_order_acquire);
+}
+
+void sync_overview_active_state(bool active) {
+  g_running.store(active, std::memory_order_release);
 }
 
 void set_overview_change_callback(OverviewStateCallback callback,

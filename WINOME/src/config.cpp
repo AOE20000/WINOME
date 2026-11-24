@@ -265,6 +265,10 @@ void sanitize_config(WinomeConfig* cfg) {
       cfg->live_wallpaper_mode != "snapshot" &&
       cfg->live_wallpaper_mode != "off")
     cfg->live_wallpaper_mode = "live";
+  if (cfg->multi_monitor_workspace_mode != "independent" &&
+      cfg->multi_monitor_workspace_mode != "primary_only" &&
+      cfg->multi_monitor_workspace_mode != "span")
+    cfg->multi_monitor_workspace_mode = "independent";
   cfg->hot_corner_cooldown_ms = std::clamp(cfg->hot_corner_cooldown_ms, 100, 5000);
 }
 
@@ -369,6 +373,10 @@ std::string serialize_config(const WinomeConfig& cfg) {
   out += cfg.dash_isolate_workspaces ? "true" : "false";
   out += ",\n  \"multi_monitor_panels\": ";
   out += cfg.multi_monitor_panels ? "true" : "false";
+  out += ",\n  \"multi_monitor_workspace_mode\": ";
+  append_escaped_json_string(cfg.multi_monitor_workspace_mode, &out);
+  out += ",\n  \"multi_monitor_overview_linked\": ";
+  out += cfg.multi_monitor_overview_linked ? "true" : "false";
   out += ",\n  \"end_session_confirm\": ";
   out += cfg.end_session_confirm ? "true" : "false";
   out += ",\n  \"unify_dark_titlebars\": ";
@@ -441,6 +449,10 @@ bool parse_config(const std::string& json, WinomeConfig* out) {
       ok = parse_json_bool(json, &pos, &cfg.dash_isolate_workspaces);
     else if (key == "multi_monitor_panels")
       ok = parse_json_bool(json, &pos, &cfg.multi_monitor_panels);
+    else if (key == "multi_monitor_workspace_mode")
+      ok = parse_json_string(json, &pos, &cfg.multi_monitor_workspace_mode);
+    else if (key == "multi_monitor_overview_linked")
+      ok = parse_json_bool(json, &pos, &cfg.multi_monitor_overview_linked);
     else if (key == "end_session_confirm")
       ok = parse_json_bool(json, &pos, &cfg.end_session_confirm);
     else if (key == "unify_dark_titlebars")

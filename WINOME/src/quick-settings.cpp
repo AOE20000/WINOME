@@ -15,6 +15,7 @@
 #include "end-session-dialog.h"
 #include "fonts.h"
 #include "i18n.h"
+#include "monitor-manager.h"
 #include "notifications.h"
 #include "settings-window.h"
 #include "st-engine.h"
@@ -2365,16 +2366,14 @@ center_modal_window (GtkWidget *dlg, int dlg_w, int dlg_h)
   LONG_PTR ex = GetWindowLongPtrW (hwnd, GWL_EXSTYLE);
   SetWindowLongPtrW (hwnd, GWL_EXSTYLE,
                      (ex | WS_EX_TOOLWINDOW | WS_EX_TOPMOST) & ~WS_EX_APPWINDOW);
-  RECT wa = {};
-  SystemParametersInfoW (SPI_GETWORKAREA, 0, &wa, 0);
+  const RECT wa = winome::monitor_manager_active_workarea ();
   RECT wr = {};
   GetWindowRect (hwnd, &wr);
   const int scale = std::max (1, gtk_widget_get_scale_factor (dlg));
   const int w = (wr.right - wr.left) > 32 ? (wr.right - wr.left) : dlg_w * scale;
   const int h = (wr.bottom - wr.top) > 32 ? (wr.bottom - wr.top) : dlg_h * scale;
-  const int x = wa.left + ((wa.right - wa.left) - w) / 2;
-  const int y = wa.top + ((wa.bottom - wa.top) - h) / 2;
-  SetWindowPos (hwnd, HWND_TOPMOST, x, y, 0, 0,
+  const POINT pos = winome::center_rect_in_bounds (wa, w, h, 0.5);
+  SetWindowPos (hwnd, HWND_TOPMOST, pos.x, pos.y, 0, 0,
                 SWP_NOSIZE | SWP_SHOWWINDOW);
 }
 

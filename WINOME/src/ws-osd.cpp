@@ -24,9 +24,13 @@
 
 #include "ws-osd.h"
 #include "fonts.h"
+#include "monitor-manager.h"
 #include "overview.h"
 #include "st-engine.h"
 #include "virtual-desktop.h"
+#include "workspace-manager.h"
+
+#include <unordered_map>
 
 #include <gtk/gtk.h>
 #include <gdk/win32/gdkwin32.h>
@@ -126,7 +130,6 @@ HWND g_hwnd = nullptr;
 
 int g_count = 0;          // workspace count (slow poll)
 int g_active = -1;        // active workspace shown
-int g_last_index = -1;    // last seen desktop (change detection)
 double g_fade = 0.0;      // 0..1, drawn premultiplied into every color
 
 guint g_timeout_id = 0;
@@ -253,6 +256,9 @@ fade_to (double to)
       gtk_widget_add_tick_callback (g_window, fade_tick, nullptr, nullptr);
 }
 
+static HMONITOR g_osd_monitor = nullptr;
+static std::unordered_map<HMONITOR, int> g_last_index_by_mon;
+
 // (Re)position the window for the current workspace count and show it.
 static void
 osd_present (void)
@@ -271,11 +277,12 @@ osd_present (void)
   if (g_hwnd == nullptr || !IsWindow (g_hwnd))
     return;
 
-  POINT origin = {0, 0};
-  HMONITOR mon = MonitorFromPoint (origin, MONITOR_DEFAULTTONEAREST);
+  HMONITOR mon = g_osd_monitor != nullptr
+                     ? g_osd_monitor
+                     : winome::monitor_manager_active_monitor ();
   MONITORINFO mi = {};
   mi.cbSize = sizeof (mi);
-  if (!GetMonitorInfoW (mon, &mi))
+  if (mon == nullptr || !GetMonitorInfoW (mon, &mi))
     return;
 
   int scale = std::max (1, gtk_widget_get_scale_factor (g_window));
@@ -323,29 +330,36 @@ osd_display (int active)
 // --- event-driven observer ---------------------------------------------------
 
 static void
-on_ws_osd_desktop_changed (int count, int cur, void *user_data G_GNUC_UNUSED)
+on_ws_osd_desktop_changed (HMONITOR monitor, int count, int cur,
+                           void *user_data G_GNUC_UNUSED)
 {
-  g_count = count;
-  if (g_count <= 1) {
-    g_last_index = cur;
+  HMONITOR key = monitor;
+  if (count <= 1) {
+    g_last_index_by_mon[key] = cur;
     return;
   }
 
   // Switches made from the overview (pill clicks, animated relayout) must
-  // not trigger the OSD: upstream only mutter's own switch actions do.
-  if (overview_is_open () != 0) {
-    g_last_index = -1;  // resync after overview closes
+  // not trigger the OSD on that monitor: upstream only mutter's own switch
+  // actions do.
+  HMONITOR check_mon =
+      monitor != nullptr ? monitor : winome::monitor_manager_active_monitor ();
+  if (overview_is_open_for_monitor (check_mon)) {
+    g_last_index_by_mon[key] = -1;  // resync after overview closes
     return;
   }
 
   if (cur < 0)
     return;
-  if (g_last_index < 0) {
-    g_last_index = cur;
+  auto it = g_last_index_by_mon.find (key);
+  if (it == g_last_index_by_mon.end () || it->second < 0) {
+    g_last_index_by_mon[key] = cur;
     return;
   }
-  if (cur != g_last_index) {
-    g_last_index = cur;
+  if (cur != it->second) {
+    it->second = cur;
+    g_count = count;
+    g_osd_monitor = monitor;
     osd_display (cur);
   }
 }
@@ -417,13 +431,15 @@ ws_osd_init ()
                                   nullptr, nullptr);
   gtk_window_set_child (GTK_WINDOW (g_window), g_area);
 
-  vd::add_change_listener (on_ws_osd_desktop_changed, nullptr);
+  ws::add_change_listener (on_ws_osd_desktop_changed, nullptr);
 }
 
 void
 ws_osd_shutdown ()
 {
-  vd::remove_change_listener (on_ws_osd_desktop_changed, nullptr);
+  ws::remove_change_listener (on_ws_osd_desktop_changed, nullptr);
+  g_last_index_by_mon.clear ();
+  g_osd_monitor = nullptr;
   if (g_timeout_id != 0) {
     g_source_remove (g_timeout_id);
     g_timeout_id = 0;

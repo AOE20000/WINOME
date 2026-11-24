@@ -96,6 +96,15 @@ bool unpin_window (HWND hwnd);
 // Move @hwnd to virtual desktop @target_index (0-based); FALSE on failure.
 bool move_window_to_desktop (HWND hwnd, int target_index);
 
+// Batch-move multiple windows in a single COM worker pass for flicker-free
+// sub-frame workspace transitions. Returns per-entry success flags matching
+// @moves order (empty if COM unavailable).
+struct WindowMoveOp {
+  HWND hwnd = nullptr;
+  int target_index = 0;
+};
+std::vector<bool> move_windows_batch (const std::vector<WindowMoveOp> &moves);
+
 // Create a new virtual desktop; FALSE if unsupported on this OS build or failed.
 bool create_desktop (void);
 

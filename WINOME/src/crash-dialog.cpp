@@ -2,6 +2,7 @@
 // Copyright (C) 2026 WINOME contributors
 
 #include "crash-dialog.h"
+#include "diagnostics-export.h"
 
 #include <dwmapi.h>
 #include <shellapi.h>
@@ -28,6 +29,7 @@ enum CtrlId : int {
   IDC_BTN_RESTART = 2003,
   IDC_BTN_OPEN_DIR = 2004,
   IDC_BTN_CLOSE = 2005,
+  IDC_BTN_EXPORT_DIAG = 2006,
 };
 
 void append_json_escaped(const std::string& s, std::string* out) {
@@ -327,7 +329,6 @@ LRESULT CALLBACK crash_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       const int row1_y = scale_px(336, dpi);
       const int row2_y = scale_px(376, dpi);
       const int col3_w = (inner_w - scale_px(16, dpi)) / 3;
-      const int col2_w = (inner_w - scale_px(8, dpi)) / 2;
 
       auto add_btn = [&](int id, const wchar_t* label, int x, int y, int bw) {
         HWND b = CreateWindowExW(
@@ -351,12 +352,15 @@ LRESULT CALLBACK crash_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
               zh ? L"正常重启 WINOME" : L"Restart WINOME",
               pad + 2 * (col3_w + scale_px(8, dpi)), row1_y, col3_w);
 
+      add_btn(IDC_BTN_EXPORT_DIAG,
+              zh ? L"导出排障包 (.zip)" : L"Export Diagnostics",
+              pad, row2_y, col3_w);
       add_btn(IDC_BTN_OPEN_DIR,
               zh ? L"打开日志与转储目录" : L"Open Logs & Crashes",
-              pad, row2_y, col2_w);
+              pad + col3_w + scale_px(8, dpi), row2_y, col3_w);
       add_btn(IDC_BTN_CLOSE,
               zh ? L"关闭（保留原生任务栏）" : L"Close (Keep Taskbar)",
-              pad + col2_w + scale_px(8, dpi), row2_y, col2_w);
+              pad + 2 * (col3_w + scale_px(8, dpi)), row2_y, col3_w);
       return 0;
     }
     case WM_COMMAND: {
@@ -379,6 +383,55 @@ LRESULT CALLBACK crash_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
       if (id == IDC_BTN_RESTART) {
         rt->action = CrashDialogAction::RestartNormal;
         DestroyWindow(hwnd);
+        return 0;
+      }
+      if (id == IDC_BTN_EXPORT_DIAG) {
+        DiagnosticsExportOptions opts{};
+        opts.data_dir = rt->input->data_dir;
+        opts.flush_stdio = false;
+        char hdr[1024];
+        std::snprintf(
+            hdr, sizeof(hdr),
+            "Trigger        : Crash Recovery Dialog\n"
+            "Reason         : %s\n"
+            "Exit/Exc Code  : %lu (0x%08lX)\n"
+            "PID            : %lu\n"
+            "Timestamp UTC  : %s\n"
+            "Minidump Path  : %s\n"
+            "Safe Mode      : %s\n"
+            "Taskbar Rest.  : %s\n",
+            rt->input->state.reason.empty() ? "-" : rt->input->state.reason.c_str(),
+            static_cast<unsigned long>(rt->input->state.exit_code),
+            static_cast<unsigned long>(rt->input->state.exit_code),
+            static_cast<unsigned long>(rt->input->state.pid),
+            rt->input->state.timestamp_utc.empty()
+                ? "-"
+                : rt->input->state.timestamp_utc.c_str(),
+            rt->input->state.minidump_path.empty()
+                ? "-"
+                : rt->input->state.minidump_path.c_str(),
+            rt->input->state.safe_mode ? "true" : "false",
+            rt->restored ? "true" : "false");
+        opts.extra_summary_text = hdr;
+        const DiagnosticsExportResult res = export_diagnostics_bundle(opts);
+        if (res.ok) {
+          reveal_file_in_explorer(res.zip_path);
+          std::wstring msg =
+              rt->input->zh
+                  ? (L"[\x2713] \u5df2\u5bfc\u51fa\u6392\u969c\u538b\u7f29\u5305 (" +
+                     std::to_wstring(res.file_count) +
+                     L" \u4e2a\u6587\u4ef6)\uff0c\u5df2\u5728\u8d44\u6e90\u7ba1\u7406\u5668\u4e2d\u9009\u4e2d\u3002")
+                  : (L"[OK] Exported diagnostics zip (" +
+                     std::to_wstring(res.file_count) +
+                     L" files) and selected it in Explorer.");
+          SetWindowTextW(rt->status_hwnd, msg.c_str());
+        } else {
+          std::wstring msg =
+              rt->input->zh
+                  ? L"[!] \u5bfc\u51fa\u6392\u969c\u538b\u7f29\u5305\u5931\u8d25\uff0c\u8bf7\u76f4\u63a5\u6253\u5f00\u65e5\u5fd7\u76ee\u5f55\u3002"
+                  : L"[!] Failed to export diagnostics zip; use 'Open Logs & Crashes' instead.";
+          SetWindowTextW(rt->status_hwnd, msg.c_str());
+        }
         return 0;
       }
       if (id == IDC_BTN_OPEN_DIR) {

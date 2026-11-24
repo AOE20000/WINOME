@@ -62,6 +62,7 @@ struct WorkareaAssertGuard {
   static constexpr int64_t kBurstWindowMs = 3000;
   static constexpr int kMaxBurstApplies = 8;
   static constexpr int64_t kBackoffDurationMs = 1000;
+  static constexpr int64_t kMaxBackoffDurationMs = 8000;
   static constexpr int64_t kWorkareaSettleGraceMs = 600;
 
   int64_t last_apply_ms = -1;
@@ -69,6 +70,7 @@ struct WorkareaAssertGuard {
   int64_t backoff_until_ms = 0;
   int64_t workarea_settle_until_ms = 0;
   int burst_count = 0;
+  int consecutive_backoff_count = 0;
   bool pending_after_defer = false;
 
   bool in_settle_grace(int64_t now_ms) const {
@@ -97,6 +99,8 @@ struct WorkareaAssertGuard {
         burst_window_start_ms = -1;
         burst_count = 0;
       }
+      backoff_until_ms = 0;
+      consecutive_backoff_count = 0;
       pending_after_defer = false;
       return WorkareaAssertAction::SkipUnchanged;
     }
@@ -118,14 +122,23 @@ struct WorkareaAssertGuard {
       return WorkareaAssertAction::DeferCooldown;
     }
 
-    if (burst_window_start_ms < 0 ||
+    const bool woke_from_backoff = (backoff_until_ms > 0);
+    backoff_until_ms = 0;
+
+    if (woke_from_backoff || burst_window_start_ms < 0 ||
         (now_ms - burst_window_start_ms) > kBurstWindowMs) {
       burst_window_start_ms = now_ms;
-      burst_count = 1;
+      // After a sustained backoff, allow a single probe apply before
+      // escalating backoff again if Explorer/OS immediately overwrites it.
+      burst_count = (consecutive_backoff_count > 0) ? kMaxBurstApplies : 1;
     } else {
       ++burst_count;
       if (burst_count > kMaxBurstApplies) {
-        backoff_until_ms = now_ms + kBackoffDurationMs;
+        const int shift = std::min(consecutive_backoff_count, 3);
+        const int64_t dur = std::min<int64_t>(kBackoffDurationMs << shift,
+                                              kMaxBackoffDurationMs);
+        ++consecutive_backoff_count;
+        backoff_until_ms = now_ms + dur;
         pending_after_defer = true;
         return WorkareaAssertAction::DeferBackoff;
       }
@@ -141,7 +154,8 @@ struct WorkareaAssertGuard {
   int remaining_defer_ms(int64_t now_ms) const {
     if (now_ms < backoff_until_ms) {
       const int64_t rem = backoff_until_ms - now_ms;
-      return static_cast<int>(std::clamp<int64_t>(rem + 25, 50, kBackoffDurationMs + 50));
+      return static_cast<int>(
+          std::clamp<int64_t>(rem + 25, 50, kMaxBackoffDurationMs + 50));
     }
     if (last_apply_ms >= 0 && (now_ms - last_apply_ms) < kMinApplyIntervalMs) {
       const int64_t rem = kMinApplyIntervalMs - (now_ms - last_apply_ms);
@@ -150,6 +164,14 @@ struct WorkareaAssertGuard {
     return 200;
   }
 };
+
+// Returns true for standard decorated or resizable maximized desktop windows
+// (including custom-chrome Electron/WPF/Chromium frames that omit WS_CAPTION
+// while retaining WS_THICKFRAME + WS_MAXIMIZEBOX).
+inline bool has_standard_maximized_frame_style(LONG_PTR style) {
+  return (style & WS_CAPTION) == WS_CAPTION ||
+         ((style & WS_THICKFRAME) != 0 && (style & WS_MAXIMIZEBOX) != 0);
+}
 
 // Returns true when @window_rect genuinely covers @monitor_rect in fullscreen
 // without tripping on normal maximized windows when workarea is unreserved.

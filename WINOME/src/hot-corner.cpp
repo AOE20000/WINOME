@@ -12,31 +12,38 @@
 #include <windows.h>
 #include <glib.h>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace winome {
 namespace {
 
 constexpr int kCornerSize = 5;
+constexpr size_t kMaxHotCornerMonitors = 16;
 constexpr UINT kMsgSyncHookState = WM_APP + 41;
+
+struct HotCornerSnapshot {
+  std::array<HotCornerMonitor, kMaxHotCornerMonitors> monitors{};
+  size_t count = 0;
+};
 
 struct HotCornerShared {
   std::atomic<HWND> panel_hwnd{nullptr};
-  // SeqLock-protected monitor bounds so WH_MOUSE_LL reads a consistent,
-  // untorn RECT without ever blocking on a mutex.
+  // SeqLock-protected monitor bounds so WH_MOUSE_LL reads consistent,
+  // untorn monitor RECTs across all displays without ever blocking on a mutex.
   std::mutex bounds_write_mu;
   std::atomic<uint64_t> bounds_seq{0};
-  std::atomic<LONG> left{0};
-  std::atomic<LONG> top{0};
-  std::atomic<LONG> right{0};
-  std::atomic<LONG> bottom{0};
+  HotCornerMonitor monitors[kMaxHotCornerMonitors]{};
+  size_t monitor_count = 0;
   std::atomic<bool> suppressed{false};
-  std::atomic<bool> in_corner{false};
+  std::atomic<int> in_corner_idx{-1};
   std::atomic<ULONGLONG> in_corner_since_tick{0};
+  std::atomic<HMONITOR> pending_monitor{nullptr};
   std::atomic<gint64> last_trigger_ms{0};
   std::atomic<int> cooldown_ms{500};
   std::atomic<bool> enabled{true};
@@ -56,39 +63,47 @@ struct HotCornerShared {
 
 HotCornerShared g_hc;
 
-gboolean invoke_open_overview(gpointer G_GNUC_UNUSED data) {
-  if (!winome::panel_hidden()) {
-    g_print("[hot] corner trigger (event-driven)\n");
-    open_overview("hot-corner");
+gboolean invoke_open_overview(gpointer data) {
+  HMONITOR target_mon = reinterpret_cast<HMONITOR>(data);
+  const bool hidden = target_mon != nullptr
+                          ? winome::panel_hidden_for_monitor(target_mon)
+                          : winome::panel_hidden();
+  if (!hidden) {
+    g_print("[hot] corner trigger (event-driven mon=%p)\n",
+            static_cast<void*>(target_mon));
+    open_overview_for_monitor("hot-corner", target_mon);
   }
   return G_SOURCE_REMOVE;
 }
 
-void store_cached_bounds(const RECT& rc) {
+void store_cached_monitors(const std::vector<HotCornerMonitor>& list) {
   std::lock_guard<std::mutex> lk(g_hc.bounds_write_mu);
   const uint64_t s = g_hc.bounds_seq.load(std::memory_order_relaxed);
   g_hc.bounds_seq.store(s + 1, std::memory_order_relaxed);
   std::atomic_thread_fence(std::memory_order_seq_cst);
-  g_hc.left.store(rc.left, std::memory_order_relaxed);
-  g_hc.top.store(rc.top, std::memory_order_relaxed);
-  g_hc.right.store(rc.right, std::memory_order_relaxed);
-  g_hc.bottom.store(rc.bottom, std::memory_order_relaxed);
+  const size_t n =
+      list.size() < kMaxHotCornerMonitors ? list.size() : kMaxHotCornerMonitors;
+  for (size_t i = 0; i < n; ++i)
+    g_hc.monitors[i] = list[i];
+  g_hc.monitor_count = n;
+  std::atomic_thread_fence(std::memory_order_seq_cst);
   g_hc.bounds_seq.store(s + 2, std::memory_order_release);
 }
 
-RECT load_cached_bounds() {
+HotCornerSnapshot load_cached_monitors() {
+  HotCornerSnapshot out{};
   for (;;) {
     const uint64_t s1 = g_hc.bounds_seq.load(std::memory_order_acquire);
     if ((s1 & 1u) != 0u) {
       YieldProcessor();
       continue;
     }
-    const RECT out{
-        g_hc.left.load(std::memory_order_relaxed),
-        g_hc.top.load(std::memory_order_relaxed),
-        g_hc.right.load(std::memory_order_relaxed),
-        g_hc.bottom.load(std::memory_order_relaxed),
-    };
+    const size_t n = g_hc.monitor_count < kMaxHotCornerMonitors
+                         ? g_hc.monitor_count
+                         : kMaxHotCornerMonitors;
+    out.count = n;
+    for (size_t i = 0; i < n; ++i)
+      out.monitors[i] = g_hc.monitors[i];
     std::atomic_thread_fence(std::memory_order_seq_cst);
     const uint64_t s2 = g_hc.bounds_seq.load(std::memory_order_relaxed);
     if (s1 == s2)
@@ -96,16 +111,39 @@ RECT load_cached_bounds() {
   }
 }
 
-void refresh_cached_bounds() {
-  HWND panel = g_hc.panel_hwnd.load(std::memory_order_acquire);
-  if (panel == nullptr || !IsWindow(panel))
-    return;
-  HMONITOR mon = MonitorFromWindow(panel, MONITOR_DEFAULTTONEAREST);
+BOOL CALLBACK enum_hot_corner_monitors_proc(HMONITOR hmon,
+                                            HDC G_GNUC_UNUSED hdc,
+                                            LPRECT G_GNUC_UNUSED lprc,
+                                            LPARAM lp) {
+  auto* list = reinterpret_cast<std::vector<HotCornerMonitor>*>(lp);
   MONITORINFO mi{};
   mi.cbSize = sizeof(mi);
-  if (mon != nullptr && GetMonitorInfoW(mon, &mi)) {
-    store_cached_bounds(mi.rcMonitor);
+  if (GetMonitorInfoW(hmon, &mi)) {
+    HotCornerMonitor entry{};
+    entry.hmonitor = hmon;
+    entry.rect = mi.rcMonitor;
+    list->push_back(entry);
   }
+  return TRUE;
+}
+
+void refresh_cached_bounds() {
+  std::vector<HotCornerMonitor> list;
+  EnumDisplayMonitors(nullptr, nullptr, enum_hot_corner_monitors_proc,
+                      reinterpret_cast<LPARAM>(&list));
+  if (list.empty()) {
+    HWND panel = g_hc.panel_hwnd.load(std::memory_order_acquire);
+    if (panel != nullptr && IsWindow(panel)) {
+      HMONITOR mon = MonitorFromWindow(panel, MONITOR_DEFAULTTONEAREST);
+      MONITORINFO mi{};
+      mi.cbSize = sizeof(mi);
+      if (mon != nullptr && GetMonitorInfoW(mon, &mi)) {
+        list.push_back(HotCornerMonitor{mon, mi.rcMonitor});
+      }
+    }
+  }
+  if (!list.empty())
+    store_cached_monitors(list);
 }
 
 LRESULT CALLBACK hot_corner_mouse_proc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -114,16 +152,16 @@ LRESULT CALLBACK hot_corner_mouse_proc(int nCode, WPARAM wParam, LPARAM lParam) 
   if (nCode == HC_ACTION && wParam == WM_MOUSEMOVE) {
     const MSLLHOOKSTRUCT* ms =
         reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
-    const RECT mon = load_cached_bounds();
-    const bool inside =
-        hot_corner_hit_test(ms->pt.x, ms->pt.y, mon, kCornerSize);
-    const bool prev =
-        g_hc.in_corner.exchange(inside, std::memory_order_acq_rel);
-    if (inside != prev) {
-      g_hc.in_corner_since_tick.store(inside ? GetTickCount64() : 0,
+    const HotCornerSnapshot snap = load_cached_monitors();
+    const int hit_idx = hot_corner_hit_test_monitors(
+        ms->pt.x, ms->pt.y, snap.monitors.data(), snap.count, kCornerSize);
+    const int prev_idx =
+        g_hc.in_corner_idx.exchange(hit_idx, std::memory_order_acq_rel);
+    if (hit_idx != prev_idx) {
+      g_hc.in_corner_since_tick.store(hit_idx >= 0 ? GetTickCount64() : 0,
                                       std::memory_order_release);
     }
-    if (inside && !prev &&
+    if (hit_idx >= 0 && hit_idx != prev_idx &&
         g_hc.enabled.load(std::memory_order_relaxed) &&
         !g_hc.suppressed.load(std::memory_order_relaxed)) {
       const gint64 now_ms = g_get_monotonic_time() / 1000;
@@ -132,6 +170,9 @@ LRESULT CALLBACK hot_corner_mouse_proc(int nCode, WPARAM wParam, LPARAM lParam) 
       const int cd = g_hc.cooldown_ms.load(std::memory_order_relaxed);
       if (now_ms - prev_ms >= static_cast<gint64>(cd)) {
         g_hc.last_trigger_ms.store(now_ms, std::memory_order_relaxed);
+        g_hc.pending_monitor.store(
+            snap.monitors[static_cast<size_t>(hit_idx)].hmonitor,
+            std::memory_order_release);
         // Never call GLib g_idle_add_full inside WH_MOUSE_LL: GMainContext
         // lock contention during Overview animations stalls the hook past
         // LowLevelHooksTimeout. Wake the dedicated dispatch thread instead.
@@ -148,8 +189,9 @@ void dispatch_thread_main() {
     WaitForSingleObject(g_hc.trigger_event, INFINITE);
     if (g_hc.dispatch_stop.load(std::memory_order_acquire))
       break;
+    HMONITOR mon = g_hc.pending_monitor.load(std::memory_order_acquire);
     g_idle_add_full(G_PRIORITY_HIGH_IDLE, invoke_open_overview,
-                    nullptr, nullptr);
+                    reinterpret_cast<gpointer>(mon), nullptr);
   }
 }
 
@@ -161,23 +203,25 @@ void sync_hook_install_on_hook_thread(bool force_reinstall = false) {
   HMODULE self_mod = GetModuleHandleW(nullptr);
   if (want_hook) {
     if (g_hc.mouse_hook == nullptr) {
-      g_hc.in_corner.store(false, std::memory_order_relaxed);
+      g_hc.in_corner_idx.store(-1, std::memory_order_relaxed);
       g_hc.in_corner_since_tick.store(0, std::memory_order_relaxed);
       g_hc.mouse_hook =
           SetWindowsHookExW(WH_MOUSE_LL, hot_corner_mouse_proc, self_mod, 0);
     } else if (force_reinstall) {
-      if (g_hc.in_corner.load(std::memory_order_relaxed)) {
+      if (g_hc.in_corner_idx.load(std::memory_order_relaxed) >= 0) {
         const ULONGLONG since =
             g_hc.in_corner_since_tick.load(std::memory_order_acquire);
         POINT pt{};
+        const HotCornerSnapshot snap = load_cached_monitors();
         if (since != 0 && (GetTickCount64() - since) >= 1500 &&
             GetCursorPos(&pt) &&
-            !hot_corner_hit_test(pt.x, pt.y, load_cached_bounds(), kCornerSize)) {
-          g_hc.in_corner.store(false, std::memory_order_relaxed);
+            hot_corner_hit_test_monitors(pt.x, pt.y, snap.monitors.data(),
+                                         snap.count, kCornerSize) < 0) {
+          g_hc.in_corner_idx.store(-1, std::memory_order_relaxed);
           g_hc.in_corner_since_tick.store(0, std::memory_order_relaxed);
         }
       }
-      if (!g_hc.in_corner.load(std::memory_order_relaxed)) {
+      if (g_hc.in_corner_idx.load(std::memory_order_relaxed) < 0) {
         HHOOK fresh =
             SetWindowsHookExW(WH_MOUSE_LL, hot_corner_mouse_proc, self_mod, 0);
         if (fresh != nullptr) {
@@ -189,7 +233,7 @@ void sync_hook_install_on_hook_thread(bool force_reinstall = false) {
   } else if (g_hc.mouse_hook != nullptr) {
     UnhookWindowsHookEx(g_hc.mouse_hook);
     g_hc.mouse_hook = nullptr;
-    g_hc.in_corner.store(false, std::memory_order_relaxed);
+    g_hc.in_corner_idx.store(-1, std::memory_order_relaxed);
     g_hc.in_corner_since_tick.store(0, std::memory_order_relaxed);
   }
 }
@@ -331,7 +375,7 @@ void hot_corner_set_suppressed(bool suppressed) {
   const bool prev =
       g_hc.suppressed.exchange(suppressed, std::memory_order_acq_rel);
   if (suppressed)
-    g_hc.in_corner.store(false, std::memory_order_relaxed);
+    g_hc.in_corner_idx.store(-1, std::memory_order_relaxed);
   if (prev != suppressed)
     post_sync_to_hook_thread();
 }

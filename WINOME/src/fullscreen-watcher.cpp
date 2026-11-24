@@ -24,6 +24,8 @@ struct PanelTrackEntry {
   HWND hwnd = nullptr;
   bool is_primary = false;
   bool hidden = false;
+  HWND tracked_fs_hwnd = nullptr;
+  FullscreenHysteresisTracker hysteresis{80};
 };
 
 std::vector<PanelTrackEntry> g_panels;
@@ -32,6 +34,7 @@ guint g_tick_source = 0;
 HWINEVENTHOOK g_fg_hook = nullptr;
 HWINEVENTHOOK g_loc_hook = nullptr;
 HWINEVENTHOOK g_state_hook = nullptr;
+HWINEVENTHOOK g_movesize_hook = nullptr;
 
 bool belongs_to_process(HWND hwnd, const wchar_t* name) {
   DWORD pid = 0;
@@ -60,9 +63,6 @@ volatile LONG g_expected_panel_height = 32;
 WorkareaAssertGuard g_workarea_guard;
 guint g_workarea_retry_id = 0;
 guint g_workarea_settle_eval_id = 0;
-FullscreenHysteresisTracker g_fs_hysteresis(80);
-HWND g_tracked_fs_hwnd = nullptr;
-HMONITOR g_tracked_fs_mon = nullptr;
 guint g_unhide_debounce_id = 0;
 guint g_hide_debounce_id = 0;
 guint g_drag_trailing_eval_id = 0;
@@ -164,10 +164,10 @@ bool covers_monitor(HWND hwnd, HMONITOR* out_mon) {
     return false;
 
   const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-  const bool has_caption = (style & WS_CAPTION) == WS_CAPTION;
+  const bool has_frame = has_standard_maximized_frame_style(style);
   const bool suppress_zoomed = g_workarea_guard.in_settle_grace(monotonic_ms());
   const bool full = is_fullscreen_bounds_for_monitor(
-      r, mi.rcMonitor, mi.rcWork, IsZoomed(hwnd) != FALSE, 2, has_caption,
+      r, mi.rcMonitor, mi.rcWork, IsZoomed(hwnd) != FALSE, 2, has_frame,
       suppress_zoomed);
   if (full && out_mon != nullptr)
     *out_mon = mon;
@@ -206,39 +206,33 @@ bool is_tracked_fullscreen_still_active(HWND tracked, HMONITOR mon) {
   return true;
 }
 
+void safe_remove_source(guint* source_id) {
+  if (source_id == nullptr || *source_id == 0)
+    return;
+  const guint id = *source_id;
+  *source_id = 0;
+  if (g_main_context_find_source_by_id(nullptr, id) != nullptr)
+    g_source_remove(id);
+}
+
 void cancel_workarea_retry() {
-  if (g_workarea_retry_id != 0) {
-    g_source_remove(g_workarea_retry_id);
-    g_workarea_retry_id = 0;
-  }
+  safe_remove_source(&g_workarea_retry_id);
 }
 
 void cancel_workarea_settle_eval() {
-  if (g_workarea_settle_eval_id != 0) {
-    g_source_remove(g_workarea_settle_eval_id);
-    g_workarea_settle_eval_id = 0;
-  }
+  safe_remove_source(&g_workarea_settle_eval_id);
 }
 
 void cancel_unhide_debounce() {
-  if (g_unhide_debounce_id != 0) {
-    g_source_remove(g_unhide_debounce_id);
-    g_unhide_debounce_id = 0;
-  }
+  safe_remove_source(&g_unhide_debounce_id);
 }
 
 void cancel_hide_debounce() {
-  if (g_hide_debounce_id != 0) {
-    g_source_remove(g_hide_debounce_id);
-    g_hide_debounce_id = 0;
-  }
+  safe_remove_source(&g_hide_debounce_id);
 }
 
 void cancel_drag_trailing_eval() {
-  if (g_drag_trailing_eval_id != 0) {
-    g_source_remove(g_drag_trailing_eval_id);
-    g_drag_trailing_eval_id = 0;
-  }
+  safe_remove_source(&g_drag_trailing_eval_id);
 }
 
 void reassert_primary_workarea_and_styles();
@@ -275,18 +269,11 @@ void schedule_hide_debounce(int delay_ms);
 gboolean unhide_debounce_cb(gpointer G_GNUC_UNUSED data) {
   g_unhide_debounce_id = 0;
   evaluate_fullscreen_state();
-  if (g_unhide_debounce_id == 0 &&
-      g_fs_hysteresis.pending_unhide_deadline_ms >= 0) {
-    const int64_t rem =
-        g_fs_hysteresis.pending_unhide_deadline_ms - monotonic_ms();
-    schedule_unhide_debounce(static_cast<int>(std::max<int64_t>(16, rem + 4)));
-  }
   return G_SOURCE_REMOVE;
 }
 
 void schedule_unhide_debounce(int delay_ms) {
-  if (g_unhide_debounce_id != 0)
-    return;
+  cancel_unhide_debounce();
   g_unhide_debounce_id = g_timeout_add(
       static_cast<guint>(std::max(20, delay_ms)), unhide_debounce_cb, nullptr);
 }
@@ -294,12 +281,6 @@ void schedule_unhide_debounce(int delay_ms) {
 gboolean hide_debounce_cb(gpointer G_GNUC_UNUSED data) {
   g_hide_debounce_id = 0;
   evaluate_fullscreen_state();
-  if (g_hide_debounce_id == 0 &&
-      g_fs_hysteresis.pending_hide_deadline_ms >= 0) {
-    const int64_t rem =
-        g_fs_hysteresis.pending_hide_deadline_ms - monotonic_ms();
-    schedule_hide_debounce(static_cast<int>(std::max<int64_t>(16, rem + 4)));
-  }
   return G_SOURCE_REMOVE;
 }
 
@@ -558,10 +539,21 @@ void CALLBACK fg_win_event_proc(HWINEVENTHOOK hook G_GNUC_UNUSED,
                                   DWORD time G_GNUC_UNUSED) {
   if (id_object != OBJID_WINDOW || id_child != CHILDID_SELF)
     return;
+  if (event == EVENT_SYSTEM_MOVESIZESTART) {
+    overview_on_external_window_drag_start(hwnd);
+    return;
+  }
+  if (event == EVENT_SYSTEM_MOVESIZEEND) {
+    overview_on_external_window_drag_end(hwnd);
+    reassert_primary_workarea_and_styles();
+    evaluate_fullscreen_state();
+    return;
+  }
   if (event == EVENT_OBJECT_LOCATIONCHANGE) {
     if (hwnd != GetForegroundWindow())
       return;
     if (is_in_move_size()) {
+      overview_on_external_window_drag_move(hwnd);
       schedule_drag_trailing_eval();
       return;
     }
@@ -593,83 +585,95 @@ void evaluate_fullscreen_state(void) {
     cancel_workarea_retry();
     cancel_workarea_settle_eval();
     cancel_drag_trailing_eval();
-    g_tracked_fs_hwnd = nullptr;
-    g_tracked_fs_mon = nullptr;
     return;
   }
 
   bool all_locked = false;
-  HMONITOR fs_mon = nullptr;
-  detect_fullscreen_state(&all_locked, &fs_mon);
-
-  bool any_hidden = false;
-  for (const auto& e : g_panels) {
-    if (e.hidden) {
-      any_hidden = true;
-      break;
-    }
-  }
+  HMONITOR raw_fs_mon = nullptr;
+  detect_fullscreen_state(&all_locked, &raw_fs_mon);
 
   HWND fg = GetForegroundWindow();
-  const bool ov_open = overview_active() || overview_is_open() != 0;
+  DWORD fg_pid = 0;
+  if (fg != nullptr)
+    GetWindowThreadProcessId(fg, &fg_pid);
+  const bool fg_is_self = (fg != nullptr && fg_pid == GetCurrentProcessId());
+  const bool fg_transient_or_null =
+      !fg_is_self && is_transient_overlay_window(fg);
+
   const bool pop_open = winome_shell_panel_top_popover_hwnd() != nullptr;
-  if (fs_mon != nullptr && fg != nullptr && !all_locked && !ov_open && !pop_open) {
-    g_tracked_fs_hwnd = fg;
-    g_tracked_fs_mon = fs_mon;
-  }
-
-  FullscreenEvalInput eval_in{};
-  eval_in.now_ms = monotonic_ms();
-  eval_in.session_locked = all_locked;
-  eval_in.overview_open = ov_open;
-  eval_in.popover_open = pop_open;
-  eval_in.currently_hidden = any_hidden;
-  eval_in.raw_fullscreen_mon = fs_mon;
-  if (fs_mon == nullptr && !all_locked && !ov_open && !pop_open && any_hidden) {
-    DWORD fg_pid = 0;
-    if (fg != nullptr)
-      GetWindowThreadProcessId(fg, &fg_pid);
-    const bool fg_is_self = (fg != nullptr && fg_pid == GetCurrentProcessId());
-    eval_in.fg_is_transient_or_null =
-        !fg_is_self && is_transient_overlay_window(fg);
-    eval_in.fg_owned_by_tracked_fs =
-        !fg_is_self && is_owned_by_window(fg, g_tracked_fs_hwnd);
-    eval_in.tracked_fs_mon = g_tracked_fs_mon;
-    eval_in.tracked_fs_still_covering =
-        is_tracked_fullscreen_still_active(g_tracked_fs_hwnd, g_tracked_fs_mon);
-  } else {
-    eval_in.tracked_fs_mon = g_tracked_fs_mon;
-  }
-
-  const FullscreenEvalResult eval_out = g_fs_hysteresis.step(eval_in);
-  if (eval_out.cancel_unhide_timer)
-    cancel_unhide_debounce();
-  if (eval_out.schedule_unhide_timer)
-    schedule_unhide_debounce(eval_out.unhide_delay_ms);
-  if (eval_out.cancel_hide_timer)
-    cancel_hide_debounce();
-  if (eval_out.schedule_hide_timer)
-    schedule_hide_debounce(eval_out.hide_delay_ms);
-
-  if (!eval_out.hide_all_locked && eval_out.effective_fullscreen_mon == nullptr) {
-    g_tracked_fs_hwnd = nullptr;
-    g_tracked_fs_mon = nullptr;
-  }
-  fs_mon = eval_out.effective_fullscreen_mon;
+  const int64_t now_ms = monotonic_ms();
 
   bool any_shown = false;
+  bool all_panels_hidden = true;
+  bool any_valid_panel = false;
+  int64_t earliest_unhide_ms = -1;
+  int64_t earliest_hide_ms = -1;
+
   for (auto& entry : g_panels) {
     if (!IsWindow(entry.hwnd))
       continue;
+    any_valid_panel = true;
     HMONITOR pmon = MonitorFromWindow(entry.hwnd, MONITOR_DEFAULTTONEAREST);
-    const bool want_hide = all_locked || (fs_mon != nullptr && pmon == fs_mon);
+    const bool ov_open = overview_is_open_for_monitor(pmon);
+    const HMONITOR raw_for_panel =
+        (!all_locked && !ov_open && !pop_open && raw_fs_mon != nullptr &&
+         pmon == raw_fs_mon)
+            ? pmon
+            : nullptr;
+
+    if (raw_for_panel != nullptr && fg != nullptr)
+      entry.tracked_fs_hwnd = fg;
+
+    FullscreenEvalInput eval_in{};
+    eval_in.now_ms = now_ms;
+    eval_in.session_locked = all_locked;
+    eval_in.overview_open = ov_open;
+    eval_in.popover_open = pop_open;
+    eval_in.currently_hidden = entry.hidden;
+    eval_in.raw_fullscreen_mon = raw_for_panel;
+    eval_in.tracked_fs_mon = (entry.tracked_fs_hwnd != nullptr) ? pmon : nullptr;
+    if (raw_for_panel == nullptr && !all_locked && !ov_open && !pop_open &&
+        entry.hidden && entry.tracked_fs_hwnd != nullptr) {
+      eval_in.fg_is_transient_or_null = fg_transient_or_null;
+      eval_in.fg_owned_by_tracked_fs =
+          !fg_is_self && is_owned_by_window(fg, entry.tracked_fs_hwnd);
+      eval_in.tracked_fs_still_covering =
+          is_tracked_fullscreen_still_active(entry.tracked_fs_hwnd, pmon);
+    }
+
+    const FullscreenEvalResult eval_out = entry.hysteresis.step(eval_in);
+    if (!eval_out.hide_all_locked &&
+        eval_out.effective_fullscreen_mon == nullptr &&
+        entry.hysteresis.pending_hide_deadline_ms < 0) {
+      entry.tracked_fs_hwnd = nullptr;
+    }
+
+    if (entry.hysteresis.pending_unhide_deadline_ms >= 0) {
+      if (earliest_unhide_ms < 0 ||
+          entry.hysteresis.pending_unhide_deadline_ms < earliest_unhide_ms) {
+        earliest_unhide_ms = entry.hysteresis.pending_unhide_deadline_ms;
+      }
+    }
+    if (entry.hysteresis.pending_hide_deadline_ms >= 0) {
+      if (earliest_hide_ms < 0 ||
+          entry.hysteresis.pending_hide_deadline_ms < earliest_hide_ms) {
+        earliest_hide_ms = entry.hysteresis.pending_hide_deadline_ms;
+      }
+    }
+
+    const bool want_hide =
+        eval_out.hide_all_locked ||
+        (eval_out.effective_fullscreen_mon != nullptr &&
+         pmon == eval_out.effective_fullscreen_mon);
+    if (!want_hide)
+      all_panels_hidden = false;
     if (want_hide != entry.hidden) {
       entry.hidden = want_hide;
       g_print("[fs] panel %s primary=%d locked=%d fs_mon=%p ov=%d\n",
               want_hide ? "hide" : "show",
               entry.is_primary ? 1 : 0,
               all_locked ? 1 : 0,
-              static_cast<void*>(fs_mon),
+              static_cast<void*>(eval_out.effective_fullscreen_mon),
               ov_open ? 1 : 0);
       ShowWindow(entry.hwnd, want_hide ? SW_HIDE : SW_SHOWNOACTIVATE);
       if (!want_hide) {
@@ -677,10 +681,29 @@ void evaluate_fullscreen_state(void) {
         if (entry.is_primary)
           schedule_workarea_retry(80);
       }
-      if (entry.is_primary)
-        hot_corner_set_suppressed(want_hide || g_session_locked);
     }
   }
+
+  // Only suppress the global hot-corner hook when the session is locked or
+  // EVERY monitor's panel is hidden (so a fullscreen app on monitor 1 never
+  // disables the hot corner on monitor 2).
+  hot_corner_set_suppressed(g_session_locked ||
+                            (any_valid_panel && all_panels_hidden));
+
+  if (earliest_unhide_ms >= 0) {
+    const int64_t rem = earliest_unhide_ms - monotonic_ms();
+    schedule_unhide_debounce(static_cast<int>(std::max<int64_t>(20, rem + 4)));
+  } else {
+    cancel_unhide_debounce();
+  }
+
+  if (earliest_hide_ms >= 0) {
+    const int64_t rem = earliest_hide_ms - monotonic_ms();
+    schedule_hide_debounce(static_cast<int>(std::max<int64_t>(20, rem + 4)));
+  } else {
+    cancel_hide_debounce();
+  }
+
   if (any_shown)
     winome::overview_restack();
 }
@@ -692,7 +715,10 @@ void register_panel_window(HWND panel_hwnd) {
     if (entry.hwnd == panel_hwnd)
       return;
   }
-  g_panels.push_back({panel_hwnd, g_panels.empty(), false});
+  PanelTrackEntry entry{};
+  entry.hwnd = panel_hwnd;
+  entry.is_primary = g_panels.empty();
+  g_panels.push_back(entry);
   evaluate_fullscreen_state();
 }
 
@@ -707,7 +733,8 @@ void unregister_panel_window(HWND panel_hwnd) {
 
 void set_session_locked(bool locked) {
   g_session_locked = locked;
-  hot_corner_set_suppressed(locked || panel_hidden());
+  if (locked)
+    hot_corner_set_suppressed(true);
   evaluate_fullscreen_state();
 }
 
@@ -737,8 +764,12 @@ bool panel_hidden_for_monitor(HMONITOR mon) {
 
 void start_fullscreen_watcher(HWND primary_panel_hwnd) {
   g_panels.clear();
-  if (primary_panel_hwnd != nullptr)
-    g_panels.push_back({primary_panel_hwnd, true, false});
+  if (primary_panel_hwnd != nullptr) {
+    PanelTrackEntry entry{};
+    entry.hwnd = primary_panel_hwnd;
+    entry.is_primary = true;
+    g_panels.push_back(entry);
+  }
 
   if (g_fg_hook == nullptr) {
     g_fg_hook = SetWinEventHook(
@@ -753,6 +784,11 @@ void start_fullscreen_watcher(HWND primary_panel_hwnd) {
   if (g_state_hook == nullptr) {
     g_state_hook = SetWinEventHook(
         EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZEEND, nullptr,
+        fg_win_event_proc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+  }
+  if (g_movesize_hook == nullptr) {
+    g_movesize_hook = SetWinEventHook(
+        EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND, nullptr,
         fg_win_event_proc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
   }
 
@@ -770,10 +806,7 @@ void stop_fullscreen_watcher(void) {
   cancel_workarea_retry();
   cancel_workarea_settle_eval();
   cancel_drag_trailing_eval();
-  if (g_tick_source != 0) {
-    g_source_remove(g_tick_source);
-    g_tick_source = 0;
-  }
+  safe_remove_source(&g_tick_source);
   if (g_fg_hook != nullptr) {
     UnhookWinEvent(g_fg_hook);
     g_fg_hook = nullptr;
@@ -786,9 +819,10 @@ void stop_fullscreen_watcher(void) {
     UnhookWinEvent(g_state_hook);
     g_state_hook = nullptr;
   }
-  g_tracked_fs_hwnd = nullptr;
-  g_tracked_fs_mon = nullptr;
-  g_fs_hysteresis = FullscreenHysteresisTracker(80);
+  if (g_movesize_hook != nullptr) {
+    UnhookWinEvent(g_movesize_hook);
+    g_movesize_hook = nullptr;
+  }
   g_panels.clear();
   g_session_locked = false;
 }

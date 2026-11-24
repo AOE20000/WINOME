@@ -42,6 +42,7 @@
 #include "settings-window.h"
 #include "systray.h"
 #include "system-status.h"
+#include "workspace-manager.h"
 #include "wifi-networks.h"
 #include "window-theming.h"
 #include "ws-osd.h"
@@ -630,6 +631,7 @@ position_panel (GtkWidget *panel)
   };
   mm_cbs.register_panel = winome::register_panel_window;
   mm_cbs.unregister_panel = winome::unregister_panel_window;
+  mm_cbs.is_panel_hidden_for_monitor = winome::panel_hidden_for_monitor;
   mm_cbs.pin_window = [] (HWND w) { winome::vd::pin_window (w); };
   mm_cbs.on_session_lock_changed = [] (bool locked) {
     winome::set_session_locked (locked);
@@ -641,6 +643,7 @@ position_panel (GtkWidget *panel)
     save_recovery_workarea (g_primary_monitor);
     winome::hot_corner_refresh_bounds ();
     winome::evaluate_fullscreen_state ();
+    winome::ws::on_monitors_changed ();
     winome::overview_reposition ();
   };
   mm_cbs.on_workarea_changed = winome::reassert_panel_workarea_now;
@@ -869,6 +872,8 @@ apply_config_set_kv (const std::string &key, const std::string &val)
     ok = parse_bool (&cfg.overview_window_blacklist);
   else if (key == "multi_monitor_panels")
     ok = parse_bool (&cfg.multi_monitor_panels);
+  else if (key == "multi_monitor_overview_linked")
+    ok = parse_bool (&cfg.multi_monitor_overview_linked);
   else if (key == "end_session_confirm")
     ok = parse_bool (&cfg.end_session_confirm);
   else if (key == "unify_dark_titlebars")
@@ -890,6 +895,9 @@ apply_config_set_kv (const std::string &key, const std::string &val)
     ok = true;
   } else if (key == "live_wallpaper_mode") {
     cfg.live_wallpaper_mode = val;
+    ok = true;
+  } else if (key == "multi_monitor_workspace_mode") {
+    cfg.multi_monitor_workspace_mode = val;
     ok = true;
   }
   if (!ok)
@@ -944,6 +952,9 @@ on_activate (GtkApplication      *app,
   const double ov_ms = winome::perf_get_startup_timings ().overview_init_ms;
   winome::perf_record_phase_ms ("panel", std::max (0.0, panel_and_ov_ms - ov_ms));
 
+  // Multi-monitor workspace manager (Independent / PrimaryOnly / Span).
+  winome::ws::init ();
+
   // Workspace-switch OSD (workspaceSwitcherPopup.js) + event-driven VD sync.
   winome::ws_osd_init ();
 
@@ -992,10 +1003,10 @@ on_activate (GtkApplication      *app,
     static const char *const kAllowed[] = {
         "developer_mode", "hot_corner_enabled", "win_key_overview",
         "overview_window_blacklist", "multi_monitor_panels",
-        "end_session_confirm", "unify_dark_titlebars", "unify_rounded_corners",
+        "multi_monitor_overview_linked", "end_session_confirm", "unify_dark_titlebars", "unify_rounded_corners",
         "clock_show_seconds", "show_battery_percentage",
         "hot_corner_cooldown_ms", "language", "clock_format",
-        "live_wallpaper_mode"};
+        "live_wallpaper_mode", "multi_monitor_workspace_mode"};
     bool known = false;
     for (const char *k : kAllowed) {
       if (key == k) {
@@ -1233,6 +1244,7 @@ on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
 
   winome::stop_overview_trigger ();
   winome::stop_win_event_hook ();
+  winome::ws::shutdown ();
   winome::vd::shutdown ();
 
   // Release the panel-strip work area reservation before restoring the

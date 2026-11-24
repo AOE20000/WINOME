@@ -8,6 +8,7 @@
 #include "easing.h"
 #include "fonts.h"
 #include "i18n.h"
+#include "monitor-manager.h"
 #include "st-engine.h"
 #include "system-status.h"
 
@@ -279,19 +280,27 @@ void position_banner_window(GtkWidget* window) {
   const int phys_w = w * scale;
   const int phys_h = h * scale;
 
-  HMONITOR mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+  HMONITOR mon = monitor_manager_active_monitor();
   MONITORINFO mi{};
   mi.cbSize = sizeof(mi);
-  GetMonitorInfoW(mon, &mi);
+  if (mon == nullptr || !GetMonitorInfoW(mon, &mi)) {
+    mon = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    GetMonitorInfoW(mon, &mi);
+  }
 
-  // Offset .notification-banner's 8px top shadow margin so the visible card
-  // sits cleanly below the top panel (or 32*scale px below monitor top).
-  int top_y = mi.rcMonitor.top + 32 * scale;
-  HWND panel_hwnd = FindWindowW(nullptr, L"WINOME Shell");
-  if (panel_hwnd != nullptr) {
+  // Sit cleanly below this monitor's panel if one is visible; otherwise anchor
+  // directly beneath the top edge of the active monitor.
+  int top_y = mi.rcMonitor.top + 8 * scale;
+  HWND panel_hwnd = monitor_manager_panel_for_monitor(mon);
+  if (panel_hwnd == nullptr)
+    panel_hwnd = FindWindowW(nullptr, L"WINOME Shell");
+  if (panel_hwnd != nullptr && IsWindowVisible(panel_hwnd)) {
     RECT pr{};
-    if (GetWindowRect(panel_hwnd, &pr) && pr.bottom > mi.rcMonitor.top)
+    if (GetWindowRect(panel_hwnd, &pr) &&
+        MonitorFromWindow(panel_hwnd, MONITOR_DEFAULTTONULL) == mon &&
+        pr.bottom > mi.rcMonitor.top) {
       top_y = pr.bottom;
+    }
   }
 
   int x = mi.rcMonitor.left + (mi.rcMonitor.right - mi.rcMonitor.left - phys_w) / 2;

@@ -7,6 +7,7 @@
 #include "config.h"
 #include "crash-dialog.h"
 #include "debug-runtime.h"
+#include "diagnostics-export.h"
 #include "end-session-dialog.h"
 #include "../ctl/ctl-protocol.h"
 #include "fonts.h"
@@ -19,6 +20,7 @@
 #include "overview-dash.h"
 #include "overview-layout.h"
 #include "overview-search.h"
+#include "overview-secondary.h"
 #include "overview-thumbs.h"
 #include "overview-trigger.h"
 #include "fullscreen-watcher.h"
@@ -33,11 +35,13 @@
 #include "system-status.h"
 #include "systray.h"
 #include "virtual-desktop.h"
+#include "workspace-manager.h"
 #include "wifi-networks.h"
 #include "window-theming.h"
 #include "winrt-bridge.h"
 
 #include <cmath>
+#include <zlib.h>
 
 #include <windows.h>
 #include <glib.h>
@@ -1121,7 +1125,7 @@ void test_ipc_dispatch_and_named_pipe_roundtrip() {
   CHECK(ping.find("\"ok\":true") != std::string::npos);
   CHECK(ping.find("\"pong\":true") != std::string::npos);
   CHECK(ping.find(std::string("\"version\":\"") + WINOME_VERSION + "\"") != std::string::npos);
-  CHECK(std::string(WINOME_VERSION) == "0.1.5");
+  CHECK(std::string(WINOME_VERSION) == "0.2.0");
 
   const std::string st = winome::ipc_dispatch_request_json("{\"cmd\":\"status\"}", cbs);
   CHECK(st.find("\"ok\":true") != std::string::npos);
@@ -2455,6 +2459,71 @@ void test_workarea_clamp_guard_and_fullscreen_hysteresis() {
   in.now_ms = 5080;
   res = debounced_tracker.step(in);
   CHECK(res.effective_fullscreen_mon == fake_mon);
+
+  // Escalating workarea backoff: repeated overwrites probe once after each
+  // backoff and double backoff duration up to 8s, resetting on SkipUnchanged.
+  {
+    winome::WorkareaAssertGuard esc;
+    int64_t t = 1000;
+    for (int k = 0; k < winome::WorkareaAssertGuard::kMaxBurstApplies; ++k) {
+      CHECK(esc.evaluate(t, want, reset, true, false, false) ==
+            winome::WorkareaAssertAction::Apply);
+      t += 150;
+    }
+    // 9th attempt triggers 1s backoff (consecutive_backoff_count = 1).
+    CHECK(esc.evaluate(t, want, reset, true, false, false) ==
+          winome::WorkareaAssertAction::DeferBackoff);
+    CHECK(esc.backoff_until_ms == t + 1000);
+    // Waking right after 1s backoff allows 1 probe apply.
+    t += 1020;
+    CHECK(esc.evaluate(t, want, reset, true, false, false) ==
+          winome::WorkareaAssertAction::Apply);
+    // Immediate overwrite 220ms later escalates backoff to 2s.
+    t += 220;
+    CHECK(esc.evaluate(t, want, reset, true, false, false) ==
+          winome::WorkareaAssertAction::DeferBackoff);
+    CHECK(esc.backoff_until_ms == t + 2000);
+    CHECK(esc.remaining_defer_ms(t) >= 2000);
+    // Once workarea sticks, escalation resets cleanly.
+    t += 2050;
+    CHECK(esc.evaluate(t, want, want, true, false, false) ==
+          winome::WorkareaAssertAction::SkipUnchanged);
+    CHECK(esc.consecutive_backoff_count == 0);
+  }
+
+  // Standard vs borderless fullscreen frame style classification.
+  {
+    CHECK(winome::has_standard_maximized_frame_style(WS_OVERLAPPEDWINDOW));
+    CHECK(winome::has_standard_maximized_frame_style(WS_CAPTION));
+    // Custom-chrome maximized window without WS_CAPTION but with resize frame + max box.
+    CHECK(winome::has_standard_maximized_frame_style(WS_THICKFRAME | WS_MAXIMIZEBOX));
+    // Borderless fullscreen popup window has neither WS_CAPTION nor resizable frame.
+    CHECK(!winome::has_standard_maximized_frame_style(WS_POPUP | WS_VISIBLE));
+  }
+
+  // Per-monitor hysteresis isolation: hiding monitor 2 does not bypass monitor 1's debounce.
+  {
+    winome::FullscreenHysteresisTracker mon1_tracker(80);
+    winome::FullscreenHysteresisTracker mon2_tracker(80);
+    HMONITOR fake_mon2 = reinterpret_cast<HMONITOR>(static_cast<uintptr_t>(0x5678));
+
+    winome::FullscreenEvalInput in2{};
+    in2.now_ms = 1000;
+    in2.raw_fullscreen_mon = fake_mon2;
+    CHECK(mon2_tracker.step(in2).effective_fullscreen_mon == nullptr);
+    in2.now_ms = 1080;
+    CHECK(mon2_tracker.step(in2).effective_fullscreen_mon == fake_mon2);
+
+    // Monitor 1 starts visible even though Monitor 2 is hidden -> still waits 80ms.
+    winome::FullscreenEvalInput in1{};
+    in1.now_ms = 1100;
+    in1.currently_hidden = false;
+    in1.raw_fullscreen_mon = fake_mon;
+    auto r1 = mon1_tracker.step(in1);
+    CHECK(r1.effective_fullscreen_mon == nullptr);
+    CHECK(r1.schedule_hide_timer);
+    CHECK(r1.hide_delay_ms == 80);
+  }
 }
 
 void test_hook_watchdog_and_lockfree_ring() {
@@ -2989,6 +3058,442 @@ void test_notification_activation_xml_and_theme_modes() {
   CHECK(winome::get_theme_modes(&apps_dark, &sys_dark));
 }
 
+void test_multi_monitor_interaction_helpers() {
+  // 1. Multi-monitor hot-corner hit testing (primary, right-extended, left-negative).
+  const winome::HotCornerMonitor mons[3] = {
+      {reinterpret_cast<HMONITOR>(static_cast<uintptr_t>(0x1)), RECT{0, 0, 1920, 1080}},
+      {reinterpret_cast<HMONITOR>(static_cast<uintptr_t>(0x2)), RECT{1920, 0, 3840, 1080}},
+      {reinterpret_cast<HMONITOR>(static_cast<uintptr_t>(0x3)), RECT{-1920, 100, 0, 1180}},
+  };
+  CHECK(winome::hot_corner_hit_test_monitors(0, 0, mons, 3, 5) == 0);
+  CHECK(winome::hot_corner_hit_test_monitors(5, 5, mons, 3, 5) == 0);
+  CHECK(winome::hot_corner_hit_test_monitors(6, 5, mons, 3, 5) == -1);
+  CHECK(winome::hot_corner_hit_test_monitors(1920, 0, mons, 3, 5) == 1);
+  CHECK(winome::hot_corner_hit_test_monitors(1924, 4, mons, 3, 5) == 1);
+  CHECK(winome::hot_corner_hit_test_monitors(1926, 0, mons, 3, 5) == -1);
+  CHECK(winome::hot_corner_hit_test_monitors(-1920, 100, mons, 3, 5) == 2);
+  CHECK(winome::hot_corner_hit_test_monitors(-1915, 105, mons, 3, 5) == 2);
+  CHECK(winome::hot_corner_hit_test_monitors(-1920, 99, mons, 3, 5) == -1);
+  CHECK(winome::hot_corner_hit_test_monitors(0, 0, nullptr, 0, 5) == -1);
+
+  // 2. Active monitor selection by pointer coordinates.
+  const std::vector<RECT> rects = {
+      RECT{0, 0, 1920, 1080},
+      RECT{1920, 0, 3840, 1080},
+      RECT{-1920, 100, 0, 1180},
+  };
+  CHECK(winome::select_monitor_index_for_point(rects, 500, 500) == 0);
+  CHECK(winome::select_monitor_index_for_point(rects, 2500, 300) == 1);
+  CHECK(winome::select_monitor_index_for_point(rects, -500, 600) == 2);
+  CHECK(winome::select_monitor_index_for_point(rects, -500, 50) == -1);
+
+  // 3. Popover positioning clamps inside secondary monitors (never snaps to primary).
+  {
+    const RECT right_mon{1920, 0, 3840, 1080};
+    const RECT clock_anchor{2800, 0, 2960, 32};
+    const POINT cal = winome::clamp_popover_origin_to_monitor(
+        right_mon, 32, clock_anchor, 640, 420, true, 2, 12, 8);
+    CHECK(cal.x == (2800 + 2960) / 2 - 320);
+    CHECK(cal.y == 34);
+    CHECK(cal.x >= right_mon.left + 8 && cal.x + 640 <= right_mon.right - 8);
+
+    const RECT qs_anchor{3700, 0, 3840, 32};
+    const POINT qs = winome::clamp_popover_origin_to_monitor(
+        right_mon, 32, qs_anchor, 400, 500, false, 2, 12, 8);
+    CHECK(qs.x == 3840 - 400 - 12);
+    CHECK(qs.y == 34);
+  }
+  {
+    const RECT left_mon{-1920, 0, 0, 1080};
+    const RECT clock_anchor{-1020, 0, -900, 32};
+    const POINT cal = winome::clamp_popover_origin_to_monitor(
+        left_mon, 32, clock_anchor, 640, 420, true, 2, 12, 8);
+    CHECK(cal.x == (-1020 + -900) / 2 - 320);
+    CHECK(cal.y == 34);
+    CHECK(cal.x >= left_mon.left + 8 && cal.x + 640 <= left_mon.right - 8);
+
+    const POINT qs = winome::clamp_popover_origin_to_monitor(
+        left_mon, 32, RECT{-120, 0, 0, 32}, 400, 500, false, 2, 12, 8);
+    CHECK(qs.x == 0 - 400 - 12);
+    CHECK(qs.y == 34);
+  }
+
+  // 4. Modal/Run dialog centering on extended monitor workareas.
+  {
+    const RECT ext_wa{1920, 32, 3840, 1080};
+    const POINT centered = winome::center_rect_in_bounds(ext_wa, 420, 220, 0.5);
+    CHECK(centered.x == 1920 + (1920 - 420) / 2);
+    CHECK(centered.y == 32 + (1048 - 220) / 2);
+
+    const POINT upper_third =
+        winome::center_rect_in_bounds(ext_wa, 500, 140, 1.0 / 3.0);
+    CHECK(upper_third.x == 1920 + (1920 - 500) / 2);
+    CHECK(upper_third.y == 32 + static_cast<int>((1048 - 140) * (1.0 / 3.0)));
+  }
+}
+
+void test_independent_per_monitor_workspace_engine() {
+  // 1. Config roundtrip & sanitization for multi_monitor_workspace_mode.
+  {
+    winome::WinomeConfig cfg;
+    CHECK(cfg.multi_monitor_workspace_mode == "independent");
+    cfg.multi_monitor_workspace_mode = "primary_only";
+    winome::WinomeConfig parsed;
+    CHECK(winome::parse_config(winome::serialize_config(cfg), &parsed));
+    CHECK(parsed.multi_monitor_workspace_mode == "primary_only");
+
+    cfg.multi_monitor_workspace_mode = "span";
+    CHECK(winome::parse_config(winome::serialize_config(cfg), &parsed));
+    CHECK(parsed.multi_monitor_workspace_mode == "span");
+
+    winome::WinomeConfig bad;
+    CHECK(winome::parse_config("{\"multi_monitor_workspace_mode\":\"bogus\"}", &bad));
+    CHECK(bad.multi_monitor_workspace_mode == "independent");
+  }
+
+  // 2. Core IndependentWorkspaceModel: Monitor 1 switching 1A -> 1B NEVER touches Monitor 2!
+  constexpr uintptr_t kMon1 = 0x101;
+  constexpr uintptr_t kMon2 = 0x202;
+  constexpr uintptr_t kWin1A = 0xA001;
+  constexpr uintptr_t kWin1B = 0xA002;
+  constexpr uintptr_t kWin2A = 0xB001;
+  constexpr uintptr_t kWin2B = 0xB002;
+
+  winome::ws::IndependentWorkspaceModel model;
+  model.ensure_monitor(kMon1);
+  model.ensure_monitor(kMon2);
+  model.reconcile({
+      {kWin1A, kMon1, false},
+      {kWin2A, kMon2, false},
+  });
+  CHECK(model.state_for(kMon1).active == 0 && model.state_for(kMon1).count == 2);
+  CHECK(model.state_for(kMon2).active == 0 && model.state_for(kMon2).count == 2);
+
+  // Place kWin1B on Monitor 1 workspace 1 (1B) and kWin2B on Monitor 2 workspace 1 (2B).
+  auto mv1 = model.move_window(kWin1B, kMon1, 1);
+  CHECK(mv1.size() == 1 && mv1[0].hwnd == kWin1B && mv1[0].native_desktop == 1);
+  CHECK(model.state_for(kMon1).count == 3);  // dynamic trailing empty ws appended on Mon1
+  CHECK(model.state_for(kMon2).count == 2);  // Mon2 untouched!
+
+  auto mv2 = model.move_window(kWin2B, kMon2, 1);
+  CHECK(mv2.size() == 1 && mv2[0].hwnd == kWin2B && mv2[0].native_desktop == 1);
+  CHECK(model.state_for(kMon2).count == 3);
+
+  // Switch Monitor 1: 1A (0) -> 1B (1). Must ONLY move kWin1A -> park(1) and kWin1B -> live(0).
+  auto sw1 = model.switch_monitor(kMon1, 1);
+  CHECK(model.state_for(kMon1).active == 1);
+  CHECK(model.state_for(kMon2).active == 0);  // Monitor 2 stays on 2A!
+  bool saw_1a_park = false, saw_1b_live = false, saw_mon2_touched = false;
+  for (const auto& m : sw1) {
+    if (m.hwnd == kWin1A && m.native_desktop == 1) saw_1a_park = true;
+    if (m.hwnd == kWin1B && m.native_desktop == 0) saw_1b_live = true;
+    if (m.hwnd == kWin2A || m.hwnd == kWin2B) saw_mon2_touched = true;
+  }
+  CHECK(saw_1a_park && saw_1b_live && !saw_mon2_touched);
+
+  // Switch Monitor 2: 2A (0) -> 2B (1). Monitor 1 must stay on 1B and be untouched.
+  auto sw2 = model.switch_monitor(kMon2, 1);
+  CHECK(model.state_for(kMon1).active == 1);
+  CHECK(model.state_for(kMon2).active == 1);
+  bool saw_2a_park = false, saw_2b_live = false, saw_mon1_touched = false;
+  for (const auto& m : sw2) {
+    if (m.hwnd == kWin2A && m.native_desktop == 1) saw_2a_park = true;
+    if (m.hwnd == kWin2B && m.native_desktop == 0) saw_2b_live = true;
+    if (m.hwnd == kWin1A || m.hwnd == kWin1B) saw_mon1_touched = true;
+  }
+  CHECK(saw_2a_park && saw_2b_live && !saw_mon1_touched);
+
+  // Reconcile dragging live window kWin1B from Monitor 1 onto Monitor 2:
+  // adopts Monitor 2's active workspace (1).
+  model.reconcile({
+      {kWin1A, kMon1, true},
+      {kWin1B, kMon2, false},
+      {kWin2A, kMon2, true},
+      {kWin2B, kMon2, false},
+  });
+  winome::ws::WindowPlacement wp{};
+  CHECK(model.find_window(kWin1B, &wp) && wp.monitor == kMon2 && wp.workspace == 1);
+
+  // Shutdown restore plan returns ALL parked windows (kWin1A and kWin2A) to Live Stage (0).
+  auto restore = model.build_restore_all_to_live_moves();
+  CHECK(restore.size() == 2);
+  bool r_1a = false, r_2a = false;
+  for (const auto& m : restore) {
+    CHECK(m.native_desktop == 0);
+    if (m.hwnd == kWin1A) r_1a = true;
+    if (m.hwnd == kWin2A) r_2a = true;
+  }
+  CHECK(r_1a && r_2a);
+
+  // 3. Simultaneous Secondary Overview geometry (1-workspace & multi-workspace).
+  {
+    const auto g1 = winome::compute_secondary_overview_geometry(1920, 1080, 32, 1, 1);
+    CHECK(g1.full_box.left == 0 && g1.full_box.top == 32 &&
+          g1.full_box.right == 1920 && g1.full_box.bottom == 1080);
+    CHECK(g1.pill_rects.empty());
+    CHECK(g1.picker_box.left > 0 && g1.picker_box.right < 1920);
+    CHECK(g1.picker_box.top > 32 && g1.picker_box.bottom < 1080);
+    const double expected_aspect = 1920.0 / 1048.0;
+    const double actual_aspect =
+        static_cast<double>(g1.picker_box.right - g1.picker_box.left) /
+        static_cast<double>(g1.picker_box.bottom - g1.picker_box.top);
+    CHECK(std::fabs(actual_aspect - expected_aspect) < 0.03);
+
+    const auto g3 = winome::compute_secondary_overview_geometry(2560, 1440, 48, 2, 3);
+    CHECK(g3.pill_rects.size() == 3);
+    CHECK(g3.pill_rects[0].right < g3.pill_rects[1].left);
+    CHECK(g3.pill_rects[1].right < g3.pill_rects[2].left);
+    CHECK(g3.pill_rects[0].bottom < g3.picker_box.top);
+    const RECT left_nb = winome::compute_secondary_workspace_box(g3, 0, 1);
+    const RECT mid_nb = winome::compute_secondary_workspace_box(g3, 1, 1);
+    const RECT right_nb = winome::compute_secondary_workspace_box(g3, 2, 1);
+    CHECK(left_nb.right < mid_nb.left);
+    CHECK(right_nb.left > mid_nb.right);
+  }
+
+  // 4. Multi-monitor Overview linked vs unlinked simultaneous dispatch & config.
+  {
+    winome::WinomeConfig cfg;
+    CHECK(cfg.multi_monitor_overview_linked == false);  // default: unlinked simultaneous
+    cfg.multi_monitor_overview_linked = true;
+    winome::WinomeConfig parsed;
+    CHECK(winome::parse_config(winome::serialize_config(cfg), &parsed));
+    CHECK(parsed.multi_monitor_overview_linked == true);
+
+    using Act = winome::OverviewDispatchAction;
+    // Unlinked (default): open Mon1 -> OpenMain; open Mon2 while Mon1 open -> OpenSecondary!
+    CHECK(winome::decide_multi_monitor_overview_action(
+              false, false, kMon1, false, 0, false, false) == Act::OpenMain);
+    CHECK(winome::decide_multi_monitor_overview_action(
+              false, false, kMon2, true, kMon1, false, false) == Act::OpenSecondary);
+    // Unlinked: toggle Mon2 while both open -> CloseSecondaryOnly (Mon1 stays open!).
+    CHECK(winome::decide_multi_monitor_overview_action(
+              false, true, kMon2, true, kMon1, true, true) == Act::CloseSecondaryOnly);
+    // Unlinked: toggle Mon1 while both open -> CloseMainOnly (Mon2 stays open!).
+    CHECK(winome::decide_multi_monitor_overview_action(
+              false, true, kMon1, true, kMon1, false, true) == Act::CloseMainOnly);
+    // Unlinked: open Mon1 again while Mon2 secondary still open -> OpenMain on Mon1!
+    CHECK(winome::decide_multi_monitor_overview_action(
+              false, true, kMon1, false, 0, false, true) == Act::OpenMain);
+    // Linked (optional): open Mon1 -> OpenLinkedAll; toggle Mon2 -> CloseAll!
+    CHECK(winome::decide_multi_monitor_overview_action(
+              true, false, kMon1, false, 0, false, false) == Act::OpenLinkedAll);
+    CHECK(winome::decide_multi_monitor_overview_action(
+              true, true, kMon2, true, kMon1, true, true) == Act::CloseAll);
+    CHECK(winome::decide_multi_monitor_overview_action(
+              true, false, kMon2, true, kMon1, true, true) == Act::None);
+  }
+
+  // 5. Cross-monitor window drop geometry & IndependentWorkspaceModel transfer.
+  {
+    const RECT mon1_rc{0, 0, 1920, 1080};
+    const RECT mon2_work{-1920, 32, 0, 1080};  // left-side monitor with negative X + panel
+    const RECT src_win{200, 140, 1000, 740};   // 800x600 window on Mon1
+
+    // 5a. Drop onto closed-overview monitor at exact cursor drop point (clamped inside workarea).
+    const RECT at_pt = winome::ws::compute_cross_monitor_window_rect(
+        src_win, mon1_rc, mon2_work, POINT{-1850, 40}, true);
+    CHECK(at_pt.left >= mon2_work.left);
+    CHECK(at_pt.top >= mon2_work.top);
+    CHECK(at_pt.right <= mon2_work.right);
+    CHECK(at_pt.bottom <= mon2_work.bottom);
+    CHECK((at_pt.right - at_pt.left) == 800);
+    CHECK((at_pt.bottom - at_pt.top) == 600);
+
+    // 5b. Drop onto open-overview monitor (proportional mapping, oversized window shrinks to fit).
+    const RECT huge_win{0, 0, 3000, 2000};
+    const RECT small_work{1920, 32, 3200, 752};  // 1280x720 below panel
+    const RECT mapped = winome::ws::compute_cross_monitor_window_rect(
+        huge_win, mon1_rc, small_work, POINT{2500, 400}, false);
+    CHECK(mapped.left >= small_work.left && mapped.right <= small_work.right);
+    CHECK(mapped.top >= small_work.top && mapped.bottom <= small_work.bottom);
+    CHECK((mapped.right - mapped.left) <= 1280);
+    CHECK((mapped.bottom - mapped.top) <= 720);
+
+    // 5c. IndependentWorkspaceModel cross-monitor move (Screen 1 ws B -> Screen 2 ws A).
+    winome::ws::IndependentWorkspaceModel xm;
+    constexpr uintptr_t kW1Base = 0x5100;
+    constexpr uintptr_t kW1 = 0x5101;
+    constexpr uintptr_t kW1Keep = 0x5102;
+    constexpr uintptr_t kW2 = 0x5201;
+    xm.reconcile({{kW1Base, kMon1, false},
+                  {kW1, kMon1, false},
+                  {kW1Keep, kMon1, false},
+                  {kW2, kMon2, false}});
+    // Keep kW1Base on Mon1 ws 0 (A), put kW1 + kW1Keep on Mon1 ws 1 (B, active).
+    xm.move_window(kW1, kMon1, 1);
+    xm.move_window(kW1Keep, kMon1, 1);
+    xm.switch_monitor(kMon1, 1);
+    CHECK(xm.state_for(kMon1).active == 1);
+    CHECK(xm.state_for(kMon2).active == 0);
+    // Drag kW1 from Mon1 ws 1 directly into Mon2 ws 0 (Mon2's active workspace):
+    const auto xmoves = xm.move_window(kW1, kMon2, 0);
+    CHECK(xm.window_workspace(kW1, kMon2) == 0);
+    // Mon2 ws 0 is active, so kW1 must be on Live Stage (native desktop 0).
+    CHECK(xmoves.size() == 1 && xmoves[0].hwnd == kW1 &&
+          xmoves[0].native_desktop == 0);
+    // Mon1 still has kW1Base on ws 0 and kW1Keep on ws 1, so Mon1 stays on active = 1.
+    CHECK(xm.state_for(kMon1).active == 1);
+    // Drag kW1 from Mon2 ws 0 into Mon1 ws 0 while Mon1 active is 1 -> parked (desktop 1).
+    const auto xmoves2 = xm.move_window(kW1, kMon1, 0);
+    CHECK(xm.window_workspace(kW1, kMon1) == 0);
+    CHECK(xmoves2.size() == 1 && xmoves2[0].hwnd == kW1 &&
+          xmoves2[0].native_desktop == 1);
+    // Dragging the last remaining window kW1Keep out of Mon1 ws 1 -> Mon2 ws 0
+    // prunes Mon1's extra trailing workspace (count 3 -> 2: ws 0 occupied + ws 1 empty).
+    CHECK(xm.state_for(kMon1).count == 3);
+    xm.move_window(kW1Keep, kMon2, 0);
+    CHECK(xm.state_for(kMon1).count == 2);
+  }
+}
+
+void test_diagnostics_zip_export() {
+  wchar_t tmp_base[MAX_PATH] = {};
+  CHECK(GetTempPathW(MAX_PATH, tmp_base) > 0);
+  std::wstring root = std::wstring(tmp_base) + L"winome-diag-test-" +
+                      std::to_wstring(GetCurrentProcessId());
+  std::wstring crashes = root + L"\\crashes";
+  CreateDirectoryW(root.c_str(), nullptr);
+  CreateDirectoryW(crashes.c_str(), nullptr);
+
+  auto write_raw = [](const std::wstring& path, const std::string& content) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+      DWORD w = 0;
+      WriteFile(h, content.data(), static_cast<DWORD>(content.size()), &w, nullptr);
+      CloseHandle(h);
+    }
+  };
+
+  std::string sample_log;
+  for (int i = 0; i < 40; ++i)
+    sample_log += "[2026-11-24 23:30:00.000] [ws] independent switch ok line=" +
+                  std::to_string(i) + "\n";
+  write_raw(root + L"\\winome.log", sample_log);
+  write_raw(root + L"\\config.json", "{\"language\":\"zh\",\"multi_monitor_workspace_mode\":\"independent\"}\n");
+  write_raw(root + L"\\last-crash.json", "{\"reason\":\"test\"}\n");
+  write_raw(crashes + L"\\dump-1.dmp", std::string(512, 'A'));
+  write_raw(crashes + L"\\dump-2.dmp", std::string(512, 'B'));
+  write_raw(crashes + L"\\dump-3.dmp", std::string(512, 'C'));
+
+  const std::wstring zip_path = root + L"\\out.zip";
+  winome::DiagnosticsExportOptions opts{};
+  opts.data_dir = root;
+  opts.output_zip_path = zip_path;
+  opts.extra_summary_text = "UnitTestSummary=1";
+  opts.extra_files.push_back({"debug/extra.txt", "hello-extra-payload"});
+  opts.max_crash_dumps = 2;
+  opts.flush_stdio = false;
+
+  const auto res = winome::export_diagnostics_bundle(opts);
+  CHECK(res.ok);
+  // Expect: winome.log, config.json, last-crash.json, 2 dumps, debug/extra.txt, system-info.txt = 7 entries.
+  CHECK(res.file_count == 7);
+  CHECK(res.uncompressed_bytes > 0);
+  CHECK(res.compressed_bytes > 0);
+  CHECK(res.compressed_bytes < res.uncompressed_bytes);
+
+  // Read back zip bytes and verify PKZIP Local File Headers, EOCD, CRC32 & raw Deflate round-trip.
+  std::vector<uint8_t> raw;
+  {
+    HANDLE h = CreateFileW(zip_path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(h != INVALID_HANDLE_VALUE);
+    if (h != INVALID_HANDLE_VALUE) {
+      LARGE_INTEGER sz{};
+      GetFileSizeEx(h, &sz);
+      raw.resize(static_cast<size_t>(sz.QuadPart));
+      DWORD got = 0;
+      ReadFile(h, raw.data(), static_cast<DWORD>(raw.size()), &got, nullptr);
+      CloseHandle(h);
+    }
+  }
+  CHECK(raw.size() > 64);
+
+  auto rd16 = [&](size_t off) -> uint16_t {
+    return static_cast<uint16_t>(raw[off] | (raw[off + 1] << 8));
+  };
+  auto rd32 = [&](size_t off) -> uint32_t {
+    return static_cast<uint32_t>(raw[off]) |
+           (static_cast<uint32_t>(raw[off + 1]) << 8) |
+           (static_cast<uint32_t>(raw[off + 2]) << 16) |
+           (static_cast<uint32_t>(raw[off + 3]) << 24);
+  };
+
+  // Verify EOCD at end of archive.
+  CHECK(rd32(raw.size() - 22) == 0x06054b50u);
+  CHECK(rd16(raw.size() - 12) == 7u);
+
+  // Walk Local File Headers and inflate logs/winome.log + system-info.txt.
+  size_t pos = 0;
+  int found_entries = 0;
+  int dump_entries = 0;
+  bool verified_log = false;
+  bool verified_sysinfo = false;
+  while (pos + 30 <= raw.size() && rd32(pos) == 0x04034b50u) {
+    const uint16_t method = rd16(pos + 8);
+    const uint32_t expected_crc = rd32(pos + 14);
+    const uint32_t comp_sz = rd32(pos + 18);
+    const uint32_t uncomp_sz = rd32(pos + 22);
+    const uint16_t name_len = rd16(pos + 26);
+    const uint16_t extra_len = rd16(pos + 28);
+    const std::string name(reinterpret_cast<const char*>(raw.data() + pos + 30),
+                           name_len);
+    const size_t data_off = pos + 30 + name_len + extra_len;
+    CHECK(data_off + comp_sz <= raw.size());
+
+    std::string decoded;
+    if (method == 0) {
+      decoded.assign(reinterpret_cast<const char*>(raw.data() + data_off), comp_sz);
+    } else {
+      CHECK(method == 8);
+      decoded.resize(uncomp_sz);
+      z_stream zs{};
+      CHECK(inflateInit2(&zs, -MAX_WBITS) == Z_OK);
+      zs.next_in = const_cast<Bytef*>(raw.data() + data_off);
+      zs.avail_in = comp_sz;
+      zs.next_out = reinterpret_cast<Bytef*>(decoded.data());
+      zs.avail_out = uncomp_sz;
+      CHECK(inflate(&zs, Z_FINISH) == Z_STREAM_END);
+      inflateEnd(&zs);
+    }
+    const uint32_t actual_crc = static_cast<uint32_t>(
+        crc32(crc32(0L, Z_NULL, 0),
+              reinterpret_cast<const Bytef*>(decoded.data()),
+              static_cast<uInt>(decoded.size())));
+    CHECK(actual_crc == expected_crc);
+
+    if (name == "logs/winome.log") {
+      CHECK(decoded == sample_log);
+      verified_log = true;
+    } else if (name == "system-info.txt") {
+      CHECK(decoded.find("UnitTestSummary=1") != std::string::npos);
+      CHECK(decoded.find(WINOME_VERSION) != std::string::npos);
+      verified_sysinfo = true;
+    } else if (name.rfind("crashes/", 0) == 0 && name.find(".dmp") != std::string::npos) {
+      ++dump_entries;
+    }
+
+    pos = data_off + comp_sz;
+    ++found_entries;
+  }
+  CHECK(found_entries == 7);
+  CHECK(dump_entries == 2);
+  CHECK(verified_log);
+  CHECK(verified_sysinfo);
+
+  DeleteFileW(zip_path.c_str());
+  DeleteFileW((root + L"\\winome.log").c_str());
+  DeleteFileW((root + L"\\config.json").c_str());
+  DeleteFileW((root + L"\\last-crash.json").c_str());
+  DeleteFileW((crashes + L"\\dump-1.dmp").c_str());
+  DeleteFileW((crashes + L"\\dump-2.dmp").c_str());
+  DeleteFileW((crashes + L"\\dump-3.dmp").c_str());
+  RemoveDirectoryW(crashes.c_str());
+  RemoveDirectoryW(root.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -3033,6 +3538,9 @@ int main() {
   test_wpn_notifications_and_wifi_bt_sorting();
   test_power_modes_overlay_and_legacy();
   test_notification_activation_xml_and_theme_modes();
+  test_multi_monitor_interaction_helpers();
+  test_independent_per_monitor_workspace_engine();
+  test_diagnostics_zip_export();
 
   if (g_failures == 0)
     std::printf("ALL WINOME UNIT TESTS PASSED\n");

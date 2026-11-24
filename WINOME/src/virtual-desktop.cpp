@@ -177,11 +177,14 @@ struct Job {
     PinWindow,
     UnpinWindow,
     MoveWindowToDesktop,
+    MoveWindowsBatch,
     CreateDesktop,
     RemoveDesktop,
   } op;
 
   std::vector<DesktopInfo> out_desktops;
+  std::vector<WindowMoveOp> in_moves;
+  std::vector<bool> out_move_results;
   int out_index = -1;
   bool out_bool = false;
   HWND in_hwnd = nullptr;
@@ -497,6 +500,61 @@ struct ComState {
     return false;
   }
 
+  std::vector<bool>
+  move_windows_batch (const std::vector<WindowMoveOp> &moves)
+  {
+    std::vector<bool> results (moves.size (), false);
+    if (moves.empty ())
+      return results;
+    if (!ensure () || !ensure_view_collection ())
+      return results;
+
+    void *arr = nullptr;
+    HRESULT hr = vcall<HRESULT> (internal, kSlotGetDesktops, &arr);
+    if (FAILED (hr) || arr == nullptr) {
+      if (recoverable (hr)) {
+        release (true);
+        if (!ensure () || !ensure_view_collection ())
+          return results;
+        hr = vcall<HRESULT> (internal, kSlotGetDesktops, &arr);
+      }
+      if (FAILED (hr) || arr == nullptr)
+        return results;
+    }
+
+    UINT n = 0;
+    vcall<HRESULT> (arr, kSlotGetCount, &n);
+    std::vector<void *> desktop_ptrs (n, nullptr);
+    for (UINT i = 0; i < n; ++i)
+      desktop_ptrs[i] = desktop_at (arr, i);
+
+    for (size_t i = 0; i < moves.size (); ++i) {
+      const WindowMoveOp &m = moves[i];
+      if (m.hwnd == nullptr || m.target_index < 0 ||
+          static_cast<UINT> (m.target_index) >= n) {
+        continue;
+      }
+      void *target_desktop = desktop_ptrs[static_cast<size_t> (m.target_index)];
+      if (target_desktop == nullptr)
+        continue;
+      void *view = nullptr;
+      HRESULT vhr = vcall<HRESULT> (view_collection, kSlotGetViewForHwnd,
+                                    m.hwnd, &view);
+      if (SUCCEEDED (vhr) && view != nullptr) {
+        results[i] = SUCCEEDED (vcall<HRESULT> (
+            internal, kSlotMoveViewToDesktop, view, target_desktop));
+        vrelease (view);
+      }
+    }
+
+    for (void *d : desktop_ptrs) {
+      if (d != nullptr)
+        vrelease (d);
+    }
+    vrelease (arr);
+    return results;
+  }
+
   bool
   create_desktop ()
   {
@@ -700,6 +758,11 @@ run_on_worker (const std::shared_ptr<Job> &job, bool wait_for_result = true)
         }
         case Job::Op::MoveWindowToDesktop: {
           cur->ok = g_com.move_window_to_desktop (cur->in_hwnd, cur->in_index);
+          break;
+        }
+        case Job::Op::MoveWindowsBatch: {
+          cur->out_move_results = g_com.move_windows_batch (cur->in_moves);
+          cur->ok = !cur->out_move_results.empty ();
           break;
         }
         case Job::Op::CreateDesktop: {
@@ -1164,6 +1227,20 @@ move_window_to_desktop (HWND hwnd, int target_index)
   job->in_index = target_index;
   run_on_worker (job);
   return job->ok;
+}
+
+std::vector<bool>
+move_windows_batch (const std::vector<WindowMoveOp> &moves)
+{
+  if (moves.empty ())
+    return {};
+  auto job = std::make_shared<Job> ();
+  job->op = Job::Op::MoveWindowsBatch;
+  job->in_moves = moves;
+  run_on_worker (job);
+  if (job->out_move_results.size () != moves.size ())
+    return std::vector<bool> (moves.size (), false);
+  return job->out_move_results;
 }
 
 bool

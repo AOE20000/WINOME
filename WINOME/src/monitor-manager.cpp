@@ -106,15 +106,37 @@ int resolved_panel_height() {
   return 32;
 }
 
+bool is_monitor_panel_hidden(HMONITOR mon) {
+  return mon != nullptr &&
+         g_mm.cbs.is_panel_hidden_for_monitor != nullptr &&
+         g_mm.cbs.is_panel_hidden_for_monitor(mon);
+}
+
+void on_secondary_window_destroyed(GtkWidget* widget,
+                                   gpointer G_GNUC_UNUSED user_data) {
+  for (auto& slot : g_mm.secondary_panels) {
+    if (slot.window == widget) {
+      HWND hwnd = slot.hwnd;
+      slot.window = nullptr;
+      slot.hwnd = nullptr;
+      if (hwnd != nullptr && g_mm.cbs.unregister_panel != nullptr)
+        g_mm.cbs.unregister_panel(hwnd);
+      break;
+    }
+  }
+}
+
 void destroy_secondary_slot(SecondaryPanelSlot* slot) {
   if (slot == nullptr)
     return;
-  if (slot->hwnd != nullptr && g_mm.cbs.unregister_panel != nullptr)
-    g_mm.cbs.unregister_panel(slot->hwnd);
-  if (slot->window != nullptr)
-    gtk_window_destroy(GTK_WINDOW(slot->window));
+  HWND hwnd = slot->hwnd;
+  GtkWidget* win = slot->window;
   slot->window = nullptr;
   slot->hwnd = nullptr;
+  if (hwnd != nullptr && g_mm.cbs.unregister_panel != nullptr)
+    g_mm.cbs.unregister_panel(hwnd);
+  if (win != nullptr)
+    gtk_window_destroy(GTK_WINDOW(win));
 }
 
 void destroy_all_secondary_panels() {
@@ -123,16 +145,17 @@ void destroy_all_secondary_panels() {
   g_mm.secondary_panels.clear();
 }
 
-void position_panel_hwnd(HWND hwnd, const RECT& mon_rect, int height, bool top_band) {
+void position_panel_hwnd(HWND hwnd, const RECT& mon_rect, int height,
+                         bool top_band, bool show_window = true) {
   if (hwnd == nullptr || !IsWindow(hwnd))
     return;
   const int w = mon_rect.right - mon_rect.left;
   if (w <= 0 || height <= 0)
     return;
 
+  const UINT flags = SWP_NOACTIVATE | (show_window ? SWP_SHOWWINDOW : 0u);
   SetWindowPos(hwnd, top_band ? HWND_TOPMOST : HWND_NOTOPMOST,
-               mon_rect.left, mon_rect.top, w, height,
-               SWP_NOACTIVATE | SWP_SHOWWINDOW);
+               mon_rect.left, mon_rect.top, w, height, flags);
 
   LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
   LONG_PTR want = (ex & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
@@ -149,14 +172,19 @@ void on_secondary_realize(GtkWidget* widget, gpointer user_data) {
   if (hwnd == nullptr)
     return;
 
+  HMONITOR slot_mon = nullptr;
   for (auto& slot : g_mm.secondary_panels) {
     if (slot.window == widget) {
       slot.hwnd = hwnd;
+      slot_mon = slot.hmonitor;
       break;
     }
   }
+  if (slot_mon == nullptr)
+    slot_mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
 
-  position_panel_hwnd(hwnd, *target_rect, resolved_panel_height(), true);
+  position_panel_hwnd(hwnd, *target_rect, resolved_panel_height(), true,
+                      !is_monitor_panel_hidden(slot_mon));
   if (g_mm.cbs.pin_window != nullptr)
     g_mm.cbs.pin_window(hwnd);
   if (g_mm.cbs.register_panel != nullptr)
@@ -276,6 +304,72 @@ bool same_monitor_topology(const std::vector<MonitorDescriptor>& a,
   return true;
 }
 
+HMONITOR monitor_manager_primary_monitor() {
+  if (g_mm.primary_panel != nullptr && IsWindow(g_mm.primary_panel)) {
+    HMONITOR mon = MonitorFromWindow(g_mm.primary_panel, MONITOR_DEFAULTTOPRIMARY);
+    if (mon != nullptr)
+      return mon;
+  }
+  return MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+}
+
+HMONITOR monitor_manager_active_monitor() {
+  POINT pt{};
+  if (GetCursorPos(&pt)) {
+    HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
+    if (mon != nullptr)
+      return mon;
+  }
+  HWND fg = GetForegroundWindow();
+  if (fg != nullptr && IsWindow(fg)) {
+    HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONULL);
+    if (mon != nullptr)
+      return mon;
+  }
+  return monitor_manager_primary_monitor();
+}
+
+RECT monitor_manager_active_workarea() {
+  HMONITOR mon = monitor_manager_active_monitor();
+  MONITORINFO mi{};
+  mi.cbSize = sizeof(mi);
+  if (mon != nullptr && GetMonitorInfoW(mon, &mi))
+    return mi.rcWork;
+  RECT wa{};
+  SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+  return wa;
+}
+
+HWND monitor_manager_panel_for_monitor(HMONITOR mon) {
+  if (mon == nullptr)
+    return nullptr;
+  if (g_mm.primary_panel != nullptr && IsWindow(g_mm.primary_panel) &&
+      MonitorFromWindow(g_mm.primary_panel, MONITOR_DEFAULTTONEAREST) == mon) {
+    return g_mm.primary_panel;
+  }
+  for (const auto& slot : g_mm.secondary_panels) {
+    if (slot.hwnd == nullptr || !IsWindow(slot.hwnd))
+      continue;
+    if (slot.hmonitor == mon ||
+        MonitorFromWindow(slot.hwnd, MONITOR_DEFAULTTONEAREST) == mon) {
+      return slot.hwnd;
+    }
+  }
+  return nullptr;
+}
+
+bool monitor_manager_is_panel_hwnd(HWND hwnd) {
+  if (hwnd == nullptr)
+    return false;
+  if (hwnd == g_mm.primary_panel)
+    return true;
+  for (const auto& slot : g_mm.secondary_panels) {
+    if (slot.hwnd == hwnd)
+      return true;
+  }
+  return false;
+}
+
 void monitor_manager_sync() {
   if (!g_mm.initialized)
     return;
@@ -289,7 +383,8 @@ void monitor_manager_sync() {
   // Re-position primary panel and primary monitor work area.
   const MonitorDescriptor& primary = monitors.front();
   if (g_mm.primary_panel != nullptr && IsWindow(g_mm.primary_panel)) {
-    position_panel_hwnd(g_mm.primary_panel, primary.monitor_rect, panel_h, true);
+    position_panel_hwnd(g_mm.primary_panel, primary.monitor_rect, panel_h, true,
+                        !is_monitor_panel_hidden(primary.hmonitor));
     if (g_mm.cbs.on_workarea_changed != nullptr) {
       g_mm.cbs.on_workarea_changed();
     } else {
@@ -311,13 +406,15 @@ void monitor_manager_sync() {
   for (size_t i = 1; i < monitors.size(); ++i)
     secondaries.push_back(monitors[i]);
 
-  // Remove panels whose monitor vanished.
+  // Remove panels whose monitor vanished or whose window was destroyed externally.
   for (size_t i = 0; i < g_mm.secondary_panels.size();) {
     bool still_present = false;
-    for (const auto& m : secondaries) {
-      if (m.hmonitor == g_mm.secondary_panels[i].hmonitor) {
-        still_present = true;
-        break;
+    if (g_mm.secondary_panels[i].window != nullptr) {
+      for (const auto& m : secondaries) {
+        if (m.hmonitor == g_mm.secondary_panels[i].hmonitor) {
+          still_present = true;
+          break;
+        }
       }
     }
     if (!still_present) {
@@ -332,11 +429,12 @@ void monitor_manager_sync() {
   // Update existing secondary panels and create missing ones.
   for (const auto& mon : secondaries) {
     bool found = false;
+    const bool mon_hidden = is_monitor_panel_hidden(mon.hmonitor);
     for (auto& slot : g_mm.secondary_panels) {
       if (slot.hmonitor == mon.hmonitor) {
         slot.rect = mon.monitor_rect;
         if (slot.hwnd != nullptr)
-          position_panel_hwnd(slot.hwnd, mon.monitor_rect, panel_h, true);
+          position_panel_hwnd(slot.hwnd, mon.monitor_rect, panel_h, true, !mon_hidden);
         found = true;
         break;
       }
@@ -350,6 +448,8 @@ void monitor_manager_sync() {
         slot.rect = mon.monitor_rect;
         g_mm.secondary_panels.push_back(slot);
 
+        g_signal_connect(win, "destroy",
+                         G_CALLBACK(on_secondary_window_destroyed), nullptr);
         RECT* rect_copy = g_new(RECT, 1);
         *rect_copy = mon.monitor_rect;
         g_signal_connect_data(
@@ -363,8 +463,10 @@ void monitor_manager_sync() {
         GdkSurface* surf = gtk_native_get_surface(GTK_NATIVE(win));
         if (surf != nullptr) {
           HWND sec_hwnd = static_cast<HWND>(gdk_win32_surface_get_handle(surf));
-          if (sec_hwnd != nullptr)
-            position_panel_hwnd(sec_hwnd, mon.monitor_rect, panel_h, true);
+          if (sec_hwnd != nullptr) {
+            position_panel_hwnd(sec_hwnd, mon.monitor_rect, panel_h, true,
+                                !mon_hidden);
+          }
         }
       }
     }

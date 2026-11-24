@@ -21,6 +21,8 @@ struct WinomeConfig {
   std::string live_wallpaper_mode = "live";  // "live", "snapshot", "off"
   bool dash_isolate_workspaces = false;  // false = all workspaces, true = active workspace only
   bool multi_monitor_panels = true;
+  std::string multi_monitor_workspace_mode = "independent";  // "independent", "primary_only", "span"
+  bool multi_monitor_overview_linked = false;  // false = allow simultaneous unlinked; true = linked open/close across all monitors
   bool end_session_confirm = true;
   bool unify_dark_titlebars = false;
   bool unify_rounded_corners = false;

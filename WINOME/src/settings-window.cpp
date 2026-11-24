@@ -5,6 +5,8 @@
 #include "settings-window.h"
 
 #include "config.h"
+#include "debug-runtime.h"
+#include "diagnostics-export.h"
 #include "fonts.h"
 #include "i18n.h"
 #include "looking-glass.h"
@@ -47,12 +49,15 @@ struct SettingsUi {
   GtkWidget* overview_blacklist_switch = nullptr;
   GtkWidget* live_wallpaper_drop = nullptr;
   GtkWidget* dash_scope_drop = nullptr;
+  GtkWidget* ws_mode_drop = nullptr;
+  GtkWidget* overview_linked_drop = nullptr;
   GtkWidget* end_session_confirm_switch = nullptr;
   GtkWidget* dev_mode_switch = nullptr;
   GtkWidget* dev_console_btn = nullptr;
 
   // Diagnostics readout container
   GtkWidget* diag_box = nullptr;
+  GtkWidget* diag_export_status = nullptr;
 
   // Switches / spins update on config notify.
   bool syncing = false;
@@ -416,6 +421,18 @@ void sync_ui_from_config() {
     gtk_drop_down_set_selected(GTK_DROP_DOWN(g_ui.dash_scope_drop),
                                cfg.dash_isolate_workspaces ? 1u : 0u);
   }
+  if (g_ui.ws_mode_drop != nullptr) {
+    guint sel = 0;
+    if (cfg.multi_monitor_workspace_mode == "primary_only")
+      sel = 1;
+    else if (cfg.multi_monitor_workspace_mode == "span")
+      sel = 2;
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(g_ui.ws_mode_drop), sel);
+  }
+  if (g_ui.overview_linked_drop != nullptr) {
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(g_ui.overview_linked_drop),
+                               cfg.multi_monitor_overview_linked ? 1u : 0u);
+  }
   if (g_ui.end_session_confirm_switch != nullptr) {
     gtk_switch_set_active(GTK_SWITCH(g_ui.end_session_confirm_switch),
                           cfg.end_session_confirm ? TRUE : FALSE);
@@ -551,6 +568,27 @@ void on_dash_scope_changed(GObject* obj, GParamSpec* pspec G_GNUC_UNUSED,
   WinomeConfig cfg = get_config();
   guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(obj));
   cfg.dash_isolate_workspaces = (sel == 1);
+  update_config(cfg);
+}
+
+void on_ws_mode_changed(GObject* obj, GParamSpec* pspec G_GNUC_UNUSED,
+                        gpointer ud G_GNUC_UNUSED) {
+  if (g_ui.syncing)
+    return;
+  WinomeConfig cfg = get_config();
+  guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(obj));
+  cfg.multi_monitor_workspace_mode =
+      (sel == 1) ? "primary_only" : (sel == 2 ? "span" : "independent");
+  update_config(cfg);
+}
+
+void on_overview_linked_changed(GObject* obj, GParamSpec* pspec G_GNUC_UNUSED,
+                                gpointer ud G_GNUC_UNUSED) {
+  if (g_ui.syncing)
+    return;
+  WinomeConfig cfg = get_config();
+  guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(obj));
+  cfg.multi_monitor_overview_linked = (sel == 1);
   update_config(cfg);
 }
 
@@ -699,6 +737,80 @@ void on_diag_refresh_clicked(GtkButton* btn G_GNUC_UNUSED, gpointer ud G_GNUC_UN
   populate_diagnostics_box();
 }
 
+void on_export_diagnostics_clicked(GtkButton* btn G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
+  debug_flush_log_repeats();
+
+  const ProcessTelemetry tel = perf_sample_process_telemetry();
+  const StartupTimings st = perf_get_startup_timings();
+  const FrameTimeTracker::Stats fs = perf_get_overview_frame_stats();
+  const vd::DesktopSnapshot ds = vd::cached_snapshot();
+  const auto caps = capability_snapshot_all();
+
+  std::string summary;
+  char line[512];
+  std::snprintf(
+      line, sizeof(line),
+      "Safe Mode      : %s\n"
+      "Memory         : RSS=%.1f MiB, Private=%.1f MiB, GDI=%lu, USER=%lu\n"
+      "Startup        : Total=%.1fms (Font=%.1fms [%d/%d], Panel=%.1fms, Overview=%.1fms, IPC=%.1fms)\n"
+      "Overview Anim  : Frames=%llu, Dropped=%llu, Avg=%.2fms, P95=%.2fms, Max=%.2fms\n"
+      "VD Cache       : %s (count=%d, active=%d)\n",
+      is_safe_mode() ? "true" : "false",
+      static_cast<double>(tel.working_set_bytes) / (1024.0 * 1024.0),
+      static_cast<double>(tel.private_bytes) / (1024.0 * 1024.0),
+      static_cast<unsigned long>(tel.gdi_objects),
+      static_cast<unsigned long>(tel.user_objects),
+      st.total_startup_ms, st.fontmap_ms, st.fonts_loaded_files,
+      st.fonts_family_count, st.panel_ms, st.overview_init_ms, st.ipc_ms,
+      static_cast<unsigned long long>(fs.frames),
+      static_cast<unsigned long long>(fs.dropped_frames),
+      fs.avg_frame_ms, fs.p95_frame_ms, fs.max_frame_ms,
+      ds.valid ? "ready" : "pending/fallback", ds.count, ds.active_index + 1);
+  summary += line;
+  summary += "\nSubsystems:\n";
+  for (const auto& c : caps) {
+    std::snprintf(line, sizeof(line), "  - %s [%s | err=%lu]: %s\n",
+                  c.name != nullptr ? c.name : "?",
+                  capability_state_label(c.state),
+                  static_cast<unsigned long>(c.failure_count),
+                  c.detail.empty() ? "-" : c.detail.c_str());
+    summary += line;
+  }
+
+  DiagnosticsExportOptions opts{};
+  opts.data_dir = local_app_winome_dir(nullptr);
+  opts.extra_summary_text = std::move(summary);
+  opts.flush_stdio = true;
+
+  const auto live_logs = debug_get_logs_since(0, "", 600);
+  if (!live_logs.empty()) {
+    opts.extra_files.push_back(
+        {"debug/live-logs.json", debug_logs_to_json(live_logs)});
+  }
+  const auto wins = debug_inspect_windows();
+  if (!wins.empty()) {
+    opts.extra_files.push_back(
+        {"debug/zorder-windows.json", debug_windows_to_json(wins)});
+  }
+
+  const DiagnosticsExportResult res = export_diagnostics_bundle(opts);
+  if (res.ok) {
+    reveal_file_in_explorer(res.zip_path);
+    if (g_ui.diag_export_status != nullptr) {
+      std::string msg = std::string(tr("Exported (", "已导出排障包（共 ")) +
+                        std::to_string(res.file_count) +
+                        tr(" files): ", " 个文件）：") +
+                        utf8_from_wide(res.zip_path);
+      gtk_label_set_text(GTK_LABEL(g_ui.diag_export_status), msg.c_str());
+      gtk_widget_set_visible(g_ui.diag_export_status, TRUE);
+    }
+  } else if (g_ui.diag_export_status != nullptr) {
+    std::string msg = std::string(tr("Export failed: ", "导出失败：")) + res.error;
+    gtk_label_set_text(GTK_LABEL(g_ui.diag_export_status), msg.c_str());
+    gtk_widget_set_visible(g_ui.diag_export_status, TRUE);
+  }
+}
+
 void on_stack_page_changed(GObject* obj, GParamSpec* pspec G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
   const char* name = gtk_stack_get_visible_child_name(GTK_STACK(obj));
   if (name != nullptr && std::string(name) == "diagnostics")
@@ -754,6 +866,7 @@ void on_window_destroy(GtkWidget* widget G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSE
   g_ui.dev_mode_switch = nullptr;
   g_ui.dev_console_btn = nullptr;
   g_ui.diag_box = nullptr;
+  g_ui.diag_export_status = nullptr;
 }
 
 GtkWidget* build_appearance_page() {
@@ -945,6 +1058,37 @@ GtkWidget* build_behavior_page() {
                g_ui.dash_scope_drop),
       true);
 
+  const char* const ws_modes[] = {
+      tr("Independent per Display (WINOME)", "每显示器独立工作区（WINOME 引擎）"),
+      tr("Primary Display Only (GNOME Default)", "仅主显示器使用工作区（GNOME 默认）"),
+      tr("Workspaces Span Displays", "工作区跨越所有显示器（全局同步）"),
+      nullptr};
+  g_ui.ws_mode_drop = gtk_drop_down_new_from_strings(ws_modes);
+  g_signal_connect(g_ui.ws_mode_drop, "notify::selected",
+                   G_CALLBACK(on_ws_mode_changed), nullptr);
+  append_row_to_card(
+      trig_card,
+      make_row(tr("Multi-Monitor Workspaces", "多显示器工作区模式"),
+               tr("Switch each display independently (built-in engine), keep secondary displays fixed (GNOME default), or switch all displays together",
+                  "独立切换每块显示器的工作区（1屏切换不影响2屏），或采用 GNOME 默认（仅主屏切换、副屏固定）及全局同步切换"),
+               g_ui.ws_mode_drop),
+      true);
+
+  const char* const ov_link_modes[] = {
+      tr("Independent (Simultaneous, Unlinked)", "允许同时打开（各屏独立开关，不联动）"),
+      tr("Linked (Open / Close All Together)", "允许同时打开（全屏联动开关）"),
+      nullptr};
+  g_ui.overview_linked_drop = gtk_drop_down_new_from_strings(ov_link_modes);
+  g_signal_connect(g_ui.overview_linked_drop, "notify::selected",
+                   G_CALLBACK(on_overview_linked_changed), nullptr);
+  append_row_to_card(
+      trig_card,
+      make_row(tr("Multi-Monitor Overview", "多显示器概览行为"),
+               tr("Allow each display to open/close Overview independently at the same time, or link all displays to open/close together",
+                  "默认允许在各显示器上分别同时打开或关闭概览（互不联动），也可切换为触发任一屏时全屏联动展开/关闭"),
+               g_ui.overview_linked_drop),
+      true);
+
   g_ui.end_session_confirm_switch = gtk_switch_new();
   g_signal_connect(g_ui.end_session_confirm_switch, "state-set",
                    G_CALLBACK(on_end_session_confirm_set), nullptr);
@@ -1126,6 +1270,19 @@ GtkWidget* build_about_page() {
                crash_btn),
       true);
 
+  GtkWidget* about_export_btn =
+      gtk_button_new_with_label(tr("Export .zip", "导出排障包"));
+  gtk_widget_set_name(about_export_btn, "winomeSettingsButton");
+  g_signal_connect(about_export_btn, "clicked",
+                   G_CALLBACK(on_export_diagnostics_clicked), nullptr);
+  append_row_to_card(
+      info_card,
+      make_row(tr("Troubleshooting Bundle", "一键导出排障信息压缩包"),
+               tr("Package logs, crash minidumps, config, and display/telemetry report into a .zip on Desktop",
+                  "将运行日志、崩溃转储、配置文件与多屏/遥测摘要打包为桌面 .zip 文件，方便反馈问题"),
+               about_export_btn),
+      true);
+
   append_row_to_card(
       info_card,
       make_row(tr("Recovery Command", "桌面恢复命令"),
@@ -1140,17 +1297,31 @@ GtkWidget* build_diagnostics_page() {
   GtkWidget* page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
   gtk_widget_set_name(page, "winomeSettingsPage");
 
-  GtkWidget* hdr = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+  GtkWidget* hdr = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
   GtkWidget* title = make_section_label(
       tr("Runtime Health & Performance", "运行时健康状态与性能遥测"));
   gtk_widget_set_hexpand(title, TRUE);
+  GtkWidget* export_btn =
+      gtk_button_new_with_label(tr("Export Diagnostics (.zip)", "一键导出排障包"));
+  gtk_widget_set_name(export_btn, "winomeSettingsButton");
+  g_signal_connect(export_btn, "clicked",
+                   G_CALLBACK(on_export_diagnostics_clicked), nullptr);
   GtkWidget* refresh_btn = gtk_button_new_with_label(tr("Refresh", "刷新"));
   gtk_widget_set_name(refresh_btn, "winomeSettingsButton");
   g_signal_connect(refresh_btn, "clicked",
                    G_CALLBACK(on_diag_refresh_clicked), nullptr);
   gtk_box_append(GTK_BOX(hdr), title);
+  gtk_box_append(GTK_BOX(hdr), export_btn);
   gtk_box_append(GTK_BOX(hdr), refresh_btn);
   gtk_box_append(GTK_BOX(page), hdr);
+
+  g_ui.diag_export_status = gtk_label_new("");
+  gtk_widget_set_name(g_ui.diag_export_status, "winomeSettingsDim");
+  gtk_label_set_xalign(GTK_LABEL(g_ui.diag_export_status), 0.0f);
+  gtk_label_set_wrap(GTK_LABEL(g_ui.diag_export_status), TRUE);
+  gtk_label_set_selectable(GTK_LABEL(g_ui.diag_export_status), TRUE);
+  gtk_widget_set_visible(g_ui.diag_export_status, FALSE);
+  gtk_box_append(GTK_BOX(page), g_ui.diag_export_status);
 
   g_ui.diag_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
   gtk_box_append(GTK_BOX(page), g_ui.diag_box);

@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <windows.h>
+
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -175,6 +177,11 @@ void stop_overview_trigger();
 // diagnostics (which trigger fired); may be null.
 void open_overview(const char *source);
 
+// Open the Activities overview on a specific target monitor (or relocate an
+// already-open overview to @monitor if it is currently on another display).
+// Passing nullptr targets the active (pointer/foreground) monitor.
+void open_overview_for_monitor(const char *source, HMONITOR monitor);
+
 // Close the Activities overview if it is running. Thread-safe; safe to call
 // from the overview window's own click handlers. @source is a diagnostic tag
 // identifying the close path; may be null.
@@ -184,13 +191,20 @@ void close_overview(const char *source);
 // @source is a diagnostic tag; may be null.
 void toggle_overview(const char *source);
 
+// Toggle the Activities overview for a specific monitor: if open on a
+// different monitor, relocates it to @monitor instead of closing.
+void toggle_overview_for_monitor(const char *source, HMONITOR monitor);
+
 // Open the Windows Start menu via a synthetic (tagged) Win key press; the
 // tag lets our own keyboard hook pass it through to the system. Used by the
 // overview dash "Show Apps" button.
 void open_start_menu();
 
-// Whether the Activities overview is currently open.
+// Whether the Activities overview is currently open on any monitor.
 bool overview_active();
+
+// Synchronize the trigger's active flag with actual open state (main thread).
+void sync_overview_active_state(bool active);
 
 // Register a callback for overview open/close state changes. Only one
 // callback is kept; pass NULL to unregister.

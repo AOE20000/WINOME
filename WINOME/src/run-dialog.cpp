@@ -8,6 +8,7 @@
 #include "fonts.h"
 #include "host-utils.h"
 #include "i18n.h"
+#include "monitor-manager.h"
 
 #include <dwmapi.h>
 #include <gdk/win32/gdkwin32.h>
@@ -286,16 +287,14 @@ void position_run_dialog(GtkWidget* dlg, int dlg_w, int dlg_h) {
   SetWindowLongPtrW(hwnd, GWL_EXSTYLE,
                     (ex | WS_EX_TOOLWINDOW | WS_EX_TOPMOST) & ~WS_EX_APPWINDOW);
 
-  RECT wa{};
-  SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+  const RECT wa = monitor_manager_active_workarea();
   RECT wr{};
   GetWindowRect(hwnd, &wr);
   const int scale = std::max(1, gtk_widget_get_scale_factor(dlg));
   const int w = (wr.right - wr.left) > 32 ? (wr.right - wr.left) : dlg_w * scale;
   const int h = (wr.bottom - wr.top) > 32 ? (wr.bottom - wr.top) : dlg_h * scale;
-  const int x = wa.left + ((wa.right - wa.left) - w) / 2;
-  const int y = wa.top + ((wa.bottom - wa.top) - h) / 3;
-  SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+  const POINT pos = center_rect_in_bounds(wa, w, h, 1.0 / 3.0);
+  SetWindowPos(hwnd, HWND_TOPMOST, pos.x, pos.y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
 }
 
 void on_entry_changed(GtkEditable* ed G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {

@@ -23,6 +23,7 @@
 #include "st-engine.h"
 #include "system-status.h"
 #include "virtual-desktop.h"
+#include "workspace-manager.h"
 #include "wifi-networks.h"
 #include "quick-settings.h"
 #include "notifications.h"
@@ -31,6 +32,7 @@
 #include "overview.h"
 #include "fonts.h"
 #include "fullscreen-watcher.h"
+#include "monitor-manager.h"
 
 #include <gdk/win32/gdkwin32.h>
 #include <dwmapi.h>
@@ -488,6 +490,8 @@ winome_activities_btn_set_desktop (GtkWidget *widget, int count, int active)
   }
 }
 
+static HMONITOR widget_monitor_handle (GtkWidget *widget);
+
 static void
 winome_activities_btn_set_scroll (GtkWidget *widget, int count, double position)
 {
@@ -496,10 +500,10 @@ winome_activities_btn_set_scroll (GtkWidget *widget, int count, double position)
   WinomeActivitiesBtn *self = WINOME_ACTIVITIES_BTN (widget);
   if (position < 0.0) {
     self->external_scroll = false;
-    const auto snap = winome::vd::cached_snapshot ();
+    HMONITOR mon = widget_monitor_handle (widget);
     winome_activities_btn_set_desktop (
-        widget, snap.valid ? snap.count : self->dot_count,
-        snap.valid ? snap.active_index : static_cast<int> (std::lround (self->target_pos)));
+        widget, winome::ws::count_for_monitor (mon),
+        winome::ws::active_for_monitor (mon));
     return;
   }
 
@@ -547,6 +551,23 @@ on_activities_pressed (GtkGestureClick *gesture G_GNUC_UNUSED,
   gtk_widget_queue_draw (GTK_WIDGET (self));
 }
 
+static HMONITOR
+widget_monitor_handle (GtkWidget *widget)
+{
+  if (widget == nullptr)
+    return nullptr;
+  GtkWidget *root = GTK_WIDGET (gtk_widget_get_root (widget));
+  if (root == nullptr)
+    return nullptr;
+  GdkSurface *surf = gtk_native_get_surface (GTK_NATIVE (root));
+  if (surf == nullptr)
+    return nullptr;
+  HWND hwnd = static_cast<HWND> (gdk_win32_surface_get_handle (surf));
+  if (hwnd == nullptr || !IsWindow (hwnd))
+    return nullptr;
+  return MonitorFromWindow (hwnd, MONITOR_DEFAULTTONEAREST);
+}
+
 static void
 on_activities_released (GtkGestureClick *gesture G_GNUC_UNUSED,
                         int n_press G_GNUC_UNUSED,
@@ -559,8 +580,10 @@ on_activities_released (GtkGestureClick *gesture G_GNUC_UNUSED,
   gtk_widget_queue_draw (GTK_WIDGET (self));
   const int w = gtk_widget_get_width (GTK_WIDGET (self));
   const int h = gtk_widget_get_height (GTK_WIDGET (self));
-  if (was_pressed && x >= 0.0 && x <= w && y >= 0.0 && y <= h)
-    winome::toggle_overview ("activities-button");
+  if (was_pressed && x >= 0.0 && x <= w && y >= 0.0 && y <= h) {
+    HMONITOR mon = widget_monitor_handle (GTK_WIDGET (self));
+    winome::toggle_overview_for_monitor ("activities-button", mon);
+  }
 }
 
 static void
@@ -594,7 +617,7 @@ static gint64 g_last_activities_scroll_us = 0;
 static gboolean
 on_activities_scroll (GtkEventControllerScroll *ctrl G_GNUC_UNUSED,
                       double dx, double dy,
-                      gpointer user_data G_GNUC_UNUSED)
+                      gpointer user_data)
 {
   double delta = (fabs (dy) >= fabs (dx)) ? dy : dx;
   if (fabs (delta) < 1e-4)
@@ -602,16 +625,16 @@ on_activities_scroll (GtkEventControllerScroll *ctrl G_GNUC_UNUSED,
   const gint64 now_us = g_get_monotonic_time ();
   if (now_us - g_last_activities_scroll_us < 150 * 1000)
     return GDK_EVENT_STOP;
-  const auto snap = winome::vd::cached_snapshot ();
-  const int count = snap.valid ? snap.count : winome::vd::count ();
-  const int cur = snap.valid ? snap.active_index : winome::vd::current_index ();
+  HMONITOR mon = widget_monitor_handle (GTK_WIDGET (user_data));
+  const int count = winome::ws::count_for_monitor (mon);
+  const int cur = winome::ws::active_for_monitor (mon);
   if (count <= 1 || cur < 0)
     return GDK_EVENT_STOP;
   const int target = cur + (delta > 0.0 ? 1 : -1);
   if (target < 0 || target >= count)
     return GDK_EVENT_STOP;
   g_last_activities_scroll_us = now_us;
-  winome::vd::switch_to (target);
+  winome::ws::switch_to (mon, target);
   return GDK_EVENT_STOP;
 }
 
@@ -646,7 +669,7 @@ create_activities_button (GtkWidget **out_indicators)
   GtkEventController *scroll = gtk_event_controller_scroll_new (
       GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
   g_signal_connect (scroll, "scroll", G_CALLBACK (on_activities_scroll),
-                    nullptr);
+                    button);
   gtk_widget_add_controller (button, scroll);
 
   return button;
@@ -791,6 +814,18 @@ winome_panel_layout_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
 }
 
 static void
+winome_panel_layout_dispose (GObject *object)
+{
+  WinomePanelLayout *self = WINOME_PANEL_LAYOUT (object);
+
+  g_clear_pointer (&self->start, gtk_widget_unparent);
+  g_clear_pointer (&self->center, gtk_widget_unparent);
+  g_clear_pointer (&self->end, gtk_widget_unparent);
+
+  G_OBJECT_CLASS (winome_panel_layout_parent_class)->dispose (object);
+}
+
+static void
 winome_panel_layout_init (WinomePanelLayout *self)
 {
   self->overview_progress = 0.0;
@@ -799,8 +834,10 @@ winome_panel_layout_init (WinomePanelLayout *self)
 static void
 winome_panel_layout_class_init (WinomePanelLayoutClass *klass)
 {
+  GObjectClass *object_class = G_OBJECT_CLASS (klass);
   GtkWidgetClass *widget_class = GTK_WIDGET_CLASS (klass);
 
+  object_class->dispose = winome_panel_layout_dispose;
   widget_class->measure = winome_panel_layout_measure;
   widget_class->size_allocate = winome_panel_layout_size_allocate;
   widget_class->snapshot = winome_panel_layout_snapshot;
@@ -811,13 +848,21 @@ winome_panel_layout_set (GtkWidget *layout,
                          GtkWidget *start, GtkWidget *center, GtkWidget *end)
 {
   WinomePanelLayout *self = WINOME_PANEL_LAYOUT (layout);
+
+  g_clear_pointer (&self->start, gtk_widget_unparent);
+  g_clear_pointer (&self->center, gtk_widget_unparent);
+  g_clear_pointer (&self->end, gtk_widget_unparent);
+
   self->start = start;
   self->center = center;
   self->end = end;
 
-  gtk_widget_set_parent (start, layout);
-  gtk_widget_set_parent (center, layout);
-  gtk_widget_set_parent (end, layout);
+  if (start != nullptr)
+    gtk_widget_set_parent (start, layout);
+  if (center != nullptr)
+    gtk_widget_set_parent (center, layout);
+  if (end != nullptr)
+    gtk_widget_set_parent (end, layout);
 }
 
 // --- Clock ------------------------------------------------------------------
@@ -853,6 +898,8 @@ is_24h_clock (void)
 static gboolean
 update_clock (gpointer data)
 {
+  if (data == nullptr || !GTK_IS_LABEL (data))
+    return G_SOURCE_REMOVE;
   GtkLabel *clock = GTK_LABEL (data);
   GDateTime *now;
   gchar *text;
@@ -907,6 +954,7 @@ typedef struct {
 } PanelPopover;
 
 static GList *g_open_popovers = NULL;
+static std::vector<PanelPopover *> g_live_popovers;
 static HHOOK g_popover_mouse_hook = NULL;
 static gboolean g_overview_hooked = FALSE;
 // Monotonic time of the last popover dismissal by an outside click while the
@@ -999,12 +1047,15 @@ panel_popover_anchor_rect (PanelPopover *pp)
   RECT pr;
   GetWindowRect (panel_hwnd, &pr);
 
+  const int scale = std::max (1, gdk_surface_get_scale_factor (surface));
   graphene_rect_t b;
   if (gtk_widget_compute_bounds (anchor, root, &b)) {
-    pp->anchor_rect.left = pr.left + (LONG) b.origin.x;
-    pp->anchor_rect.top = pr.top + (LONG) b.origin.y;
-    pp->anchor_rect.right = pp->anchor_rect.left + (LONG) b.size.width;
-    pp->anchor_rect.bottom = pp->anchor_rect.top + (LONG) b.size.height;
+    pp->anchor_rect.left = pr.left + static_cast<LONG> (std::lround (b.origin.x * scale));
+    pp->anchor_rect.top = pr.top + static_cast<LONG> (std::lround (b.origin.y * scale));
+    pp->anchor_rect.right =
+        pp->anchor_rect.left + static_cast<LONG> (std::lround (b.size.width * scale));
+    pp->anchor_rect.bottom =
+        pp->anchor_rect.top + static_cast<LONG> (std::lround (b.size.height * scale));
   }
 }
 
@@ -1153,39 +1204,33 @@ static gboolean
 panel_popover_geometry (PanelPopover *pp, int width, int height,
                         int *out_x, int *out_y)
 {
+  if (pp == nullptr || pp->button == nullptr)
+    return FALSE;
   GtkWidget *root = GTK_WIDGET (gtk_widget_get_root (pp->button));
   if (root == nullptr)
     return FALSE;
   GdkSurface *ps = gtk_native_get_surface (GTK_NATIVE (root));
+  HWND panel_hwnd = ps != nullptr
+      ? static_cast<HWND> (gdk_win32_surface_get_handle (ps))
+      : nullptr;
   RECT pr = {};
-  if (ps == nullptr ||
-      !GetWindowRect (static_cast<HWND> (gdk_win32_surface_get_handle (ps)),
-                      &pr))
+  if (panel_hwnd == nullptr || !GetWindowRect (panel_hwnd, &pr))
     return FALSE;
 
-  HWND hwnd = panel_popover_hwnd (pp);
-  HMONITOR mon = MonitorFromWindow (hwnd, MONITOR_DEFAULTTONEAREST);
+  // Always resolve the target monitor from the anchor panel HWND (never from
+  // the popover HWND, which lives on the primary monitor before first placement).
+  HMONITOR mon = MonitorFromWindow (panel_hwnd, MONITOR_DEFAULTTONEAREST);
   MONITORINFO mi = {};
   mi.cbSize = sizeof (mi);
   if (!GetMonitorInfoW (mon, &mi))
     return FALSE;
-  RECT wa = mi.rcMonitor;
 
-  // Right-align for the quick settings; center on the clock for the calendar.
-  int x = pp->centered
-      ? (pp->anchor_rect.left + pp->anchor_rect.right) / 2 - width / 2
-      : wa.right - width - POPOVER_SIDE_GAP;
-
-  // A stable gap below the panel (the panel spans the monitor top).
-  int y = pr.bottom + POPOVER_TOP_GAP;
-
-  // Clamp inside the monitor.
-  int x_min = wa.left + POPOVER_SCREEN_GAP;
-  int x_max = MAX (x_min, wa.right - width - POPOVER_SCREEN_GAP);
-  int y_min = pr.bottom + POPOVER_TOP_GAP;
-  int y_max = MAX (y_min, wa.bottom - height - POPOVER_SCREEN_GAP);
-  *out_x = CLAMP (x, x_min, x_max);
-  *out_y = CLAMP (y, y_min, y_max);
+  const POINT pos = winome::clamp_popover_origin_to_monitor (
+      mi.rcMonitor, pr.bottom, pp->anchor_rect, width, height,
+      pp->centered != FALSE, POPOVER_TOP_GAP, POPOVER_SIDE_GAP,
+      POPOVER_SCREEN_GAP);
+  *out_x = pos.x;
+  *out_y = pos.y;
   return TRUE;
 }
 
@@ -1248,7 +1293,11 @@ panel_popover_close_ex (PanelPopover *pp, const char *reason, gboolean immediate
   winome::tween_opacity (
       pp->wrap, cur_op, 0.0, winome::BOXPOPOVER_ANIMATION_TIME,
       winome::Ease::ease_out_quad, [pp, gen] () {
-        if (pp->open || pp->anim_gen != gen)
+        if (std::find (g_live_popovers.begin (), g_live_popovers.end (), pp) ==
+            g_live_popovers.end ()) {
+          return;
+        }
+        if (pp->open || pp->anim_gen != gen || pp->window == nullptr)
           return;
         panel_popover_hide_now (pp);
       });
@@ -1636,6 +1685,23 @@ winome_shell_panel_set_overview_progress (double progress)
 }
 
 void
+winome_shell_panel_set_overview_progress_for_monitor (void *hmonitor,
+                                                      double progress)
+{
+  if (hmonitor == nullptr) {
+    winome_shell_panel_set_overview_progress (progress);
+    return;
+  }
+  const double p = std::clamp (progress, 0.0, 1.0);
+  HMONITOR target = static_cast<HMONITOR> (hmonitor);
+  for (GtkWidget *panel : g_registered_panels) {
+    HMONITOR pmon = widget_monitor_handle (panel);
+    if (pmon == target)
+      apply_panel_overview_progress (panel, p);
+  }
+}
+
+void
 winome_shell_panel_set_workspace_scroll (int count, double position)
 {
   if (position < 0.0) {
@@ -1656,7 +1722,15 @@ winome_shell_panel_set_workspace_scroll (int count, double position)
   g_panel_scroll_active = true;
   g_panel_scroll_count = count;
   g_panel_scroll_pos = std::clamp (position, 0.0, static_cast<double> (count - 1));
+  const bool per_mon =
+      winome::ws::effective_mode () != winome::ws::MultiMonitorWorkspaceMode::Span;
+  HMONITOR ov_mon = per_mon ? winome::overview_target_monitor () : nullptr;
   for (GtkWidget *panel : g_registered_panels) {
+    if (per_mon && ov_mon != nullptr) {
+      HMONITOR pmon = widget_monitor_handle (panel);
+      if (pmon != nullptr && pmon != ov_mon)
+        continue;
+    }
     GtkWidget *act_btn = static_cast<GtkWidget *> (
         g_object_get_data (G_OBJECT (panel), "activities-button"));
     if (act_btn != nullptr) {
@@ -1664,6 +1738,36 @@ winome_shell_panel_set_workspace_scroll (int count, double position)
                                         g_panel_scroll_pos);
     }
   }
+}
+
+static void
+on_popover_button_destroy (GtkWidget *button, gpointer data)
+{
+  PanelPopover *pp = static_cast<PanelPopover *> (data);
+  if (pp == nullptr)
+    return;
+  g_object_set_data (G_OBJECT (button), "popover", nullptr);
+  g_live_popovers.erase (
+      std::remove (g_live_popovers.begin (), g_live_popovers.end (), pp),
+      g_live_popovers.end ());
+  pp->open = FALSE;
+  ++pp->anim_gen;
+  panel_popover_cancel_raise (pp);
+  g_open_popovers = g_list_remove (g_open_popovers, pp);
+  if (g_open_popovers == nullptr && g_popover_mouse_hook != nullptr) {
+    UnhookWindowsHookEx (g_popover_mouse_hook);
+    g_popover_mouse_hook = nullptr;
+  }
+  pp->button = nullptr;
+  GtkWidget *win = pp->window;
+  pp->window = nullptr;
+  pp->wrap = nullptr;
+  pp->arrow_area = nullptr;
+  pp->card = nullptr;
+  pp->child = nullptr;
+  if (win != nullptr && GTK_IS_WINDOW (win))
+    gtk_window_destroy (GTK_WINDOW (win));
+  g_free (pp);
 }
 
 // A popover anchored to the given panel button: a borderless toplevel card
@@ -1674,6 +1778,7 @@ static GtkWidget *
 make_panel_popover (GtkWidget *button, GtkWidget *child, gboolean centered)
 {
   PanelPopover *pp = g_new0 (PanelPopover, 1);
+  g_live_popovers.push_back (pp);
   pp->button = button;
   pp->centered = centered;
 
@@ -1716,6 +1821,7 @@ make_panel_popover (GtkWidget *button, GtkWidget *child, gboolean centered)
 
   g_object_set_data (G_OBJECT (button), "popover", pp);
   g_signal_connect (button, "clicked", G_CALLBACK (on_click_popover), pp);
+  g_signal_connect (button, "destroy", G_CALLBACK (on_popover_button_destroy), pp);
 
   // Raise above the (topmost) overview only after GDK's map completes.
   g_signal_connect (pp->window, "map", G_CALLBACK (on_popover_map), pp);
@@ -1749,6 +1855,7 @@ winome_shell_panel_close_popovers_immediate (void)
 }
 typedef struct PanelStatus {
   bool is_primary;
+  bool destroyed;
   guint status_timer_id;
   guint clock_timer_id;
   GtkWidget *activities_indicators;
@@ -1797,16 +1904,30 @@ apply_activities_dots (PanelStatus *st, int count, int active)
 static void
 sync_activities_dots (PanelStatus *st)
 {
-  const auto snap = winome::vd::cached_snapshot ();
-  apply_activities_dots (st, snap.valid ? snap.count : 1,
-                         snap.valid ? snap.active_index : 0);
+  if (st == nullptr || st->destroyed)
+    return;
+  HMONITOR mon = widget_monitor_handle (st->activities_indicators);
+  if (mon == nullptr && st->is_primary)
+    mon = winome::monitor_manager_primary_monitor ();
+  apply_activities_dots (st, winome::ws::count_for_monitor (mon),
+                         winome::ws::active_for_monitor (mon));
 }
 
 static void
-on_panel_desktop_changed (int count, int active_index, void *user_data)
+on_panel_desktop_changed (HMONITOR monitor, int count, int active_index,
+                          void *user_data)
 {
-  apply_activities_dots (static_cast<PanelStatus *> (user_data), count,
-                         active_index);
+  PanelStatus *st = static_cast<PanelStatus *> (user_data);
+  if (st == nullptr || st->destroyed)
+    return;
+  if (monitor != nullptr) {
+    HMONITOR panel_mon = widget_monitor_handle (st->activities_indicators);
+    if (panel_mon == nullptr && st->is_primary)
+      panel_mon = winome::monitor_manager_primary_monitor ();
+    if (panel_mon != nullptr && panel_mon != monitor)
+      return;
+  }
+  apply_activities_dots (st, count, active_index);
 }
 
 // In GNOME the hover/active highlight lives on the .clock child (an St.Widget).
@@ -1825,14 +1946,46 @@ update_messages_indicator (PanelStatus *st)
     gtk_widget_set_visible (st->messages_indicator_pad, show ? TRUE : FALSE);
 }
 
+static void
+clear_glib_source (guint *source_id)
+{
+  if (source_id == nullptr || *source_id == 0)
+    return;
+  const guint id = *source_id;
+  *source_id = 0;
+  if (g_main_context_find_source_by_id (nullptr, id) != nullptr)
+    g_source_remove (id);
+}
+
+static void
+track_panel_widget (GtkWidget **slot, GtkWidget *widget)
+{
+  if (slot == nullptr)
+    return;
+  if (*slot != nullptr) {
+    g_object_remove_weak_pointer (G_OBJECT (*slot),
+                                  reinterpret_cast<gpointer *> (slot));
+    *slot = nullptr;
+  }
+  if (widget != nullptr) {
+    *slot = widget;
+    g_object_add_weak_pointer (G_OBJECT (widget),
+                               reinterpret_cast<gpointer *> (slot));
+  }
+}
+
 static void reschedule_clock_timer (PanelStatus *st);
 
 static gboolean
 on_clock_second_tick (gpointer data)
 {
   auto *st = static_cast<PanelStatus *> (data);
-  if (st == nullptr || st->clock_label == nullptr)
+  if (st == nullptr || st->destroyed || st->clock_label == nullptr ||
+      !GTK_IS_LABEL (st->clock_label)) {
+    if (st != nullptr)
+      st->clock_timer_id = 0;
     return G_SOURCE_REMOVE;
+  }
   update_clock (st->clock_label);
   if (!winome::get_config ().clock_show_seconds) {
     st->clock_timer_id = 0;
@@ -1846,8 +1999,12 @@ static gboolean
 on_clock_minute_tick (gpointer data)
 {
   auto *st = static_cast<PanelStatus *> (data);
-  if (st == nullptr || st->clock_label == nullptr)
+  if (st == nullptr || st->destroyed || st->clock_label == nullptr ||
+      !GTK_IS_LABEL (st->clock_label)) {
+    if (st != nullptr)
+      st->clock_timer_id = 0;
     return G_SOURCE_REMOVE;
+  }
   st->clock_timer_id = 0;
   reschedule_clock_timer (st);
   return G_SOURCE_REMOVE;
@@ -1856,11 +2013,12 @@ on_clock_minute_tick (gpointer data)
 static void
 reschedule_clock_timer (PanelStatus *st)
 {
-  if (st == nullptr || st->clock_label == nullptr)
+  if (st == nullptr)
     return;
-  if (st->clock_timer_id != 0) {
-    g_source_remove (st->clock_timer_id);
-    st->clock_timer_id = 0;
+  clear_glib_source (&st->clock_timer_id);
+  if (st->destroyed || st->clock_label == nullptr ||
+      !GTK_IS_LABEL (st->clock_label)) {
+    return;
   }
   update_clock (st->clock_label);
   if (winome::get_config ().clock_show_seconds) {
@@ -1930,9 +2088,9 @@ create_clock_button (PanelStatus *st, bool with_popover)
 
   gtk_button_set_child (GTK_BUTTON (button), display_box);
 
-  st->messages_indicator_pad = indicator_pad;
-  st->messages_indicator = indicator;
-  st->clock_label = clock_label;
+  track_panel_widget (&st->messages_indicator_pad, indicator_pad);
+  track_panel_widget (&st->messages_indicator, indicator);
+  track_panel_widget (&st->clock_label, clock_label);
   reschedule_clock_timer (st);
   update_messages_indicator (st);
 
@@ -2101,10 +2259,13 @@ static gboolean
 refresh_status (gpointer data)
 {
   PanelStatus *st = static_cast<PanelStatus *>(data);
-  if (st == nullptr)
+  if (st == nullptr || st->destroyed) {
+    if (st != nullptr)
+      st->status_timer_id = 0;
     return G_SOURCE_REMOVE;
+  }
 
-  if (st->clock_label != nullptr)
+  if (st->clock_label != nullptr && GTK_IS_LABEL (st->clock_label))
     update_clock (st->clock_label);
   sync_activities_dots (st);
   update_messages_indicator (st);
@@ -2236,7 +2397,7 @@ compact_tray_label (const std::string &title, const std::string &app_hint)
 static void
 rebuild_tray_views (PanelStatus *st)
 {
-  if (st == nullptr)
+  if (st == nullptr || st->destroyed)
     return;
 
   std::vector<winome::TrayIconEntry> items = winome::systray_get_items ();
@@ -2678,7 +2839,7 @@ struct PanelPluginClickData {
 };
 
 static std::vector<PanelPluginSlotSpec> g_panel_plugin_slots;
-static GtkWidget *g_primary_plugin_box = nullptr;
+static std::vector<GtkWidget *> g_panel_plugin_boxes;
 static WinomePluginTopBarClickCb g_panel_plugin_click_cb = nullptr;
 
 static void
@@ -2691,12 +2852,12 @@ on_panel_plugin_btn_clicked (GtkButton *button, gpointer G_GNUC_UNUSED data)
 }
 
 static void
-rebuild_panel_plugin_slots (void)
+rebuild_panel_plugin_slots_for_box (GtkWidget *plugin_box)
 {
-  if (g_primary_plugin_box == nullptr)
+  if (plugin_box == nullptr || !GTK_IS_BOX (plugin_box))
     return;
-  clear_box_children (g_primary_plugin_box);
-  gtk_widget_set_visible (g_primary_plugin_box,
+  clear_box_children (plugin_box);
+  gtk_widget_set_visible (plugin_box,
                           g_panel_plugin_slots.empty () ? FALSE : TRUE);
 
   for (const auto &s : g_panel_plugin_slots) {
@@ -2727,8 +2888,15 @@ rebuild_panel_plugin_slots (void)
         +[](gpointer p) { delete static_cast<PanelPluginClickData *>(p); });
     g_signal_connect (btn, "clicked",
                       G_CALLBACK (on_panel_plugin_btn_clicked), nullptr);
-    gtk_box_append (GTK_BOX (g_primary_plugin_box), btn);
+    gtk_box_append (GTK_BOX (plugin_box), btn);
   }
+}
+
+static void
+rebuild_panel_plugin_slots (void)
+{
+  for (GtkWidget *box : g_panel_plugin_boxes)
+    rebuild_panel_plugin_slots_for_box (box);
 }
 
 void
@@ -2784,29 +2952,36 @@ winome_shell_panel_plugin_remove (const char *key)
 }
 
 static void
-on_panel_destroy (GtkWidget *panel, gpointer user_data)
+on_panel_destroy (GtkWidget *panel, gpointer user_data G_GNUC_UNUSED)
 {
-  PanelStatus *st = static_cast<PanelStatus *> (user_data);
   g_registered_panels.erase (
       std::remove (g_registered_panels.begin (), g_registered_panels.end (),
                    panel),
       g_registered_panels.end ());
 
+  PanelStatus *st = static_cast<PanelStatus *> (
+      g_object_steal_data (G_OBJECT (panel), "panel-status"));
   if (st != nullptr) {
-    if (st->plugin_box != nullptr && st->plugin_box == g_primary_plugin_box)
-      g_primary_plugin_box = nullptr;
-    if (st->status_timer_id != 0)
-      g_source_remove (st->status_timer_id);
-    if (st->clock_timer_id != 0)
-      g_source_remove (st->clock_timer_id);
-    winome::vd::remove_change_listener (on_panel_desktop_changed, st);
+    st->destroyed = true;
+    if (st->plugin_box != nullptr) {
+      g_panel_plugin_boxes.erase (
+          std::remove (g_panel_plugin_boxes.begin (),
+                       g_panel_plugin_boxes.end (), st->plugin_box),
+          g_panel_plugin_boxes.end ());
+    }
+    clear_glib_source (&st->status_timer_id);
+    clear_glib_source (&st->clock_timer_id);
+    winome::ws::remove_change_listener (on_panel_desktop_changed, st);
     winome::remove_config_listener (on_panel_config_changed, st);
     winome::notifications_remove_listener (on_panel_status_event, st);
-    if (st->is_primary) {
-      winome::systray_remove_listener (on_systray_changed, st);
-      winome::remove_volume_listener (on_panel_status_event, st);
-      winome_wifi_remove_listener (on_panel_status_event, st);
-    }
+    winome::systray_remove_listener (on_systray_changed, st);
+    winome::remove_volume_listener (on_panel_status_event, st);
+    winome_wifi_remove_listener (on_panel_status_event, st);
+    track_panel_widget (&st->activities_indicators, nullptr);
+    track_panel_widget (&st->clock_label, nullptr);
+    track_panel_widget (&st->messages_indicator, nullptr);
+    track_panel_widget (&st->messages_indicator_pad, nullptr);
+    track_panel_widget (&st->plugin_box, nullptr);
     g_free (st);
   }
 }
@@ -2829,6 +3004,10 @@ on_panel_realize (GtkWidget *panel, gpointer G_GNUC_UNUSED user_data)
     SetWindowPos (hwnd, nullptr, 0, 0, 0, 0,
                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
                       SWP_FRAMECHANGED);
+  }
+  if (PanelStatus *st = static_cast<PanelStatus *> (
+          g_object_get_data (G_OBJECT (panel), "panel-status"))) {
+    sync_activities_dots (st);
   }
 }
 
@@ -2869,20 +3048,27 @@ build_shell_panel (bool primary)
   status->is_primary = primary;
   status->desktop_count = -1;
   status->active_desktop = -1;
+  g_object_set_data (G_OBJECT (panel), "panel-status", status);
+  GtkWidget *activities_indicators = nullptr;
   GtkWidget *activities_btn =
-      create_activities_button (&status->activities_indicators);
+      create_activities_button (&activities_indicators);
+  track_panel_widget (&status->activities_indicators, activities_indicators);
   g_object_set_data (G_OBJECT (panel), "activities-button", activities_btn);
   gtk_box_append (GTK_BOX (left_box), activities_btn);
   sync_activities_dots (status);
-  winome::vd::add_change_listener (on_panel_desktop_changed, status);
-  gtk_box_append (GTK_BOX (center_box), create_clock_button (status, primary));
-  if (primary) {
-    status->plugin_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 2);
-    gtk_widget_set_name (status->plugin_box, "panelPlugins");
-    gtk_widget_set_visible (status->plugin_box, FALSE);
-    gtk_box_append (GTK_BOX (right_box), status->plugin_box);
-    g_primary_plugin_box = status->plugin_box;
-    rebuild_panel_plugin_slots ();
+  winome::ws::add_change_listener (on_panel_desktop_changed, status);
+  // Every monitor's top bar is fully interactive: Activities + DateMenu +
+  // Plugins + System Tray + Quick Settings, with popovers anchored to the
+  // clicked panel's monitor.
+  gtk_box_append (GTK_BOX (center_box), create_clock_button (status, true));
+  {
+    GtkWidget *plugin_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 2);
+    gtk_widget_set_name (plugin_box, "panelPlugins");
+    gtk_widget_set_visible (plugin_box, FALSE);
+    gtk_box_append (GTK_BOX (right_box), plugin_box);
+    track_panel_widget (&status->plugin_box, plugin_box);
+    g_panel_plugin_boxes.push_back (plugin_box);
+    rebuild_panel_plugin_slots_for_box (plugin_box);
 
     gtk_box_append (GTK_BOX (right_box), create_tray_button (status));
     gtk_box_append (GTK_BOX (right_box), create_quick_settings (status));
@@ -2890,18 +3076,16 @@ build_shell_panel (bool primary)
 
   winome_panel_layout_set (layout, left_box, center_box, right_box);
 
-  if (primary) {
-    refresh_status (status);
-    // Slow fallback poll for battery percentage / Bluetooth; volume, clock,
-    // WLAN, notifications, and VD push event callbacks.
-    status->status_timer_id = g_timeout_add_seconds (10, refresh_status, status);
-    winome::systray_add_listener (on_systray_changed, status);
-    winome::add_volume_listener (on_panel_status_event, status);
-    winome_wifi_add_listener (on_panel_status_event, status);
-  }
+  refresh_status (status);
+  // Slow fallback poll for battery percentage / Bluetooth; volume, clock,
+  // WLAN, notifications, and VD push event callbacks.
+  status->status_timer_id = g_timeout_add_seconds (10, refresh_status, status);
+  winome::systray_add_listener (on_systray_changed, status);
+  winome::add_volume_listener (on_panel_status_event, status);
+  winome_wifi_add_listener (on_panel_status_event, status);
   winome::add_config_listener (on_panel_config_changed, status);
   winome::notifications_add_listener (on_panel_status_event, status);
-  g_signal_connect (panel, "destroy", G_CALLBACK (on_panel_destroy), status);
+  g_signal_connect (panel, "destroy", G_CALLBACK (on_panel_destroy), nullptr);
 
   // Give the panel its own font map so the bundled Cantarell font is used.
   winome::install_bundled_fonts (panel);

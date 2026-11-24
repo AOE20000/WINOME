@@ -20,6 +20,7 @@
 #include "st-engine.h"
 #include "system-status.h"
 #include "virtual-desktop.h"
+#include "workspace-manager.h"
 
 #include <gdk/gdk.h>
 #include <gdk/win32/gdkwin32.h>
@@ -361,9 +362,9 @@ dash_collect (HWND hwnd, LPARAM lparam)
   int win_ws = -1;
   bool on_cur = false;
   if (ctx->vd_available) {
-    win_ws = vd::window_desktop_index (hwnd);
+    win_ws = ws::window_workspace (hwnd, ctx->monitor);
     if (win_ws < 0 && ctx->isolate_workspaces)
-      on_cur = vd::window_on_current (hwnd);
+      on_cur = ws::window_on_active_workspace (hwnd, ctx->monitor);
   }
   if (!should_include_dash_window (ctx->isolate_workspaces, ctx->vd_available,
                                    ctx->target_desktop, win_ws, on_cur,
@@ -383,8 +384,9 @@ dash_collect (HWND hwnd, LPARAM lparam)
   }
   if (r.right <= r.left || r.bottom <= r.top)
     return TRUE;
-  if (MonitorFromRect (&r, MONITOR_DEFAULTTONULL) != ctx->monitor)
-    return TRUE;
+  // GNOME Shell dash.js shows running apps across all monitors so users can
+  // focus/switch running applications regardless of which monitor hosts the
+  // overview.
 
   ctx->windows->push_back (DashWindowEntry{hwnd, win_ws});
   return TRUE;
@@ -564,7 +566,7 @@ activate_app (WinomeDash *self, int index)
   const DashApp &app = self->apps[index];
   const int cur_ws =
       self->last_active_desktop >= 0 ? self->last_active_desktop
-                                     : vd::current_index ();
+                                     : ws::active_for_monitor (nullptr);
   HWND best = nullptr;
   int best_ws = -1;
   // Prefer a window on the currently active workspace if available; otherwise
@@ -597,10 +599,11 @@ activate_app (WinomeDash *self, int index)
   }
 
   overview_discard_restore_focus ();
+  HMONITOR win_mon = MonitorFromWindow (best, MONITOR_DEFAULTTONEAREST);
   if (best_ws < 0 && vd::available ())
-    best_ws = vd::window_desktop_index (best);
-  if (best_ws >= 0 && best_ws != vd::current_index ())
-    vd::switch_to (best_ws);
+    best_ws = ws::window_workspace (best, win_mon);
+  if (best_ws >= 0 && best_ws != ws::active_for_monitor (win_mon))
+    ws::switch_to (win_mon, best_ws);
   if (IsIconic (best))
     ShowWindow (best, SW_RESTORE);
   SetForegroundWindow (best);
@@ -725,10 +728,11 @@ on_dash_menu_window (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
   int ws = wctx->desktop_index;
   overview_dash_close_menu (GTK_WIDGET (self));
   overview_discard_restore_focus ();
+  HMONITOR win_mon = MonitorFromWindow (hwnd, MONITOR_DEFAULTTONEAREST);
   if (ws < 0 && vd::available ())
-    ws = vd::window_desktop_index (hwnd);
-  if (ws >= 0 && ws != vd::current_index ())
-    vd::switch_to (ws);
+    ws = ws::window_workspace (hwnd, win_mon);
+  if (ws >= 0 && ws != ws::active_for_monitor (win_mon))
+    ws::switch_to (win_mon, ws);
   if (app_index_activate_hwnd (hwnd))
     close_overview ("dash-activate-window");
 }
@@ -820,10 +824,11 @@ show_dash_context_menu (WinomeDash *self, int index)
     gtk_box_append (GTK_BOX (box), hdr);
 
     const bool show_ws_tag =
-        !get_config ().dash_isolate_workspaces && vd::count () > 1;
+        !get_config ().dash_isolate_workspaces &&
+        ws::count_for_monitor (nullptr) > 1;
     const int cur_ws =
         self->last_active_desktop >= 0 ? self->last_active_desktop
-                                       : vd::current_index ();
+                                       : ws::active_for_monitor (nullptr);
     int shown = 0;
     for (size_t wi = 0; wi < app.windows.size () && shown < 8; ++wi) {
       HWND hwnd = app.windows[wi];
@@ -1527,7 +1532,7 @@ overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height,
   const bool vd_avail = vd::available ();
   const int target_ws =
       (active_desktop >= 0) ? active_desktop
-                            : (vd_avail ? vd::current_index () : -1);
+                            : (vd_avail ? ws::active_for_monitor (monitor) : -1);
   std::vector<DashWindowEntry> windows;
   EnumCtx ctx{monitor, &windows, vd_avail, cfg.dash_isolate_workspaces,
               target_ws, cfg.overview_window_blacklist};
