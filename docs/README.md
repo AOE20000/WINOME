@@ -20,15 +20,15 @@
 1. **技术路线**：在 Windows 上用原生 Win32/COM 能力支撑的 GNOME Shell UI 复刻。宿主单进程 `winome.exe`（C++17 + GTK4），无注入、无核心 UI DLL；核心模块按 `upstream/gnome-shell` 逐组件移植，`upstream/` 与 `extracted/` 用作只读/派生参考（其中 `upstream/Seelen-UI` 受 AGPL 约束仅作功能思路致谢，不派生其代码）。
 2. **注释与文档语言**：源码注释使用英文；技术散文与开发文档使用中文。
 3. **模块职责边界**：
-   - 概览、动态壁纸同步、应用索引与分页网格 → `WINOME/src/overview*.cpp`、`live-wallpaper.cpp`、`app-index.cpp`、`app-grid.cpp`
+   - 概览（含多屏同时概览）、动态壁纸同步、应用索引与分页网格 → `WINOME/src/overview*.cpp`、`overview-secondary.cpp`、`live-wallpaper.cpp`、`app-index.cpp`、`app-grid.cpp`
    - 顶栏、工作区保留与弹出窗窗口壳 → `WINOME/src/shell-panel.cpp`
    - 多显示器拓扑、全屏与锁屏监测 → `WINOME/src/monitor-manager.cpp`、`fullscreen-watcher.cpp`
    - 快速设置面板与系统托盘 → `WINOME/src/quick-settings.cpp`、`systray.cpp`
    - 日历、通知中心与媒体卡片 → `WINOME/src/calendar.cpp`、`notifications.cpp`、`winrt-bridge.cpp`
-   - 虚拟桌面 COM 与窗口移动/创建/关闭 → `WINOME/src/virtual-desktop.cpp`
+   - 多屏独立工作区引擎与虚拟桌面 COM → `WINOME/src/workspace-manager.cpp`、`virtual-desktop.cpp`
    - 系统数据源 → `WINOME/src/system-status.cpp`、`wifi-networks.cpp`、`power-modes.cpp`
    - 配置、国际化与设置窗口 → `WINOME/src/config.cpp`、`i18n.cpp`、`settings-window.cpp`
-   - 宿主通信、遥测/安全、调试台、运行弹窗与插件宿主机 → `WINOME/src/shell-ipc.cpp`、`perf-metrics.cpp`、`crash-dialog.cpp`、`debug-runtime.cpp`、`looking-glass.cpp`、`run-dialog.cpp`、`plugin-host.cpp` 及非提权控制端 `WINOME/ctl/winome-ctl.cpp`
+   - 宿主通信、遥测/安全、崩溃弹窗、一键排障压缩包导出、调试台、运行弹窗与插件宿主机 → `WINOME/src/shell-ipc.cpp`、`perf-metrics.cpp`、`crash-dialog.cpp`、`diagnostics-export.cpp`、`debug-runtime.cpp`、`looking-glass.cpp`、`run-dialog.cpp`、`plugin-host.cpp` 及非提权控制端 `WINOME/ctl/winome-ctl.cpp`
    - 会话确认弹窗与 DWM 窗口统一样式 → `WINOME/src/end-session-dialog.cpp`、`window-theming.cpp`
 4. **构建清单同步**：新增源码文件必须同步加入 [WINOME/src/meson.build](../WINOME/src/meson.build) 的 `winome_sources`；引入新的 Win32 系统库须同步添加 `cc.find_library(...)`。
 5. **状态清单单一事实源**：功能完成状态统一维护在根目录 [README.md](../README.md)，避免多处 README 各自维护导致漂移。
