@@ -379,6 +379,8 @@ std::string serialize_config(const WinomeConfig& cfg) {
   append_escaped_json_string(cfg.multi_monitor_workspace_mode, &out);
   out += ",\n  \"multi_monitor_overview_linked\": ";
   out += cfg.multi_monitor_overview_linked ? "true" : "false";
+  out += ",\n  \"sync_windows_primary_display\": ";
+  out += cfg.sync_windows_primary_display ? "true" : "false";
   out += ",\n  \"end_session_confirm\": ";
   out += cfg.end_session_confirm ? "true" : "false";
   out += ",\n  \"unify_dark_titlebars\": ";
@@ -457,6 +459,8 @@ bool parse_config(const std::string& json, WinomeConfig* out) {
       ok = parse_json_string(json, &pos, &cfg.multi_monitor_workspace_mode);
     else if (key == "multi_monitor_overview_linked")
       ok = parse_json_bool(json, &pos, &cfg.multi_monitor_overview_linked);
+    else if (key == "sync_windows_primary_display")
+      ok = parse_json_bool(json, &pos, &cfg.sync_windows_primary_display);
     else if (key == "end_session_confirm")
       ok = parse_json_bool(json, &pos, &cfg.end_session_confirm);
     else if (key == "unify_dark_titlebars")

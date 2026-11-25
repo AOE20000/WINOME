@@ -82,6 +82,64 @@ inline bool should_secondary_overview_show_dash(
   return mode != ws::MultiMonitorWorkspaceMode::PrimaryOnly;
 }
 
+// Unified per-monitor Overview role resolved from workspace mode and whether
+// the monitor is currently WINOME's Shell Primary (unit-tested in winome-tests).
+// All monitors share the exact same Overview engine, with independent search
+// and App Grid available in all states; Dash & multi-workspace switching follow
+// the active workspace mode and dynamic Shell Primary.
+struct OverviewMonitorRole {
+  bool is_shell_primary = true;
+  bool show_search = true;
+  bool show_dash = true;
+  bool allow_app_grid = true;
+  bool multi_workspace = true;
+};
+
+inline OverviewMonitorRole resolve_monitor_overview_role(
+    ws::MultiMonitorWorkspaceMode mode,
+    bool is_shell_primary) {
+  OverviewMonitorRole role{};
+  role.is_shell_primary = is_shell_primary;
+  role.show_search = true;
+  role.allow_app_grid = true;
+  if (mode == ws::MultiMonitorWorkspaceMode::PrimaryOnly) {
+    role.show_dash = is_shell_primary;
+    role.multi_workspace = is_shell_primary;
+  } else {
+    role.show_dash = true;
+    role.multi_workspace = true;
+  }
+  return role;
+}
+
+enum class UnifiedOverviewAction {
+  None,
+  OpenMonitor,
+  CloseMonitor,
+  OpenAllLinked,
+  CloseAll,
+};
+
+// Pure unified multi-monitor Overview dispatch logic (no primary/secondary
+// engine split: every monitor runs the same OverviewView engine).
+inline UnifiedOverviewAction decide_unified_overview_action(
+    bool linked,
+    bool is_toggle,
+    bool target_is_open,
+    bool any_open) {
+  if (linked) {
+    if (is_toggle)
+      return any_open ? UnifiedOverviewAction::CloseAll
+                      : UnifiedOverviewAction::OpenAllLinked;
+    return any_open ? UnifiedOverviewAction::None
+                    : UnifiedOverviewAction::OpenAllLinked;
+  }
+  if (target_is_open)
+    return is_toggle ? UnifiedOverviewAction::CloseMonitor
+                     : UnifiedOverviewAction::None;
+  return UnifiedOverviewAction::OpenMonitor;
+}
+
 struct SecondaryOverviewGeometry {
   RECT full_box{};
   RECT picker_box{};
@@ -173,90 +231,18 @@ inline RECT compute_secondary_workspace_box(const SecondaryOverviewGeometry& g,
               g.picker_box.right + dx, g.picker_box.bottom};
 }
 
-// --- Linked mode API (driven in lockstep with overview.cpp) -----------------
-
-// Synchronize and show Secondary Overview windows on all monitors other than
-// @primary_overview_monitor. Shares @wallpaper_texture (may be nullptr).
-void overview_secondary_sync(HMONITOR primary_overview_monitor,
-                             GdkTexture* wallpaper_texture,
-                             double progress);
-
-// Update open/close animation progress [0..1] in lockstep for linked hosts.
-void overview_secondary_set_progress(double progress);
-
-// --- Independent (unlinked simultaneous) mode API ---------------------------
-
-// Open a self-animated Secondary Overview on @monitor only.
-void overview_secondary_open_monitor(HMONITOR monitor,
-                                     GdkTexture* wallpaper_texture);
-
-// Close @monitor's Secondary Overview with smooth 250ms animation.
-void overview_secondary_close_monitor(HMONITOR monitor);
-
-// Close all currently open Secondary Overviews with smooth 250ms animation.
-void overview_secondary_close_all_animated();
-
-// Close any currently open Secondary Overviews that are NOT driven by an active
-// linked Main Overview (e.g. opened before toggling linked mode on).
-void overview_secondary_close_unlinked_animated();
-
-// Sync or detach open Secondary Overviews when multi_monitor_overview_linked
-// changes while Overview windows are already mapped.
-void overview_secondary_on_linked_changed(bool linked,
-                                          HMONITOR main_mon,
-                                          bool main_open,
-                                          GdkTexture* wallpaper_texture,
-                                          double progress);
-
-// Query per-monitor or aggregate Secondary Overview open state.
-bool overview_secondary_is_open_for_monitor(HMONITOR monitor);
-bool overview_secondary_any_open();
-
-struct CrossMonitorDropTarget {
-  HMONITOR monitor = nullptr;
-  int workspace = -1;
-  bool create_new = false;
-  bool is_overview = false;
-};
-
-// Hit-test a global screen point against any currently open Secondary Overview
-// (top workspace pills, peeking neighbor workspace cards, or active workspace
-// card). Returns true if @screen_pt lands inside an open Secondary Overview.
-bool overview_secondary_hit_test_screen_point(POINT screen_pt,
-                                              CrossMonitorDropTarget* out);
-
-// Update visual drop-target highlight on Secondary Overviews during an active
-// drag (from Main Overview, another Secondary Overview, or a live desktop
-// window). Pass clear to remove all highlights.
-void overview_secondary_set_drop_highlight(POINT screen_pt);
-void overview_secondary_clear_drop_highlight();
-
-// Rebuild an open Secondary Overview on @monitor (or all open hosts if null).
-void overview_secondary_refresh_monitor(HMONITOR monitor);
-
-// Prune hosts belonging to disconnected monitors and reposition/restack any
-// remaining open Secondary Overview windows on WM_DISPLAYCHANGE / DPI change.
-void overview_secondary_reposition_all();
-
-// --- Shared maintenance API -------------------------------------------------
-
-// Update shared wallpaper texture when wallpaper reloads.
-void overview_secondary_set_wallpaper(GdkTexture* wallpaper_texture);
-
-// Immediately hide all Secondary Overview windows and release thumbnails.
-void overview_secondary_hide_all();
-
-// Re-assert z-order (panel > secondary overview) for each visible host.
-void overview_secondary_restack();
-
-// Destroy all Secondary Overview windows cleanly on shutdown.
-void overview_secondary_shutdown();
-
-// True if @hwnd belongs to any managed Secondary Overview window.
-bool overview_secondary_is_hwnd(HWND hwnd);
-
-// Close any open Dash context menu on an open Secondary Overview window.
-// Returns true if a popover menu was open and closed.
-bool overview_secondary_close_open_dash_menu();
+// Guard against a delayed pre-switch Virtual Desktop poll echoing the previous
+// desktop index right after an Overview-initiated switch (e.g. rapid 0 -> 1 -> 2
+// where an async poll for hop 1 reports active=1 right after moving to 2).
+// Never suppresses genuine switches to another desktop or after the 350ms grace.
+inline bool should_ignore_stale_desktop_echo(int incoming_active,
+                                             int last_internal_from,
+                                             int last_internal_to,
+                                             int64_t elapsed_us) {
+  constexpr int64_t kStaleEchoGraceUs = 350000;
+  return last_internal_from >= 0 && last_internal_from != last_internal_to &&
+         incoming_active == last_internal_from && elapsed_us >= 0 &&
+         elapsed_us < kStaleEchoGraceUs;
+}
 
 }  // namespace winome

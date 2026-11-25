@@ -70,6 +70,15 @@ std::vector<DesktopInfo> desktops (void);
 // pinned to all desktops (GetDesktopIdByWindow yields the empty GUID).
 int window_desktop_index (HWND hwnd);
 
+// Single COM worker roundtrip: fetches the desktop list, active desktop index,
+// and resolves the owning desktop index (-1 if unknown/pinned) for every HWND
+// in @hwnds against that same desktop list.
+bool query_desktops_and_windows_batch (
+    const std::vector<HWND> &hwnds,
+    std::vector<DesktopInfo> *out_desktops,
+    int *out_active_index,
+    std::vector<int> *out_window_desktops);
+
 // TRUE when @hwnd belongs to the current desktop (pinned windows included).
 // FALSE when unavailable.
 bool window_on_current (HWND hwnd);

@@ -42,6 +42,7 @@ struct RuntimeState {
   std::atomic<MultiMonitorWorkspaceMode> active_mode_atomic{
       MultiMonitorWorkspaceMode::Span};
   int monitor_count = 1;
+  HMONITOR last_primary_monitor = nullptr;
   IndependentWorkspaceModel model;
   std::unordered_set<HWND> auto_pinned_secondary;
   std::vector<ListenerEntry> listeners;
@@ -225,7 +226,9 @@ void sync_primary_only_secondary_pins() {
   const auto monitors = enumerate_monitors();
   if (monitors.size() <= 1 || !vd::available())
     return;
-  HMONITOR primary = monitors.front().hmonitor;
+  HMONITOR primary = monitor_manager_primary_monitor();
+  if (primary == nullptr)
+    primary = monitors.front().hmonitor;
   const auto live = enumerate_live_windows();
 
   std::vector<HWND> to_pin;
@@ -299,10 +302,15 @@ void apply_mode_transition() {
   std::vector<BatchMoveIntent> restore_moves;
   std::vector<HWND> to_unpin;
   bool changed = false;
+  const HMONITOR cur_primary = monitor_manager_primary_monitor();
   {
     std::lock_guard<std::mutex> lk(g_ws.mu);
     g_ws.monitor_count = std::max(mon_count, 1);
     const MultiMonitorWorkspaceMode prev = g_ws.active_mode;
+    const bool primary_changed =
+        (target == MultiMonitorWorkspaceMode::PrimaryOnly &&
+         g_ws.last_primary_monitor != cur_primary);
+    g_ws.last_primary_monitor = cur_primary;
     if (prev != target) {
       changed = true;
       if (prev == MultiMonitorWorkspaceMode::Independent) {
@@ -326,6 +334,8 @@ void apply_mode_transition() {
     } else if (target == MultiMonitorWorkspaceMode::Independent) {
       for (const auto& m : monitors)
         g_ws.model.ensure_monitor(mon_key(m.hmonitor));
+    } else if (primary_changed) {
+      changed = true;
     }
   }
 

@@ -341,14 +341,11 @@ exe_file_description (const std::wstring &exe)
 struct DashWindowEntry {
   HWND hwnd = nullptr;
   int desktop_index = -1;
+  DWORD cloaked = 0;
 };
 
 struct EnumCtx {
-  HMONITOR monitor = nullptr;
-  std::vector<DashWindowEntry> *windows = nullptr;
-  bool vd_available = false;
-  bool isolate_workspaces = false;
-  int target_desktop = -1;
+  std::vector<DashWindowEntry> *raw_candidates = nullptr;
   bool use_blacklist = true;
 };
 
@@ -361,18 +358,8 @@ dash_collect (HWND hwnd, LPARAM lparam)
     return TRUE;
 
   const DWORD cloaked = dash_cloaked_flags (hwnd);
-  int win_ws = -1;
-  bool on_cur = false;
-  if (ctx->vd_available) {
-    win_ws = ws::window_workspace (hwnd, ctx->monitor);
-    if (win_ws < 0 && ctx->isolate_workspaces)
-      on_cur = ws::window_on_active_workspace (hwnd, ctx->monitor);
-  }
-  if (!should_include_dash_window (ctx->isolate_workspaces, ctx->vd_available,
-                                   ctx->target_desktop, win_ws, on_cur,
-                                   cloaked)) {
+  if ((cloaked & (0x1u | 0x4u)) != 0)
     return TRUE;
-  }
 
   RECT r = {};
   if (IsIconic (hwnd)) {
@@ -390,7 +377,7 @@ dash_collect (HWND hwnd, LPARAM lparam)
   // focus/switch running applications regardless of which monitor hosts the
   // overview.
 
-  ctx->windows->push_back (DashWindowEntry{hwnd, win_ws});
+  ctx->raw_candidates->push_back (DashWindowEntry{hwnd, -1, cloaked});
   return TRUE;
 }
 
@@ -563,10 +550,8 @@ void
 dismiss_overview_from_dash (WinomeDash *self, const char *reason)
 {
   if (!get_config ().multi_monitor_overview_linked && self != nullptr &&
-      self->last_monitor != nullptr &&
-      overview_secondary_is_open_for_monitor (self->last_monitor) &&
-      self->last_monitor != overview_main_monitor ()) {
-    overview_close_secondary_for_monitor (self->last_monitor);
+      self->last_monitor != nullptr) {
+    close_overview_for_monitor (reason, self->last_monitor);
     return;
   }
   close_overview (reason);
@@ -1546,8 +1531,9 @@ overview_dash_has_open_menu (GtkWidget *dash)
 }
 
 void
-overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height,
-                          int active_desktop)
+overview_dash_repopulate (
+    GtkWidget *dash, HMONITOR monitor, int max_height, int active_desktop,
+    const std::unordered_map<HWND, int> *pre_window_desktops)
 {
   if (dash == nullptr)
     return;
@@ -1570,16 +1556,67 @@ overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor, int max_height,
       max_v_icon = kBaseIconSizes[i];
   }
 
-  // Enumerate windows top-down and group into running applications.
+  // Enumerate candidate windows first, then resolve virtual desktop indices in
+  // O(1) from @pre_window_desktops (or a single batched COM call when invoked
+  // standalone) so Overview opening never pays N synchronous COM roundtrips.
   WinomeConfig cfg = get_config ();
-  const bool vd_avail = vd::available ();
+  const ws::MultiMonitorWorkspaceMode ws_mode = ws::effective_mode ();
+  const vd::DesktopSnapshot vd_snap = vd::cached_snapshot ();
+  const bool vd_avail =
+      (ws_mode == ws::MultiMonitorWorkspaceMode::Independent)
+          ? true
+          : (vd_snap.valid ? (vd_snap.count > 0)
+                           : (pre_window_desktops != nullptr
+                                  ? !pre_window_desktops->empty ()
+                                  : vd::available ()));
   const int target_ws =
       (active_desktop >= 0) ? active_desktop
                             : (vd_avail ? ws::active_for_monitor (monitor) : -1);
-  std::vector<DashWindowEntry> windows;
-  EnumCtx ctx{monitor, &windows, vd_avail, cfg.dash_isolate_workspaces,
-              target_ws, cfg.overview_window_blacklist};
+  std::vector<DashWindowEntry> raw_candidates;
+  EnumCtx ctx{&raw_candidates, cfg.overview_window_blacklist};
   EnumWindows (dash_collect, reinterpret_cast<LPARAM> (&ctx));
+
+  std::vector<int> batch_desktops;
+  if (vd_avail && pre_window_desktops == nullptr &&
+      ws_mode != ws::MultiMonitorWorkspaceMode::Independent &&
+      !raw_candidates.empty ()) {
+    std::vector<HWND> hwnds;
+    hwnds.reserve (raw_candidates.size ());
+    for (const DashWindowEntry &c : raw_candidates)
+      hwnds.push_back (c.hwnd);
+    vd::query_desktops_and_windows_batch (hwnds, nullptr, nullptr,
+                                          &batch_desktops);
+  }
+
+  std::vector<DashWindowEntry> windows;
+  windows.reserve (raw_candidates.size ());
+  for (size_t i = 0; i < raw_candidates.size (); ++i) {
+    DashWindowEntry &cand = raw_candidates[i];
+    int win_ws = -1;
+    bool on_cur = false;
+    if (vd_avail) {
+      if (ws_mode == ws::MultiMonitorWorkspaceMode::Independent) {
+        win_ws = ws::window_workspace (cand.hwnd, monitor);
+      } else if (ws_mode == ws::MultiMonitorWorkspaceMode::PrimaryOnly &&
+                 monitor != monitor_manager_primary_monitor ()) {
+        win_ws = 0;
+      } else if (pre_window_desktops != nullptr) {
+        auto it = pre_window_desktops->find (cand.hwnd);
+        if (it != pre_window_desktops->end ())
+          win_ws = it->second;
+      } else if (i < batch_desktops.size ()) {
+        win_ws = batch_desktops[i];
+      }
+      if (win_ws < 0 && cfg.dash_isolate_workspaces)
+        on_cur = ws::window_on_active_workspace (cand.hwnd, monitor);
+    }
+    if (!should_include_dash_window (cfg.dash_isolate_workspaces, vd_avail,
+                                     target_ws, win_ws, on_cur, cand.cloaked)) {
+      continue;
+    }
+    cand.desktop_index = win_ws;
+    windows.push_back (cand);
+  }
 
   struct RunningGroup {
     std::string id;

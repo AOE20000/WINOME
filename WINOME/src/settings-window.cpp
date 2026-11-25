@@ -10,6 +10,7 @@
 #include "fonts.h"
 #include "i18n.h"
 #include "looking-glass.h"
+#include "monitor-manager.h"
 #include "perf-metrics.h"
 #include "virtual-desktop.h"
 #include "window-theming.h"
@@ -51,6 +52,7 @@ struct SettingsUi {
   GtkWidget* dash_scope_drop = nullptr;
   GtkWidget* ws_mode_drop = nullptr;
   GtkWidget* overview_linked_drop = nullptr;
+  GtkWidget* sync_os_primary_switch = nullptr;
   GtkWidget* end_session_confirm_switch = nullptr;
   GtkWidget* auto_elevate_switch = nullptr;
   GtkWidget* dev_mode_switch = nullptr;
@@ -434,6 +436,10 @@ void sync_ui_from_config() {
     gtk_drop_down_set_selected(GTK_DROP_DOWN(g_ui.overview_linked_drop),
                                cfg.multi_monitor_overview_linked ? 1u : 0u);
   }
+  if (g_ui.sync_os_primary_switch != nullptr) {
+    gtk_switch_set_active(GTK_SWITCH(g_ui.sync_os_primary_switch),
+                          cfg.sync_windows_primary_display ? TRUE : FALSE);
+  }
   if (g_ui.end_session_confirm_switch != nullptr) {
     gtk_switch_set_active(GTK_SWITCH(g_ui.end_session_confirm_switch),
                           cfg.end_session_confirm ? TRUE : FALSE);
@@ -584,6 +590,11 @@ void on_ws_mode_changed(GObject* obj, GParamSpec* pspec G_GNUC_UNUSED,
   guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(obj));
   cfg.multi_monitor_workspace_mode =
       (sel == 1) ? "primary_only" : (sel == 2 ? "span" : "independent");
+  if (sel == 1 && g_ui.window != nullptr) {
+    HMONITOR win_mon = monitor_manager_monitor_for_widget(g_ui.window);
+    if (win_mon != nullptr)
+      monitor_manager_set_shell_primary_monitor(win_mon, true);
+  }
   update_config(cfg);
 }
 
@@ -595,6 +606,16 @@ void on_overview_linked_changed(GObject* obj, GParamSpec* pspec G_GNUC_UNUSED,
   guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(obj));
   cfg.multi_monitor_overview_linked = (sel == 1);
   update_config(cfg);
+}
+
+gboolean on_sync_os_primary_set(GtkSwitch* sw G_GNUC_UNUSED, gboolean state,
+                                gpointer ud G_GNUC_UNUSED) {
+  if (g_ui.syncing)
+    return FALSE;
+  WinomeConfig cfg = get_config();
+  cfg.sync_windows_primary_display = state != FALSE;
+  update_config(cfg);
+  return FALSE;
 }
 
 gboolean on_dark_titlebars_set(GtkSwitch* sw G_GNUC_UNUSED, gboolean state, gpointer ud G_GNUC_UNUSED) {
@@ -878,6 +899,7 @@ void on_window_destroy(GtkWidget* widget G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSE
   g_ui.dash_scope_drop = nullptr;
   g_ui.ws_mode_drop = nullptr;
   g_ui.overview_linked_drop = nullptr;
+  g_ui.sync_os_primary_switch = nullptr;
   g_ui.end_session_confirm_switch = nullptr;
   g_ui.auto_elevate_switch = nullptr;
   g_ui.dev_mode_switch = nullptr;
@@ -1104,6 +1126,18 @@ GtkWidget* build_behavior_page() {
                tr("Allow each display to open/close Overview independently at the same time, or link all displays to open/close together",
                   "默认允许在各显示器上分别同时打开或关闭概览（互不联动），也可切换为触发任一屏时全屏联动展开/关闭"),
                g_ui.overview_linked_drop),
+      true);
+
+  g_ui.sync_os_primary_switch = gtk_switch_new();
+  g_signal_connect(g_ui.sync_os_primary_switch, "state-set",
+                   G_CALLBACK(on_sync_os_primary_set), nullptr);
+  append_row_to_card(
+      trig_card,
+      make_row(tr("Sync Shell Primary to Windows Primary Display",
+                  "切换主屏时同步为 Windows 系统主显示器"),
+               tr("When choosing Primary-Only mode on another monitor, also promote it to the Windows OS primary display (default off: logical WINOME primary only)",
+                  "在副屏选择“仅主屏切换”时，同时将该屏设为 Windows 系统主显示器并执行兼容恢复（默认关闭，仅切换 WINOME 逻辑主屏）"),
+               g_ui.sync_os_primary_switch),
       true);
 
   g_ui.end_session_confirm_switch = gtk_switch_new();

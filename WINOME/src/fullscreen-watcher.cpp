@@ -448,13 +448,6 @@ void detect_fullscreen_state(bool* all_locked, HMONITOR* fullscreen_mon) {
   if (g_session_locked)
     return;
 
-  // Overview and top-bar popovers always keep top panels visible.
-  if (winome::overview_active() || winome::overview_is_open() != 0)
-    return;
-
-  if (winome_shell_panel_top_popover_hwnd() != nullptr)
-    return;
-
   HWND fg = GetForegroundWindow();
   if (fg == nullptr)
     return;
@@ -600,7 +593,6 @@ void evaluate_fullscreen_state(void) {
   const bool fg_transient_or_null =
       !fg_is_self && is_transient_overlay_window(fg);
 
-  const bool pop_open = winome_shell_panel_top_popover_hwnd() != nullptr;
   const int64_t now_ms = monotonic_ms();
 
   bool any_shown = false;
@@ -615,6 +607,8 @@ void evaluate_fullscreen_state(void) {
     any_valid_panel = true;
     HMONITOR pmon = MonitorFromWindow(entry.hwnd, MONITOR_DEFAULTTONEAREST);
     const bool ov_open = overview_is_open_for_monitor(pmon);
+    const bool pop_open =
+        winome_shell_panel_top_popover_hwnd_for_monitor(pmon) != nullptr;
     const HMONITOR raw_for_panel =
         (!all_locked && !ov_open && !pop_open && raw_fs_mon != nullptr &&
          pmon == raw_fs_mon)

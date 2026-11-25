@@ -43,6 +43,10 @@ C:\msys64\usr\bin\bash.exe -lc 'export PATH=/ucrt64/bin:$PATH && ...'
 
 ## 构建方案（`build.sh`）
 
+<!-- excerpt:start -->
+如果你想从源码编译或参与开发，只需准备 Windows 下的 MSYS2（UCRT64 + GTK4）环境，运行仓库根目录的 `./build.sh release` 即可一键编译约 2.8 MB 的发布版程序，并可通过 `./WINOME/package.sh` 直接打出完整绿色便携包。
+<!-- excerpt:end -->
+
 WINOME 主工程在 `WINOME/` 目录下，统一使用仓库根目录的交互式构建脚本 [build.sh](../build.sh)：
 
 ```bash

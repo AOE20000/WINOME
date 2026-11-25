@@ -172,6 +172,7 @@ struct Job {
     CurrentIndex,
     Snapshot,
     WindowDesktopIndex,
+    QueryDesktopsAndWindowsBatch,
     WindowOnCurrent,
     SwitchTo,
     PinWindow,
@@ -183,6 +184,8 @@ struct Job {
   } op;
 
   std::vector<DesktopInfo> out_desktops;
+  std::vector<HWND> in_hwnds;
+  std::vector<int> out_window_indices;
   std::vector<WindowMoveOp> in_moves;
   std::vector<bool> out_move_results;
   int out_index = -1;
@@ -711,6 +714,50 @@ run_on_worker (const std::shared_ptr<Job> &job, bool wait_for_result = true)
           }
           break;
         }
+        case Job::Op::QueryDesktopsAndWindowsBatch: {
+          auto ds = g_com.desktops ();
+          if (!g_com.ensure () || ds.empty ())
+            break;
+          int active_idx = -1;
+          void *d = nullptr;
+          HRESULT hr = vcall<HRESULT> (g_com.internal, kSlotGetCurrentDesktop,
+                                       &d);
+          if (SUCCEEDED (hr) && d != nullptr) {
+            GUID id{};
+            bool got = SUCCEEDED (vcall<HRESULT> (d, kSlotGetId, &id));
+            vrelease (d);
+            if (got) {
+              for (const DesktopInfo &info : ds) {
+                if (IsEqualGUID (info.id, id)) {
+                  active_idx = info.index;
+                  break;
+                }
+              }
+            }
+          }
+          cur->out_window_indices.assign (cur->in_hwnds.size (), -1);
+          GUID zero{};
+          for (size_t i = 0; i < cur->in_hwnds.size (); ++i) {
+            HWND h = cur->in_hwnds[i];
+            if (h == nullptr)
+              continue;
+            GUID wid{};
+            if (SUCCEEDED (vcall<HRESULT> (g_com.manager, kSlotDesktopByWindow,
+                                           h, &wid)) &&
+                !IsEqualGUID (wid, zero)) {
+              for (const DesktopInfo &info : ds) {
+                if (IsEqualGUID (info.id, wid)) {
+                  cur->out_window_indices[i] = info.index;
+                  break;
+                }
+              }
+            }
+          }
+          cur->out_desktops = std::move (ds);
+          cur->out_index = active_idx >= 0 ? active_idx : 0;
+          cur->ok = true;
+          break;
+        }
         case Job::Op::WindowOnCurrent: {
           if (!g_com.ensure ())
             break;
@@ -1079,6 +1126,35 @@ window_desktop_index (HWND hwnd)
   job->in_hwnd = hwnd;
   run_on_worker (job);
   return job->ok ? job->out_index : -1;
+}
+
+bool
+query_desktops_and_windows_batch (
+    const std::vector<HWND> &hwnds,
+    std::vector<DesktopInfo> *out_desktops,
+    int *out_active_index,
+    std::vector<int> *out_window_desktops)
+{
+  auto job = std::make_shared<Job> ();
+  job->op = Job::Op::QueryDesktopsAndWindowsBatch;
+  job->in_hwnds = hwnds;
+  run_on_worker (job);
+  if (!job->ok) {
+    if (out_desktops != nullptr)
+      out_desktops->clear ();
+    if (out_active_index != nullptr)
+      *out_active_index = -1;
+    if (out_window_desktops != nullptr)
+      out_window_desktops->assign (hwnds.size (), -1);
+    return false;
+  }
+  if (out_desktops != nullptr)
+    *out_desktops = std::move (job->out_desktops);
+  if (out_active_index != nullptr)
+    *out_active_index = job->out_index;
+  if (out_window_desktops != nullptr)
+    *out_window_desktops = std::move (job->out_window_indices);
+  return true;
 }
 
 bool

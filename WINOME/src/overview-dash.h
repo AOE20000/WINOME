@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace winome {
@@ -94,8 +95,11 @@ GtkWidget *overview_dash_new (GtkWidget *root_fixed);
 // rebuild the tiles. @max_height is the available dash height in LOGICAL px.
 // @active_desktop optionally supplies the overview's current desktop index
 // (>= 0) so workspace-isolated mode updates immediately on workspace switches.
-void overview_dash_repopulate (GtkWidget *dash, HMONITOR monitor,
-                               int max_height, int active_desktop = -1);
+// @pre_window_desktops optionally supplies an already-resolved HWND -> desktop
+// index map from the Overview snapshot to avoid redundant COM roundtrips.
+void overview_dash_repopulate (
+    GtkWidget *dash, HMONITOR monitor, int max_height, int active_desktop = -1,
+    const std::unordered_map<HWND, int> *pre_window_desktops = nullptr);
 
 void overview_dash_set_show_apps_cb (GtkWidget *dash, void (*cb) (void *),
                                      void *user_data);

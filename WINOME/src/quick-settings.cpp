@@ -1144,8 +1144,16 @@ apply_ws_mode (const char *mode, GtkWidget *panel)
 {
   if (mode == nullptr)
     return;
+  const bool selecting_primary_only = (strcmp (mode, "primary_only") == 0);
+  HMONITOR trigger_mon = nullptr;
+  if (selecting_primary_only && panel != nullptr)
+    trigger_mon = winome::monitor_manager_monitor_for_widget (panel);
+
   winome::WinomeConfig cfg = winome::get_config ();
-  if (cfg.multi_monitor_workspace_mode != mode) {
+  const bool mode_changed = (cfg.multi_monitor_workspace_mode != mode);
+  if (selecting_primary_only && trigger_mon != nullptr)
+    winome::monitor_manager_set_shell_primary_monitor (trigger_mon, true);
+  if (mode_changed) {
     cfg.multi_monitor_workspace_mode = mode;
     winome::update_config (cfg);
   }

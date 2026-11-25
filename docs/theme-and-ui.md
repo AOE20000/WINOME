@@ -6,6 +6,10 @@ WINOME 以 sassc 编译后的上游样式表 [gnome-shell-dark.css](../WINOME/sr
 
 ## 1. 双 CSS 管线
 
+<!-- excerpt:start -->
+WINOME 直接以上游 GNOME Shell 样式表为视觉基准，结合构建期样式转换与运行时原生样式求值引擎，确保顶栏、快捷面板、日历通知中心与概览界面的间距、圆角和动效与原生 GNOME 保持一致。
+<!-- excerpt:end -->
+
 两份样式表通过 [winome.gresource.xml](../WINOME/src/theme/winome.gresource.xml) 一并打入 GResource（前缀 `/org/winome/theme`）：
 
 1. **原始版 `gnome-shell-dark.css`** → 供运行时 St 引擎查询；

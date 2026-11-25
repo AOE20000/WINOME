@@ -20,7 +20,7 @@
 1. **技术路线**：在 Windows 上用原生 Win32/COM 能力支撑的 GNOME Shell UI 复刻。宿主单进程 `winome.exe`（C++17 + GTK4），无注入、无核心 UI DLL；核心模块按 `upstream/gnome-shell` 逐组件移植，`upstream/` 与 `extracted/` 用作只读/派生参考（其中 `upstream/Seelen-UI` 受 AGPL 约束仅作功能思路致谢，不派生其代码）。
 2. **注释与文档语言**：源码注释使用英文；技术散文与开发文档使用中文。
 3. **模块职责边界**：
-   - 概览（含多屏同时概览）、动态壁纸同步、应用索引与分页网格 → `WINOME/src/overview*.cpp`、`overview-secondary.cpp`、`live-wallpaper.cpp`、`app-index.cpp`、`app-grid.cpp`
+   - 概览（含统一多屏同时概览）、动态壁纸同步、应用索引与分页网格 → `WINOME/src/overview*.cpp`、`live-wallpaper.cpp`、`app-index.cpp`、`app-grid.cpp`
    - 顶栏、工作区保留与弹出窗窗口壳 → `WINOME/src/shell-panel.cpp`
    - 多显示器拓扑、全屏与锁屏监测 → `WINOME/src/monitor-manager.cpp`、`fullscreen-watcher.cpp`
    - 快速设置面板与系统托盘 → `WINOME/src/quick-settings.cpp`、`systray.cpp`

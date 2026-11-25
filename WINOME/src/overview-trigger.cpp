@@ -131,7 +131,7 @@ void *g_state_cb_data = nullptr;
 enum class OverviewQueueOp {
   Open,
   Toggle,
-  CloseMainOrAll,
+  CloseMonitor,
   CloseAll,
 };
 
@@ -217,137 +217,30 @@ should_intercept_overview_esc ()
   return is_cached_panel_hwnd (fg);
 }
 
-bool
-has_visible_popover_child (GtkWidget *parent)
-{
-  if (parent == nullptr || !gtk_widget_get_visible (parent))
-    return false;
-  std::vector<GtkWidget *> stack;
-  stack.push_back (parent);
-  while (!stack.empty ()) {
-    GtkWidget *cur = stack.back ();
-    stack.pop_back ();
-    for (GtkWidget *c = gtk_widget_get_first_child (cur); c != nullptr;
-         c = gtk_widget_get_next_sibling (c)) {
-      if (!gtk_widget_get_visible (c))
-        continue;
-      if (GTK_IS_POPOVER (c))
-        return true;
-      stack.push_back (c);
-    }
-  }
-  return false;
-}
-
 gboolean
 handle_unfocused_esc_idle (gpointer user_data G_GNUC_UNUSED)
 {
   if (!overview_active ())
     return G_SOURCE_REMOVE;
 
+  HMONITOR active_mon = monitor_manager_active_monitor ();
   // 1. Panel popover (Quick Settings / Calendar / Tray) floating over overview.
+  if (winome_shell_panel_top_popover_hwnd_for_monitor (active_mon) != nullptr) {
+    winome_shell_panel_close_popovers_for_monitor (active_mon);
+    return G_SOURCE_REMOVE;
+  }
   if (winome_shell_panel_top_popover_hwnd () != nullptr) {
     winome_shell_panel_close_popovers ();
     return G_SOURCE_REMOVE;
   }
 
-  // In unlinked mode, if the cursor monitor has a Secondary Overview open
-  // (or no main Overview is open at all), dismiss an open secondary Dash menu
-  // first, otherwise dismiss that Secondary Overview.
-  if (overview_secondary_close_open_dash_menu ())
-    return G_SOURCE_REMOVE;
-  if (!get_config ().multi_monitor_overview_linked) {
-    HMONITOR cursor_mon = monitor_manager_active_monitor ();
-    if (overview_secondary_is_open_for_monitor (cursor_mon)) {
-      overview_close_secondary_for_monitor (cursor_mon);
-      return G_SOURCE_REMOVE;
-    }
-    if (!overview_is_main_open () && overview_secondary_any_open ()) {
-      overview_close_all_secondary ();
-      return G_SOURCE_REMOVE;
-    }
+  // 2. Delegate full layered GNOME Esc handling to the unified OverviewView.
+  if (!overview_handle_escape (active_mon)) {
+    if (get_config ().multi_monitor_overview_linked)
+      close_overview ("esc");
+    else
+      close_overview_for_monitor ("esc", active_mon);
   }
-
-  if (!gtk_is_initialized ()) {
-    close_overview ("esc");
-    return G_SOURCE_REMOVE;
-  }
-
-  // Locate the live WINOME Overview window and its children on the main thread.
-  GtkWindow *ov_win = nullptr;
-  GListModel *toplevels = gtk_window_get_toplevels ();
-  if (toplevels != nullptr) {
-    const guint count = g_list_model_get_n_items (toplevels);
-    for (guint i = 0; i < count; ++i) {
-      gpointer obj = g_list_model_get_item (toplevels, i);
-      if (obj == nullptr)
-        continue;
-      if (GTK_IS_WINDOW (obj) &&
-          g_strcmp0 (gtk_window_get_title (GTK_WINDOW (obj)),
-                     "WINOME Overview") == 0) {
-        ov_win = GTK_WINDOW (obj);
-        g_object_unref (obj);
-        break;
-      }
-      g_object_unref (obj);
-    }
-  }
-
-  if (ov_win == nullptr || !gtk_widget_get_visible (GTK_WIDGET (ov_win))) {
-    close_overview ("esc");
-    return G_SOURCE_REMOVE;
-  }
-
-  GtkWidget *root = gtk_window_get_child (ov_win);
-  GtkWidget *search_entry = nullptr;
-  GtkWidget *app_grid = nullptr;
-  GtkWidget *dash = nullptr;
-  if (root != nullptr) {
-    for (GtkWidget *c = gtk_widget_get_first_child (root); c != nullptr;
-         c = gtk_widget_get_next_sibling (c)) {
-      const char *tname = G_OBJECT_TYPE_NAME (c);
-      if (GTK_IS_ENTRY (c))
-        search_entry = c;
-      else if (g_strcmp0 (tname, "WinomeAppGrid") == 0)
-        app_grid = c;
-      else if (g_strcmp0 (tname, "WinomeAppGridClip") == 0)
-        app_grid = gtk_widget_get_first_child (c);
-      else if (g_strcmp0 (tname, "WinomeDash") == 0)
-        dash = c;
-    }
-  }
-
-  // 2. Context menu popovers owned by Dash or App Grid.
-  if (has_visible_popover_child (dash)) {
-    overview_dash_close_menu (dash);
-    return G_SOURCE_REMOVE;
-  }
-  if (has_visible_popover_child (app_grid)) {
-    app_grid_close_menu (app_grid);
-    return G_SOURCE_REMOVE;
-  }
-
-  // 3. Clear non-empty search query before leaving App Grid or closing overview.
-  if (search_entry != nullptr) {
-    const char *txt = gtk_editable_get_text (GTK_EDITABLE (search_entry));
-    if (txt != nullptr && txt[0] != '\0') {
-      gtk_editable_set_text (GTK_EDITABLE (search_entry), "");
-      overview_restore_focus_if_active ();
-      return G_SOURCE_REMOVE;
-    }
-  }
-
-  // 4. In APP_GRID state (or transitioning/pending APP_GRID), close open
-  //    folder first, otherwise step back to WINDOW_PICKER.
-  if (!overview_can_shift_to_app_grid ()) {
-    if (app_grid != nullptr && app_grid_close_open_folder (app_grid))
-      return G_SOURCE_REMOVE;
-    overview_toggle_app_grid ();
-    return G_SOURCE_REMOVE;
-  }
-
-  // 5. Base WINDOW_PICKER state: close the overview.
-  close_overview ("esc");
   return G_SOURCE_REMOVE;
 }
 
@@ -379,102 +272,75 @@ dispatch_overview_events_idle (gpointer data G_GNUC_UNUSED)
     const bool linked = get_config ().multi_monitor_overview_linked;
     HMONITOR target =
         (ev.monitor != nullptr) ? ev.monitor : monitor_manager_active_monitor ();
-    const bool main_open = overview_is_main_open ();
-    HMONITOR main_mon = overview_main_monitor ();
-    const bool target_has_sec = overview_secondary_is_open_for_monitor (target);
-    const bool any_sec = overview_secondary_any_open ();
+    const bool target_open = overview_is_open_for_monitor (target);
+    const bool any_open = overview_any_open ();
 
-    OverviewDispatchAction act = OverviewDispatchAction::None;
+    UnifiedOverviewAction act = UnifiedOverviewAction::None;
     if (ev.op == OverviewQueueOp::CloseAll) {
-      act = (main_open || any_sec) ? OverviewDispatchAction::CloseAll
-                                   : OverviewDispatchAction::None;
-    } else if (ev.op == OverviewQueueOp::CloseMainOrAll) {
+      act = any_open ? UnifiedOverviewAction::CloseAll
+                     : UnifiedOverviewAction::None;
+    } else if (ev.op == OverviewQueueOp::CloseMonitor) {
       if (linked) {
-        act = (main_open || any_sec) ? OverviewDispatchAction::CloseAll
-                                     : OverviewDispatchAction::None;
-      } else if (main_open) {
-        act = OverviewDispatchAction::CloseMainOnly;
-      } else if (target_has_sec) {
-        act = OverviewDispatchAction::CloseSecondaryOnly;
-      } else if (any_sec) {
-        act = OverviewDispatchAction::CloseAll;
+        act = any_open ? UnifiedOverviewAction::CloseAll
+                       : UnifiedOverviewAction::None;
+      } else if (target_open) {
+        act = UnifiedOverviewAction::CloseMonitor;
+      } else if (any_open) {
+        act = UnifiedOverviewAction::CloseAll;
       }
     } else {
-      act = decide_multi_monitor_overview_action (
-          linked, ev.op == OverviewQueueOp::Toggle,
-          reinterpret_cast<uintptr_t> (target), main_open,
-          reinterpret_cast<uintptr_t> (main_mon), target_has_sec, any_sec);
+      act = decide_unified_overview_action (
+          linked, ev.op == OverviewQueueOp::Toggle, target_open, any_open);
     }
 
     switch (act) {
-      case OverviewDispatchAction::None:
+      case UnifiedOverviewAction::None:
         break;
-      case OverviewDispatchAction::OpenMain:
-      case OverviewDispatchAction::OpenLinkedAll: {
+      case UnifiedOverviewAction::OpenMonitor: {
         g_running.store (true, std::memory_order_release);
-        g_print ("[trig] open_overview (%s mon=%p linked=%d)\n",
-                 ev.source != nullptr ? ev.source : "?",
-                 static_cast<void *> (target), linked ? 1 : 0);
-        if (cb != nullptr)
-          cb (true, cb_data);
-        overview_set_target_monitor (target);
-        overview_show ();
-        refresh_cached_window_handles ();
-        break;
-      }
-      case OverviewDispatchAction::OpenSecondary: {
-        g_running.store (true, std::memory_order_release);
-        g_last_win_press_us.store (0, std::memory_order_release);
-        g_print ("[trig] open_secondary_overview (%s mon=%p)\n",
+        g_print ("[trig] open_overview (%s mon=%p linked=0)\n",
                  ev.source != nullptr ? ev.source : "?",
                  static_cast<void *> (target));
         if (cb != nullptr)
-          cb (true, cb_data);
-        overview_open_secondary_for_monitor (target);
+          cb (true, target, cb_data);
+        overview_show_for_monitor (target);
         refresh_cached_window_handles ();
         break;
       }
-      case OverviewDispatchAction::CloseMainOnly: {
-        g_last_win_press_us.store (0, std::memory_order_release);
-        g_print ("[trig] close_overview (%s main-only)\n",
-                 ev.source != nullptr ? ev.source : "?");
-        overview_hide ();
-        refresh_cached_window_handles ();
-        if (!any_sec) {
-          g_running.store (false, std::memory_order_release);
-          if (cb != nullptr)
-            cb (false, cb_data);
-        }
-        break;
-      }
-      case OverviewDispatchAction::CloseSecondaryOnly: {
-        g_last_win_press_us.store (0, std::memory_order_release);
-        g_print ("[trig] close_secondary_overview (%s mon=%p)\n",
+      case UnifiedOverviewAction::OpenAllLinked: {
+        g_running.store (true, std::memory_order_release);
+        g_print ("[trig] open_overview (%s mon=%p linked=1)\n",
                  ev.source != nullptr ? ev.source : "?",
                  static_cast<void *> (target));
-        overview_close_secondary_for_monitor (target);
+        if (cb != nullptr)
+          cb (true, nullptr, cb_data);
+        overview_show_all_linked (target);
         refresh_cached_window_handles ();
-        if (!main_open && !overview_secondary_any_open ()) {
+        break;
+      }
+      case UnifiedOverviewAction::CloseMonitor: {
+        g_last_win_press_us.store (0, std::memory_order_release);
+        g_print ("[trig] close_overview (%s mon=%p)\n",
+                 ev.source != nullptr ? ev.source : "?",
+                 static_cast<void *> (target));
+        overview_hide_for_monitor (target);
+        refresh_cached_window_handles ();
+        if (!overview_any_open ()) {
           g_running.store (false, std::memory_order_release);
           if (cb != nullptr)
-            cb (false, cb_data);
+            cb (false, target, cb_data);
         }
         break;
       }
-      case OverviewDispatchAction::CloseAll: {
+      case UnifiedOverviewAction::CloseAll: {
         g_last_win_press_us.store (0, std::memory_order_release);
         g_running.store (false, std::memory_order_release);
         g_print ("[trig] close_overview (%s all)\n",
                  ev.source != nullptr ? ev.source : "?");
-        if (main_open)
-          overview_hide ();
-        if (should_close_secondary_on_close_all (linked, main_open, any_sec))
-          overview_close_all_secondary ();
-        else if (any_sec)
-          overview_secondary_close_unlinked_animated ();
+        overview_hide_all ();
         refresh_cached_window_handles ();
         if (cb != nullptr)
-          cb (false, cb_data);
+          cb (false, nullptr, cb_data);
         break;
       }
     }
@@ -1300,7 +1166,18 @@ void close_overview(const char *source) {
   bool schedule = false;
   {
     std::lock_guard<std::mutex> lk(g_state_mu);
-    enqueue_overview_op_locked(OverviewQueueOp::CloseMainOrAll, source, nullptr,
+    enqueue_overview_op_locked(OverviewQueueOp::CloseAll, source, nullptr,
+                               &schedule);
+  }
+  if (schedule)
+    schedule_overview_dispatch();
+}
+
+void close_overview_for_monitor(const char *source, HMONITOR monitor) {
+  bool schedule = false;
+  {
+    std::lock_guard<std::mutex> lk(g_state_mu);
+    enqueue_overview_op_locked(OverviewQueueOp::CloseMonitor, source, monitor,
                                &schedule);
   }
   if (schedule)

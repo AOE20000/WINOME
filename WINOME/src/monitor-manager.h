@@ -35,7 +35,46 @@ struct MonitorRuntimeCallbacks {
   void (*on_wallpaper_changed)() = nullptr;
   void (*on_theme_changed)() = nullptr;
   void (*on_workarea_changed)() = nullptr;
+  void (*on_shell_primary_changed)(HMONITOR new_primary) = nullptr;
+  void (*on_os_primary_display_changed)() = nullptr;
 };
+
+struct DisplayPositionSpec {
+  std::wstring device_name;
+  LONG x = 0;
+  LONG y = 0;
+  LONG width = 0;
+  LONG height = 0;
+  bool is_primary = false;
+};
+
+// Pure helper (unit-tested in winome-tests): shift all display coordinates so
+// @new_primary_device moves to (0, 0) while preserving exact relative monitor
+// geometry. Returns false if @new_primary_device is not found.
+inline bool compute_os_primary_display_positions(
+    std::vector<DisplayPositionSpec>* displays,
+    const std::wstring& new_primary_device) {
+  if (displays == nullptr || displays->empty() || new_primary_device.empty())
+    return false;
+  size_t target_idx = displays->size();
+  for (size_t i = 0; i < displays->size(); ++i) {
+    if (_wcsicmp((*displays)[i].device_name.c_str(),
+                 new_primary_device.c_str()) == 0) {
+      target_idx = i;
+      break;
+    }
+  }
+  if (target_idx >= displays->size())
+    return false;
+  const LONG dx = (*displays)[target_idx].x;
+  const LONG dy = (*displays)[target_idx].y;
+  for (size_t i = 0; i < displays->size(); ++i) {
+    (*displays)[i].x -= dx;
+    (*displays)[i].y -= dy;
+    (*displays)[i].is_primary = (i == target_idx);
+  }
+  return true;
+}
 
 // Enumerate active display monitors (primary monitor sorted first).
 std::vector<MonitorDescriptor> enumerate_monitors();
@@ -103,8 +142,22 @@ inline POINT center_rect_in_bounds(const RECT& bounds,
   return out;
 }
 
-// Primary monitor handle (from primary panel HWND or origin fallback).
+// Windows OS physical primary monitor handle (MONITORINFOF_PRIMARY, origin 0,0).
+HMONITOR monitor_manager_os_primary_monitor();
+
+// WINOME Shell Primary monitor handle (defaults to OS primary; may be promoted
+// to any connected monitor via monitor_manager_set_shell_primary_monitor(), and
+// automatically falls back to OS primary if disconnected).
 HMONITOR monitor_manager_primary_monitor();
+
+// True if @mon is currently WINOME's active Shell Primary monitor.
+bool monitor_manager_is_shell_primary(HMONITOR mon);
+
+// Promote @mon to WINOME's Shell Primary monitor. When @allow_os_sync is true
+// and config.sync_windows_primary_display is enabled, also promotes @mon to the
+// Windows OS primary display with compatibility recovery.
+bool monitor_manager_set_shell_primary_monitor(HMONITOR mon,
+                                               bool allow_os_sync = true);
 
 // Active monitor handle (GNOME layoutManager.currentMonitor: pointer monitor,
 // falling back to foreground window monitor, then primary monitor).

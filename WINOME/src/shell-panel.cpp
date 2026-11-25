@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <windows.h>
@@ -1339,6 +1340,9 @@ popover_raise_idle (gpointer data)
     DwmGetWindowAttribute (hwnd, DWMWA_CLOAKED, &cloaked, sizeof (cloaked));
 
     if (pp->raise_attempts == 0) {
+      // Pin the mapped popover HWND across all Windows virtual desktops so
+      // switching workspaces on another monitor never cloaks/hides it.
+      winome::vd::pin_window_async (hwnd);
       // Recompute the position from the anchor; keep the current size (GTK
       // has negotiated it by now).
       int w = before.right - before.left;
@@ -1478,6 +1482,9 @@ panel_popover_open (PanelPopover *pp)
     gtk_widget_set_visible (pp->window, TRUE);
   }
 
+  if (hwnd != nullptr)
+    winome::vd::pin_window_async (hwnd);
+
   // Re-assert the topmost placement after GTK's map completes (see
   // popover_raise_idle): the first map demotes the window out of the
   // topmost band, hiding it below the overview.
@@ -1613,15 +1620,61 @@ ensure_popover_mouse_hook (void)
                                               GetModuleHandleW (nullptr), 0);
 }
 
-// When the Activities overview opens it takes over the screen: close any open
-// popover immediately, while overview.cpp drives the panel backdrop (#000000
-// <-> #222226) and #panelActivities pill highlight frame-locked via
-// winome_shell_panel_set_overview_progress().
+// When the Activities overview opens on a monitor it takes over that monitor:
+// close only open popovers hosted on that monitor (or all monitors in linked
+// mode), while overview.cpp drives each monitor's top bar backdrop (#000000
+// <-> #222226) and #panelActivities highlight independently per monitor.
 static std::vector<GtkWidget *> g_registered_panels;
+static std::unordered_map<HMONITOR, double> g_panel_progress_by_mon;
 static double g_panel_overview_progress = 0.0;
-static bool g_panel_scroll_active = false;
-static int g_panel_scroll_count = 1;
-static double g_panel_scroll_pos = 0.0;
+
+static HMONITOR
+panel_popover_monitor (PanelPopover *pp)
+{
+  if (pp == nullptr)
+    return nullptr;
+  if (pp->button != nullptr) {
+    HMONITOR mon = widget_monitor_handle (pp->button);
+    if (mon != nullptr)
+      return mon;
+  }
+  HWND hwnd = panel_popover_hwnd (pp);
+  if (hwnd != nullptr && IsWindow (hwnd))
+    return MonitorFromWindow (hwnd, MONITOR_DEFAULTTONEAREST);
+  return nullptr;
+}
+
+// Guard open panel popovers (Notification Center / Quick Settings / Tray)
+// against Windows Virtual Desktop cloaking whenever another monitor switches
+// workspaces: re-pin and immediately restore any popover that Explorer cloaked.
+static void
+on_vd_changed_keep_popovers_visible (int count,
+                                     int active_index,
+                                     void *user_data)
+{
+  (void) count;
+  (void) user_data;
+  if (g_open_popovers == nullptr)
+    return;
+  for (GList *l = g_open_popovers; l != nullptr; l = l->next) {
+    PanelPopover *pp = static_cast<PanelPopover *> (l->data);
+    if (pp == nullptr || !pp->open)
+      continue;
+    HWND hwnd = panel_popover_hwnd (pp);
+    if (hwnd == nullptr || !IsWindow (hwnd))
+      continue;
+    winome::vd::pin_window_async (hwnd);
+    DWORD cloaked = 0;
+    DwmGetWindowAttribute (hwnd, DWMWA_CLOAKED, &cloaked, sizeof (cloaked));
+    if (cloaked != 0 && active_index >= 0) {
+      winome::vd::move_window_to_desktop (hwnd, active_index);
+      winome::vd::pin_window_async (hwnd);
+    }
+    SetWindowPos (hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                      SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+  }
+}
 
 static void
 apply_panel_overview_progress (GtkWidget *panel, double progress)
@@ -1645,11 +1698,13 @@ apply_panel_overview_progress (GtkWidget *panel, double progress)
 }
 
 static void
-on_overview_state_changed (bool active, void *user_data G_GNUC_UNUSED)
+on_overview_state_changed (bool active, HMONITOR monitor,
+                           void *user_data G_GNUC_UNUSED)
 {
-  g_print ("[panel] overview state -> %d\n", (int)active);
+  g_print ("[panel] overview state -> %d mon=%p\n", (int)active,
+           static_cast<void *> (monitor));
   if (active)
-    winome_shell_panel_close_popovers ();
+    winome_shell_panel_close_popovers_for_monitor (monitor);
 }
 
 // Register a panel window in the shared overview state tracker.
@@ -1663,27 +1718,30 @@ connect_overview_state (GtkWidget *panel)
   if (!g_overview_hooked) {
     g_overview_hooked = TRUE;
     winome::set_overview_change_callback (on_overview_state_changed, nullptr);
+    winome::vd::add_change_listener (on_vd_changed_keep_popovers_visible,
+                                     nullptr);
   }
-  apply_panel_overview_progress (panel, g_panel_overview_progress);
-  if (g_panel_scroll_active) {
-    GtkWidget *act_btn = static_cast<GtkWidget *> (
-        g_object_get_data (G_OBJECT (panel), "activities-button"));
-    if (act_btn != nullptr) {
-      winome_activities_btn_set_scroll (act_btn, g_panel_scroll_count,
-                                        g_panel_scroll_pos);
-    }
+  HMONITOR pmon = widget_monitor_handle (panel);
+  double init_p = g_panel_overview_progress;
+  if (pmon != nullptr) {
+    auto it = g_panel_progress_by_mon.find (pmon);
+    init_p = (it != g_panel_progress_by_mon.end ()) ? it->second : 0.0;
   }
+  apply_panel_overview_progress (panel, init_p);
 }
 
 void
 winome_shell_panel_set_overview_progress (double progress)
 {
   const double p = std::clamp (progress, 0.0, 1.0);
-  if (std::fabs (g_panel_overview_progress - p) < 1e-4)
-    return;
   g_panel_overview_progress = p;
-  for (GtkWidget *panel : g_registered_panels)
+  for (auto &kv : g_panel_progress_by_mon)
+    kv.second = p;
+  for (GtkWidget *panel : g_registered_panels) {
+    if (HMONITOR pmon = widget_monitor_handle (panel))
+      g_panel_progress_by_mon[pmon] = p;
     apply_panel_overview_progress (panel, p);
+  }
 }
 
 void
@@ -1696,6 +1754,7 @@ winome_shell_panel_set_overview_progress_for_monitor (void *hmonitor,
   }
   const double p = std::clamp (progress, 0.0, 1.0);
   HMONITOR target = static_cast<HMONITOR> (hmonitor);
+  g_panel_progress_by_mon[target] = p;
   for (GtkWidget *panel : g_registered_panels) {
     HMONITOR pmon = widget_monitor_handle (panel);
     if (pmon == target)
@@ -1704,13 +1763,18 @@ winome_shell_panel_set_overview_progress_for_monitor (void *hmonitor,
 }
 
 void
-winome_shell_panel_set_workspace_scroll (int count, double position)
+winome_shell_panel_set_workspace_scroll_for_monitor (void *hmonitor,
+                                                     int count,
+                                                     double position)
 {
+  HMONITOR target = static_cast<HMONITOR> (hmonitor);
   if (position < 0.0) {
-    if (!g_panel_scroll_active)
-      return;
-    g_panel_scroll_active = false;
     for (GtkWidget *panel : g_registered_panels) {
+      if (target != nullptr) {
+        HMONITOR pmon = widget_monitor_handle (panel);
+        if (pmon != nullptr && pmon != target)
+          continue;
+      }
       GtkWidget *act_btn = static_cast<GtkWidget *> (
           g_object_get_data (G_OBJECT (panel), "activities-button"));
       if (act_btn != nullptr)
@@ -1721,25 +1785,28 @@ winome_shell_panel_set_workspace_scroll (int count, double position)
 
   if (count < 1)
     count = 1;
-  g_panel_scroll_active = true;
-  g_panel_scroll_count = count;
-  g_panel_scroll_pos = std::clamp (position, 0.0, static_cast<double> (count - 1));
-  const bool per_mon =
-      winome::ws::effective_mode () != winome::ws::MultiMonitorWorkspaceMode::Span;
-  HMONITOR ov_mon = per_mon ? winome::overview_target_monitor () : nullptr;
+  const double clamped_pos =
+      std::clamp (position, 0.0, static_cast<double> (count - 1));
   for (GtkWidget *panel : g_registered_panels) {
-    if (per_mon && ov_mon != nullptr) {
+    if (target != nullptr) {
       HMONITOR pmon = widget_monitor_handle (panel);
-      if (pmon != nullptr && pmon != ov_mon)
+      if (pmon != nullptr && pmon != target)
         continue;
     }
     GtkWidget *act_btn = static_cast<GtkWidget *> (
         g_object_get_data (G_OBJECT (panel), "activities-button"));
-    if (act_btn != nullptr) {
-      winome_activities_btn_set_scroll (act_btn, g_panel_scroll_count,
-                                        g_panel_scroll_pos);
-    }
+    if (act_btn != nullptr)
+      winome_activities_btn_set_scroll (act_btn, count, clamped_pos);
   }
+}
+
+void
+winome_shell_panel_set_workspace_scroll (int count, double position)
+{
+  const bool per_mon =
+      winome::ws::effective_mode () != winome::ws::MultiMonitorWorkspaceMode::Span;
+  HMONITOR ov_mon = per_mon ? winome::overview_target_monitor () : nullptr;
+  winome_shell_panel_set_workspace_scroll_for_monitor (ov_mon, count, position);
 }
 
 static void
@@ -1837,24 +1904,39 @@ make_panel_popover (GtkWidget *button, GtkWidget *child, gboolean centered)
 }
 
 static void
-close_all_open_popovers (gboolean immediate)
+close_open_popovers_for_monitor (HMONITOR monitor, gboolean immediate)
 {
-  while (g_open_popovers != nullptr) {
-    PanelPopover *pp = static_cast<PanelPopover *> (g_open_popovers->data);
+  GList *snapshot = g_list_copy (g_open_popovers);
+  for (GList *l = snapshot; l != nullptr; l = l->next) {
+    PanelPopover *pp = static_cast<PanelPopover *> (l->data);
+    if (g_list_find (g_open_popovers, pp) == nullptr)
+      continue;
+    if (monitor != nullptr) {
+      HMONITOR pmon = panel_popover_monitor (pp);
+      if (pmon != nullptr && pmon != monitor)
+        continue;
+    }
     panel_popover_close_ex (pp, "dismiss", immediate);
   }
+  g_list_free (snapshot);
 }
 
 void
 winome_shell_panel_close_popovers (void)
 {
-  close_all_open_popovers (FALSE);
+  close_open_popovers_for_monitor (nullptr, FALSE);
+}
+
+void
+winome_shell_panel_close_popovers_for_monitor (void *hmonitor)
+{
+  close_open_popovers_for_monitor (static_cast<HMONITOR> (hmonitor), FALSE);
 }
 
 void
 winome_shell_panel_close_popovers_immediate (void)
 {
-  close_all_open_popovers (TRUE);
+  close_open_popovers_for_monitor (nullptr, TRUE);
 }
 typedef struct PanelStatus {
   bool is_primary;
@@ -1911,7 +1993,7 @@ sync_activities_dots (PanelStatus *st)
     return;
   HMONITOR mon = widget_monitor_handle (st->activities_indicators);
   if (mon == nullptr && st->is_primary)
-    mon = winome::monitor_manager_primary_monitor ();
+    mon = winome::monitor_manager_os_primary_monitor ();
   apply_activities_dots (st, winome::ws::count_for_monitor (mon),
                          winome::ws::active_for_monitor (mon));
 }
@@ -1926,7 +2008,7 @@ on_panel_desktop_changed (HMONITOR monitor, int count, int active_index,
   if (monitor != nullptr) {
     HMONITOR panel_mon = widget_monitor_handle (st->activities_indicators);
     if (panel_mon == nullptr && st->is_primary)
-      panel_mon = winome::monitor_manager_primary_monitor ();
+      panel_mon = winome::monitor_manager_os_primary_monitor ();
     if (panel_mon != nullptr && panel_mon != monitor)
       return;
   }
@@ -2793,11 +2875,29 @@ winome_shell_reload_theme (void)
 void *
 winome_shell_panel_top_popover_hwnd (void)
 {
+  return winome_shell_panel_top_popover_hwnd_for_monitor (nullptr);
+}
+
+void *
+winome_shell_panel_top_popover_hwnd_for_monitor (void *hmonitor)
+{
   if (g_open_popovers == nullptr)
     return nullptr;
-  GList *last = g_list_last (g_open_popovers);
-  PanelPopover *pp = static_cast<PanelPopover *> (last->data);
-  return panel_popover_hwnd (pp);
+  HMONITOR target = static_cast<HMONITOR> (hmonitor);
+  for (GList *l = g_list_last (g_open_popovers); l != nullptr; l = l->prev) {
+    PanelPopover *pp = static_cast<PanelPopover *> (l->data);
+    if (pp == nullptr || !pp->open)
+      continue;
+    if (target != nullptr) {
+      HMONITOR pmon = panel_popover_monitor (pp);
+      if (pmon != nullptr && pmon != target)
+        continue;
+    }
+    HWND h = panel_popover_hwnd (pp);
+    if (h != nullptr)
+      return h;
+  }
+  return nullptr;
 }
 
 // See shell-panel.h: TRUE for ~350ms after a popover was dismissed by an

@@ -53,6 +53,9 @@ struct MonitorManagerState {
   BOOL(WINAPI* wts_unreg)(HWND) = nullptr;
   guint display_debounce_id = 0;
   guint workarea_idle_id = 0;
+  guint os_primary_recover_id1 = 0;
+  guint os_primary_recover_id2 = 0;
+  std::wstring shell_primary_device;
   bool initialized = false;
   guint launch_watch_timer_id = 0;
   HMONITOR launch_target_mon = nullptr;
@@ -312,13 +315,162 @@ bool same_monitor_topology(const std::vector<MonitorDescriptor>& a,
   return true;
 }
 
-HMONITOR monitor_manager_primary_monitor() {
+HMONITOR monitor_manager_os_primary_monitor() {
+  const auto monitors = enumerate_monitors();
+  if (!monitors.empty())
+    return monitors.front().hmonitor;
   if (g_mm.primary_panel != nullptr && IsWindow(g_mm.primary_panel)) {
     HMONITOR mon = MonitorFromWindow(g_mm.primary_panel, MONITOR_DEFAULTTOPRIMARY);
     if (mon != nullptr)
       return mon;
   }
   return MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+}
+
+HMONITOR monitor_manager_primary_monitor() {
+  if (!g_mm.shell_primary_device.empty()) {
+    const auto monitors = enumerate_monitors();
+    for (const auto& m : monitors) {
+      if (!m.device_name.empty() &&
+          _wcsicmp(m.device_name.c_str(), g_mm.shell_primary_device.c_str()) == 0) {
+        return m.hmonitor;
+      }
+    }
+    g_mm.shell_primary_device.clear();
+  }
+  return monitor_manager_os_primary_monitor();
+}
+
+bool monitor_manager_is_shell_primary(HMONITOR mon) {
+  return mon != nullptr && mon == monitor_manager_primary_monitor();
+}
+
+namespace {
+
+bool sync_windows_os_primary_display(const std::wstring& target_device) {
+  if (target_device.empty())
+    return false;
+
+  std::vector<DisplayPositionSpec> specs;
+  std::vector<DEVMODEW> modes;
+  DISPLAY_DEVICEW dd{};
+  dd.cb = sizeof(dd);
+  for (DWORD idx = 0; EnumDisplayDevicesW(nullptr, idx, &dd, 0); ++idx) {
+    const DWORD flags = dd.StateFlags;
+    if ((flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0 &&
+        (flags & DISPLAY_DEVICE_MIRRORING_DRIVER) == 0) {
+      DEVMODEW dm{};
+      dm.dmSize = sizeof(dm);
+      if (EnumDisplaySettingsExW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm, 0)) {
+        DisplayPositionSpec sp{};
+        sp.device_name = dd.DeviceName;
+        sp.x = dm.dmPosition.x;
+        sp.y = dm.dmPosition.y;
+        sp.width = static_cast<LONG>(dm.dmPelsWidth);
+        sp.height = static_cast<LONG>(dm.dmPelsHeight);
+        sp.is_primary = (flags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
+        specs.push_back(std::move(sp));
+        modes.push_back(dm);
+      }
+    }
+    dd = {};
+    dd.cb = sizeof(dd);
+  }
+
+  if (specs.size() <= 1 ||
+      !compute_os_primary_display_positions(&specs, target_device)) {
+    return false;
+  }
+
+  for (size_t i = 0; i < specs.size(); ++i) {
+    DEVMODEW dm = modes[i];
+    dm.dmFields = DM_POSITION;
+    dm.dmPosition.x = specs[i].x;
+    dm.dmPosition.y = specs[i].y;
+    DWORD cds_flags = CDS_UPDATEREGISTRY | CDS_NORESET;
+    if (specs[i].is_primary)
+      cds_flags |= CDS_SET_PRIMARY;
+    LONG r = ChangeDisplaySettingsExW(specs[i].device_name.c_str(), &dm,
+                                      nullptr, cds_flags, nullptr);
+    if (r != DISP_CHANGE_SUCCESSFUL) {
+      g_print("[mon] OS primary stage failed dev=%ls err=%ld\n",
+              specs[i].device_name.c_str(), r);
+      return false;
+    }
+  }
+
+  LONG commit = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+  g_print("[mon] OS primary commit dev=%ls result=%ld\n",
+          target_device.c_str(), commit);
+  return commit == DISP_CHANGE_SUCCESSFUL;
+}
+
+gboolean os_primary_recover_cb1(gpointer G_GNUC_UNUSED data) {
+  g_mm.os_primary_recover_id1 = 0;
+  monitor_manager_sync();
+  if (g_mm.cbs.on_os_primary_display_changed != nullptr)
+    g_mm.cbs.on_os_primary_display_changed();
+  return G_SOURCE_REMOVE;
+}
+
+gboolean os_primary_recover_cb2(gpointer G_GNUC_UNUSED data) {
+  g_mm.os_primary_recover_id2 = 0;
+  monitor_manager_sync();
+  if (g_mm.cbs.on_os_primary_display_changed != nullptr)
+    g_mm.cbs.on_os_primary_display_changed();
+  return G_SOURCE_REMOVE;
+}
+
+void cancel_os_primary_recover_timers() {
+  if (g_mm.os_primary_recover_id1 != 0) {
+    g_source_remove(g_mm.os_primary_recover_id1);
+    g_mm.os_primary_recover_id1 = 0;
+  }
+  if (g_mm.os_primary_recover_id2 != 0) {
+    g_source_remove(g_mm.os_primary_recover_id2);
+    g_mm.os_primary_recover_id2 = 0;
+  }
+}
+
+}  // namespace
+
+bool monitor_manager_set_shell_primary_monitor(HMONITOR mon,
+                                               bool allow_os_sync) {
+  if (mon == nullptr)
+    return false;
+  MONITORINFOEXW mi{};
+  mi.cbSize = sizeof(mi);
+  if (!GetMonitorInfoW(mon, &mi) || mi.szDevice[0] == L'\0')
+    return false;
+
+  const std::wstring target_dev = mi.szDevice;
+  const bool already_os_primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+  const bool want_os_sync =
+      allow_os_sync && get_config().sync_windows_primary_display &&
+      !already_os_primary;
+
+  g_mm.shell_primary_device = target_dev;
+  g_print("[mon] shell primary -> %ls (mon=%p already_os_primary=%d sync_os=%d)\n",
+          target_dev.c_str(), static_cast<void*>(mon),
+          already_os_primary ? 1 : 0, want_os_sync ? 1 : 0);
+
+  if (want_os_sync && sync_windows_os_primary_display(target_dev)) {
+    mon = monitor_manager_primary_monitor();
+    monitor_manager_sync();
+    if (g_mm.cbs.on_os_primary_display_changed != nullptr)
+      g_mm.cbs.on_os_primary_display_changed();
+    cancel_os_primary_recover_timers();
+    if (gtk_is_initialized()) {
+      g_mm.os_primary_recover_id1 =
+          g_timeout_add(350, os_primary_recover_cb1, nullptr);
+      g_mm.os_primary_recover_id2 =
+          g_timeout_add(950, os_primary_recover_cb2, nullptr);
+    }
+  }
+
+  if (g_mm.cbs.on_shell_primary_changed != nullptr)
+    g_mm.cbs.on_shell_primary_changed(mon);
+  return true;
 }
 
 HMONITOR monitor_manager_active_monitor() {
@@ -707,6 +859,8 @@ void monitor_manager_shutdown() {
     g_source_remove(g_mm.workarea_idle_id);
     g_mm.workarea_idle_id = 0;
   }
+  cancel_os_primary_recover_timers();
+  g_mm.shell_primary_device.clear();
   cancel_launch_watch();
 
   destroy_all_secondary_panels();

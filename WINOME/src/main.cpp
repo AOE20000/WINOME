@@ -658,6 +658,27 @@ position_panel (GtkWidget *panel)
   };
   mm_cbs.on_workarea_changed = winome::reassert_panel_workarea_now;
   mm_cbs.on_wallpaper_changed = winome::overview_invalidate_wallpaper;
+  mm_cbs.on_shell_primary_changed = [] (HMONITOR G_GNUC_UNUSED new_primary) {
+    winome::ws::on_monitors_changed ();
+    winome::overview_refresh_all_open ();
+  };
+  mm_cbs.on_os_primary_display_changed = [] () {
+    g_print ("[shell] OS primary display changed; re-suppressing taskbar & reasserting workarea\n");
+    winome::NativeTaskbar::on_explorer_restarted ();
+    HMONITOR os_pri = winome::monitor_manager_os_primary_monitor ();
+    MONITORINFO os_mi {};
+    os_mi.cbSize = sizeof (os_mi);
+    if (os_pri != nullptr && GetMonitorInfoW (os_pri, &os_mi)) {
+      g_primary_monitor = os_mi.rcMonitor;
+      save_recovery_workarea (g_primary_monitor);
+    }
+    winome::reassert_panel_workarea_now ();
+    winome::hot_corner_refresh_bounds ();
+    winome::evaluate_fullscreen_state ();
+    winome::ws::on_monitors_changed ();
+    winome::overview_reposition ();
+    g_timeout_add (250, pin_shell_windows, nullptr);
+  };
   winome::monitor_manager_init (hwnd, mm_cbs);
 }
 
@@ -897,6 +918,8 @@ apply_config_set_kv (const std::string &key, const std::string &val)
     ok = parse_bool (&cfg.multi_monitor_panels);
   else if (key == "multi_monitor_overview_linked")
     ok = parse_bool (&cfg.multi_monitor_overview_linked);
+  else if (key == "sync_windows_primary_display")
+    ok = parse_bool (&cfg.sync_windows_primary_display);
   else if (key == "end_session_confirm")
     ok = parse_bool (&cfg.end_session_confirm);
   else if (key == "unify_dark_titlebars")
@@ -1026,7 +1049,8 @@ on_activate (GtkApplication      *app,
     static const char *const kAllowed[] = {
         "developer_mode", "hot_corner_enabled", "win_key_overview",
         "overview_window_blacklist", "multi_monitor_panels",
-        "multi_monitor_overview_linked", "end_session_confirm", "unify_dark_titlebars", "unify_rounded_corners",
+        "multi_monitor_overview_linked", "sync_windows_primary_display",
+        "end_session_confirm", "unify_dark_titlebars", "unify_rounded_corners",
         "clock_show_seconds", "show_battery_percentage",
         "hot_corner_cooldown_ms", "language", "clock_format",
         "live_wallpaper_mode", "multi_monitor_workspace_mode"};
@@ -1250,6 +1274,7 @@ on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
   winome::ws_osd_shutdown ();
   winome::window_theming_shutdown ();
   winome::app_icon_cache_clear ();
+  winome::overview_shutdown ();
   winome::monitor_manager_shutdown ();
   winome::stop_hot_corner ();
   winome::stop_fullscreen_watcher ();

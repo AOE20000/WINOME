@@ -6,6 +6,10 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 
 ## 1. 宿主启动、自愈与退出流程（`src/main.cpp`）
 
+<!-- excerpt:start -->
+WINOME 作为独立程序运行，不修改系统文件、不向 `explorer.exe` 注入任何代码。启动时自动拉起独立看门狗进程守护状态，无论是正常退出还是意外崩溃，都会迅速恢复 Windows 原生任务栏与全部窗口，并支持安全模式启动与一键导出排障日志。
+<!-- excerpt:end -->
+
 1. **CLI 与双向 IPC 入口**：支持 `--restore`（多遍 `force_restore_all()` + `ABM_GETSTATE` 恢复原生任务栏后立即退出）、`--watchdog <pid> [--no-crash-ui]`（基于 `RecoverySnapshot` / `CrashState` 自动还原任务栏并在异常退出时拉起零 GTK 依赖的纯 Win32 `show_crash_recovery_dialog` 操作窗口，内置 `diagnostics-export.{h,cpp}` 一键导出含版本/系统/多屏拓扑/日志/转储的 `.zip` 排障压缩包）、`--safe-mode`（跳过外置插件与窗口外观注入）、`--after-pid <pid>`（供 `Alt+F2 -> r` 无竞态平滑重启）、`--status`（经 Named Pipe 查询运行中宿主遥测与健康状态 JSON），以及 `--crash-ui`、`--show-overview`、`--settings`、`--reload`、`--quit`；`src/shell-ipc.{h,cpp}` 通过 `ipc_build_user_pipe_sddl()`（当前用户 SID + `S:(ML;;NW;;;ME)`）保护 Named Pipe `\\.\pipe\WINOME_Shell_IPC`，供无 UAC 清单的 `WINOME/ctl/winome-ctl.exe` 在普通用户权限下发送 `ping`/`status`/`logs.*`/`debug.flags.*`/`subsystem.*`/`inspect.*`/`overview.*`/`desktop.*`/`theme.reload`/`plugin.*`/`looking_glass.*`/`run.exec`/`quit` 等 JSON 指令。
 2. **单实例、配置、遥测、实时日志与崩溃钩子**：通过互斥体 `Local\WINOME_Shell_SingleInstance` 保证单实例；加载 `%LOCALAPPDATA%\WINOME\config.json`（含 `developer_mode` 与 `disabled_plugins`）；`src/perf-metrics.{h,cpp}` 维护启动遥测与子系统熔断器；`src/debug-runtime.{h,cpp}` 通过 `debug_install_log_capture()` 将 `g_print`/`g_printerr` 与插件日志写入 512 条内存环形缓冲区（并发追加写入 `%LOCALAPPDATA%\WINOME\winome.log`，`5MB` 自动轮转 `winome.prev.log`）；注册 `SetUnhandledExceptionFilter`、`std::set_terminate` 与 `signal(SIGABRT/SIGSEGV/SIGILL/SIGFPE)` 写入 `MiniDump`、`crash-state.json` 并执行无锁 `restore_emergency_no_join()`，同时保留 `recovery.dat` 交给 `--watchdog` 完成多遍自愈兜底。
 3. **系统接入**：启用 Per-Monitor DPI Awareness v2（`src/host-utils.cpp`），尝试 `SeTcbPrivilege`，隐藏原生任务栏并快照初始 `ABM_GETSTATE`（`src/native-taskbar.cpp`），启动事件钩子（`src/win-event-hook.cpp`）、可选零注入 DWM 窗口外观统一（`src/window-theming.{h,cpp}`）与全局键盘钩子（`src/overview-trigger.cpp`，涵盖 `Alt+F2` 运行弹窗与虚拟桌面热键）。
@@ -46,14 +50,17 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 
 ## 4. 原生 Activities 概览（`src/overview*.cpp`）
 
-已全面替代早期基于 DLL 注入的 `extracted/WinOverview/` 方案，在宿主进程内基于 `overviewControls.js`（三态 `ControlsState::HIDDEN` / `WINDOW_PICKER` / `APP_GRID`）与 `workspace.js` 逐组件移植。
+<!-- excerpt:start -->
+主屏与副屏共用同一套活动概览引擎：展开时一次性同步全部桌面与窗口预览并多屏同步显现，杜绝延迟与壁纸闪屏；在任意屏幕都可直接搜索应用与窗口、拖拽整理工作区，并在底部使用完整的 Dash 应用栏与分页应用网格。
+<!-- excerpt:end -->
+
+在宿主进程内基于 `overviewControls.js`（三态 `ControlsState::HIDDEN` / `WINDOW_PICKER` / `APP_GRID`）与 `workspace.js` 逐组件移植，并通过多实例 `OverviewView` 统一驱动主屏与全部副屏。
 
 ### 布局与交互模块
 
 | 模块 | 上游参考 | 职责 |
 |------|----------|------|
-| `overview.cpp` | `overviewControls.js`, `windowPreview.js` | 搜索输入过滤（应用+打开窗口）、工作区背景盒与 0→30px 圆角插值（`APP_GRID` 时收起为顶部 15% 工作区缩略条）、单遍双槽位（`picker_rect` / `grid_rect`）计算、DWM 实时缩略图飞入/开合动画、`GtkGestureDrag` 同屏/跨屏拖拽、桌面实时窗口拖入（经 `EVENT_SYSTEM_MOVESIZESTART/END`）、中键关窗、chrome 淡出与 z-order 管理、快捷键（`Ctrl+F` / `Ctrl+Shift+N` / `PageUp` / `PageDown` / `Esc`） |
-| `overview-secondary.cpp` | 多显示器同时概览 | 独立或联动展开任意副屏概览（默认 `multi_monitor_overview_linked=false` 支持各屏同时独立开合，也可切换全屏联动），支持顶部工作区胶囊、侧边露出相邻工作区、副屏窗口预览点击/中键关闭/跨屏拖拽、实时蓝色落点高亮与显示器热插拔自动清理重定位 |
+| `overview.cpp` | `overviewControls.js`, `windowPreview.js` | 统一多屏 `OverviewView` 入口（主屏与全部副屏共用同一套状态机与渲染管线，支持单开或全屏联动）：搜索输入过滤（应用+打开窗口）、工作区背景盒与 0→30px 圆角插值（`APP_GRID` 时收起为顶部 15% 工作区缩略条）、`DWMWA_CLOAK` 原子无闪屏展开与单次批量 COM 快照（`SharedOpenSnapshot`）、启动全屏预热、DWM 实时缩略图飞入/开合动画、`GtkGestureDrag` 同屏/跨屏拖拽、桌面实时窗口拖入（经 `EVENT_SYSTEM_MOVESIZESTART/END`）、中键关窗、chrome 淡出与 z-order 管理、快捷键（`Ctrl+F` / `Ctrl+Shift+N` / `PageUp` / `PageDown` / `Esc`） |
 | `overview-layout.cpp` | `workspace.js` (`UnalignedLayoutStrategy`) | `lerp(1.5, 1)` 窗口缩放、行搜索最优 scale/space、`WINDOW_PREVIEW_MAXIMUM_SCALE = 0.95`、像素对齐、有效间距（主题 6px + chrome oversize） |
 | `overview-dash.cpp` | `dash.js` | Favorites 固定列表持久化（`pinned_apps`）+ `.dash-separator` 分割线 + 未固定运行应用、右键菜单、9 点应用网格切换（Shift+点击回退开始菜单）、LRU 图标缓存与 300ms 悬停标签 |
 | `app-index.cpp` | `appSystem.js`, `appSearch.js` | 异步索引开始菜单 `.lnk`/`.url`（保留 User/Common `Programs` 目录顺序、`folder_name`/`folder_order`/`item_order`）、原生 AES-256-CBC/MT19937 解密 Win11 `start2.bin`（`decrypt_start2_bin_bytes()`，完整还原固定项与 `pinType: 2` 文件夹编组，含 `KnownFolder` `{GUID}` 与 `Export-StartLayout` 回退）及 `FOLDERID_AppsFolder`（附加 Win32 AUMID、`PKEY_AppUserModel_ID`）、`build_app_grid_items()` 两级单向同步编排（开始菜单固定配置优先 → 未固定项按目录顺序自动分组，严格单向不回写磁盘）、`FindFirstChangeNotificationW` 目录与 `start2.bin` 单向监听、`1024` 条上限 `GdkTexture` LRU 缓存与后台 `RawDecodedIcon` 解码 |
@@ -74,10 +81,14 @@ WINOME 在宿主单进程 `winome.exe` 内以 C++17 + GTK4 渲染完整 Shell UI
 
 ## 5. 多屏工作区引擎与虚拟桌面 COM（`src/workspace-manager.cpp`、`src/virtual-desktop.cpp`）
 
+<!-- excerpt:start -->
+提供三种可随时热切换的多显示器工作区策略：**内置独立切换**（各屏互不干扰）、**仅主屏切换**（支持在副屏选择时动态将其升格为 Shell 主屏，并可选同步 Windows 系统主屏）以及**全屏同步联动**；无论选择哪种模式，每块屏幕展开概览时底部均提供完整 Dash。
+<!-- excerpt:end -->
+
 在底层虚拟桌面 COM 之上新增 `src/workspace-manager.{h,cpp}`，提供三档可热切换的多显示器工作区模式（`config.json` `multi_monitor_workspace_mode`）：
 - **`independent`（默认，WINOME 内置每屏独立工作区引擎）**：将 Windows 原生桌面 0 作为全局常驻 Live Stage，原生桌面 1 作为停泊桌面（Parking Desktop），通过 `vd::move_windows_batch()` 单遍批量隐藏/还原目标显示器的窗口，使各块显示器拥有完全独立的工作区列表与活动索引（屏幕 1 切换工作区绝不影响屏幕 2），并支持外部点击/通知激活停泊窗口自动跟随、跨屏窗口迁移（`ws::transfer_window_to_monitor_workspace`）以及退出/拔屏时全量还原所有停泊窗口；
-- **`primary_only`（GNOME 默认）**：工作区仅作用于主显示器，自动跨桌面固定副屏窗口并在切回或退出时解除固定；
-- **`span`（全局同步）**：所有显示器跟随 Windows 原生虚拟桌面同步切换。
+- **`primary_only`（GNOME 默认）**：工作区仅作用于当前 Shell 主屏，自动跨桌面固定其余屏幕窗口并在切回或退出时解除固定；当在副屏选中该模式时，动态将该副屏认定为新的 Shell 主屏（并支持通过 `sync_windows_primary_display` 可选同步 Windows 系统主显示器）；
+- **`span`（全局同步）**：所有显示器以零延迟锁步跟随 Windows 原生虚拟桌面同步切换，且全部显示器在概览中均保留完整 Dash 与流畅的工作区滑动动画。
 
 底层虚拟桌面模块移植并扩展自 [VirtualDesktopAccessor-rust](https://github.com/Ciantic/VirtualDesktopAccessor)（MIT），在 Windows 11 22621 / 24H2+ 验证：
 

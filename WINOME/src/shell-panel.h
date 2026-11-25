@@ -125,14 +125,19 @@ int winome_shell_panel_height (void);
 // overview from overview_restack().
 void *winome_shell_panel_top_popover_hwnd (void);
 
+// Per-monitor variant: returns the topmost open popover anchored on @hmonitor
+// (or any open popover when @hmonitor == nullptr).
+void *winome_shell_panel_top_popover_hwnd_for_monitor (void *hmonitor);
+
 // TRUE for a short window after a popover was dismissed by a click outside
 // itself while the Activities overview was open. In GNOME that click is
 // consumed by the menu grab: it closes the menu only, so the overview must
 // ignore it instead of closing too (windowPreview/overview click handling).
 int winome_shell_panel_popover_just_closed (void);
 
-// Close all open panel popovers.
+// Close all open panel popovers, or only popovers on @hmonitor (nullptr = all).
 void winome_shell_panel_close_popovers (void);
+void winome_shell_panel_close_popovers_for_monitor (void *hmonitor);
 void winome_shell_panel_close_popovers_immediate (void);
 
 // Reload GNOME theme stylesheet, optional developer user-debug.css, and StEngine.
@@ -151,6 +156,9 @@ void winome_shell_panel_set_overview_progress_for_monitor (void *hmonitor,
 // (matching upstream panel.js WorkspaceIndicators). Pass position < 0 to release
 // back to virtual-desktop observer sync.
 void winome_shell_panel_set_workspace_scroll (int count, double position);
+void winome_shell_panel_set_workspace_scroll_for_monitor (void *hmonitor,
+                                                          int count,
+                                                          double position);
 
 // Declarative TopBar plugin UI slots (host updates only on GTK main thread).
 typedef void (*WinomePluginTopBarClickCb) (const char *plugin_id,

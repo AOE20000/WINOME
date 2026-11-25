@@ -24,6 +24,7 @@ struct WinomeConfig {
   bool multi_monitor_panels = true;
   std::string multi_monitor_workspace_mode = "independent";  // "independent", "primary_only", "span"
   bool multi_monitor_overview_linked = false;  // false = allow simultaneous unlinked; true = linked open/close across all monitors
+  bool sync_windows_primary_display = false;   // opt-in: also promote Shell Primary to Windows OS primary display
   bool end_session_confirm = true;
   bool unify_dark_titlebars = false;
   bool unify_rounded_corners = false;

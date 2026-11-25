@@ -112,6 +112,7 @@ void test_config_roundtrip() {
   CHECK(def.auto_elevate == true);
   CHECK(def.unify_dark_titlebars == false);
   CHECK(def.unify_rounded_corners == false);
+  CHECK(def.sync_windows_primary_display == false);
 
   winome::WinomeConfig src;
   src.language = "zh";
@@ -126,6 +127,7 @@ void test_config_roundtrip() {
   src.live_wallpaper_mode = "snapshot";
   src.dash_isolate_workspaces = true;
   src.multi_monitor_panels = false;
+  src.sync_windows_primary_display = true;
   src.end_session_confirm = false;
   src.unify_dark_titlebars = true;
   src.unify_rounded_corners = true;
@@ -150,6 +152,7 @@ void test_config_roundtrip() {
   CHECK(dst.live_wallpaper_mode == src.live_wallpaper_mode);
   CHECK(dst.dash_isolate_workspaces == src.dash_isolate_workspaces);
   CHECK(dst.multi_monitor_panels == src.multi_monitor_panels);
+  CHECK(dst.sync_windows_primary_display == src.sync_windows_primary_display);
   CHECK(dst.end_session_confirm == src.end_session_confirm);
   CHECK(dst.unify_dark_titlebars == src.unify_dark_titlebars);
   CHECK(dst.unify_rounded_corners == src.unify_rounded_corners);
@@ -163,6 +166,7 @@ void test_config_roundtrip() {
   CHECK(legacy.overview_window_blacklist == true);
   CHECK(legacy.live_wallpaper_mode == "live");
   CHECK(legacy.dash_isolate_workspaces == false);
+  CHECK(legacy.sync_windows_primary_display == false);
   CHECK(legacy.unify_dark_titlebars == false);
   CHECK(legacy.unify_rounded_corners == false);
 
@@ -3336,6 +3340,86 @@ void test_independent_per_monitor_workspace_engine() {
         1920, 1080, 32, 1, 2, 100);
     CHECK(sec_with_dash.picker_box.bottom <= 1080 - 114);
     CHECK(sec_with_dash.picker_box.bottom < sec_no_dash.picker_box.bottom);
+  }
+
+  // 4b. Unified per-monitor Overview role, unified dispatch & OS primary sync math.
+  {
+    using Mode = winome::ws::MultiMonitorWorkspaceMode;
+    // Search & App Grid are ALWAYS enabled on every monitor in every mode.
+    // Dash & multi-workspace are enabled everywhere EXCEPT non-primary in PrimaryOnly.
+    const auto r_ind_p = winome::resolve_monitor_overview_role(Mode::Independent, true);
+    const auto r_ind_s = winome::resolve_monitor_overview_role(Mode::Independent, false);
+    CHECK(r_ind_p.show_search && r_ind_p.allow_app_grid && r_ind_p.show_dash && r_ind_p.multi_workspace);
+    CHECK(r_ind_s.show_search && r_ind_s.allow_app_grid && r_ind_s.show_dash && r_ind_s.multi_workspace);
+
+    const auto r_span_p = winome::resolve_monitor_overview_role(Mode::Span, true);
+    const auto r_span_s = winome::resolve_monitor_overview_role(Mode::Span, false);
+    CHECK(r_span_p.show_search && r_span_p.allow_app_grid && r_span_p.show_dash && r_span_p.multi_workspace);
+    CHECK(r_span_s.show_search && r_span_s.allow_app_grid && r_span_s.show_dash && r_span_s.multi_workspace);
+
+    const auto r_po_p = winome::resolve_monitor_overview_role(Mode::PrimaryOnly, true);
+    const auto r_po_s = winome::resolve_monitor_overview_role(Mode::PrimaryOnly, false);
+    CHECK(r_po_p.show_search && r_po_p.allow_app_grid && r_po_p.show_dash && r_po_p.multi_workspace);
+    CHECK(r_po_s.show_search && r_po_s.allow_app_grid && !r_po_s.show_dash && !r_po_s.multi_workspace);
+
+    using UAct = winome::UnifiedOverviewAction;
+    // Unlinked simultaneous: each monitor toggles independently without closing others.
+    CHECK(winome::decide_unified_overview_action(false, false, false, false) == UAct::OpenMonitor);
+    CHECK(winome::decide_unified_overview_action(false, false, false, true) == UAct::OpenMonitor);
+    CHECK(winome::decide_unified_overview_action(false, false, true, true) == UAct::None);
+    CHECK(winome::decide_unified_overview_action(false, true, false, true) == UAct::OpenMonitor);
+    CHECK(winome::decide_unified_overview_action(false, true, true, true) == UAct::CloseMonitor);
+    // Linked: opens all monitors together and closes all together.
+    CHECK(winome::decide_unified_overview_action(true, false, false, false) == UAct::OpenAllLinked);
+    CHECK(winome::decide_unified_overview_action(true, false, true, true) == UAct::None);
+    CHECK(winome::decide_unified_overview_action(true, true, false, false) == UAct::OpenAllLinked);
+    CHECK(winome::decide_unified_overview_action(true, true, true, true) == UAct::CloseAll);
+    CHECK(winome::decide_unified_overview_action(true, true, false, true) == UAct::CloseAll);
+
+    // Windows OS primary display coordinate re-origin math:
+    // Case 1: 2 monitors side-by-side (Mon1 at 0,0; Mon2 at +1920,0) -> promote Mon2.
+    std::vector<winome::DisplayPositionSpec> two_right = {
+        {L"\\\\.\\DISPLAY1", 0, 0, 1920, 1080, true},
+        {L"\\\\.\\DISPLAY2", 1920, 0, 1920, 1080, false},
+    };
+    CHECK(winome::compute_os_primary_display_positions(&two_right, L"\\\\.\\DISPLAY2"));
+    CHECK(two_right[0].device_name == L"\\\\.\\DISPLAY1" && two_right[0].x == -1920 && two_right[0].y == 0 && !two_right[0].is_primary);
+    CHECK(two_right[1].device_name == L"\\\\.\\DISPLAY2" && two_right[1].x == 0 && two_right[1].y == 0 && two_right[1].is_primary);
+
+    // Case 2: 2 monitors with left-negative secondary (-2560, 120) -> promote Mon2.
+    std::vector<winome::DisplayPositionSpec> two_left = {
+        {L"\\\\.\\DISPLAY1", 0, 0, 1920, 1080, true},
+        {L"\\\\.\\DISPLAY2", -2560, 120, 2560, 1440, false},
+    };
+    CHECK(winome::compute_os_primary_display_positions(&two_left, L"\\\\.\\DISPLAY2"));
+    CHECK(two_left[0].x == 2560 && two_left[0].y == -120 && !two_left[0].is_primary);
+    CHECK(two_left[1].x == 0 && two_left[1].y == 0 && two_left[1].is_primary);
+
+    // Case 3: 3 monitors L-shaped -> promote DISPLAY3, exact relative offsets preserved.
+    std::vector<winome::DisplayPositionSpec> three_l = {
+        {L"\\\\.\\DISPLAY1", 0, 0, 1920, 1080, true},
+        {L"\\\\.\\DISPLAY2", 1920, 0, 1920, 1080, false},
+        {L"\\\\.\\DISPLAY3", 1920, -1080, 1920, 1080, false},
+    };
+    CHECK(winome::compute_os_primary_display_positions(&three_l, L"\\\\.\\DISPLAY3"));
+    CHECK(three_l[0].x == -1920 && three_l[0].y == 1080 && !three_l[0].is_primary);
+    CHECK(three_l[1].x == 0 && three_l[1].y == 1080 && !three_l[1].is_primary);
+    CHECK(three_l[2].x == 0 && three_l[2].y == 0 && three_l[2].is_primary);
+
+    // Unknown device returns false cleanly.
+    CHECK(!winome::compute_os_primary_display_positions(&three_l, L"\\\\.\\DISPLAY99"));
+    CHECK(!winome::compute_os_primary_display_positions(&three_l, L""));
+
+    // Stale desktop echo guard: suppresses delayed pre-switch poll echoing
+    // `from` within 350ms, but NEVER blocks genuine switches to another desktop
+    // or switches after the grace window (fixing Span + linked overview desync).
+    CHECK(winome::should_ignore_stale_desktop_echo(0, 0, 1, 150000));
+    CHECK(winome::should_ignore_stale_desktop_echo(1, 1, 2, 349999));
+    CHECK(!winome::should_ignore_stale_desktop_echo(2, 0, 1, 100000));
+    CHECK(!winome::should_ignore_stale_desktop_echo(0, 0, 1, 350000));
+    CHECK(!winome::should_ignore_stale_desktop_echo(0, 0, 1, 650000));
+    CHECK(!winome::should_ignore_stale_desktop_echo(0, -1, -1, 50000));
+    CHECK(!winome::should_ignore_stale_desktop_echo(1, 1, 1, 50000));
   }
 
   // 5. Cross-monitor window drop geometry & IndependentWorkspaceModel transfer.

@@ -11,7 +11,6 @@ winome_sources = files(
   'overview-trigger.cpp',
   'live-wallpaper.cpp',
   'overview.cpp',
-  'overview-secondary.cpp',
   'overview-layout.cpp',
   'overview-dash.cpp',
   'overview-search.cpp',

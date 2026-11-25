@@ -193,9 +193,10 @@ inline WinKeyComboAction classify_win_key_combo(unsigned vk,
 }
 
 // Callback invoked (on the main thread) whenever the Activities overview opens
-// or closes. Used e.g. by the panel to close its popovers when the overview
-// takes over.
-typedef void (*OverviewStateCallback)(bool active, void *user_data);
+// or closes. @monitor identifies the affected monitor (or nullptr when all
+// monitors transition together, e.g. linked open / close-all). Used e.g. by
+// the panel to close only popovers on the affected monitor.
+typedef void (*OverviewStateCallback)(bool active, HMONITOR monitor, void *user_data);
 
 // Start the low-level keyboard hook (a bare Win press toggles the overview,
 // Win+Tab opens the Start menu, Esc closes it; other Win combos are forwarded
@@ -217,6 +218,10 @@ void open_overview_for_monitor(const char *source, HMONITOR monitor);
 // from the overview window's own click handlers. @source is a diagnostic tag
 // identifying the close path; may be null.
 void close_overview(const char *source);
+
+// Close the Activities overview on a specific monitor (in unlinked mode) or
+// across all monitors (in linked mode).
+void close_overview_for_monitor(const char *source, HMONITOR monitor);
 
 // Toggle the Activities overview (used by the panel Activities button).
 // @source is a diagnostic tag; may be null.
