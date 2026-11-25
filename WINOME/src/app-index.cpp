@@ -4,6 +4,7 @@
 #include "app-index.h"
 #include "config.h"
 #include "host-utils.h"
+#include "monitor-manager.h"
 
 #include <bcrypt.h>
 #include <commctrl.h>
@@ -2301,15 +2302,26 @@ toggle_app_id_pinned (const std::string &id_or_aumid)
 namespace {
 
 void
-shell_execute_async (std::wstring verb, std::wstring file, std::wstring params)
+shell_execute_async (std::wstring verb,
+                     std::wstring file,
+                     std::wstring params,
+                     HMONITOR target_monitor)
 {
+  HMONITOR mon = (target_monitor != nullptr)
+                     ? target_monitor
+                     : monitor_manager_active_monitor ();
+  watch_launched_window_for_monitor (mon);
   std::thread ([v = std::move (verb), f = std::move (file),
-                p = std::move (params)] () {
+                p = std::move (params), mon] () {
     HRESULT hr = CoInitializeEx (
         nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     SHELLEXECUTEINFOW sei {};
     sei.cbSize = sizeof (sei);
     sei.fMask = SEE_MASK_FLAG_NO_UI;
+    if (mon != nullptr) {
+      sei.fMask |= SEE_MASK_HMONITOR;
+      sei.hMonitor = mon;
+    }
     sei.lpVerb = v.empty () ? L"open" : v.c_str ();
     sei.lpFile = f.c_str ();
     sei.lpParameters = p.empty () ? nullptr : p.c_str ();
@@ -2323,50 +2335,57 @@ shell_execute_async (std::wstring verb, std::wstring file, std::wstring params)
 }  // namespace
 
 bool
-app_index_launch (const AppEntry &entry, bool as_admin)
+app_index_launch (const AppEntry &entry, bool as_admin, HMONITOR target_monitor)
 {
   const std::wstring &target =
       !entry.launch_path.empty () ? entry.launch_path : entry.target_exe;
   if (target.empty ())
     return false;
-  shell_execute_async (as_admin ? L"runas" : L"open", target, L"");
+  shell_execute_async (as_admin ? L"runas" : L"open", target, L"",
+                       target_monitor);
   return true;
 }
 
 bool
-app_index_launch_id (const std::string &id_or_aumid, bool as_admin)
+app_index_launch_id (const std::string &id_or_aumid,
+                     bool as_admin,
+                     HMONITOR target_monitor)
 {
   AppEntry entry;
   if (app_index_find_by_id (id_or_aumid, &entry))
-    return app_index_launch (entry, as_admin);
+    return app_index_launch (entry, as_admin, target_monitor);
 
   std::wstring wide = app_utf8_to_wide (id_or_aumid);
   if (wide.empty ())
     return false;
   if (GetFileAttributesW (wide.c_str ()) != INVALID_FILE_ATTRIBUTES) {
-    shell_execute_async (as_admin ? L"runas" : L"open", wide, L"");
+    shell_execute_async (as_admin ? L"runas" : L"open", wide, L"",
+                         target_monitor);
     return true;
   }
   if (id_or_aumid.find ('!') != std::string::npos) {
-    shell_execute_async (L"open", L"shell:AppsFolder\\" + wide, L"");
+    shell_execute_async (L"open", L"shell:AppsFolder\\" + wide, L"",
+                         target_monitor);
     return true;
   }
   return false;
 }
 
 bool
-app_index_open_location (const AppEntry &entry)
+app_index_open_location (const AppEntry &entry, HMONITOR target_monitor)
 {
   std::wstring target =
       !entry.target_exe.empty () ? entry.target_exe : entry.launch_path;
   if (target.empty () || target.rfind (L"shell:", 0) == 0)
     return false;
-  shell_execute_async (L"open", L"explorer.exe", L"/select,\"" + target + L"\"");
+  shell_execute_async (L"open", L"explorer.exe", L"/select,\"" + target + L"\"",
+                       target_monitor);
   return true;
 }
 
 bool
-app_index_launch_best_match (const std::string &query_lower)
+app_index_launch_best_match (const std::string &query_lower,
+                             HMONITOR target_monitor)
 {
   std::string q = app_utf8_tolower (query_lower);
   if (q.empty ())
@@ -2375,7 +2394,7 @@ app_index_launch_best_match (const std::string &query_lower)
       filter_and_sort_apps (app_index_get_all (), q);
   if (matches.empty ())
     return false;
-  return app_index_launch (matches[0], false);
+  return app_index_launch (matches[0], false, target_monitor);
 }
 
 void

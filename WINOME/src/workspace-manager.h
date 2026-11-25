@@ -392,6 +392,23 @@ bool switch_to(HMONITOR mon, int target_index);
 bool create_workspace(HMONITOR mon);
 bool remove_workspace(HMONITOR mon, int index);
 
+// Pure helper: whether Quick Settings should show the secondary-monitor
+// workspace-mode toggle (only when more than one monitor is connected).
+inline bool should_show_quick_settings_ws_mode_toggle(size_t monitor_count) {
+  return monitor_count > 1;
+}
+
+// Pure helper: cycle through the three multi-monitor workspace modes when
+// clicking the Quick Settings pill button directly.
+inline std::string next_multi_monitor_workspace_mode(
+    const std::string& current) {
+  if (current == "independent")
+    return "primary_only";
+  if (current == "primary_only")
+    return "span";
+  return "independent";
+}
+
 // Pure helper: compute destination window RECT when transferring a window
 // across monitors (unit-tested in winome-tests). Preserves size (clamped to
 // @dst_work); uses @drop_pt when dropped directly on a non-overview desktop,

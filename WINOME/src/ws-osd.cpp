@@ -24,6 +24,7 @@
 
 #include "ws-osd.h"
 #include "fonts.h"
+#include "host-utils.h"
 #include "monitor-manager.h"
 #include "overview.h"
 #include "st-engine.h"
@@ -380,6 +381,7 @@ on_osd_realize (GtkWidget *widget, gpointer user_data)
   want &= ~WS_EX_APPWINDOW;
   if (want != ex)
     SetWindowLongPtrW (g_hwnd, GWL_EXSTYLE, want);
+  winome::harden_shell_overlay_hwnd (g_hwnd);
 
   // Suppress Windows 11 DWM rectangular shadow, border, and corner clipping so
   // only the transparent Cairo capsule renders.
@@ -416,6 +418,7 @@ void
 ws_osd_init ()
 {
   g_window = gtk_window_new ();
+  gtk_window_set_title (GTK_WINDOW (g_window), "WINOME Workspace OSD");
   gtk_widget_set_name (g_window, "winomeWsOsdWindow");
   gtk_window_set_decorated (GTK_WINDOW (g_window), FALSE);
   gtk_window_set_resizable (GTK_WINDOW (g_window), FALSE);

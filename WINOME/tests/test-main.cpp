@@ -16,6 +16,7 @@
 #include "i18n.h"
 #include "live-wallpaper.h"
 #include "monitor-manager.h"
+#include "native-taskbar.h"
 #include "notifications.h"
 #include "overview-dash.h"
 #include "overview-layout.h"
@@ -108,6 +109,7 @@ void test_config_roundtrip() {
   CHECK(def.overview_window_blacklist == true);
   CHECK(def.live_wallpaper_mode == "live");
   CHECK(def.dash_isolate_workspaces == false);
+  CHECK(def.auto_elevate == true);
   CHECK(def.unify_dark_titlebars == false);
   CHECK(def.unify_rounded_corners == false);
 
@@ -119,6 +121,7 @@ void test_config_roundtrip() {
   src.hot_corner_enabled = false;
   src.hot_corner_cooldown_ms = 1250;
   src.win_key_overview = false;
+  src.auto_elevate = false;
   src.overview_window_blacklist = false;
   src.live_wallpaper_mode = "snapshot";
   src.dash_isolate_workspaces = true;
@@ -142,6 +145,7 @@ void test_config_roundtrip() {
   CHECK(dst.hot_corner_enabled == src.hot_corner_enabled);
   CHECK(dst.hot_corner_cooldown_ms == src.hot_corner_cooldown_ms);
   CHECK(dst.win_key_overview == src.win_key_overview);
+  CHECK(dst.auto_elevate == src.auto_elevate);
   CHECK(dst.overview_window_blacklist == src.overview_window_blacklist);
   CHECK(dst.live_wallpaper_mode == src.live_wallpaper_mode);
   CHECK(dst.dash_isolate_workspaces == src.dash_isolate_workspaces);
@@ -155,11 +159,24 @@ void test_config_roundtrip() {
   winome::WinomeConfig legacy;
   CHECK(winome::parse_config("{\"language\":\"en\"}", &legacy));
   CHECK(legacy.end_session_confirm == true);
+  CHECK(legacy.auto_elevate == true);
   CHECK(legacy.overview_window_blacklist == true);
   CHECK(legacy.live_wallpaper_mode == "live");
   CHECK(legacy.dash_isolate_workspaces == false);
   CHECK(legacy.unify_dark_titlebars == false);
   CHECK(legacy.unify_rounded_corners == false);
+
+  // Startup auto-elevation & relaunch command-line quoting helpers.
+  CHECK(winome::should_attempt_auto_elevate(true, false, false));
+  CHECK(!winome::should_attempt_auto_elevate(false, false, false));
+  CHECK(!winome::should_attempt_auto_elevate(true, true, false));
+  CHECK(!winome::should_attempt_auto_elevate(true, false, true));
+  CHECK(winome::build_elevated_relaunch_args({}) == L"--no-elevate");
+  CHECK(winome::build_elevated_relaunch_args({L"--no-elevate"}) ==
+        L"--no-elevate");
+  CHECK(winome::build_elevated_relaunch_args(
+            {L"--safe-mode", L"C:\\My Folder\\arg\"x", L"--no-elevate"}) ==
+        L"--safe-mode \"C:\\My Folder\\arg\\\"x\" --no-elevate");
 }
 
 void test_config_sanitization_and_unknown_keys() {
@@ -1125,7 +1142,7 @@ void test_ipc_dispatch_and_named_pipe_roundtrip() {
   CHECK(ping.find("\"ok\":true") != std::string::npos);
   CHECK(ping.find("\"pong\":true") != std::string::npos);
   CHECK(ping.find(std::string("\"version\":\"") + WINOME_VERSION + "\"") != std::string::npos);
-  CHECK(std::string(WINOME_VERSION) == "0.2.0");
+  CHECK(std::string(WINOME_VERSION) == "0.2.1");
 
   const std::string st = winome::ipc_dispatch_request_json("{\"cmd\":\"status\"}", cbs);
   CHECK(st.find("\"ok\":true") != std::string::npos);
@@ -2592,6 +2609,21 @@ void test_hook_watchdog_and_lockfree_ring() {
   CHECK(out.clear_alt_f2);
   CHECK(out.clear_combo);
   CHECK(out.safe_to_reinstall);
+
+  // Healthy active low-level hooks should not be churned; silent/missing hooks reinstall.
+  CHECK(winome::should_reinstall_ll_hook(false, 10000, 9990, 9900, 4000, 2500));
+  CHECK(!winome::should_reinstall_ll_hook(true, 10000, 9000, 5000, 4000, 2500));
+  CHECK(winome::should_reinstall_ll_hook(true, 15000, 9000, 5000, 4000, 2500));
+  CHECK(!winome::should_reinstall_ll_hook(true, 15000, 9000, 14000, 4000, 2500));
+  CHECK(winome::should_reinstall_ll_hook(true, 10000, 0, 5000, 4000, 2500));
+
+  // Only visible, uncloaked Start/Search host windows count as open Start Menu.
+  CHECK(winome::is_start_menu_window_active(true, 0, true, true));
+  CHECK(!winome::is_start_menu_window_active(true, 1, true, true));
+  CHECK(!winome::is_start_menu_window_active(true, 2, true, true));
+  CHECK(!winome::is_start_menu_window_active(false, 0, true, true));
+  CHECK(!winome::is_start_menu_window_active(true, 0, false, true));
+  CHECK(!winome::is_start_menu_window_active(true, 0, true, false));
 }
 
 void test_overview_search_helpers() {
@@ -3282,6 +3314,28 @@ void test_independent_per_monitor_workspace_engine() {
               true, true, kMon2, true, kMon1, true, true) == Act::CloseAll);
     CHECK(winome::decide_multi_monitor_overview_action(
               true, false, kMon2, true, kMon1, true, true) == Act::None);
+
+    // CloseAll secondary-closing guard (never strands unlinked/orphan hosts):
+    CHECK(winome::should_close_secondary_on_close_all(false, true, true));
+    CHECK(winome::should_close_secondary_on_close_all(false, false, true));
+    CHECK(winome::should_close_secondary_on_close_all(true, false, true));
+    CHECK(!winome::should_close_secondary_on_close_all(true, true, true));
+    CHECK(!winome::should_close_secondary_on_close_all(false, true, false));
+
+    // Secondary Overview shows its own bottom Dash in Independent and Span modes.
+    CHECK(winome::should_secondary_overview_show_dash(
+        winome::ws::MultiMonitorWorkspaceMode::Independent));
+    CHECK(!winome::should_secondary_overview_show_dash(
+        winome::ws::MultiMonitorWorkspaceMode::PrimaryOnly));
+    CHECK(winome::should_secondary_overview_show_dash(
+        winome::ws::MultiMonitorWorkspaceMode::Span));
+
+    const auto sec_no_dash = winome::compute_secondary_overview_geometry(
+        1920, 1080, 32, 1, 2, 0);
+    const auto sec_with_dash = winome::compute_secondary_overview_geometry(
+        1920, 1080, 32, 1, 2, 100);
+    CHECK(sec_with_dash.picker_box.bottom <= 1080 - 114);
+    CHECK(sec_with_dash.picker_box.bottom < sec_no_dash.picker_box.bottom);
   }
 
   // 5. Cross-monitor window drop geometry & IndependentWorkspaceModel transfer.
@@ -3496,6 +3550,75 @@ void test_diagnostics_zip_export() {
 
 }  // namespace
 
+namespace {
+constexpr const wchar_t* kTestGuardProp = L"WINOME_TestGuardOrigProc";
+int g_test_guard_calls = 0;
+
+LRESULT CALLBACK test_guarded_subclass_proc(HWND hwnd,
+                                            UINT msg,
+                                            WPARAM wParam,
+                                            LPARAM lParam) {
+  ++g_test_guard_calls;
+  WNDPROC orig = reinterpret_cast<WNDPROC>(GetPropW(hwnd, kTestGuardProp));
+  if (msg == WM_NCDESTROY) {
+    RemovePropW(hwnd, kTestGuardProp);
+    if (orig != nullptr) {
+      if (GetWindowLongPtrW(hwnd, GWLP_WNDPROC) ==
+          reinterpret_cast<LONG_PTR>(test_guarded_subclass_proc)) {
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(orig));
+      }
+      return CallWindowProcW(orig, hwnd, msg, wParam, lParam);
+    }
+  }
+  return orig != nullptr ? CallWindowProcW(orig, hwnd, msg, wParam, lParam)
+                         : DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void install_guarded_test_subclass(HWND hwnd) {
+  if (hwnd == nullptr || !IsWindow(hwnd) ||
+      GetPropW(hwnd, kTestGuardProp) != nullptr) {
+    return;
+  }
+  WNDPROC cur = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(hwnd, GWLP_WNDPROC));
+  if (cur != nullptr && cur != test_guarded_subclass_proc) {
+    SetPropW(hwnd, kTestGuardProp, reinterpret_cast<HANDLE>(cur));
+    SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
+                      reinterpret_cast<LONG_PTR>(test_guarded_subclass_proc));
+  }
+}
+}  // namespace
+
+void test_overlay_wndproc_chaining_no_recursion() {
+  HWND hwnd = CreateWindowExW(
+      WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"STATIC", L"winome-test-overlay",
+      WS_POPUP | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME, 0, 0, 64, 64,
+      nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+  CHECK(hwnd != nullptr);
+  if (hwnd == nullptr)
+    return;
+
+  // Apply harden_shell_overlay_hwnd + guarded secondary subclass twice (mirroring
+  // on_realize + relayout): the second pass must be an idempotent no-op with zero cycle.
+  winome::harden_shell_overlay_hwnd(hwnd);
+  install_guarded_test_subclass(hwnd);
+  winome::harden_shell_overlay_hwnd(hwnd);
+  install_guarded_test_subclass(hwnd);
+
+  g_test_guard_calls = 0;
+  const LRESULT len = SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0);
+  CHECK(len >= 0);
+  CHECK(g_test_guard_calls == 1);
+
+  // SC_MINIMIZE must be swallowed cleanly without recursion.
+  g_test_guard_calls = 0;
+  const LRESULT min_res = SendMessageW(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+  CHECK(min_res == 0);
+  CHECK(IsIconic(hwnd) == FALSE);
+  CHECK(g_test_guard_calls == 1);
+
+  CHECK(DestroyWindow(hwnd) != FALSE);
+}
+
 int main() {
   ScopedTempConfigDir temp_dir;
   test_config_roundtrip();
@@ -3530,6 +3653,56 @@ int main() {
   test_overview_window_blacklist();
   test_winrt_safe_com_getter_and_notifications();
   test_win_hotkey_passthrough_classification();
+
+  // Quick Settings secondary-monitor workspace mode visibility & cycling.
+  CHECK(!winome::ws::should_show_quick_settings_ws_mode_toggle(0));
+  CHECK(!winome::ws::should_show_quick_settings_ws_mode_toggle(1));
+  CHECK(winome::ws::should_show_quick_settings_ws_mode_toggle(2));
+  CHECK(winome::ws::should_show_quick_settings_ws_mode_toggle(3));
+  CHECK(winome::ws::next_multi_monitor_workspace_mode("independent") ==
+        "primary_only");
+  CHECK(winome::ws::next_multi_monitor_workspace_mode("primary_only") ==
+        "span");
+  CHECK(winome::ws::next_multi_monitor_workspace_mode("span") ==
+        "independent");
+  CHECK(winome::ws::next_multi_monitor_workspace_mode("") == "independent");
+  CHECK(winome::ws::next_multi_monitor_workspace_mode("unknown") ==
+        "independent");
+
+  // Native taskbar ABM_SETSTATE guard (avoids Explorer's duplicate-AppBar popup).
+  CHECK(winome::should_send_taskbar_autohide_state(true, false, false));
+  CHECK(!winome::should_send_taskbar_autohide_state(false, false, false));
+  CHECK(!winome::should_send_taskbar_autohide_state(true, true, false));
+  CHECK(!winome::should_send_taskbar_autohide_state(true, false, true));
+
+  // Overlay style hardening preserves non-frame bits and clears min/max/thickframe.
+  const LONG_PTR stripped = winome::strip_overlay_minimize_styles(
+      static_cast<LONG_PTR>(WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS |
+                            WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME));
+  CHECK((stripped & WS_MINIMIZEBOX) == 0);
+  CHECK((stripped & WS_MAXIMIZEBOX) == 0);
+  CHECK((stripped & WS_THICKFRAME) == 0);
+  CHECK((stripped & WS_POPUP) != 0);
+  CHECK((stripped & WS_VISIBLE) != 0);
+  CHECK((stripped & WS_CLIPSIBLINGS) != 0);
+
+  // Launched app placement on secondary monitor centers & clamps to target work area.
+  const RECT sec_work{-150, 1112, 2190, 2160};
+  const RECT centered = winome::compute_launched_window_rect(
+      RECT{100, 100, 900, 700}, sec_work);
+  CHECK(centered.right - centered.left == 800);
+  CHECK(centered.bottom - centered.top == 600);
+  CHECK(centered.left == 620);
+  CHECK(centered.top == 1336);
+  const RECT clamped = winome::compute_launched_window_rect(
+      RECT{0, 0, 3000, 2000}, sec_work);
+  CHECK(clamped.left == -150);
+  CHECK(clamped.top == 1112);
+  CHECK(clamped.right == 2190);
+  CHECK(clamped.bottom == 2160);
+  const RECT def_sz = winome::compute_launched_window_rect(RECT{0, 0, 0, 0}, sec_work);
+  CHECK(def_sz.right - def_sz.left == (2340 * 3) / 4);
+  CHECK(def_sz.bottom - def_sz.top == (1048 * 3) / 4);
   test_workarea_clamp_guard_and_fullscreen_hysteresis();
   test_hook_watchdog_and_lockfree_ring();
   test_overview_search_helpers();
@@ -3539,6 +3712,7 @@ int main() {
   test_power_modes_overlay_and_legacy();
   test_notification_activation_xml_and_theme_modes();
   test_multi_monitor_interaction_helpers();
+  test_overlay_wndproc_chaining_no_recursion();
   test_independent_per_monitor_workspace_engine();
   test_diagnostics_zip_export();
 

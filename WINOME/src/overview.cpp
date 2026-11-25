@@ -261,6 +261,7 @@ ControlsState g_pending_show_state = ControlsState::WINDOW_PICKER;
 std::atomic<bool> g_atomic_can_shift_app_grid{false};
 std::atomic<bool> g_pending_shift_app_grid{false};
 WNDPROC g_orig_overview_wndproc = nullptr;
+bool g_last_overview_linked = false;
 bool g_overview_surface_hooked = false;
 bool g_placed = false;
 bool g_thumbs_has_pills = false;
@@ -1871,8 +1872,15 @@ chrome_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
       return 0;
     }
   }
-  if (msg == WM_NCDESTROY)
+  if (msg == WM_NCDESTROY) {
     RemovePropW (hwnd, kChromeOrigProcProp);
+    if (orig != nullptr &&
+        GetWindowLongPtrW (hwnd, GWLP_WNDPROC) ==
+            reinterpret_cast<LONG_PTR> (chrome_subclass_wndproc)) {
+      SetWindowLongPtrW (hwnd, GWLP_WNDPROC,
+                         reinterpret_cast<LONG_PTR> (orig));
+    }
+  }
   return orig != nullptr ? CallWindowProcW (orig, hwnd, msg, wParam, lParam)
                          : DefWindowProcW (hwnd, msg, wParam, lParam);
 }
@@ -1880,8 +1888,10 @@ chrome_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 static void
 ensure_chrome_subclass (HWND hwnd)
 {
-  if (hwnd == nullptr || !IsWindow (hwnd))
+  if (hwnd == nullptr || !IsWindow (hwnd) ||
+      GetPropW (hwnd, kChromeOrigProcProp) != nullptr) {
     return;
+  }
   WNDPROC cur = reinterpret_cast<WNDPROC> (
       GetWindowLongPtrW (hwnd, GWLP_WNDPROC));
   if (cur != nullptr && cur != chrome_subclass_wndproc) {
@@ -1889,19 +1899,6 @@ ensure_chrome_subclass (HWND hwnd)
     SetWindowLongPtrW (hwnd, GWLP_WNDPROC,
                        reinterpret_cast<LONG_PTR> (chrome_subclass_wndproc));
   }
-}
-
-static void
-chrome_present_window (GtkWidget *win, void (*apply_want) (void))
-{
-  if (win == nullptr)
-    return;
-  if (!gtk_widget_get_realized (win))
-    gtk_widget_realize (win);
-  if (!gtk_widget_get_visible (win))
-    gtk_widget_set_visible (win, TRUE);
-  if (apply_want != nullptr)
-    apply_want ();
 }
 
 static void
@@ -2000,8 +1997,95 @@ struct ChromeSurfaceHooks {
   GtkWidget **window;
   HWND *hwnd;
   guint layout_idle;
+  guint reenable_idle;
+  guint reenable_fallback_timer;
+  bool pending_reenable;
+  GdkFrameClock *frame_clock;
+  gulong after_paint_id;
   void (*apply_want) (void);
 };
+
+static void
+chrome_finish_reenable (ChromeSurfaceHooks *hooks)
+{
+  if (hooks->reenable_idle != 0) {
+    g_source_remove (hooks->reenable_idle);
+    hooks->reenable_idle = 0;
+  }
+  if (hooks->reenable_fallback_timer != 0) {
+    g_source_remove (hooks->reenable_fallback_timer);
+    hooks->reenable_fallback_timer = 0;
+  }
+  hooks->pending_reenable = false;
+  if (hooks->hwnd != nullptr && *hooks->hwnd != nullptr &&
+      IsWindow (*hooks->hwnd) && !IsWindowEnabled (*hooks->hwnd)) {
+    EnableWindow (*hooks->hwnd, TRUE);
+  }
+}
+
+static gboolean
+chrome_reenable_idle_cb (gpointer user_data)
+{
+  auto *hooks = static_cast<ChromeSurfaceHooks *> (user_data);
+  hooks->reenable_idle = 0;
+  chrome_finish_reenable (hooks);
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
+chrome_reenable_fallback_cb (gpointer user_data)
+{
+  auto *hooks = static_cast<ChromeSurfaceHooks *> (user_data);
+  hooks->reenable_fallback_timer = 0;
+  chrome_finish_reenable (hooks);
+  return G_SOURCE_REMOVE;
+}
+
+static void
+chrome_schedule_reenable (ChromeSurfaceHooks *hooks)
+{
+  if (hooks->pending_reenable && hooks->reenable_idle == 0) {
+    // Schedule strictly below GDK_PRIORITY_REDRAW (120) so GDK4 finishes
+    // its frame-clock paint/ShowWindow pass before WS_DISABLED is cleared.
+    hooks->reenable_idle = g_idle_add_full (
+        G_PRIORITY_DEFAULT_IDLE, chrome_reenable_idle_cb, hooks, nullptr);
+  }
+}
+
+static void
+chrome_disconnect_after_paint (ChromeSurfaceHooks *hooks)
+{
+  if (hooks->frame_clock != nullptr && hooks->after_paint_id != 0)
+    g_signal_handler_disconnect (hooks->frame_clock, hooks->after_paint_id);
+  hooks->frame_clock = nullptr;
+  hooks->after_paint_id = 0;
+}
+
+static void
+on_chrome_after_paint (GdkFrameClock *clock G_GNUC_UNUSED, gpointer user_data)
+{
+  auto *hooks = static_cast<ChromeSurfaceHooks *> (user_data);
+  if (hooks->pending_reenable)
+    chrome_schedule_reenable (hooks);
+}
+
+static void
+chrome_ensure_after_paint_hook (ChromeSurfaceHooks *hooks)
+{
+  if (hooks == nullptr || hooks->window == nullptr || *hooks->window == nullptr)
+    return;
+  GdkSurface *surf = gtk_native_get_surface (GTK_NATIVE (*hooks->window));
+  GdkFrameClock *clock =
+      surf != nullptr ? gdk_surface_get_frame_clock (surf) : nullptr;
+  if (clock == nullptr)
+    return;
+  if (hooks->frame_clock == clock && hooks->after_paint_id != 0)
+    return;
+  chrome_disconnect_after_paint (hooks);
+  hooks->frame_clock = clock;
+  hooks->after_paint_id = g_signal_connect (
+      clock, "after-paint", G_CALLBACK (on_chrome_after_paint), hooks);
+}
 
 static gboolean
 chrome_surface_idle_cb (gpointer user_data)
@@ -2031,6 +2115,7 @@ chrome_cancel_apply (ChromeSurfaceHooks *hooks)
     g_source_remove (hooks->layout_idle);
     hooks->layout_idle = 0;
   }
+  chrome_finish_reenable (hooks);
 }
 
 static void
@@ -2045,6 +2130,42 @@ on_chrome_surface_layout (GdkSurface *surface G_GNUC_UNUSED,
 }
 
 static void
+chrome_present_window (ChromeSurfaceHooks *hooks)
+{
+  if (hooks == nullptr || hooks->window == nullptr || *hooks->window == nullptr)
+    return;
+  GtkWidget *win = *hooks->window;
+  if (!gtk_widget_get_realized (win))
+    gtk_widget_realize (win);
+  if (!gtk_widget_get_visible (win)) {
+    // GDK4's Win32 backend defers ShowWindow(SW_SHOWNORMAL) to its frame-clock
+    // paint tick (GDK_PRIORITY_REDRAW = 120), which ignores WS_EX_NOACTIVATE.
+    // Keep WS_DISABLED across that frame-clock map and re-enable from
+    // GdkFrameClock::after-paint -> G_PRIORITY_DEFAULT_IDLE (or 160ms fallback).
+    if (hooks->reenable_idle != 0) {
+      g_source_remove (hooks->reenable_idle);
+      hooks->reenable_idle = 0;
+    }
+    if (hooks->reenable_fallback_timer != 0) {
+      g_source_remove (hooks->reenable_fallback_timer);
+      hooks->reenable_fallback_timer = 0;
+    }
+    if (GdkSurface *surf = gtk_native_get_surface (GTK_NATIVE (win))) {
+      HWND hwnd = static_cast<HWND> (gdk_win32_surface_get_handle (surf));
+      if (hwnd != nullptr && IsWindow (hwnd) && IsWindowEnabled (hwnd) != FALSE)
+        EnableWindow (hwnd, FALSE);
+    }
+    hooks->pending_reenable = true;
+    hooks->reenable_fallback_timer =
+        g_timeout_add (160, chrome_reenable_fallback_cb, hooks);
+    gtk_widget_set_visible (win, TRUE);
+    chrome_ensure_after_paint_hook (hooks);
+  }
+  if (hooks->apply_want != nullptr)
+    hooks->apply_want ();
+}
+
+static void
 on_chrome_window_realize (GtkWidget *widget, gpointer user_data)
 {
   auto *hooks = static_cast<ChromeSurfaceHooks *> (user_data);
@@ -2054,6 +2175,7 @@ on_chrome_window_realize (GtkWidget *widget, gpointer user_data)
   HWND hwnd = static_cast<HWND> (gdk_win32_surface_get_handle (surface));
   *hooks->hwnd = hwnd;
   chrome_apply_base_ex_styles (hwnd);
+  harden_shell_overlay_hwnd (hwnd);
   ensure_chrome_subclass (hwnd);
   chrome_bind_owner (hwnd);
   ensure_hwnd_topmost (hwnd);
@@ -2065,6 +2187,7 @@ static void
 on_chrome_window_map (GtkWidget *widget G_GNUC_UNUSED, gpointer user_data)
 {
   auto *hooks = static_cast<ChromeSurfaceHooks *> (user_data);
+  chrome_ensure_after_paint_hook (hooks);
   chrome_schedule_apply (hooks);
 }
 
@@ -2072,6 +2195,7 @@ static GtkWidget *
 make_chrome_toplevel (ChromeSurfaceHooks *hooks)
 {
   GtkWidget *win = gtk_window_new ();
+  gtk_window_set_title (GTK_WINDOW (win), "WINOME Overview Chrome");
   gtk_window_set_decorated (GTK_WINDOW (win), FALSE);
   gtk_window_set_resizable (GTK_WINDOW (win), FALSE);
   gtk_window_set_hide_on_close (GTK_WINDOW (win), TRUE);
@@ -2158,8 +2282,8 @@ chrome_apply_want (void)
                             panel != nullptr ? panel : HWND_TOPMOST);
 }
 
-ChromeSurfaceHooks g_chrome_hooks{&g_chrome_window, &g_chrome_hwnd, 0,
-                                  chrome_apply_want};
+ChromeSurfaceHooks g_chrome_hooks{&g_chrome_window, &g_chrome_hwnd, 0, 0, 0, false,
+                                  nullptr, 0, chrome_apply_want};
 
 void
 chrome_hide (void)
@@ -2269,7 +2393,7 @@ chrome_show_at (const RECT &preview_rect)
   g_chrome_want.bottom = g_chrome_want.top + h;
 
   gtk_widget_set_opacity (g_chrome_button, g_overlay_opacity);
-  chrome_present_window (g_chrome_window, chrome_apply_want);
+  chrome_present_window (&g_chrome_hooks);
 }
 
 // --- app-icon chrome window -----------------------------------------------------
@@ -2284,8 +2408,8 @@ icon_chrome_apply_want (void)
   chrome_window_apply_want (g_icon_window, g_icon_hwnd, g_icon_want, after);
 }
 
-ChromeSurfaceHooks g_icon_hooks{&g_icon_window, &g_icon_hwnd, 0,
-                                icon_chrome_apply_want};
+ChromeSurfaceHooks g_icon_hooks{&g_icon_window, &g_icon_hwnd, 0, 0, 0, false,
+                                nullptr, 0, icon_chrome_apply_want};
 
 void
 icon_hide (void)
@@ -2377,7 +2501,7 @@ icon_show_at (const RECT &preview_rect, HWND target)
   }
 
   gtk_widget_set_opacity (g_icon_picture, g_overlay_opacity);
-  chrome_present_window (g_icon_window, icon_chrome_apply_want);
+  chrome_present_window (&g_icon_hooks);
 }
 
 // --- window-caption chrome window -----------------------------------------------
@@ -2395,8 +2519,8 @@ caption_chrome_apply_want (void)
                             after);
 }
 
-ChromeSurfaceHooks g_caption_hooks{&g_caption_window, &g_caption_hwnd, 0,
-                                   caption_chrome_apply_want};
+ChromeSurfaceHooks g_caption_hooks{&g_caption_window, &g_caption_hwnd, 0, 0, 0, false,
+                                   nullptr, 0, caption_chrome_apply_want};
 
 void
 caption_hide (void)
@@ -2524,7 +2648,7 @@ caption_show_at (const RECT &preview_rect)
   g_caption_want.bottom = top_px + h;
 
   gtk_widget_set_opacity (g_caption, g_overlay_opacity);
-  chrome_present_window (g_caption_window, caption_chrome_apply_want);
+  chrome_present_window (&g_caption_hooks);
 }
 
 // --- hover (caption + close button + icon) ---------------------------------------
@@ -4133,6 +4257,8 @@ find_lowest_popup_menu_above_panel (HWND panel_hwnd)
   return nullptr;
 }
 
+constexpr const wchar_t *kOverviewOrigProcProp = L"WINOME_OverviewOrigProc";
+
 static LRESULT CALLBACK
 overview_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -4188,7 +4314,23 @@ overview_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     // ringing MessageBeep on Alt+<key> or stray menu-char lookups.
     return (msg == WM_MENUCHAR) ? MAKELRESULT (0, MNC_CLOSE) : 0;
   }
-  WNDPROC orig = g_orig_overview_wndproc;
+  WNDPROC prop_orig = reinterpret_cast<WNDPROC> (
+      GetPropW (hwnd, kOverviewOrigProcProp));
+  WNDPROC orig = prop_orig != nullptr ? prop_orig : g_orig_overview_wndproc;
+  if (msg == WM_NCDESTROY) {
+    RemovePropW (hwnd, kOverviewOrigProcProp);
+    if (hwnd == g_overview_hwnd)
+      g_orig_overview_wndproc = nullptr;
+    if (orig != nullptr) {
+      if (GetWindowLongPtrW (hwnd, GWLP_WNDPROC) ==
+          reinterpret_cast<LONG_PTR> (overview_subclass_wndproc)) {
+        SetWindowLongPtrW (hwnd, GWLP_WNDPROC,
+                           reinterpret_cast<LONG_PTR> (orig));
+      }
+      return CallWindowProcW (orig, hwnd, msg, wParam, lParam);
+    }
+    return DefWindowProcW (hwnd, msg, wParam, lParam);
+  }
   LRESULT res = orig != nullptr
                     ? CallWindowProcW (orig, hwnd, msg, wParam, lParam)
                     : DefWindowProcW (hwnd, msg, wParam, lParam);
@@ -4223,12 +4365,15 @@ overview_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 static void
 ensure_overview_subclass (HWND hwnd)
 {
-  if (hwnd == nullptr || !IsWindow (hwnd))
+  if (hwnd == nullptr || !IsWindow (hwnd) ||
+      GetPropW (hwnd, kOverviewOrigProcProp) != nullptr) {
     return;
+  }
   WNDPROC cur = reinterpret_cast<WNDPROC> (
       GetWindowLongPtrW (hwnd, GWLP_WNDPROC));
   if (cur != nullptr && cur != overview_subclass_wndproc) {
     g_orig_overview_wndproc = cur;
+    SetPropW (hwnd, kOverviewOrigProcProp, reinterpret_cast<HANDLE> (cur));
     SetWindowLongPtrW (hwnd, GWLP_WNDPROC,
                        reinterpret_cast<LONG_PTR> (overview_subclass_wndproc));
   }
@@ -4237,15 +4382,19 @@ ensure_overview_subclass (HWND hwnd)
 static void
 unsubclass_overview_hwnd (void)
 {
-  if (g_overview_hwnd != nullptr && IsWindow (g_overview_hwnd) &&
-      g_orig_overview_wndproc != nullptr) {
+  if (g_overview_hwnd != nullptr && IsWindow (g_overview_hwnd)) {
+    WNDPROC prop_orig = reinterpret_cast<WNDPROC> (
+        GetPropW (g_overview_hwnd, kOverviewOrigProcProp));
+    WNDPROC orig =
+        prop_orig != nullptr ? prop_orig : g_orig_overview_wndproc;
     WNDPROC cur = reinterpret_cast<WNDPROC> (
         GetWindowLongPtrW (g_overview_hwnd, GWLP_WNDPROC));
-    if (cur == overview_subclass_wndproc) {
+    if (orig != nullptr && cur == overview_subclass_wndproc) {
       SetWindowLongPtrW (
           g_overview_hwnd, GWLP_WNDPROC,
-          reinterpret_cast<LONG_PTR> (g_orig_overview_wndproc));
+          reinterpret_cast<LONG_PTR> (orig));
     }
+    RemovePropW (g_overview_hwnd, kOverviewOrigProcProp);
   }
   g_orig_overview_wndproc = nullptr;
 }
@@ -4265,6 +4414,7 @@ apply_ex_styles (HWND hwnd)
     swp_flags |= SWP_FRAMECHANGED;
   }
   ensure_hwnd_topmost (hwnd);
+  harden_shell_overlay_hwnd (hwnd);
   ensure_overview_subclass (hwnd);
 
   HWND panel = active_overview_panel_hwnd ();
@@ -5391,6 +5541,7 @@ dash_resync_timeout_cb (gpointer user_data G_GNUC_UNUSED)
 {
   g_dash_resync_timer = 0;
   refresh_dash_in_place ();
+  overview_secondary_refresh_monitor (nullptr);
   return G_SOURCE_REMOVE;
 }
 
@@ -5406,7 +5557,15 @@ schedule_dash_resync (guint delay_ms = 120)
 static void
 on_overview_config_changed (void *user_data G_GNUC_UNUSED)
 {
+  const bool linked = winome::get_config ().multi_monitor_overview_linked;
+  if (linked != g_last_overview_linked) {
+    g_last_overview_linked = linked;
+    overview_secondary_on_linked_changed (
+        linked, overview_main_monitor (), overview_is_main_open (),
+        g_wallpaper, g_panel_cur_progress);
+  }
   refresh_dash_in_place ();
+  overview_secondary_refresh_monitor (nullptr);
   const std::string live_mode =
       sanitize_live_wallpaper_mode (winome::get_config ().live_wallpaper_mode);
   if (live_mode == "off") {
@@ -5747,7 +5906,6 @@ void
 finish_hide (void)
 {
   g_panel_cur_progress = 0.0;
-  winome_shell_panel_set_overview_progress (0.0);
   winome_shell_panel_set_workspace_scroll (-1, -1.0);
   live_wallpaper_stop ();
   clear_pending_dwm_frame ();
@@ -6319,6 +6477,16 @@ on_drag_end (GtkGestureDrag *drag G_GNUC_UNUSED, double dx, double dy,
 
 // --- clicks --------------------------------------------------------------------------
 
+static bool
+is_shell_core_window (HWND hwnd)
+{
+  if (hwnd == nullptr || !IsWindow (hwnd))
+    return false;
+  wchar_t cls[64] = {};
+  const int n = GetClassNameW (hwnd, cls, 63);
+  return n > 0 && wcscmp (cls, L"Windows.UI.Core.CoreWindow") == 0;
+}
+
 static void
 acquire_overview_foreground (HWND hwnd)
 {
@@ -6361,6 +6529,28 @@ acquire_overview_foreground (HWND hwnd)
         AllowSetForegroundWindow (ASFW_ANY);
         BringWindowToTop (hwnd);
         SetForegroundWindow (hwnd);
+      }
+      if (GetForegroundWindow () != hwnd) {
+        SwitchToThisWindow (hwnd, TRUE);
+        if (GetForegroundWindow () != hwnd &&
+            is_shell_core_window (GetForegroundWindow ())) {
+          // Win11 AppContainer CoreWindow (Start/Search/QuickSettings/Input)
+          // sometimes ignores VK=0xFF foreground unlock; a synthetic VK_MENU
+          // pulse releases the foreground lock without triggering any Win32
+          // menu bar on a CoreWindow.
+          INPUT alt_pair[2] = {};
+          alt_pair[0].type = INPUT_KEYBOARD;
+          alt_pair[0].ki.wVk = VK_MENU;
+          alt_pair[0].ki.dwExtraInfo = 0x574E4F31;
+          alt_pair[1].type = INPUT_KEYBOARD;
+          alt_pair[1].ki.wVk = VK_MENU;
+          alt_pair[1].ki.dwExtraInfo = 0x574E4F31;
+          alt_pair[1].ki.dwFlags = KEYEVENTF_KEYUP;
+          SendInput (2, alt_pair, sizeof (INPUT));
+          AllowSetForegroundWindow (ASFW_ANY);
+          BringWindowToTop (hwnd);
+          SetForegroundWindow (hwnd);
+        }
       }
     }
   }
@@ -6488,7 +6678,7 @@ focus_verify_cb (gpointer user_data G_GNUC_UNUSED)
   HWND fg = GetForegroundWindow ();
   if (fg != g_overview_hwnd &&
       (is_overview_chrome_or_panel_hwnd (fg) || fg == nullptr ||
-       fg == g_prev_foreground_hwnd)) {
+       fg == g_prev_foreground_hwnd || is_shell_core_window (fg))) {
     acquire_overview_foreground (g_overview_hwnd);
   }
   if (GetForegroundWindow () == g_overview_hwnd)
@@ -6911,6 +7101,7 @@ on_app_grid_pins_changed (void *user_data G_GNUC_UNUSED)
       gtk_widget_get_visible (g_window)) {
     if (g_target_state == ControlsState::APP_GRID && g_panel_hwnd != nullptr) {
       refresh_dash_in_place ();
+      overview_secondary_refresh_monitor (nullptr);
       if (g_app_grid != nullptr)
         app_grid_refresh_running (g_app_grid);
       return;
@@ -7866,6 +8057,7 @@ overview_init (HWND panel_hwnd)
   gtk_widget_add_controller (g_window, ws_scroll);
 
   ws::add_change_listener (on_overview_desktop_changed, nullptr);
+  g_last_overview_linked = winome::get_config ().multi_monitor_overview_linked;
   add_config_listener (on_overview_config_changed, nullptr);
   g_signal_connect (
       g_window, "close-request",
@@ -7961,6 +8153,9 @@ overview_init (HWND panel_hwnd)
         chrome_cancel_apply (&g_chrome_hooks);
         chrome_cancel_apply (&g_icon_hooks);
         chrome_cancel_apply (&g_caption_hooks);
+        chrome_disconnect_after_paint (&g_chrome_hooks);
+        chrome_disconnect_after_paint (&g_icon_hooks);
+        chrome_disconnect_after_paint (&g_caption_hooks);
         g_chrome_target = nullptr;
         g_icon_target = nullptr;
         g_chrome_button = nullptr;
@@ -8596,6 +8791,37 @@ overview_toggle_app_grid (void)
   if (winome_shell_panel_top_popover_hwnd () == nullptr)
     focus_overview_window (false);
   restack_locked ();
+}
+
+void
+overview_open_app_grid_on_monitor (HMONITOR monitor)
+{
+  if (monitor == nullptr)
+    return;
+  if (overview_is_main_open () && overview_main_monitor () == monitor) {
+    overview_toggle_app_grid ();
+    return;
+  }
+  if (overview_is_main_open ()) {
+    HMONITOR prev_mon = overview_main_monitor ();
+    const bool linked = winome::get_config ().multi_monitor_overview_linked;
+    if (!linked)
+      overview_secondary_close_monitor (monitor);
+    g_app_grid_mode = false;
+    overview_set_target_monitor (monitor);
+    place_overview_locked (false);
+    if (!linked && prev_mon != nullptr && prev_mon != monitor)
+      overview_open_secondary_for_monitor (prev_mon);
+    if (winome_shell_panel_top_popover_hwnd () == nullptr)
+      focus_overview_window (false);
+    restack_locked ();
+    overview_toggle_app_grid ();
+  } else {
+    overview_secondary_close_monitor (monitor);
+    overview_set_target_monitor (monitor);
+    g_pending_shift_app_grid.store (true, std::memory_order_release);
+    overview_show ();
+  }
 }
 
 void

@@ -80,6 +80,10 @@ void overview_reposition();
 // Toggle in-host paginated App Grid view inside the open overview.
 void overview_toggle_app_grid();
 
+// Ensure App Grid view is opened on @monitor (migrating the main overview
+// window onto @monitor when triggered from a Secondary Overview's Dash).
+void overview_open_app_grid_on_monitor(HMONITOR monitor);
+
 // Thread-safe double-Win progression: interrupt/advance an opening or open
 // WINDOW_PICKER overview into the APP_GRID state.
 void overview_shift_to_app_grid_async();

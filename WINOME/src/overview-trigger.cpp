@@ -34,6 +34,7 @@
 #include <gtk/gtk.h>
 #include <gdk/win32/gdkwin32.h>
 #include <windows.h>
+#include <dwmapi.h>
 #include <glib.h>
 
 #include <algorithm>
@@ -79,6 +80,13 @@ BOOL g_esc_swallowed = FALSE;
 ULONGLONG g_esc_swallow_tick = 0;
 HHOOK g_keyboard_hook = nullptr;
 HWINEVENTHOOK g_desktop_switch_hook = nullptr;
+ULONGLONG g_last_kbd_event_tick = 0;
+bool g_kbd_swapping_hook = false;
+WPARAM g_swap_last_wparam = 0;
+DWORD g_swap_last_vk = 0;
+DWORD g_swap_last_scan = 0;
+DWORD g_swap_last_flags = 0;
+DWORD g_swap_last_time = 0;
 std::atomic<gint64> g_last_win_press_us{0};
 std::atomic<bool> g_win_key_overview_enabled{true};
 
@@ -244,7 +252,10 @@ handle_unfocused_esc_idle (gpointer user_data G_GNUC_UNUSED)
   }
 
   // In unlinked mode, if the cursor monitor has a Secondary Overview open
-  // (or no main Overview is open at all), dismiss that Secondary Overview.
+  // (or no main Overview is open at all), dismiss an open secondary Dash menu
+  // first, otherwise dismiss that Secondary Overview.
+  if (overview_secondary_close_open_dash_menu ())
+    return G_SOURCE_REMOVE;
   if (!get_config ().multi_monitor_overview_linked) {
     HMONITOR cursor_mon = monitor_manager_active_monitor ();
     if (overview_secondary_is_open_for_monitor (cursor_mon)) {
@@ -457,8 +468,10 @@ dispatch_overview_events_idle (gpointer data G_GNUC_UNUSED)
                  ev.source != nullptr ? ev.source : "?");
         if (main_open)
           overview_hide ();
-        if (any_sec && !linked)
+        if (should_close_secondary_on_close_all (linked, main_open, any_sec))
           overview_close_all_secondary ();
+        else if (any_sec)
+          overview_secondary_close_unlinked_animated ();
         refresh_cached_window_handles ();
         if (cb != nullptr)
           cb (false, cb_data);
@@ -536,13 +549,19 @@ bool is_start_menu_foreground() {
   HWND fg = GetForegroundWindow();
   if (fg == nullptr)
     return false;
+  const bool visible = IsWindowVisible(fg) != FALSE;
+  DWORD cloaked = 0;
+  const bool cloak_ok =
+      SUCCEEDED(DwmGetWindowAttribute(fg, DWMWA_CLOAKED, &cloaked,
+                                      sizeof(cloaked)));
   wchar_t cls[128] = {};
   if (GetClassNameW(fg, cls, 128) <= 0)
     return false;
-  if (std::wcscmp(cls, L"Windows.UI.Core.CoreWindow") != 0 &&
-      std::wcscmp(cls, L"XamlExplorerHostIslandWindow") != 0) {
+  const bool is_core_class =
+      std::wcscmp(cls, L"Windows.UI.Core.CoreWindow") == 0 ||
+      std::wcscmp(cls, L"XamlExplorerHostIslandWindow") == 0;
+  if (!is_core_class)
     return false;
-  }
   DWORD pid = 0;
   GetWindowThreadProcessId(fg, &pid);
   if (pid == 0 || pid == GetCurrentProcessId())
@@ -558,9 +577,24 @@ bool is_start_menu_foreground() {
     return false;
   const wchar_t* base = std::wcsrchr(path, L'\\');
   base = (base != nullptr) ? (base + 1) : path;
-  return _wcsicmp(base, L"StartMenuExperienceHost.exe") == 0 ||
-         _wcsicmp(base, L"SearchHost.exe") == 0 ||
-         _wcsicmp(base, L"SearchApp.exe") == 0;
+  const bool is_start_exe =
+      _wcsicmp(base, L"StartMenuExperienceHost.exe") == 0 ||
+      _wcsicmp(base, L"SearchHost.exe") == 0 ||
+      _wcsicmp(base, L"SearchApp.exe") == 0;
+  return is_start_menu_window_active(visible, cloak_ok ? cloaked : 0u,
+                                     is_core_class, is_start_exe);
+}
+
+bool is_current_process_elevated() {
+  HANDLE tok = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok))
+    return false;
+  TOKEN_ELEVATION elev{};
+  DWORD ret_len = 0;
+  const BOOL ok = GetTokenInformation(tok, TokenElevation, &elev,
+                                      sizeof(elev), &ret_len);
+  CloseHandle(tok);
+  return ok != FALSE && elev.TokenIsElevated != 0;
 }
 
 void on_trigger_config_changed(void* data G_GNUC_UNUSED) {
@@ -835,11 +869,13 @@ void maybe_refresh_keyboard_hook(ULONGLONG now_tick,
 
   if (!out.safe_to_reinstall)
     return;
-  if (*last_reinstall_tick != 0 &&
-      (now_tick - *last_reinstall_tick) < min_spacing_ms) {
+  if (!should_reinstall_ll_hook(g_keyboard_hook != nullptr, now_tick,
+                                g_last_kbd_event_tick, *last_reinstall_tick,
+                                4000, min_spacing_ms)) {
     return;
   }
 
+  g_kbd_swapping_hook = true;
   HHOOK fresh = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
                                   GetModuleHandleW(nullptr), 0);
   if (fresh != nullptr) {
@@ -851,6 +887,7 @@ void maybe_refresh_keyboard_hook(ULONGLONG now_tick,
     g_print("[trig] SetWindowsHookExW(WH_KEYBOARD_LL) failed gle=%lu\n",
             GetLastError());
   }
+  g_kbd_swapping_hook = false;
 }
 
 void trigger_thread_main() {
@@ -873,6 +910,9 @@ void trigger_thread_main() {
 
   g_keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
                                       GetModuleHandleW(nullptr), 0);
+  g_print("[trig] keyboard hook ready (installed=%d elevated=%d)\n",
+          g_keyboard_hook != nullptr ? 1 : 0,
+          is_current_process_elevated() ? 1 : 0);
   g_desktop_switch_hook = SetWinEventHook(
       EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH, nullptr,
       on_desktop_switch_event, 0, 0, WINEVENT_OUTOFCONTEXT);
@@ -940,6 +980,19 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
   if (nCode == HC_ACTION) {
     KBDLLHOOKSTRUCT* state = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+    g_last_kbd_event_tick = GetTickCount64();
+    if (g_kbd_swapping_hook && wParam == g_swap_last_wparam &&
+        state->vkCode == g_swap_last_vk &&
+        state->scanCode == g_swap_last_scan &&
+        state->flags == g_swap_last_flags &&
+        state->time == g_swap_last_time) {
+      return CallNextHookEx(nullptr, nCode, wParam, lParam);
+    }
+    g_swap_last_wparam = wParam;
+    g_swap_last_vk = state->vkCode;
+    g_swap_last_scan = state->scanCode;
+    g_swap_last_flags = state->flags;
+    g_swap_last_time = state->time;
 
     // Synthetic Win presses injected below: pass them through untouched so the
     // system sees the Start menu / Win+<key> we deliberately re-created.

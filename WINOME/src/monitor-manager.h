@@ -119,6 +119,39 @@ HWND monitor_manager_panel_for_monitor(HMONITOR mon);
 // True if @hwnd is the primary or any managed secondary panel window.
 bool monitor_manager_is_panel_hwnd(HWND hwnd);
 
+// Pure helper: center a newly launched window onto @dst_work while preserving
+// its intended size (clamped to @dst_work). Used by winome-tests.
+inline RECT compute_launched_window_rect(const RECT& src_rect,
+                                         const RECT& dst_work) {
+  const int work_w =
+      (dst_work.right > dst_work.left) ? (dst_work.right - dst_work.left) : 800;
+  const int work_h =
+      (dst_work.bottom > dst_work.top) ? (dst_work.bottom - dst_work.top) : 600;
+  int w = src_rect.right - src_rect.left;
+  int h = src_rect.bottom - src_rect.top;
+  if (w <= 0)
+    w = (work_w * 3) / 4;
+  if (h <= 0)
+    h = (work_h * 3) / 4;
+  if (w > work_w)
+    w = work_w;
+  if (h > work_h)
+    h = work_h;
+  RECT out{};
+  out.left = dst_work.left + (work_w - w) / 2;
+  out.top = dst_work.top + (work_h - h) / 2;
+  out.right = out.left + w;
+  out.bottom = out.top + h;
+  return out;
+}
+
+// Resolve the HMONITOR containing @widget (falls back to active monitor).
+HMONITOR monitor_manager_monitor_for_widget(GtkWidget* widget);
+
+// Watch briefly for a newly opened app window and relocate it to @target_monitor
+// if the OS/app placed its initial window on another display.
+void watch_launched_window_for_monitor(HMONITOR target_monitor);
+
 // Start display/DPI/wallpaper/session watcher and secondary panels.
 void monitor_manager_init(HWND primary_panel_hwnd,
                           const MonitorRuntimeCallbacks& callbacks);

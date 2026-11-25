@@ -16,6 +16,8 @@
 #include "fonts.h"
 #include "host-utils.h"
 #include "i18n.h"
+#include "monitor-manager.h"
+#include "overview-secondary.h"
 #include "overview-trigger.h"
 #include "st-engine.h"
 #include "system-status.h"
@@ -558,6 +560,19 @@ tile_at (WinomeDash *self, double x, double y)
 }
 
 void
+dismiss_overview_from_dash (WinomeDash *self, const char *reason)
+{
+  if (!get_config ().multi_monitor_overview_linked && self != nullptr &&
+      self->last_monitor != nullptr &&
+      overview_secondary_is_open_for_monitor (self->last_monitor) &&
+      self->last_monitor != overview_main_monitor ()) {
+    overview_close_secondary_for_monitor (self->last_monitor);
+    return;
+  }
+  close_overview (reason);
+}
+
+void
 activate_app (WinomeDash *self, int index)
 {
   if (index < 0 || index >= (int)self->apps.size ())
@@ -588,13 +603,27 @@ activate_app (WinomeDash *self, int index)
   }
   if (best == nullptr) {
     overview_discard_restore_focus ();
-    if (app_index_launch_id (app.id, false) ||
-        (!app.exe_path.empty () &&
-         reinterpret_cast<INT_PTR> (ShellExecuteW (
-             nullptr, L"open", app.exe_path.c_str (), nullptr,
-             nullptr, SW_SHOWNORMAL)) > 32)) {
-      close_overview ("dash-launch-favorite");
+    HMONITOR target_mon =
+        (self != nullptr && self->last_monitor != nullptr)
+            ? self->last_monitor
+            : monitor_manager_monitor_for_widget (GTK_WIDGET (self));
+    bool launched = app_index_launch_id (app.id, false, target_mon);
+    if (!launched && !app.exe_path.empty ()) {
+      watch_launched_window_for_monitor (target_mon);
+      SHELLEXECUTEINFOW sei {};
+      sei.cbSize = sizeof (sei);
+      sei.fMask = SEE_MASK_FLAG_NO_UI;
+      if (target_mon != nullptr) {
+        sei.fMask |= SEE_MASK_HMONITOR;
+        sei.hMonitor = target_mon;
+      }
+      sei.lpVerb = L"open";
+      sei.lpFile = app.exe_path.c_str ();
+      sei.nShow = SW_SHOWNORMAL;
+      launched = ShellExecuteExW (&sei) != FALSE;
     }
+    if (launched)
+      dismiss_overview_from_dash (self, "dash-launch-favorite");
     return;
   }
 
@@ -607,7 +636,7 @@ activate_app (WinomeDash *self, int index)
   if (IsIconic (best))
     ShowWindow (best, SW_RESTORE);
   SetForegroundWindow (best);
-  close_overview ("dash-activate");
+  dismiss_overview_from_dash (self, "dash-activate");
 }
 
 void
@@ -679,13 +708,27 @@ on_dash_menu_new_window (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
   std::wstring exe_path = ctx->exe_path;
   overview_dash_close_menu (GTK_WIDGET (self));
   overview_discard_restore_focus ();
-  if (app_index_launch_id (app_id, false) ||
-      (!exe_path.empty () &&
-       reinterpret_cast<INT_PTR> (ShellExecuteW (
-           nullptr, L"open", exe_path.c_str (), nullptr, nullptr,
-           SW_SHOWNORMAL)) > 32)) {
-    close_overview ("dash-new-window");
+  HMONITOR target_mon =
+      (self != nullptr && self->last_monitor != nullptr)
+          ? self->last_monitor
+          : monitor_manager_monitor_for_widget (GTK_WIDGET (self));
+  bool launched = app_index_launch_id (app_id, false, target_mon);
+  if (!launched && !exe_path.empty ()) {
+    watch_launched_window_for_monitor (target_mon);
+    SHELLEXECUTEINFOW sei {};
+    sei.cbSize = sizeof (sei);
+    sei.fMask = SEE_MASK_FLAG_NO_UI;
+    if (target_mon != nullptr) {
+      sei.fMask |= SEE_MASK_HMONITOR;
+      sei.hMonitor = target_mon;
+    }
+    sei.lpVerb = L"open";
+    sei.lpFile = exe_path.c_str ();
+    sei.nShow = SW_SHOWNORMAL;
+    launched = ShellExecuteExW (&sei) != FALSE;
   }
+  if (launched)
+    dismiss_overview_from_dash (self, "dash-new-window");
 }
 
 void
@@ -734,7 +777,7 @@ on_dash_menu_window (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
   if (ws >= 0 && ws != ws::active_for_monitor (win_mon))
     ws::switch_to (win_mon, ws);
   if (app_index_activate_hwnd (hwnd))
-    close_overview ("dash-activate-window");
+    dismiss_overview_from_dash (self, "dash-activate-window");
 }
 
 void

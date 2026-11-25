@@ -607,11 +607,18 @@ bool execute_run_command_string(const std::string& raw_cmd,
 
   debug_append_log("run", std::string("[run] exec: ") + trimmed);
 
+  HMONITOR target_mon = monitor_manager_monitor_for_widget(g_run.window);
+  watch_launched_window_for_monitor(target_mon);
+
   if (in_terminal) {
     const std::wstring wargs = L"/k " + utf8_to_wide(trimmed);
     SHELLEXECUTEINFOW sei{};
     sei.cbSize = sizeof(sei);
     sei.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+    if (target_mon != nullptr) {
+      sei.fMask |= SEE_MASK_HMONITOR;
+      sei.hMonitor = target_mon;
+    }
     sei.lpVerb = L"open";
     sei.lpFile = L"cmd.exe";
     sei.lpParameters = wargs.c_str();
@@ -633,6 +640,10 @@ bool execute_run_command_string(const std::string& raw_cmd,
   SHELLEXECUTEINFOW sei{};
   sei.cbSize = sizeof(sei);
   sei.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+  if (target_mon != nullptr) {
+    sei.fMask |= SEE_MASK_HMONITOR;
+    sei.hMonitor = target_mon;
+  }
   sei.lpVerb = L"open";
   sei.lpFile = wfile.c_str();
   sei.lpParameters = wargs.empty() ? nullptr : wargs.c_str();
@@ -648,6 +659,10 @@ bool execute_run_command_string(const std::string& raw_cmd,
       SHELLEXECUTEINFOW sei2{};
       sei2.cbSize = sizeof(sei2);
       sei2.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+      if (target_mon != nullptr) {
+        sei2.fMask |= SEE_MASK_HMONITOR;
+        sei2.hMonitor = target_mon;
+      }
       sei2.lpVerb = L"open";
       sei2.lpFile = wfull.c_str();
       sei2.nShow = SW_SHOWNORMAL;

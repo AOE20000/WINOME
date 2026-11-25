@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include "workspace-manager.h"
+
 #include <gdk/gdk.h>
 #include <windows.h>
 
@@ -63,6 +65,23 @@ inline OverviewDispatchAction decide_multi_monitor_overview_action(
   return OverviewDispatchAction::OpenSecondary;
 }
 
+// Whether CloseAll must explicitly close secondary Overview hosts (when unlinked
+// or when main Overview is not open to drive linked close).
+inline bool should_close_secondary_on_close_all(bool linked,
+                                                bool main_open,
+                                                bool any_secondary_open) {
+  return any_secondary_open && (!linked || !main_open);
+}
+
+// Whether a Secondary Overview display should render its own bottom Dash:
+// both Independent and Span workspace modes show a Dash on every open
+// overview display (in both linked and unlinked simultaneous modes), while
+// PrimaryOnly (GNOME default) keeps a single Dash on the active overview display.
+inline bool should_secondary_overview_show_dash(
+    ws::MultiMonitorWorkspaceMode mode) {
+  return mode != ws::MultiMonitorWorkspaceMode::PrimaryOnly;
+}
+
 struct SecondaryOverviewGeometry {
   RECT full_box{};
   RECT picker_box{};
@@ -78,7 +97,8 @@ inline SecondaryOverviewGeometry compute_secondary_overview_geometry(
     int mon_h,
     int panel_h,
     int scale,
-    int ws_count) {
+    int ws_count,
+    int dash_reserved_h = 0) {
   SecondaryOverviewGeometry g{};
   const int safe_w = std::max(mon_w, 320);
   const int safe_h = std::max(mon_h, 240);
@@ -86,6 +106,7 @@ inline SecondaryOverviewGeometry compute_secondary_overview_geometry(
   const int safe_panel = std::clamp(panel_h, 0, safe_h / 4);
   const int wa_h = std::max(safe_h - safe_panel, 120);
   const bool show_pills = (ws_count > 1);
+  const int safe_dash = std::clamp(dash_reserved_h, 0, wa_h / 3);
 
   g.full_box = RECT{0, safe_panel, safe_w, safe_h};
 
@@ -97,8 +118,11 @@ inline SecondaryOverviewGeometry compute_secondary_overview_geometry(
                           ? (pill_band_h + 24 * safe_scale)
                           : std::max(static_cast<int>(std::lround(wa_h * 0.06)),
                                      24 * safe_scale);
-  const int bot_pad = std::max(static_cast<int>(std::lround(wa_h * 0.06)),
-                               24 * safe_scale);
+  const int bot_pad =
+      (safe_dash > 0)
+          ? (safe_dash + 14 * safe_scale)
+          : std::max(static_cast<int>(std::lround(wa_h * 0.06)),
+                     24 * safe_scale);
   const int side_pad = std::max(static_cast<int>(std::lround(safe_w * 0.05)),
                                 28 * safe_scale);
 
@@ -172,6 +196,18 @@ void overview_secondary_close_monitor(HMONITOR monitor);
 // Close all currently open Secondary Overviews with smooth 250ms animation.
 void overview_secondary_close_all_animated();
 
+// Close any currently open Secondary Overviews that are NOT driven by an active
+// linked Main Overview (e.g. opened before toggling linked mode on).
+void overview_secondary_close_unlinked_animated();
+
+// Sync or detach open Secondary Overviews when multi_monitor_overview_linked
+// changes while Overview windows are already mapped.
+void overview_secondary_on_linked_changed(bool linked,
+                                          HMONITOR main_mon,
+                                          bool main_open,
+                                          GdkTexture* wallpaper_texture,
+                                          double progress);
+
 // Query per-monitor or aggregate Secondary Overview open state.
 bool overview_secondary_is_open_for_monitor(HMONITOR monitor);
 bool overview_secondary_any_open();
@@ -218,5 +254,9 @@ void overview_secondary_shutdown();
 
 // True if @hwnd belongs to any managed Secondary Overview window.
 bool overview_secondary_is_hwnd(HWND hwnd);
+
+// Close any open Dash context menu on an open Secondary Overview window.
+// Returns true if a popover menu was open and closed.
+bool overview_secondary_close_open_dash_menu();
 
 }  // namespace winome

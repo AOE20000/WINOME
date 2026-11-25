@@ -61,6 +61,18 @@ bool enable_privilege(const wchar_t* name) {
   return granted;
 }
 
+bool is_process_elevated() {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+    return false;
+  TOKEN_ELEVATION elev{};
+  DWORD ret_len = 0;
+  const BOOL ok = GetTokenInformation(token, TokenElevation, &elev,
+                                      sizeof(elev), &ret_len);
+  CloseHandle(token);
+  return ok != FALSE && elev.TokenIsElevated != 0;
+}
+
 bool set_process_dpi_aware() {
   HMODULE user32 = GetModuleHandleW(L"user32.dll");
   auto set_context = reinterpret_cast<SetDpiAwarenessContextFn>(
@@ -311,6 +323,68 @@ bool is_overview_default_blacklisted_hwnd(HWND hwnd, bool enabled) {
       cloaked != 0,
       cloaked,
       has_core_window);
+}
+
+namespace {
+
+constexpr const wchar_t* kOverlayNoMinOrigProp = L"WINOME_OverlayNoMinOrig";
+
+LRESULT CALLBACK overlay_nomin_subclass_proc(HWND hwnd,
+                                             UINT msg,
+                                             WPARAM wParam,
+                                             LPARAM lParam) {
+  WNDPROC orig = reinterpret_cast<WNDPROC>(GetPropW(hwnd, kOverlayNoMinOrigProp));
+  if (msg == WM_SYSCOMMAND) {
+    const WPARAM cmd = wParam & 0xFFF0u;
+    if (cmd == SC_MINIMIZE || cmd == SC_MAXIMIZE)
+      return 0;
+  }
+  if (msg == WM_STYLECHANGING && wParam == static_cast<WPARAM>(GWL_STYLE) &&
+      lParam != 0) {
+    auto* ss = reinterpret_cast<STYLESTRUCT*>(lParam);
+    ss->styleNew = strip_overlay_minimize_styles(
+        static_cast<LONG_PTR>(ss->styleNew));
+  }
+  if (msg == WM_SIZE && wParam == SIZE_MINIMIZED && IsWindowVisible(hwnd)) {
+    ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
+  }
+  if (msg == WM_NCDESTROY) {
+    RemovePropW(hwnd, kOverlayNoMinOrigProp);
+    if (orig != nullptr) {
+      if (GetWindowLongPtrW(hwnd, GWLP_WNDPROC) ==
+          reinterpret_cast<LONG_PTR>(overlay_nomin_subclass_proc)) {
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(orig));
+      }
+      return CallWindowProcW(orig, hwnd, msg, wParam, lParam);
+    }
+  }
+  return orig != nullptr ? CallWindowProcW(orig, hwnd, msg, wParam, lParam)
+                         : DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+}  // namespace
+
+void harden_shell_overlay_hwnd(HWND hwnd) {
+  if (hwnd == nullptr || !IsWindow(hwnd))
+    return;
+  const LONG_PTR cur_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+  const LONG_PTR want_style = strip_overlay_minimize_styles(cur_style);
+  if (want_style != cur_style) {
+    SetWindowLongPtrW(hwnd, GWL_STYLE, want_style);
+    SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                     SWP_FRAMECHANGED);
+  }
+  if (GetPropW(hwnd, kOverlayNoMinOrigProp) == nullptr) {
+    WNDPROC cur_proc = reinterpret_cast<WNDPROC>(
+        GetWindowLongPtrW(hwnd, GWLP_WNDPROC));
+    if (cur_proc != nullptr && cur_proc != overlay_nomin_subclass_proc) {
+      SetPropW(hwnd, kOverlayNoMinOrigProp,
+               reinterpret_cast<HANDLE>(cur_proc));
+      SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
+                        reinterpret_cast<LONG_PTR>(overlay_nomin_subclass_proc));
+    }
+  }
 }
 
 }  // namespace winome

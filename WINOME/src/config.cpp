@@ -365,6 +365,8 @@ std::string serialize_config(const WinomeConfig& cfg) {
   out += std::to_string(cfg.hot_corner_cooldown_ms);
   out += ",\n  \"win_key_overview\": ";
   out += cfg.win_key_overview ? "true" : "false";
+  out += ",\n  \"auto_elevate\": ";
+  out += cfg.auto_elevate ? "true" : "false";
   out += ",\n  \"overview_window_blacklist\": ";
   out += cfg.overview_window_blacklist ? "true" : "false";
   out += ",\n  \"live_wallpaper_mode\": ";
@@ -441,6 +443,8 @@ bool parse_config(const std::string& json, WinomeConfig* out) {
       ok = parse_json_int(json, &pos, &cfg.hot_corner_cooldown_ms);
     else if (key == "win_key_overview")
       ok = parse_json_bool(json, &pos, &cfg.win_key_overview);
+    else if (key == "auto_elevate")
+      ok = parse_json_bool(json, &pos, &cfg.auto_elevate);
     else if (key == "overview_window_blacklist")
       ok = parse_json_bool(json, &pos, &cfg.overview_window_blacklist);
     else if (key == "live_wallpaper_mode")

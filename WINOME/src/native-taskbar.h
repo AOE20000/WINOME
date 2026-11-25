@@ -12,6 +12,15 @@
 
 namespace winome {
 
+// Pure helper: ABM_SETSTATE(ABS_AUTOHIDE) is global to the shell taskbar, so
+// only the primary Shell_TrayWnd should ever send it, and only when not already
+// autohide and not blocked by another auto-hide AppBar on the same screen edge.
+inline bool should_send_taskbar_autohide_state(bool is_primary,
+                                               bool already_autohide,
+                                               bool edge_occupied_by_other) {
+  return is_primary && !already_autohide && !edge_occupied_by_other;
+}
+
 // Owns the visibility of the native Windows taskbar. hide() launches a
 // keeper thread that re-hides the taskbar whenever Explorer brings it back,
 // so the shell bar cannot reappear while WINOME is running. restore() stops

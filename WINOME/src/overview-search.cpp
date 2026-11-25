@@ -10,6 +10,7 @@
 #include "app-index.h"
 #include "end-session-dialog.h"
 #include "i18n.h"
+#include "monitor-manager.h"
 #include "system-status.h"
 
 #include <shlobj.h>
@@ -111,14 +112,27 @@ copy_utf8_to_clipboard (const std::string &text)
 }
 
 void
-shell_open_utf8 (const std::string &target)
+shell_open_utf8 (const std::string &target, HMONITOR target_monitor = nullptr)
 {
   if (target.empty ())
     return;
   std::wstring wide = app_utf8_to_wide (target);
   AllowSetForegroundWindow (ASFW_ANY);
-  ShellExecuteW (nullptr, L"open", wide.c_str (), nullptr, nullptr,
-                 SW_SHOWNORMAL);
+  HMONITOR mon = (target_monitor != nullptr)
+                     ? target_monitor
+                     : monitor_manager_active_monitor ();
+  watch_launched_window_for_monitor (mon);
+  SHELLEXECUTEINFOW sei {};
+  sei.cbSize = sizeof (sei);
+  sei.fMask = SEE_MASK_FLAG_NO_UI;
+  if (mon != nullptr) {
+    sei.fMask |= SEE_MASK_HMONITOR;
+    sei.hMonitor = mon;
+  }
+  sei.lpVerb = L"open";
+  sei.lpFile = wide.c_str ();
+  sei.nShow = SW_SHOWNORMAL;
+  ShellExecuteExW (&sei);
 }
 
 void
@@ -843,7 +857,9 @@ activate_item (WinomeSearchView *self, int idx, bool new_instance)
           return;
         }
       }
-      if (app_index_launch (item.app_entry, false))
+      HMONITOR target_mon =
+          monitor_manager_monitor_for_widget (GTK_WIDGET (self));
+      if (app_index_launch (item.app_entry, false, target_mon))
         close_ov (new_instance ? "search-app-new" : "search-app-launch", true);
       break;
     }
@@ -888,9 +904,21 @@ activate_item (WinomeSearchView *self, int idx, bool new_instance)
       break;
     }
     case SearchItemKind::File: {
+      HMONITOR target_mon =
+          monitor_manager_monitor_for_widget (GTK_WIDGET (self));
       AllowSetForegroundWindow (ASFW_ANY);
-      ShellExecuteW (nullptr, L"open", item.wide_path.c_str (), nullptr,
-                     nullptr, SW_SHOWNORMAL);
+      watch_launched_window_for_monitor (target_mon);
+      SHELLEXECUTEINFOW sei {};
+      sei.cbSize = sizeof (sei);
+      sei.fMask = SEE_MASK_FLAG_NO_UI;
+      if (target_mon != nullptr) {
+        sei.fMask |= SEE_MASK_HMONITOR;
+        sei.hMonitor = target_mon;
+      }
+      sei.lpVerb = L"open";
+      sei.lpFile = item.wide_path.c_str ();
+      sei.nShow = SW_SHOWNORMAL;
+      ShellExecuteExW (&sei);
       close_ov ("search-file-open", true);
       break;
     }
@@ -903,14 +931,18 @@ activate_item (WinomeSearchView *self, int idx, bool new_instance)
                                       self->cbs.user_data);
         }
       } else {
+        HMONITOR target_mon =
+            monitor_manager_monitor_for_widget (GTK_WIDGET (self));
         close_ov ("search-win-settings", true);
-        shell_open_utf8 (item.payload);
+        shell_open_utf8 (item.payload, target_mon);
       }
       break;
     }
     case SearchItemKind::UrlOrCommand: {
+      HMONITOR target_mon =
+          monitor_manager_monitor_for_widget (GTK_WIDGET (self));
       close_ov ("search-url-cmd", true);
-      shell_open_utf8 (item.payload);
+      shell_open_utf8 (item.payload, target_mon);
       break;
     }
   }

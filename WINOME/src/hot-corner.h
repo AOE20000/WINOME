@@ -60,4 +60,11 @@ void hot_corner_set_suppressed(bool suppressed);
 // Refresh cached monitor coordinates across all displays after display/DPI changes.
 void hot_corner_refresh_bounds(void);
 
+// Feed pointer screen coordinates from panel motion/leave events into the
+// shared hot-corner state machine (bypasses UIPI when elevated apps hold focus).
+void hot_corner_notify_pointer(int screen_x, int screen_y);
+
+// Returns true if the cursor was last recorded inside a monitor's hot corner.
+bool hot_corner_is_in_corner(void);
+
 }  // namespace winome

@@ -109,6 +109,37 @@ inline HookWatchdogOutcome evaluate_hook_watchdog(const HookWatchdogInput& in) {
   return out;
 }
 
+// Determines whether a low-level Windows hook needs to be (re-)installed.
+// Avoids churning a healthy live hook that is actively receiving events.
+inline bool should_reinstall_ll_hook(bool has_hook,
+                                     uint64_t now_tick,
+                                     uint64_t last_event_tick,
+                                     uint64_t last_reinstall_tick,
+                                     uint64_t silent_threshold_ms,
+                                     uint64_t min_spacing_ms) {
+  if (!has_hook)
+    return true;
+  if (last_event_tick != 0 &&
+      (now_tick - last_event_tick) < silent_threshold_ms) {
+    return false;
+  }
+  if (last_reinstall_tick != 0 &&
+      (now_tick - last_reinstall_tick) < min_spacing_ms) {
+    return false;
+  }
+  return true;
+}
+
+// Determines whether a foreground Shell CoreWindow/Xaml host actually represents
+// a visible, uncloaked Start Menu / Search surface (and not a cloaked Win11
+// StartMenuExperienceHost window left foreground after dismissal).
+inline bool is_start_menu_window_active(bool visible,
+                                        unsigned cloaked,
+                                        bool is_core_class,
+                                        bool is_start_exe) {
+  return visible && cloaked == 0 && is_core_class && is_start_exe;
+}
+
 enum class WinKeyComboAction {
   ModifierPassthrough,
   StartMenu,

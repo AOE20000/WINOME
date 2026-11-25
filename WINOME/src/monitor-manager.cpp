@@ -5,12 +5,15 @@
 #include "monitor-manager.h"
 
 #include "config.h"
+#include "host-utils.h"
 
+#include <dwmapi.h>
 #include <gdk/win32/gdkwin32.h>
 #include <windows.h>
 
 #include <algorithm>
 #include <cstring>
+#include <unordered_set>
 #include <vector>
 
 namespace winome {
@@ -51,6 +54,11 @@ struct MonitorManagerState {
   guint display_debounce_id = 0;
   guint workarea_idle_id = 0;
   bool initialized = false;
+  guint launch_watch_timer_id = 0;
+  HMONITOR launch_target_mon = nullptr;
+  RECT launch_target_work{};
+  gint64 launch_deadline_ms = 0;
+  std::unordered_set<HWND> launch_baseline;
 };
 
 MonitorManagerState g_mm;
@@ -473,6 +481,176 @@ void monitor_manager_sync() {
   }
 }
 
+namespace {
+
+void cancel_launch_watch() {
+  if (g_mm.launch_watch_timer_id != 0) {
+    g_source_remove(g_mm.launch_watch_timer_id);
+    g_mm.launch_watch_timer_id = 0;
+  }
+  g_mm.launch_target_mon = nullptr;
+  g_mm.launch_target_work = RECT{};
+  g_mm.launch_deadline_ms = 0;
+  g_mm.launch_baseline.clear();
+}
+
+bool is_manageable_launched_window(HWND hwnd) {
+  if (hwnd == nullptr || !IsWindow(hwnd) || !IsWindowVisible(hwnd))
+    return false;
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (pid == 0 || pid == GetCurrentProcessId())
+    return false;
+  const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+  const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+  if ((style & WS_CHILD) != 0 || (ex & WS_EX_TOOLWINDOW) != 0)
+    return false;
+  if (GetWindow(hwnd, GW_OWNER) != nullptr && (ex & WS_EX_APPWINDOW) == 0)
+    return false;
+
+  wchar_t cls[128] = {};
+  if (GetClassNameW(hwnd, cls, 128) > 0) {
+    if (std::wcscmp(cls, L"Shell_TrayWnd") == 0 ||
+        std::wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0 ||
+        std::wcscmp(cls, L"Progman") == 0 ||
+        std::wcscmp(cls, L"WorkerW") == 0) {
+      return false;
+    }
+  }
+
+  DWORD cloaked = 0;
+  DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+  if (cloaked != 0)
+    return false;
+  if (is_overview_default_blacklisted_hwnd(hwnd, true))
+    return false;
+
+  RECT rc{};
+  if (IsZoomed(hwnd)) {
+    WINDOWPLACEMENT wp{};
+    wp.length = sizeof(wp);
+    if (!GetWindowPlacement(hwnd, &wp))
+      return false;
+    rc = wp.rcNormalPosition;
+  } else if (!GetWindowRect(hwnd, &rc)) {
+    return false;
+  }
+  return (rc.right - rc.left) >= 120 && (rc.bottom - rc.top) >= 80;
+}
+
+BOOL CALLBACK collect_launch_windows_proc(HWND hwnd, LPARAM lp) {
+  auto* list = reinterpret_cast<std::vector<HWND>*>(lp);
+  if (is_manageable_launched_window(hwnd))
+    list->push_back(hwnd);
+  return TRUE;
+}
+
+gboolean launch_monitor_watch_tick(gpointer G_GNUC_UNUSED data) {
+  const gint64 now_ms = g_get_monotonic_time() / 1000;
+  if (g_mm.launch_target_mon == nullptr || now_ms >= g_mm.launch_deadline_ms) {
+    g_mm.launch_watch_timer_id = 0;
+    cancel_launch_watch();
+    return G_SOURCE_REMOVE;
+  }
+
+  std::vector<HWND> current;
+  EnumWindows(collect_launch_windows_proc, reinterpret_cast<LPARAM>(&current));
+
+  HWND fg = GetForegroundWindow();
+  HWND cand = nullptr;
+  for (HWND h : current) {
+    if (g_mm.launch_baseline.find(h) != g_mm.launch_baseline.end())
+      continue;
+    if (h == fg) {
+      cand = h;
+      break;
+    }
+    if (cand == nullptr)
+      cand = h;
+  }
+
+  if (cand == nullptr)
+    return G_SOURCE_CONTINUE;
+
+  const HMONITOR cur_mon = MonitorFromWindow(cand, MONITOR_DEFAULTTONEAREST);
+  if (cur_mon == g_mm.launch_target_mon) {
+    g_mm.launch_watch_timer_id = 0;
+    cancel_launch_watch();
+    return G_SOURCE_REMOVE;
+  }
+
+  const bool was_max = IsZoomed(cand) != FALSE;
+  RECT src_rc{};
+  if (was_max) {
+    WINDOWPLACEMENT wp{};
+    wp.length = sizeof(wp);
+    if (GetWindowPlacement(cand, &wp))
+      src_rc = wp.rcNormalPosition;
+  } else {
+    GetWindowRect(cand, &src_rc);
+  }
+
+  const RECT dst = compute_launched_window_rect(src_rc, g_mm.launch_target_work);
+  const int dst_w = dst.right - dst.left;
+  const int dst_h = dst.bottom - dst.top;
+  if (was_max)
+    ShowWindow(cand, SW_RESTORE);
+  SetWindowPos(cand, nullptr, dst.left, dst.top, dst_w, dst_h,
+               SWP_NOZORDER | SWP_NOACTIVATE);
+  if (was_max)
+    ShowWindow(cand, SW_MAXIMIZE);
+  AllowSetForegroundWindow(ASFW_ANY);
+  SetForegroundWindow(cand);
+  g_print("[mon] relocated launched window %p -> mon=%p (%ld,%ld %dx%d)\n",
+          static_cast<void*>(cand), static_cast<void*>(g_mm.launch_target_mon),
+          dst.left, dst.top, dst_w, dst_h);
+
+  g_mm.launch_watch_timer_id = 0;
+  cancel_launch_watch();
+  return G_SOURCE_REMOVE;
+}
+
+}  // namespace
+
+HMONITOR monitor_manager_monitor_for_widget(GtkWidget* widget) {
+  if (widget != nullptr && gtk_is_initialized()) {
+    GtkNative* native = gtk_widget_get_native(widget);
+    GdkSurface* surf =
+        native != nullptr ? gtk_native_get_surface(native) : nullptr;
+    HWND hwnd = surf != nullptr
+                    ? static_cast<HWND>(gdk_win32_surface_get_handle(surf))
+                    : nullptr;
+    if (hwnd != nullptr && IsWindow(hwnd)) {
+      HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+      if (mon != nullptr)
+        return mon;
+    }
+  }
+  return monitor_manager_active_monitor();
+}
+
+void watch_launched_window_for_monitor(HMONITOR target_monitor) {
+  if (target_monitor == nullptr || !gtk_is_initialized())
+    return;
+  if (enumerate_monitors().size() <= 1)
+    return;
+  MONITORINFO mi{};
+  mi.cbSize = sizeof(mi);
+  if (!GetMonitorInfoW(target_monitor, &mi))
+    return;
+
+  cancel_launch_watch();
+  std::vector<HWND> existing;
+  EnumWindows(collect_launch_windows_proc, reinterpret_cast<LPARAM>(&existing));
+  for (HWND h : existing)
+    g_mm.launch_baseline.insert(h);
+  g_mm.launch_target_mon = target_monitor;
+  g_mm.launch_target_work = mi.rcWork;
+  g_mm.launch_deadline_ms = g_get_monotonic_time() / 1000 + 5000;
+  g_mm.launch_watch_timer_id =
+      g_timeout_add(120, launch_monitor_watch_tick, nullptr);
+}
+
 void monitor_manager_init(HWND primary_panel_hwnd,
                           const MonitorRuntimeCallbacks& callbacks) {
   if (g_mm.initialized)
@@ -529,6 +707,7 @@ void monitor_manager_shutdown() {
     g_source_remove(g_mm.workarea_idle_id);
     g_mm.workarea_idle_id = 0;
   }
+  cancel_launch_watch();
 
   destroy_all_secondary_panels();
 

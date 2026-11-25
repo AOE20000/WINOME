@@ -17,6 +17,7 @@ struct WinomeConfig {
   bool hot_corner_enabled = true;
   int hot_corner_cooldown_ms = 500;
   bool win_key_overview = true;
+  bool auto_elevate = true;
   bool overview_window_blacklist = true;
   std::string live_wallpaper_mode = "live";  // "live", "snapshot", "off"
   bool dash_isolate_workspaces = false;  // false = all workspaces, true = active workspace only

@@ -7,6 +7,7 @@
 #include "app-index.h"
 #include "easing.h"
 #include "fonts.h"
+#include "host-utils.h"
 #include "i18n.h"
 #include "monitor-manager.h"
 #include "st-engine.h"
@@ -264,6 +265,7 @@ void position_banner_window(GtkWidget* window) {
   SetWindowLongPtrW(hwnd, GWL_EXSTYLE,
                     (ex | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE) &
                         ~WS_EX_APPWINDOW);
+  harden_shell_overlay_hwnd(hwnd);
 
   gtk_widget_realize(window);
   int min_w = 0, nat_w = 420;
@@ -313,6 +315,7 @@ void ensure_banner_window() {
     return;
 
   g_banner_window = gtk_window_new();
+  gtk_window_set_title(GTK_WINDOW(g_banner_window), "WINOME Notification");
   gtk_widget_set_name(g_banner_window, "winomeToastWindow");
   gtk_window_set_decorated(GTK_WINDOW(g_banner_window), FALSE);
   gtk_window_set_resizable(GTK_WINDOW(g_banner_window), FALSE);

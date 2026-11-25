@@ -43,6 +43,30 @@ BOOL CALLBACK collect_taskbar(HWND hwnd, LPARAM lparam) {
   return TRUE;
 }
 
+bool is_primary_taskbar_hwnd(HWND hwnd) {
+  if (hwnd == nullptr || !IsWindow(hwnd))
+    return false;
+  wchar_t cls[kClassBuffer] = {0};
+  return GetClassNameW(hwnd, cls, kClassBuffer) > 0 &&
+         wcscmp(cls, kPrimaryTaskbarClass) == 0;
+}
+
+bool is_taskbar_edge_occupied_by_other_autohide(HWND primary_hwnd) {
+  APPBARDATA pos_abd{};
+  pos_abd.cbSize = sizeof(APPBARDATA);
+  pos_abd.hWnd = primary_hwnd;
+  UINT edge = ABE_BOTTOM;
+  if (SHAppBarMessage(ABM_GETTASKBARPOS, &pos_abd) != 0)
+    edge = pos_abd.uEdge;
+
+  APPBARDATA edge_abd{};
+  edge_abd.cbSize = sizeof(APPBARDATA);
+  edge_abd.uEdge = edge;
+  HWND other = reinterpret_cast<HWND>(
+      SHAppBarMessage(ABM_GETAUTOHIDEBAR, &edge_abd));
+  return other != nullptr && other != primary_hwnd && IsWindow(other) != FALSE;
+}
+
 }  // namespace
 
 std::thread NativeTaskbar::keeper_thread_;
@@ -69,6 +93,7 @@ std::vector<HWND> NativeTaskbar::find_taskbars(HWND* out_primary) {
 bool NativeTaskbar::set_visibility(HWND hwnd, bool visible, int restore_state) {
   if (hwnd == nullptr || !IsWindow(hwnd))
     return false;
+  const bool is_primary = is_primary_taskbar_hwnd(hwnd);
   APPBARDATA abd{};
   abd.cbSize = sizeof(APPBARDATA);
   abd.hWnd = hwnd;
@@ -76,9 +101,12 @@ bool NativeTaskbar::set_visibility(HWND hwnd, bool visible, int restore_state) {
   if (visible) {
     // Always restore as visible non-autohide unless caller preserves an
     // explicit state; crash recovery defaults to ABS_ALWAYSONTOP so user
-    // immediately sees the taskbar.
-    abd.lParam = (restore_state >= 0) ? restore_state : ABS_ALWAYSONTOP;
-    SHAppBarMessage(ABM_SETSTATE, &abd);
+    // immediately sees the taskbar. Only the primary Shell_TrayWnd owns the
+    // global ABM_SETSTATE setting.
+    if (is_primary) {
+      abd.lParam = (restore_state >= 0) ? restore_state : ABS_ALWAYSONTOP;
+      SHAppBarMessage(ABM_SETSTATE, &abd);
+    }
     ShowWindowAsync(hwnd, SW_SHOWNORMAL);
     // Ensure taskbar is never left DWM-cloaked on restore or emergency exit.
     BOOL uncloak = FALSE;
@@ -88,13 +116,21 @@ bool NativeTaskbar::set_visibility(HWND hwnd, bool visible, int restore_state) {
                      SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS);
     changed = true;
   } else {
-    // Only send ABM_SETSTATE when not already ABS_AUTOHIDE so Explorer is not
-    // poked into repeatedly recalculating SPI_SETWORKAREA to (0,0,W,H).
-    const UINT_PTR cur_state = SHAppBarMessage(ABM_GETSTATE, &abd);
-    if ((cur_state & ABS_AUTOHIDE) == 0) {
-      abd.lParam = ABS_AUTOHIDE;
-      SHAppBarMessage(ABM_SETSTATE, &abd);
-      changed = true;
+    // Only send ABM_SETSTATE from the primary taskbar when not already
+    // ABS_AUTOHIDE and no third-party auto-hide AppBar occupies that edge,
+    // avoiding Explorer's "already an auto-hide toolbar on this side" popup.
+    if (is_primary) {
+      const UINT_PTR cur_state = SHAppBarMessage(ABM_GETSTATE, &abd);
+      const bool already_autohide = (cur_state & ABS_AUTOHIDE) != 0;
+      const bool occupied =
+          !already_autohide &&
+          is_taskbar_edge_occupied_by_other_autohide(hwnd);
+      if (should_send_taskbar_autohide_state(is_primary, already_autohide,
+                                             occupied)) {
+        abd.lParam = ABS_AUTOHIDE;
+        SHAppBarMessage(ABM_SETSTATE, &abd);
+        changed = true;
+      }
     }
     if (IsWindowVisible(hwnd)) {
       ShowWindowAsync(hwnd, SW_HIDE);

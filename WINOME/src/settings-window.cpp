@@ -52,6 +52,7 @@ struct SettingsUi {
   GtkWidget* ws_mode_drop = nullptr;
   GtkWidget* overview_linked_drop = nullptr;
   GtkWidget* end_session_confirm_switch = nullptr;
+  GtkWidget* auto_elevate_switch = nullptr;
   GtkWidget* dev_mode_switch = nullptr;
   GtkWidget* dev_console_btn = nullptr;
 
@@ -437,6 +438,10 @@ void sync_ui_from_config() {
     gtk_switch_set_active(GTK_SWITCH(g_ui.end_session_confirm_switch),
                           cfg.end_session_confirm ? TRUE : FALSE);
   }
+  if (g_ui.auto_elevate_switch != nullptr) {
+    gtk_switch_set_active(GTK_SWITCH(g_ui.auto_elevate_switch),
+                          cfg.auto_elevate ? TRUE : FALSE);
+  }
   if (g_ui.dev_mode_switch != nullptr) {
     gtk_switch_set_active(GTK_SWITCH(g_ui.dev_mode_switch),
                           cfg.developer_mode ? TRUE : FALSE);
@@ -617,6 +622,15 @@ gboolean on_end_session_confirm_set(GtkSwitch* sw G_GNUC_UNUSED, gboolean state,
     return FALSE;
   WinomeConfig cfg = get_config();
   cfg.end_session_confirm = state != FALSE;
+  update_config(cfg);
+  return FALSE;
+}
+
+gboolean on_auto_elevate_set(GtkSwitch* sw G_GNUC_UNUSED, gboolean state, gpointer ud G_GNUC_UNUSED) {
+  if (g_ui.syncing)
+    return FALSE;
+  WinomeConfig cfg = get_config();
+  cfg.auto_elevate = state != FALSE;
   update_config(cfg);
   return FALSE;
 }
@@ -862,7 +876,10 @@ void on_window_destroy(GtkWidget* widget G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSE
   g_ui.overview_blacklist_switch = nullptr;
   g_ui.live_wallpaper_drop = nullptr;
   g_ui.dash_scope_drop = nullptr;
+  g_ui.ws_mode_drop = nullptr;
+  g_ui.overview_linked_drop = nullptr;
   g_ui.end_session_confirm_switch = nullptr;
+  g_ui.auto_elevate_switch = nullptr;
   g_ui.dev_mode_switch = nullptr;
   g_ui.dev_console_btn = nullptr;
   g_ui.diag_box = nullptr;
@@ -1098,6 +1115,17 @@ GtkWidget* build_behavior_page() {
                tr("Show GNOME-style 60-second countdown modal before Restart, Power Off, or Log Out",
                   "在执行重启、关机或注销前显示 GNOME 风格 60 秒倒计时确认弹窗"),
                g_ui.end_session_confirm_switch),
+      true);
+
+  g_ui.auto_elevate_switch = gtk_switch_new();
+  g_signal_connect(g_ui.auto_elevate_switch, "state-set",
+                   G_CALLBACK(on_auto_elevate_set), nullptr);
+  append_row_to_card(
+      trig_card,
+      make_row(tr("Auto-Elevate to Administrator", "启动时自动以管理员权限运行"),
+               tr("Automatically relaunch elevated so Win / Alt+F2 hotkeys work over administrator windows (applies on next start)",
+                  "自动以管理员权限启动，确保 Win / Alt+F2 全局快捷键在管理员窗口前台时也稳定生效（下次启动生效）"),
+               g_ui.auto_elevate_switch),
       true);
 
   gtk_box_append(GTK_BOX(page), trig_card);

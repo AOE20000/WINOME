@@ -22,6 +22,7 @@
 #include "system-status.h"
 #include "power-modes.h"
 #include "wifi-networks.h"
+#include "workspace-manager.h"
 #include "shell-panel.h"
 
 #include <gdk/win32/gdkwin32.h>
@@ -1096,6 +1097,137 @@ build_dark_mode_menu (gpointer user_data)
       tr ("Dark Style", "深色主题"), dark_mode_subtitle (apps_dark, sys_dark),
       (apps_dark || sys_dark) ? TRUE : FALSE);
   g_object_set_data_full (G_OBJECT (menu), "dark-mode-targets", targets, g_free);
+  return menu;
+}
+
+static const char *
+ws_mode_icon (const std::string &mode)
+{
+  if (mode == "primary_only")
+    return "video-single-display-symbolic";
+  if (mode == "span")
+    return "view-dual-symbolic";
+  return "video-joined-displays-symbolic";
+}
+
+static const char *
+ws_mode_short_label (const std::string &mode)
+{
+  if (mode == "primary_only")
+    return tr ("Primary Only", "仅主屏切换");
+  if (mode == "span")
+    return tr ("Span All", "全局同步");
+  return tr ("Independent", "独立切换");
+}
+
+static const char *
+ws_mode_pill_subtitle (bool linked, const std::string &mode)
+{
+  if (!linked) {
+    if (mode == "primary_only")
+      return tr ("Solo · Primary", "单开·主屏");
+    if (mode == "span")
+      return tr ("Solo · Span", "单开·同步");
+    return tr ("Solo · Indep.", "单开·独立");
+  }
+  if (mode == "primary_only")
+    return tr ("Linked · Primary", "联动·主屏");
+  if (mode == "span")
+    return tr ("Linked · Span", "联动·同步");
+  return tr ("Linked · Indep.", "联动·独立");
+}
+
+static void refresh_all_quick_settings_instances (GtkWidget *preferred_panel);
+
+static void
+apply_ws_mode (const char *mode, GtkWidget *panel)
+{
+  if (mode == nullptr)
+    return;
+  winome::WinomeConfig cfg = winome::get_config ();
+  if (cfg.multi_monitor_workspace_mode != mode) {
+    cfg.multi_monitor_workspace_mode = mode;
+    winome::update_config (cfg);
+  }
+  refresh_all_quick_settings_instances (panel);
+}
+
+static void
+on_ws_mode_toggled (GtkToggleButton *button, gpointer user_data)
+{
+  winome::WinomeConfig cfg = winome::get_config ();
+  const bool linked = gtk_toggle_button_get_active (button) != FALSE;
+  if (cfg.multi_monitor_overview_linked != linked) {
+    cfg.multi_monitor_overview_linked = linked;
+    winome::update_config (cfg);
+  }
+  refresh_all_quick_settings_instances (GTK_WIDGET (user_data));
+}
+
+struct WsModeMenuTarget {
+  const char *mode;
+  bool open_settings;
+  GtkWidget *panel;
+};
+
+static void
+on_ws_mode_menu_activate (gpointer user_data)
+{
+  auto *t = static_cast<WsModeMenuTarget *> (user_data);
+  if (t == nullptr)
+    return;
+  if (t->open_settings) {
+    winome_shell_panel_close_popovers ();
+    winome::open_settings_window_page ("behavior");
+    return;
+  }
+  apply_ws_mode (t->mode, t->panel);
+}
+
+static GtkWidget *
+build_ws_mode_menu (gpointer user_data)
+{
+  GtkWidget *panel = GTK_WIDGET (user_data);
+  const std::string cur = winome::get_config ().multi_monitor_workspace_mode;
+
+  auto *targets = g_new0 (WsModeMenuTarget, 4);
+  targets[0] = {"independent", false, panel};
+  targets[1] = {"primary_only", false, panel};
+  targets[2] = {"span", false, panel};
+  targets[3] = {nullptr, true, panel};
+
+  WinomeMenuEntry items[5] = {};
+  items[0].label = tr ("Independent (Per-Monitor)", "各屏独立工作区");
+  items[0].icon_name = "video-joined-displays-symbolic";
+  items[0].checked = (cur == "independent") ? TRUE : FALSE;
+  items[0].callback = on_ws_mode_menu_activate;
+  items[0].user_data = &targets[0];
+
+  items[1].label = tr ("Primary Only (GNOME Default)", "仅主屏切换（副屏固定）");
+  items[1].icon_name = "video-single-display-symbolic";
+  items[1].checked = (cur == "primary_only") ? TRUE : FALSE;
+  items[1].callback = on_ws_mode_menu_activate;
+  items[1].user_data = &targets[1];
+
+  items[2].label = tr ("Span All Displays", "所有显示器同步切换");
+  items[2].icon_name = "view-dual-symbolic";
+  items[2].checked = (cur == "span") ? TRUE : FALSE;
+  items[2].callback = on_ws_mode_menu_activate;
+  items[2].user_data = &targets[2];
+
+  items[3].label = nullptr;  // separator
+
+  items[4].label = tr ("Multi-Monitor Settings", "多显示器设置");
+  items[4].icon_name = "preferences-system-symbolic";
+  items[4].checked = FALSE;
+  items[4].callback = on_ws_mode_menu_activate;
+  items[4].user_data = &targets[3];
+
+  GtkWidget *menu = build_quick_menu_full (
+      items, G_N_ELEMENTS (items), ws_mode_icon (cur),
+      tr ("Workspace Mode", "工作区模式"), ws_mode_short_label (cur),
+      TRUE);
+  g_object_set_data_full (G_OBJECT (menu), "ws-mode-targets", targets, g_free);
   return menu;
 }
 
@@ -3114,6 +3246,7 @@ winome_quick_settings_new (void)
   GtkWidget *brightness_slider, *brightness_row = NULL;
   GtkWidget *wlan = NULL, *bluetooth = NULL, *powermode = NULL;
   GtkWidget *nightlight = NULL, *darkmode = NULL, *dnd = NULL;
+  GtkWidget *wsmode = NULL;
   GtkWidget *keyboard = NULL, *airplane = NULL;
   GtkWidget *power_icon, *power_title, *power_toggle;
 
@@ -3266,6 +3399,26 @@ winome_quick_settings_new (void)
                       G_CALLBACK (on_dnd_toggled), NULL);
     winome_quick_settings_grid_attach (grid, dnd, 1);
 
+    const auto &qs_cfg = winome::get_config ();
+    const std::string &cur_ws_mode = qs_cfg.multi_monitor_workspace_mode;
+    wsmode = make_quick_menu_toggle (
+        ws_mode_icon (cur_ws_mode),
+        tr ("Workspaces", "副屏工作区"),
+        ws_mode_pill_subtitle (qs_cfg.multi_monitor_overview_linked,
+                               cur_ws_mode),
+        build_ws_mode_menu, root);
+    gtk_toggle_button_set_active (
+        GTK_TOGGLE_BUTTON (quick_menu_toggle_button (wsmode)),
+        qs_cfg.multi_monitor_overview_linked ? TRUE : FALSE);
+    g_signal_connect (quick_menu_toggle_button (wsmode), "toggled",
+                      G_CALLBACK (on_ws_mode_toggled), root);
+    gtk_widget_set_visible (
+        wsmode, winome::ws::should_show_quick_settings_ws_mode_toggle (
+                    winome::enumerate_monitors ().size ())
+                    ? TRUE
+                    : FALSE);
+    winome_quick_settings_grid_attach (grid, wsmode, 1);
+
     // keyboard_brightness and rfkill are the last two upstream registers.
     keyboard = make_quick_menu_toggle ("input-keyboard-symbolic",
                                        tr ("Keyboard", "键盘"),
@@ -3302,6 +3455,7 @@ winome_quick_settings_new (void)
   g_object_set_data (G_OBJECT (root), "nightlight-toggle", nightlight);
   g_object_set_data (G_OBJECT (root), "darkmode-toggle", darkmode);
   g_object_set_data (G_OBJECT (root), "dnd-toggle", dnd);
+  g_object_set_data (G_OBJECT (root), "wsmode-toggle", wsmode);
   g_object_set_data (G_OBJECT (root), "airplane-toggle", airplane);
 
   qs_register_and_sync_plugins (root);
@@ -3451,6 +3605,24 @@ on_qs_root_destroy (GtkWidget *widget, gpointer G_GNUC_UNUSED data)
 }
 
 static void
+refresh_all_quick_settings_instances (GtkWidget *preferred_panel)
+{
+  bool refreshed_preferred = false;
+  std::vector<GtkWidget *> snapshot = g_qs_root_instances;
+  for (GtkWidget *inst : snapshot) {
+    if (inst != nullptr &&
+        std::find (g_qs_root_instances.begin (), g_qs_root_instances.end (),
+                   inst) != g_qs_root_instances.end ()) {
+      if (inst == preferred_panel)
+        refreshed_preferred = true;
+      winome_quick_settings_refresh (inst);
+    }
+  }
+  if (preferred_panel != nullptr && !refreshed_preferred)
+    winome_quick_settings_refresh (preferred_panel);
+}
+
+static void
 qs_register_and_sync_plugins (GtkWidget *root)
 {
   g_qs_root_instances.push_back (root);
@@ -3546,6 +3718,8 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
       GTK_WIDGET (g_object_get_data (G_OBJECT (quick_settings), "darkmode-toggle"));
   GtkWidget *dnd_toggle =
       GTK_WIDGET (g_object_get_data (G_OBJECT (quick_settings), "dnd-toggle"));
+  GtkWidget *wsmode_toggle =
+      GTK_WIDGET (g_object_get_data (G_OBJECT (quick_settings), "wsmode-toggle"));
   GtkWidget *airplane_toggle =
       GTK_WIDGET (g_object_get_data (G_OBJECT (quick_settings), "airplane-toggle"));
 
@@ -3697,6 +3871,40 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
                                     dnd_on ? TRUE : FALSE);
       g_signal_handlers_unblock_by_func (dnd_toggle,
           (gpointer) on_dnd_toggled, NULL);
+    }
+  }
+
+  if (wsmode_toggle) {
+    const bool show_ws_mode =
+        winome::ws::should_show_quick_settings_ws_mode_toggle (
+            winome::enumerate_monitors ().size ());
+    if (!show_ws_mode) {
+      WinomeQuickSettingsGrid *g = WINOME_QUICK_SETTINGS_GRID (
+          g_object_get_data (G_OBJECT (quick_settings), "qs-grid"));
+      if (g != nullptr && g->drawer_anchor == wsmode_toggle)
+        winome_quick_settings_close_menu (quick_settings, FALSE);
+    }
+    gtk_widget_set_visible (wsmode_toggle, show_ws_mode ? TRUE : FALSE);
+    if (show_ws_mode) {
+      const auto &cfg = winome::get_config ();
+      const std::string &cur = cfg.multi_monitor_workspace_mode;
+      set_toggle_active_blocked (
+          wsmode_toggle,
+          cfg.multi_monitor_overview_linked ? TRUE : FALSE,
+          G_CALLBACK (on_ws_mode_toggled), quick_settings);
+      MenuToggleParts *parts = static_cast<MenuToggleParts *> (
+          g_object_get_data (G_OBJECT (wsmode_toggle), "menu-toggle-parts"));
+      if (parts) {
+        if (parts->subtitle_label) {
+          gtk_label_set_text (
+              GTK_LABEL (parts->subtitle_label),
+              ws_mode_pill_subtitle (cfg.multi_monitor_overview_linked, cur));
+        }
+        if (parts->icon) {
+          gtk_image_set_from_icon_name (GTK_IMAGE (parts->icon),
+                                        ws_mode_icon (cur));
+        }
+      }
     }
   }
 

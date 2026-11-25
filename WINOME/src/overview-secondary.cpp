@@ -13,6 +13,7 @@
 #include "fullscreen-watcher.h"
 #include "host-utils.h"
 #include "monitor-manager.h"
+#include "overview-dash.h"
 #include "overview-layout.h"
 #include "overview-trigger.h"
 #include "overview.h"
@@ -62,7 +63,11 @@ struct SecondaryHost {
   SecondaryOverviewGeometry geo{};
 
   GtkWidget* window = nullptr;
+  GtkWidget* root = nullptr;
   GtkWidget* area = nullptr;
+  GtkWidget* dash = nullptr;
+  bool show_dash = false;
+  int dash_h_px = 0;
   HWND hwnd = nullptr;
   bool visible = false;
   bool target_open = false;
@@ -220,9 +225,15 @@ LRESULT CALLBACK sec_ov_subclass_proc(HWND hwnd,
         (ss->styleNew | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST) &
         ~WS_EX_APPWINDOW;
   }
-  if (msg == WM_NCDESTROY && orig != nullptr) {
-    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(orig));
+  if (msg == WM_NCDESTROY) {
     RemovePropW(hwnd, kSecOvOrigProcProp);
+    if (orig != nullptr) {
+      if (GetWindowLongPtrW(hwnd, GWLP_WNDPROC) ==
+          reinterpret_cast<LONG_PTR>(sec_ov_subclass_proc)) {
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(orig));
+      }
+      return CallWindowProcW(orig, hwnd, msg, wParam, lParam);
+    }
   }
   return orig != nullptr ? CallWindowProcW(orig, hwnd, msg, wParam, lParam)
                          : DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -238,6 +249,7 @@ void ensure_sec_ov_styles_and_subclass(HWND hwnd) {
   if (want != ex) {
     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want);
   }
+  harden_shell_overlay_hwnd(hwnd);
   if (GetPropW(hwnd, kSecOvOrigProcProp) == nullptr) {
     WNDPROC orig = reinterpret_cast<WNDPROC>(
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
@@ -293,12 +305,29 @@ void apply_host_thumbnails(SecondaryHost* h, double progress) {
   }
 }
 
+void apply_host_dash_progress(SecondaryHost* h, double progress) {
+  if (h == nullptr || h->dash == nullptr)
+    return;
+  if (!h->show_dash) {
+    gtk_widget_set_visible(h->dash, FALSE);
+    return;
+  }
+  const double alpha =
+      std::clamp((std::clamp(progress, 0.0, 1.0) - 0.12) / 0.88, 0.0, 1.0);
+  gtk_widget_set_visible(h->dash, alpha > 0.01 ? TRUE : FALSE);
+  gtk_widget_set_opacity(h->dash, alpha);
+}
+
 void finish_host_hide(SecondaryHost* h) {
   if (h == nullptr)
     return;
   cancel_host_anim(h);
   cancel_host_rebuild_timer(h);
   destroy_host_thumbnails(h);
+  if (h->dash != nullptr) {
+    overview_dash_close_menu(h->dash);
+    gtk_widget_set_visible(h->dash, FALSE);
+  }
   h->visible = false;
   h->target_open = false;
   h->linked_driven = false;
@@ -339,6 +368,7 @@ gboolean host_anim_tick(GtkWidget* widget G_GNUC_UNUSED,
 
   winome_shell_panel_set_overview_progress_for_monitor(h->monitor, h->progress);
   apply_host_thumbnails(h, h->progress);
+  apply_host_dash_progress(h, h->progress);
   if (h->area != nullptr)
     gtk_widget_queue_draw(h->area);
 
@@ -447,13 +477,46 @@ void rebuild_host_layout(SecondaryHost* h) {
     h->panel_h = std::max<int>(0, pr.bottom - pr.top);
 
   h->scale = std::max(gtk_widget_get_scale_factor(h->window), 1);
+  if (h->area != nullptr) {
+    gtk_widget_set_size_request(
+        h->area, std::max(h->mon_w / h->scale, 1),
+        std::max(h->mon_h / h->scale, 1));
+    if (h->root != nullptr)
+      gtk_fixed_move(GTK_FIXED(h->root), h->area, 0, 0);
+  }
   if (ws::is_independent_active())
     ws::sync_dynamic_workspaces(h->monitor);
   h->ws_count = std::max(ws::count_for_monitor(h->monitor), 1);
   h->active_ws = std::clamp(ws::active_for_monitor(h->monitor), 0, h->ws_count - 1);
 
+  h->show_dash = should_secondary_overview_show_dash(ws::effective_mode());
+  const int wa_h = std::max(h->mon_h - h->panel_h, 120);
+  int dash_reserved_h = 0;
+  if (h->show_dash && h->dash != nullptr) {
+    const int dash_max_px =
+        std::max(static_cast<int>(std::lround(wa_h * 0.15)), 48 * h->scale);
+    overview_dash_repopulate(h->dash, h->monitor,
+                             std::max(dash_max_px / h->scale, 48), h->active_ws);
+    const int dash_w_px = overview_dash_get_width(h->dash) * h->scale;
+    const int dash_h_px =
+        std::min(overview_dash_get_height(h->dash) * h->scale, dash_max_px);
+    h->dash_h_px = dash_h_px;
+    dash_reserved_h = dash_h_px;
+    const int dash_x = std::max((h->mon_w - dash_w_px) / 2 / h->scale, 0);
+    const int dash_y = std::max(
+        (h->panel_h + wa_h - dash_h_px) / h->scale, h->panel_h / h->scale);
+    if (h->root != nullptr)
+      gtk_fixed_move(GTK_FIXED(h->root), h->dash, dash_x, dash_y);
+  } else {
+    h->dash_h_px = 0;
+    if (h->dash != nullptr) {
+      overview_dash_close_menu(h->dash);
+      gtk_widget_set_visible(h->dash, FALSE);
+    }
+  }
+
   h->geo = compute_secondary_overview_geometry(
-      h->mon_w, h->mon_h, h->panel_h, h->scale, h->ws_count);
+      h->mon_w, h->mon_h, h->panel_h, h->scale, h->ws_count, dash_reserved_h);
 
   destroy_host_thumbnails(h);
 
@@ -503,6 +566,7 @@ void rebuild_host_layout(SecondaryHost* h) {
   }
 
   apply_host_thumbnails(h, h->progress);
+  apply_host_dash_progress(h, h->progress);
   if (h->area != nullptr)
     gtk_widget_queue_draw(h->area);
 }
@@ -810,6 +874,10 @@ void on_sec_click_released(GtkGestureClick* gesture,
 
   if (py < h->panel_h)
     return;
+  if (h->dash != nullptr && overview_dash_has_open_menu(h->dash)) {
+    overview_dash_close_menu(h->dash);
+    return;
+  }
 
   // 1. Top workspace pill switches THIS secondary monitor's workspace.
   const int pill = hit_test_pill(h, px, py);
@@ -1119,6 +1187,7 @@ void on_sec_drag_end(GtkGestureDrag* drag G_GNUC_UNUSED,
   }
 
   apply_host_thumbnails(h, h->progress);
+  apply_host_dash_progress(h, h->progress);
   if (h->area != nullptr)
     gtk_widget_queue_draw(h->area);
 }
@@ -1181,6 +1250,16 @@ void on_sec_ws_changed(HMONITOR monitor,
   }
 }
 
+void on_sec_dash_show_apps(void* user_data) {
+  auto* h = static_cast<SecondaryHost*>(user_data);
+  if (h != nullptr && h->monitor != nullptr)
+    overview_open_app_grid_on_monitor(h->monitor);
+}
+
+void on_sec_dash_changed(void* user_data G_GNUC_UNUSED) {
+  overview_refresh_all_open();
+}
+
 std::unique_ptr<SecondaryHost> create_host(HMONITOR mon) {
   auto h = std::make_unique<SecondaryHost>();
   h->monitor = mon;
@@ -1192,12 +1271,22 @@ std::unique_ptr<SecondaryHost> create_host(HMONITOR mon) {
   gtk_widget_set_name(h->window, "overviewGroup");
   install_bundled_fonts(h->window);
 
+  h->root = gtk_fixed_new();
+  gtk_widget_set_name(h->root, "overviewGroup");
+  gtk_window_set_child(GTK_WINDOW(h->window), h->root);
+
   h->area = gtk_drawing_area_new();
   gtk_widget_set_hexpand(h->area, TRUE);
   gtk_widget_set_vexpand(h->area, TRUE);
   gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(h->area),
                                  draw_secondary_overview, h.get(), nullptr);
-  gtk_window_set_child(GTK_WINDOW(h->window), h->area);
+  gtk_fixed_put(GTK_FIXED(h->root), h->area, 0, 0);
+
+  h->dash = overview_dash_new(h->root);
+  overview_dash_set_show_apps_cb(h->dash, on_sec_dash_show_apps, h.get());
+  overview_dash_set_changed_cb(h->dash, on_sec_dash_changed, h.get());
+  gtk_fixed_put(GTK_FIXED(h->root), h->dash, 0, 0);
+  gtk_widget_set_visible(h->dash, FALSE);
 
   GtkGesture* click = gtk_gesture_click_new();
   gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click), 0);
@@ -1231,13 +1320,17 @@ void destroy_host(SecondaryHost* h) {
   cancel_host_anim(h);
   cancel_host_rebuild_timer(h);
   destroy_host_thumbnails(h);
+  if (h->dash != nullptr)
+    overview_dash_close_menu(h->dash);
   h->visible = false;
   h->target_open = false;
   h->hwnd = nullptr;
   if (h->window != nullptr) {
     gtk_window_destroy(GTK_WINDOW(h->window));
     h->window = nullptr;
+    h->root = nullptr;
     h->area = nullptr;
+    h->dash = nullptr;
   }
 }
 
@@ -1309,6 +1402,7 @@ void overview_secondary_set_progress(double progress) {
       continue;
     h->progress = p;
     apply_host_thumbnails(h.get(), p);
+    apply_host_dash_progress(h.get(), p);
     if (h->area != nullptr)
       gtk_widget_queue_draw(h->area);
   }
@@ -1358,6 +1452,32 @@ void overview_secondary_close_all_animated() {
     h->target_open = false;
     h->linked_driven = false;
     start_host_anim(h.get(), 0.0);
+  }
+}
+
+void overview_secondary_close_unlinked_animated() {
+  for (auto& h : g_hosts) {
+    if (!h->visible || h->linked_driven)
+      continue;
+    h->target_open = false;
+    h->linked_driven = false;
+    start_host_anim(h.get(), 0.0);
+  }
+}
+
+void overview_secondary_on_linked_changed(bool linked,
+                                          HMONITOR main_mon,
+                                          bool main_open,
+                                          GdkTexture* wallpaper_texture,
+                                          double progress) {
+  if (linked) {
+    if (main_open && main_mon != nullptr)
+      overview_secondary_sync(main_mon, wallpaper_texture, progress);
+    return;
+  }
+  for (auto& h : g_hosts) {
+    if (h->visible && h->linked_driven)
+      h->linked_driven = false;
   }
 }
 
@@ -1425,6 +1545,18 @@ bool overview_secondary_is_hwnd(HWND hwnd) {
       return true;
   }
   return false;
+}
+
+bool overview_secondary_close_open_dash_menu() {
+  bool closed = false;
+  for (auto& h : g_hosts) {
+    if (h->visible && h->dash != nullptr &&
+        overview_dash_has_open_menu(h->dash)) {
+      overview_dash_close_menu(h->dash);
+      closed = true;
+    }
+  }
+  return closed;
 }
 
 bool overview_secondary_hit_test_screen_point(POINT screen_pt,

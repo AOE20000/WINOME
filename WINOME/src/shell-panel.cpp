@@ -32,6 +32,7 @@
 #include "overview.h"
 #include "fonts.h"
 #include "fullscreen-watcher.h"
+#include "hot-corner.h"
 #include "monitor-manager.h"
 
 #include <gdk/win32/gdkwin32.h>
@@ -1330,6 +1331,7 @@ popover_raise_idle (gpointer data)
     LONG_PTR want = (ex & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
     if (want != ex)
       SetWindowLongPtrW (hwnd, GWL_EXSTYLE, want);
+    winome::harden_shell_overlay_hwnd (hwnd);
 
     RECT before = {0, 0, 0, 0};
     GetWindowRect (hwnd, &before);
@@ -1608,7 +1610,7 @@ ensure_popover_mouse_hook (void)
   if (g_popover_mouse_hook == nullptr)
     g_popover_mouse_hook = SetWindowsHookExW (WH_MOUSE_LL,
                                               popover_mouse_hook_proc,
-                                              nullptr, 0);
+                                              GetModuleHandleW (nullptr), 0);
 }
 
 // When the Activities overview opens it takes over the screen: close any open
@@ -1783,6 +1785,7 @@ make_panel_popover (GtkWidget *button, GtkWidget *child, gboolean centered)
   pp->centered = centered;
 
   pp->window = gtk_window_new ();
+  gtk_window_set_title (GTK_WINDOW (pp->window), "WINOME Popover");
   gtk_window_set_decorated (GTK_WINDOW (pp->window), FALSE);
   gtk_window_set_resizable (GTK_WINDOW (pp->window), FALSE);
   gtk_widget_add_css_class (pp->window, "quick-settings-popover-window");
@@ -2987,6 +2990,30 @@ on_panel_destroy (GtkWidget *panel, gpointer user_data G_GNUC_UNUSED)
 }
 
 static void
+on_panel_motion (GtkEventControllerMotion *ctrl G_GNUC_UNUSED,
+                 double x,
+                 double y,
+                 gpointer data G_GNUC_UNUSED)
+{
+  if ((x <= 16.0 && y <= 16.0) || winome::hot_corner_is_in_corner ()) {
+    POINT pt{};
+    if (GetCursorPos (&pt))
+      winome::hot_corner_notify_pointer (pt.x, pt.y);
+  }
+}
+
+static void
+on_panel_leave (GtkEventControllerMotion *ctrl G_GNUC_UNUSED,
+                gpointer data G_GNUC_UNUSED)
+{
+  if (winome::hot_corner_is_in_corner ()) {
+    POINT pt{};
+    if (GetCursorPos (&pt))
+      winome::hot_corner_notify_pointer (pt.x, pt.y);
+  }
+}
+
+static void
 on_panel_realize (GtkWidget *panel, gpointer G_GNUC_UNUSED user_data)
 {
   GdkSurface *surface = gtk_native_get_surface (GTK_NATIVE (panel));
@@ -2995,16 +3022,7 @@ on_panel_realize (GtkWidget *panel, gpointer G_GNUC_UNUSED user_data)
   HWND hwnd = static_cast<HWND> (gdk_win32_surface_get_handle (surface));
   if (hwnd == nullptr)
     return;
-  const LONG_PTR style = GetWindowLongPtrW (hwnd, GWL_STYLE);
-  const LONG_PTR stripped =
-      style & ~static_cast<LONG_PTR> (WS_THICKFRAME | WS_MAXIMIZEBOX |
-                                      WS_MINIMIZEBOX);
-  if (stripped != style) {
-    SetWindowLongPtrW (hwnd, GWL_STYLE, stripped);
-    SetWindowPos (hwnd, nullptr, 0, 0, 0, 0,
-                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
-                      SWP_FRAMECHANGED);
-  }
+  winome::harden_shell_overlay_hwnd (hwnd);
   if (PanelStatus *st = static_cast<PanelStatus *> (
           g_object_get_data (G_OBJECT (panel), "panel-status"))) {
     sync_activities_dots (st);
@@ -3095,6 +3113,17 @@ build_shell_panel (bool primary)
 
   // Make the panel transparent (and close popovers) while the overview is open.
   connect_overview_state (panel);
+
+  // Feed top-left pointer motion into the hot-corner state machine so the hot
+  // corner remains responsive even when an elevated window suppresses hooks.
+  GtkEventController *panel_motion = gtk_event_controller_motion_new ();
+  g_signal_connect (panel_motion, "enter", G_CALLBACK (on_panel_motion),
+                    nullptr);
+  g_signal_connect (panel_motion, "motion", G_CALLBACK (on_panel_motion),
+                    nullptr);
+  g_signal_connect (panel_motion, "leave", G_CALLBACK (on_panel_leave),
+                    nullptr);
+  gtk_widget_add_controller (panel, panel_motion);
 
   return panel;
 }

@@ -97,11 +97,16 @@ bool set_app_id_pinned (const std::string &id_or_aumid, bool pinned);
 bool toggle_app_id_pinned (const std::string &id_or_aumid);
 
 // Launching & shell actions.
-bool app_index_launch (const AppEntry &entry, bool as_admin = false);
+bool app_index_launch (const AppEntry &entry,
+                       bool as_admin = false,
+                       HMONITOR target_monitor = nullptr);
 bool app_index_launch_id (const std::string &id_or_aumid,
-                          bool as_admin = false);
-bool app_index_open_location (const AppEntry &entry);
-bool app_index_launch_best_match (const std::string &query_lower);
+                          bool as_admin = false,
+                          HMONITOR target_monitor = nullptr);
+bool app_index_open_location (const AppEntry &entry,
+                              HMONITOR target_monitor = nullptr);
+bool app_index_launch_best_match (const std::string &query_lower,
+                                  HMONITOR target_monitor = nullptr);
 
 // Running-window inspection & activation shared between App Grid and Dash.
 struct RunningWindow {

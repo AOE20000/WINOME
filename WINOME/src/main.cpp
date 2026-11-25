@@ -16,6 +16,7 @@
 #include <cstring>
 #include <exception>
 #include <string>
+#include <vector>
 
 #include "config.h"
 #include "app-index.h"
@@ -360,6 +361,15 @@ on_glib_log (const gchar *log_domain,
              const gchar *message,
              gpointer user_data)
 {
+  // Upstream GTK4 Win32 GtkIMContextIME passes our isolated PangoFcFont to
+  // pango_win32_font_logfont(), emitting one benign Pango-CRITICAL on first
+  // IME attach. Avoiding CAIRO_FONT_TYPE_WIN32 saves ~4.5s startup and ~500MB
+  // font scan RSS, so silence only that specific upstream assertion here.
+  if (log_domain != nullptr && std::strcmp (log_domain, "Pango") == 0 &&
+      (log_level & G_LOG_LEVEL_CRITICAL) != 0 && message != nullptr &&
+      std::strstr (message, "pango_win32_font_logfont") != nullptr) {
+    return;
+  }
   if ((log_level & G_LOG_LEVEL_ERROR) != 0) {
     char msg[256];
     std::snprintf (msg, sizeof (msg), "GLib Fatal Error [%s]: %s",
@@ -758,6 +768,19 @@ create_control_window (void)
   g_control_hwnd = CreateWindowExW (0, kControlWindowClass, L"WINOME Control",
                                     WS_POPUP, 0, 0, 0, 0,
                                     nullptr, nullptr, inst, nullptr);
+  if (g_control_hwnd != nullptr) {
+    const UINT allowed_msgs[] = {
+        WINOME_CMD_SHOW_OVERVIEW,
+        WINOME_CMD_RELOAD_CONFIG,
+        WINOME_CMD_QUIT,
+        WINOME_CMD_OPEN_SETTINGS,
+        g_msg_taskbar_created,
+    };
+    for (UINT m : allowed_msgs) {
+      if (m != 0)
+        ChangeWindowMessageFilterEx (g_control_hwnd, m, MSGFLT_ALLOW, nullptr);
+    }
+  }
 }
 
 static void
@@ -1360,13 +1383,17 @@ main (int argc, char **argv)
 
   // Parse headless / recovery / watchdog flags first.
   bool no_crash_ui = false;
+  bool no_elevate = false;
   DWORD wait_prev_pid = 0;
   for (int i = 1; i < argc; ++i) {
-    if (std::string (argv[i]) == "--no-crash-ui")
+    const std::string flag (argv[i]);
+    if (flag == "--no-crash-ui")
       no_crash_ui = true;
-    else if (std::string (argv[i]) == "--safe-mode")
+    else if (flag == "--no-elevate")
+      no_elevate = true;
+    else if (flag == "--safe-mode")
       winome::set_safe_mode (true);
-    else if (std::string (argv[i]) == "--after-pid" && i + 1 < argc)
+    else if (flag == "--after-pid" && i + 1 < argc)
       wait_prev_pid = static_cast<DWORD> (std::strtoul (argv[i + 1], nullptr, 10));
   }
   if (wait_prev_pid != 0) {
@@ -1438,22 +1465,81 @@ main (int argc, char **argv)
   g_open_overview_on_start = want_overview;
   g_open_settings_on_start = want_settings;
 
+  // Check if a shell instance is already alive before prompting for UAC, so a
+  // second non-elevated launch exits silently instead of triggering UAC.
+  SetLastError (ERROR_SUCCESS);
+  if (HANDLE existing_mutex = OpenMutexW (
+          SYNCHRONIZE, FALSE, L"Local\\WINOME_Shell_SingleInstance")) {
+    CloseHandle (existing_mutex);
+    return 0;
+  } else if (GetLastError () == ERROR_ACCESS_DENIED &&
+             FindWindowW (kControlWindowClass, nullptr) != nullptr) {
+    return 0;
+  }
+
+  // Load user configuration before self-elevation & subsystem initialization.
+  (void)winome::get_config ();
+
+  bool auto_elevate_failed = false;
+  DWORD auto_elevate_err = ERROR_SUCCESS;
+  if (winome::should_attempt_auto_elevate (winome::get_config ().auto_elevate,
+                                           winome::is_process_elevated (),
+                                           no_elevate)) {
+    wchar_t exe_path[MAX_PATH] = {};
+    const DWORD exe_len = GetModuleFileNameW (nullptr, exe_path, MAX_PATH);
+    if (exe_len > 0 && exe_len < MAX_PATH) {
+      std::wstring exe_dir (exe_path);
+      const size_t slash = exe_dir.find_last_of (L"\\/");
+      if (slash != std::wstring::npos)
+        exe_dir.resize (slash);
+      else
+        exe_dir.clear ();
+
+      std::vector<std::wstring> orig_args;
+      int wargc = 0;
+      if (LPWSTR *wargv = CommandLineToArgvW (GetCommandLineW (), &wargc)) {
+        for (int i = 1; i < wargc; ++i)
+          orig_args.emplace_back (wargv[i]);
+        LocalFree (wargv);
+      }
+      const std::wstring params = winome::build_elevated_relaunch_args (orig_args);
+      SHELLEXECUTEINFOW sei {};
+      sei.cbSize = sizeof (sei);
+      sei.fMask = SEE_MASK_NOASYNC;
+      sei.lpVerb = L"runas";
+      sei.lpFile = exe_path;
+      sei.lpParameters = params.empty () ? nullptr : params.c_str ();
+      sei.lpDirectory = exe_dir.empty () ? nullptr : exe_dir.c_str ();
+      sei.nShow = SW_SHOWNORMAL;
+      if (ShellExecuteExW (&sei))
+        return 0;
+      auto_elevate_failed = true;
+      auto_elevate_err = GetLastError ();
+    }
+  }
+
   // Single-instance guard so two shell panels do not fight over the taskbar.
   HANDLE instance_mutex = CreateMutexW (nullptr, TRUE,
                                         L"Local\\WINOME_Shell_SingleInstance");
+  if (instance_mutex == nullptr &&
+      GetLastError () == ERROR_ACCESS_DENIED &&
+      FindWindowW (kControlWindowClass, nullptr) != nullptr) {
+    return 0;
+  }
   if (instance_mutex != nullptr && GetLastError () == ERROR_ALREADY_EXISTS) {
     CloseHandle (instance_mutex);
     return 0;
   }
-
-  // Load user configuration before initializing subsystems.
-  (void)winome::get_config ();
 
   // Route stdout/stderr to a log file first: this process is a GUI app and
   // must never pop a console window.
   init_crash_paths ();
   setup_log_file ();
   winome::debug_install_log_capture ();
+  if (auto_elevate_failed) {
+    std::printf ("[init] auto-elevate declined/failed (gle=%lu); continuing non-elevated\n",
+                 static_cast<unsigned long> (auto_elevate_err));
+  }
 
   // Recover taskbar and work area if a prior session terminated abnormally.
   const gint64 rec_t0 = g_get_monotonic_time ();
@@ -1471,6 +1557,10 @@ main (int argc, char **argv)
   std::signal (SIGILL, on_crt_signal);
   std::signal (SIGFPE, on_crt_signal);
   g_log_set_default_handler (on_glib_log, nullptr);
+  g_log_set_handler (
+      "Pango",
+      static_cast<GLogLevelFlags> (G_LOG_LEVEL_CRITICAL | G_LOG_LEVEL_WARNING),
+      on_glib_log, nullptr);
 
   // Snapshot the clean work area before hiding the taskbar so watchdog can
   // recover even if the process exits before on_activate completes.

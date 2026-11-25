@@ -5,7 +5,9 @@
 #include "app-index.h"
 #include "config.h"
 #include "fonts.h"
+#include "host-utils.h"
 #include "i18n.h"
+#include "monitor-manager.h"
 #include "st-engine.h"
 
 #include <gdk/win32/gdkwin32.h>
@@ -396,7 +398,9 @@ close_tile_menu_extract (gpointer user_data, AppEntry *out_entry)
 }
 
 bool
-activate_or_launch_entry (const AppEntry &entry, bool force_new_window)
+activate_or_launch_entry (const AppEntry &entry,
+                          bool force_new_window,
+                          HMONITOR target_monitor = nullptr)
 {
   if (!force_new_window) {
     std::vector<RunningWindow> wins =
@@ -406,7 +410,7 @@ activate_or_launch_entry (const AppEntry &entry, bool force_new_window)
         return true;
     }
   }
-  return app_index_launch (entry, false);
+  return app_index_launch (entry, false, target_monitor);
 }
 
 void
@@ -414,7 +418,8 @@ on_tile_action_launch (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 {
   AppEntry entry;
   WinomeAppGrid *self = close_tile_menu_extract (user_data, &entry);
-  if (app_index_launch (entry, false) && self->on_launch_done != nullptr)
+  HMONITOR mon = monitor_manager_monitor_for_widget (GTK_WIDGET (self));
+  if (app_index_launch (entry, false, mon) && self->on_launch_done != nullptr)
     self->on_launch_done (self->user_data);
 }
 
@@ -423,7 +428,8 @@ on_tile_action_admin (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 {
   AppEntry entry;
   WinomeAppGrid *self = close_tile_menu_extract (user_data, &entry);
-  if (app_index_launch (entry, true) && self->on_launch_done != nullptr)
+  HMONITOR mon = monitor_manager_monitor_for_widget (GTK_WIDGET (self));
+  if (app_index_launch (entry, true, mon) && self->on_launch_done != nullptr)
     self->on_launch_done (self->user_data);
 }
 
@@ -442,7 +448,8 @@ on_tile_action_location (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 {
   AppEntry entry;
   WinomeAppGrid *self = close_tile_menu_extract (user_data, &entry);
-  app_index_open_location (entry);
+  HMONITOR mon = monitor_manager_monitor_for_widget (GTK_WIDGET (self));
+  app_index_open_location (entry, mon);
   if (self->on_launch_done != nullptr)
     self->on_launch_done (self->user_data);
 }
@@ -698,7 +705,8 @@ on_tile_clicked (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
 {
   auto *ctx = static_cast<TileActionCtx *> (user_data);
   bool ctrl = (GetKeyState (VK_CONTROL) & 0x8000) != 0;
-  if (activate_or_launch_entry (ctx->entry, ctrl)) {
+  HMONITOR mon = monitor_manager_monitor_for_widget (GTK_WIDGET (ctx->self));
+  if (activate_or_launch_entry (ctx->entry, ctrl, mon)) {
     close_folder_dialog (ctx->self);
     if (ctx->self->on_launch_done != nullptr)
       ctx->self->on_launch_done (ctx->self->user_data);
@@ -711,7 +719,8 @@ on_tile_middle_click (GtkGestureClick *gesture G_GNUC_UNUSED,
                       double y G_GNUC_UNUSED, gpointer user_data)
 {
   auto *ctx = static_cast<TileActionCtx *> (user_data);
-  if (app_index_launch (ctx->entry, false)) {
+  HMONITOR mon = monitor_manager_monitor_for_widget (GTK_WIDGET (ctx->self));
+  if (app_index_launch (ctx->entry, false, mon)) {
     close_folder_dialog (ctx->self);
     if (ctx->self->on_launch_done != nullptr)
       ctx->self->on_launch_done (ctx->self->user_data);
@@ -1125,6 +1134,7 @@ folder_apply_window_want (WinomeAppGrid *self)
       ~WS_EX_APPWINDOW;
   if (want_ex != ex)
     SetWindowLongPtrW (hwnd, GWL_EXSTYLE, want_ex);
+  harden_shell_overlay_hwnd (hwnd);
   if (GetWindowLongPtrW (hwnd, GWLP_HWNDPARENT) != 0)
     SetWindowLongPtrW (hwnd, GWLP_HWNDPARENT, 0);
 

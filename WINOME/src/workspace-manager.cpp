@@ -39,6 +39,8 @@ struct RuntimeState {
   std::mutex mu;
   bool initialized = false;
   MultiMonitorWorkspaceMode active_mode = MultiMonitorWorkspaceMode::Span;
+  std::atomic<MultiMonitorWorkspaceMode> active_mode_atomic{
+      MultiMonitorWorkspaceMode::Span};
   int monitor_count = 1;
   IndependentWorkspaceModel model;
   std::unordered_set<HWND> auto_pinned_secondary;
@@ -312,6 +314,7 @@ void apply_mode_transition() {
         unpin_all_auto_pinned_locked(&to_unpin);
       }
       g_ws.active_mode = target;
+      g_ws.active_mode_atomic.store(target, std::memory_order_release);
       if (target == MultiMonitorWorkspaceMode::Independent) {
         for (const auto& m : monitors)
           g_ws.model.ensure_monitor(mon_key(m.hmonitor));
@@ -456,6 +459,8 @@ void shutdown() {
     }
     unpin_all_auto_pinned_locked(&to_unpin);
     g_ws.active_mode = MultiMonitorWorkspaceMode::Span;
+    g_ws.active_mode_atomic.store(MultiMonitorWorkspaceMode::Span,
+                                  std::memory_order_release);
     g_ws.listeners.clear();
   }
 
@@ -484,8 +489,7 @@ void on_monitors_changed() {
 }
 
 MultiMonitorWorkspaceMode effective_mode() {
-  std::lock_guard<std::mutex> lk(g_ws.mu);
-  return g_ws.active_mode;
+  return g_ws.active_mode_atomic.load(std::memory_order_acquire);
 }
 
 bool is_independent_active() {
