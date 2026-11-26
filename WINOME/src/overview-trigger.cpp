@@ -735,6 +735,11 @@ void maybe_refresh_keyboard_hook(ULONGLONG now_tick,
 
   if (!out.safe_to_reinstall)
     return;
+  // Never unhook/reinstall a healthy live WH_KEYBOARD_LL hook just because the
+  // user hasn't pressed a key for a few seconds; only reinstall on explicit
+  // refresh requests (desktop switch / session unlock) or when missing.
+  if (g_keyboard_hook != nullptr && min_spacing_ms >= 2000)
+    return;
   if (!should_reinstall_ll_hook(g_keyboard_hook != nullptr, now_tick,
                                 g_last_kbd_event_tick, *last_reinstall_tick,
                                 4000, min_spacing_ms)) {
@@ -1212,6 +1217,46 @@ void set_overview_change_callback(OverviewStateCallback callback,
   std::lock_guard<std::mutex> lk(g_state_mu);
   g_state_cb = callback;
   g_state_cb_data = user_data;
+}
+
+void simulate_bare_win_tap() {
+  g_print("[dev-test] simulate_bare_win_tap\n");
+  TriggerAction act{};
+  act.kind = TriggerActionKind::BareWinUp;
+  act.timestamp_us = g_get_monotonic_time();
+  enqueue_trigger_action(act);
+}
+
+void simulate_os_key_tap(unsigned vk, int hold_ms) {
+  const int clamped_hold = std::clamp(hold_ms, 5, 500);
+  const DWORD ext = (vk == VK_LWIN || vk == VK_RWIN) ? KEYEVENTF_EXTENDEDKEY : 0u;
+  INPUT down{};
+  down.type = INPUT_KEYBOARD;
+  down.ki.wVk = static_cast<WORD>(vk);
+  down.ki.wScan = static_cast<WORD>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+  down.ki.dwFlags = ext;
+  down.ki.dwExtraInfo = 0;  // Untagged: flows through WH_KEYBOARD_LL normally.
+  SetLastError(0);
+  const UINT sent_down = SendInput(1, &down, sizeof(INPUT));
+  const DWORD gle_down = GetLastError();
+  Sleep(static_cast<DWORD>(clamped_hold));
+  INPUT up{};
+  up.type = INPUT_KEYBOARD;
+  up.ki.wVk = static_cast<WORD>(vk);
+  up.ki.wScan = static_cast<WORD>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+  up.ki.dwFlags = ext | KEYEVENTF_KEYUP;
+  up.ki.dwExtraInfo = 0;
+  SetLastError(0);
+  const UINT sent_up = SendInput(1, &up, sizeof(INPUT));
+  const DWORD gle_up = GetLastError();
+  g_print("[dev-test] simulate_os_key_tap vk=0x%x hold=%dms sent=%u/%u gle=%lu/%lu\n",
+          vk, clamped_hold, sent_down, sent_up,
+          static_cast<unsigned long>(gle_down),
+          static_cast<unsigned long>(gle_up));
+}
+
+void simulate_os_win_tap(int hold_ms) {
+  simulate_os_key_tap(VK_LWIN, hold_ms);
 }
 
 }  // namespace winome

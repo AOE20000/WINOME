@@ -38,6 +38,7 @@ winome_sources = files(
   'crash-dialog.cpp',
   'diagnostics-export.cpp',
   'debug-runtime.cpp',
+  'dev-channel.cpp',
   'looking-glass.cpp',
   'plugin-host.cpp',
   'run-dialog.cpp',

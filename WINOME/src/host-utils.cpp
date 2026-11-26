@@ -387,4 +387,45 @@ void harden_shell_overlay_hwnd(HWND hwnd) {
   }
 }
 
+namespace {
+
+BOOL CALLBACK sanitize_gdk_gl_enum_proc(HWND hwnd, LPARAM /*lparam*/) {
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (pid != GetCurrentProcessId())
+    return TRUE;
+  wchar_t cls[32] = L"";
+  if (GetClassNameW(hwnd, cls, 32) != 10 || wcscmp(cls, L"GdkWin32GL") != 0)
+    return TRUE;
+
+  if (GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) != 0)
+    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
+
+  const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+  const LONG_PTR want_ex =
+      (ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT) &
+      ~static_cast<LONG_PTR>(WS_EX_APPWINDOW);
+  if (want_ex != ex)
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want_ex);
+
+  if ((ex & WS_EX_TOPMOST) != 0) {
+    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+  }
+
+  DWORD cloaked = 0;
+  DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+  if (cloaked == 0) {
+    BOOL cloak = TRUE;
+    DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+  }
+  return TRUE;
+}
+
+}  // namespace
+
+void sanitize_gdk_gl_backing_windows() {
+  EnumWindows(sanitize_gdk_gl_enum_proc, 0);
+}
+
 }  // namespace winome

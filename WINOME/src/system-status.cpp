@@ -22,10 +22,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdio.h>
+#include <thread>
 #include <vector>
 
 namespace winome {
@@ -85,8 +87,12 @@ bool get_battery_status(BatteryStatus* out) {
   return true;
 }
 
+namespace {
+IAudioEndpointVolume* acquire_bound_endpoint_volume();
+}  // namespace
+
 bool get_volume(double* out) {
-  IAudioEndpointVolume* volume = get_endpoint_volume();
+  IAudioEndpointVolume* volume = acquire_bound_endpoint_volume();
   if (volume == nullptr)
     return false;
 
@@ -101,7 +107,7 @@ bool get_volume(double* out) {
 }
 
 bool set_volume(double fraction) {
-  IAudioEndpointVolume* volume = get_endpoint_volume();
+  IAudioEndpointVolume* volume = acquire_bound_endpoint_volume();
   if (volume == nullptr)
     return false;
 
@@ -112,7 +118,7 @@ bool set_volume(double fraction) {
 }
 
 bool get_mute(bool* out) {
-  IAudioEndpointVolume* volume = get_endpoint_volume();
+  IAudioEndpointVolume* volume = acquire_bound_endpoint_volume();
   if (volume == nullptr)
     return false;
 
@@ -127,7 +133,7 @@ bool get_mute(bool* out) {
 }
 
 bool toggle_mute() {
-  IAudioEndpointVolume* volume = get_endpoint_volume();
+  IAudioEndpointVolume* volume = acquire_bound_endpoint_volume();
   if (volume == nullptr)
     return false;
 
@@ -317,6 +323,18 @@ bool set_lcd_brightness(double fraction) {
   return ok != FALSE;
 }
 
+struct Dxva2Cache {
+  std::mutex mu;
+  HMONITOR mon = nullptr;
+  bool probed = false;
+  bool supported = false;
+  DWORD min_b = 0;
+  DWORD max_b = 0;
+  int64_t last_fail_us = 0;
+};
+
+Dxva2Cache g_dxva2_cache;
+
 bool get_dxva2_brightness(double *out) {
   const Dxva2Api &api = dxva2_api();
   if (!api.loaded)
@@ -326,15 +344,40 @@ bool get_dxva2_brightness(double *out) {
   if (mon == nullptr)
     return false;
 
+  // Avoid repeatedly stalling the UI thread on DDC/CI I2C timeouts for desktop
+  // displays that do not support DDC/CI (re-probe after 60s or display change).
+  {
+    std::lock_guard<std::mutex> lock(g_dxva2_cache.mu);
+    const int64_t now_us = g_get_monotonic_time();
+    if (g_dxva2_cache.probed && g_dxva2_cache.mon == mon &&
+        !g_dxva2_cache.supported &&
+        (now_us - g_dxva2_cache.last_fail_us) < 60LL * 1000 * 1000) {
+      return false;
+    }
+  }
+
   DWORD count = 0;
-  if (!api.get_count(mon, &count) || count == 0)
+  if (!api.get_count(mon, &count) || count == 0) {
+    std::lock_guard<std::mutex> lock(g_dxva2_cache.mu);
+    g_dxva2_cache.mon = mon;
+    g_dxva2_cache.probed = true;
+    g_dxva2_cache.supported = false;
+    g_dxva2_cache.last_fail_us = g_get_monotonic_time();
     return false;
+  }
 
   std::vector<WinomePhysicalMonitor> mons(count);
-  if (!api.get_mons(mon, count, mons.data()))
+  if (!api.get_mons(mon, count, mons.data())) {
+    std::lock_guard<std::mutex> lock(g_dxva2_cache.mu);
+    g_dxva2_cache.mon = mon;
+    g_dxva2_cache.probed = true;
+    g_dxva2_cache.supported = false;
+    g_dxva2_cache.last_fail_us = g_get_monotonic_time();
     return false;
+  }
 
   bool result = false;
+  DWORD got_min = 0, got_max = 0;
   for (DWORD i = 0; i < count; ++i) {
     DWORD min_b = 0, cur_b = 0, max_b = 0;
     if (api.get_bright(mons[i].hPhysicalMonitor, &min_b, &cur_b, &max_b) &&
@@ -342,12 +385,26 @@ bool get_dxva2_brightness(double *out) {
       *out = std::clamp(
           static_cast<double>(cur_b - min_b) / static_cast<double>(max_b - min_b),
           0.0, 1.0);
+      got_min = min_b;
+      got_max = max_b;
       result = true;
       break;
     }
   }
 
   api.destroy_mons(count, mons.data());
+  {
+    std::lock_guard<std::mutex> lock(g_dxva2_cache.mu);
+    g_dxva2_cache.mon = mon;
+    g_dxva2_cache.probed = true;
+    g_dxva2_cache.supported = result;
+    if (result) {
+      g_dxva2_cache.min_b = got_min;
+      g_dxva2_cache.max_b = got_max;
+    } else {
+      g_dxva2_cache.last_fail_us = g_get_monotonic_time();
+    }
+  }
   return result;
 }
 
@@ -360,6 +417,24 @@ bool set_dxva2_brightness(double fraction) {
   if (mon == nullptr)
     return false;
 
+  bool have_bounds = false;
+  DWORD cached_min = 0, cached_max = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_dxva2_cache.mu);
+    if (g_dxva2_cache.probed && g_dxva2_cache.mon == mon) {
+      if (!g_dxva2_cache.supported &&
+          (g_get_monotonic_time() - g_dxva2_cache.last_fail_us) <
+              60LL * 1000 * 1000) {
+        return false;
+      }
+      if (g_dxva2_cache.supported && g_dxva2_cache.max_b > g_dxva2_cache.min_b) {
+        have_bounds = true;
+        cached_min = g_dxva2_cache.min_b;
+        cached_max = g_dxva2_cache.max_b;
+      }
+    }
+  }
+
   DWORD count = 0;
   if (!api.get_count(mon, &count) || count == 0)
     return false;
@@ -371,9 +446,14 @@ bool set_dxva2_brightness(double fraction) {
   double clamped = std::clamp(fraction, 0.0, 1.0);
   bool result = false;
   for (DWORD i = 0; i < count; ++i) {
-    DWORD min_b = 0, cur_b = 0, max_b = 0;
-    if (api.get_bright(mons[i].hPhysicalMonitor, &min_b, &cur_b, &max_b) &&
-        max_b > min_b) {
+    DWORD min_b = cached_min, cur_b = 0, max_b = cached_max;
+    bool bounds_ok = have_bounds;
+    if (!bounds_ok) {
+      bounds_ok = api.get_bright(mons[i].hPhysicalMonitor, &min_b, &cur_b,
+                                 &max_b) &&
+                  max_b > min_b;
+    }
+    if (bounds_ok) {
       DWORD val = min_b + static_cast<DWORD>(clamped * (max_b - min_b) + 0.5);
       if (api.set_bright(mons[i].hPhysicalMonitor, val))
         result = true;
@@ -519,6 +599,75 @@ bool get_brightness(double* out) {
   }
   update_brightness_capability(false, "Display brightness read failed");
   return false;
+}
+
+struct BrightnessWorkerState {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::thread worker;
+  bool running = false;
+  bool stop = false;
+  bool has_pending = false;
+  double pending_value = 0.5;
+};
+
+BrightnessWorkerState g_bright_worker;
+
+void brightness_worker_loop() {
+  for (;;) {
+    double target = 0.5;
+    {
+      std::unique_lock<std::mutex> lock(g_bright_worker.mu);
+      g_bright_worker.cv.wait(lock, [] {
+        return g_bright_worker.stop || g_bright_worker.has_pending;
+      });
+      if (g_bright_worker.stop)
+        break;
+      target = g_bright_worker.pending_value;
+      g_bright_worker.has_pending = false;
+    }
+    set_brightness(target);
+  }
+}
+
+void stop_brightness_worker() {
+  std::thread to_join;
+  {
+    std::lock_guard<std::mutex> lock(g_bright_worker.mu);
+    if (!g_bright_worker.running)
+      return;
+    g_bright_worker.stop = true;
+    g_bright_worker.has_pending = false;
+    g_bright_worker.running = false;
+    to_join = std::move(g_bright_worker.worker);
+  }
+  g_bright_worker.cv.notify_all();
+  if (to_join.joinable())
+    to_join.join();
+}
+
+void set_brightness_async(double fraction) {
+  const double clamped = std::clamp(fraction, 0.0, 1.0);
+  s_cached_brightness = clamped;
+  {
+    std::lock_guard<std::mutex> lock(g_bright_worker.mu);
+    g_bright_worker.pending_value = clamped;
+    g_bright_worker.has_pending = true;
+    if (!g_bright_worker.running) {
+      g_bright_worker.stop = false;
+      g_bright_worker.running = true;
+      g_bright_worker.worker = std::thread(brightness_worker_loop);
+    }
+  }
+  g_bright_worker.cv.notify_one();
+}
+
+void invalidate_brightness_cache() {
+  std::lock_guard<std::mutex> lock(g_dxva2_cache.mu);
+  g_dxva2_cache.probed = false;
+  g_dxva2_cache.supported = false;
+  g_dxva2_cache.mon = nullptr;
+  g_dxva2_cache.last_fail_us = 0;
 }
 
 bool set_brightness(double fraction) {
@@ -725,15 +874,61 @@ bool get_bluetooth_status(bool* present, bool* enabled,
     return true;
   }
 
-  // No powered radio handle: query WinRT Radio API first for powered-off state.
-  bool winrt_present = false;
-  bool winrt_enabled = false;
-  if (winrt_get_bluetooth_radio(&winrt_present, &winrt_enabled) &&
-      winrt_present) {
+  // No powered radio handle: never block the UI thread for up to 3s on
+  // WinRT Radio::GetRadiosAsync. Serve the cached WinRT probe result and
+  // refresh it asynchronously when stale.
+  struct WinRtBtCache {
+    std::mutex mu;
+    bool has_result = false;
+    bool present = false;
+    bool enabled = false;
+    int64_t updated_us = 0;
+    std::atomic<bool> in_flight{false};
+  };
+  static auto* s_bt_cache_ptr = new std::shared_ptr<WinRtBtCache>(
+      std::make_shared<WinRtBtCache>());
+  auto cache = *s_bt_cache_ptr;
+
+  bool cached_valid = false;
+  bool cached_present = false;
+  bool cached_enabled = false;
+  bool need_refresh = false;
+  const int64_t now_us = g_get_monotonic_time();
+  {
+    std::lock_guard<std::mutex> lock(cache->mu);
+    cached_valid = cache->has_result;
+    cached_present = cache->present;
+    cached_enabled = cache->enabled;
+    if (!cache->has_result ||
+        (now_us - cache->updated_us) >= 10LL * 1000 * 1000) {
+      need_refresh = true;
+    }
+  }
+  if (need_refresh) {
+    bool expected = false;
+    if (cache->in_flight.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+      std::thread([cache] {
+        bool wp = false, we = false;
+        const bool ok = winrt_get_bluetooth_radio(&wp, &we);
+        {
+          std::lock_guard<std::mutex> lock(cache->mu);
+          if (ok) {
+            cache->has_result = true;
+            cache->present = wp;
+            cache->enabled = we;
+          }
+          cache->updated_us = g_get_monotonic_time();
+        }
+        cache->in_flight.store(false, std::memory_order_release);
+      }).detach();
+    }
+  }
+  if (cached_valid && cached_present) {
     if (present != nullptr)
       *present = true;
     if (enabled != nullptr)
-      *enabled = winrt_enabled;
+      *enabled = cached_enabled;
     return true;
   }
 
@@ -1000,6 +1195,7 @@ struct VolumeMonitorState {
   std::mutex mu;
   std::vector<VolumeListenerEntry> listeners;
   std::atomic<bool> notify_queued{false};
+  std::atomic<bool> rebind_queued{false};
   bool started = false;
   IMMDeviceEnumerator* enumerator = nullptr;
   IAudioEndpointVolume* bound_volume = nullptr;
@@ -1008,6 +1204,17 @@ struct VolumeMonitorState {
 };
 
 VolumeMonitorState g_vol_mon;
+
+IAudioEndpointVolume* acquire_bound_endpoint_volume() {
+  {
+    std::lock_guard<std::mutex> lock(g_vol_mon.mu);
+    if (g_vol_mon.started && g_vol_mon.bound_volume != nullptr) {
+      g_vol_mon.bound_volume->AddRef();
+      return g_vol_mon.bound_volume;
+    }
+  }
+  return get_endpoint_volume();
+}
 
 gboolean idle_dispatch_volume_changed(gpointer G_GNUC_UNUSED data) {
   g_vol_mon.notify_queued.store(false, std::memory_order_release);
@@ -1034,6 +1241,7 @@ void queue_volume_changed_notification() {
 void rebind_default_endpoint_locked();
 
 gboolean idle_rebind_default_endpoint(gpointer G_GNUC_UNUSED data) {
+  g_vol_mon.rebind_queued.store(false, std::memory_order_release);
   {
     std::lock_guard<std::mutex> lock(g_vol_mon.mu);
     if (g_vol_mon.started)
@@ -1041,6 +1249,14 @@ gboolean idle_rebind_default_endpoint(gpointer G_GNUC_UNUSED data) {
   }
   queue_volume_changed_notification();
   return G_SOURCE_REMOVE;
+}
+
+void queue_rebind_default_endpoint() {
+  bool expected = false;
+  if (g_vol_mon.rebind_queued.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    g_idle_add(idle_rebind_default_endpoint, nullptr);
+  }
 }
 
 class EndpointVolumeCallbackImpl final : public IAudioEndpointVolumeCallback {
@@ -1101,7 +1317,7 @@ class DeviceNotificationClientImpl final : public IMMNotificationClient {
   HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(
       LPCWSTR pwstrDeviceId G_GNUC_UNUSED,
       DWORD dwNewState G_GNUC_UNUSED) override {
-    g_idle_add(idle_rebind_default_endpoint, nullptr);
+    queue_rebind_default_endpoint();
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE OnDeviceAdded(
@@ -1117,7 +1333,7 @@ class DeviceNotificationClientImpl final : public IMMNotificationClient {
       ERole role,
       LPCWSTR pwstrDeviceId G_GNUC_UNUSED) override {
     if (flow == eRender && role == eConsole)
-      g_idle_add(idle_rebind_default_endpoint, nullptr);
+      queue_rebind_default_endpoint();
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(
@@ -1182,6 +1398,7 @@ void start_volume_monitor() {
 }
 
 void stop_volume_monitor() {
+  stop_brightness_worker();
   std::lock_guard<std::mutex> lock(g_vol_mon.mu);
   g_vol_mon.listeners.clear();
   if (!g_vol_mon.started)

@@ -110,6 +110,7 @@ struct WinomeDash {
   void *show_apps_data = nullptr;
   void (*changed_cb) (void *) = nullptr;
   void *changed_data = nullptr;
+  guint notify_changed_timer = 0;
 
   GdkRGBA pill_color;
   GdkRGBA pill_border_color;
@@ -294,10 +295,19 @@ exe_file_description (const std::wstring &exe)
 {
   if (exe.empty ())
     return {};
+  static std::unordered_map<std::wstring, std::string> s_desc_cache;
+  auto it = s_desc_cache.find (exe);
+  if (it != s_desc_cache.end ())
+    return it->second;
+
   DWORD zero = 0;
   DWORD size = GetFileVersionInfoSizeW (exe.c_str (), &zero);
-  if (size == 0)
+  if (size == 0) {
+    if (s_desc_cache.size () >= 256)
+      s_desc_cache.clear ();
+    s_desc_cache.emplace (exe, std::string{});
     return {};
+  }
   std::vector<char> buffer (size);
   if (!GetFileVersionInfoW (exe.c_str (), 0, size, buffer.data ()))
     return {};
@@ -335,6 +345,9 @@ exe_file_description (const std::wstring &exe)
       }
     }
   }
+  if (s_desc_cache.size () >= 256)
+    s_desc_cache.clear ();
+  s_desc_cache.emplace (exe, result);
   return result;
 }
 
@@ -654,6 +667,7 @@ gboolean
 deferred_notify_changed (gpointer user_data)
 {
   WinomeDash *self = static_cast<WinomeDash *> (user_data);
+  self->notify_changed_timer = 0;
   if (GTK_IS_WIDGET (self) && self->changed_cb != nullptr)
     self->changed_cb (self->changed_data);
   g_object_unref (self);
@@ -737,8 +751,13 @@ on_dash_menu_close_all (GtkButton *btn G_GNUC_UNUSED, gpointer user_data)
   std::vector<HWND> hwnds = ctx->windows;
   overview_dash_close_menu (GTK_WIDGET (self));
   app_index_close_windows (hwnds);
+  if (self->notify_changed_timer != 0) {
+    g_source_remove (self->notify_changed_timer);
+    self->notify_changed_timer = 0;
+    g_object_unref (self);
+  }
   g_object_ref (self);
-  g_timeout_add (140, deferred_notify_changed, self);
+  self->notify_changed_timer = g_timeout_add (140, deferred_notify_changed, self);
 }
 
 struct DashWindowCtx {
@@ -1325,6 +1344,15 @@ winome_dash_dispose (GObject *object)
 {
   WinomeDash *self = WINOME_DASH (object);
   overview_dash_close_menu (GTK_WIDGET (self));
+  if (self->notify_changed_timer != 0) {
+    g_source_remove (self->notify_changed_timer);
+    self->notify_changed_timer = 0;
+    g_object_unref (self);
+  }
+  self->changed_cb = nullptr;
+  self->changed_data = nullptr;
+  self->show_apps_cb = nullptr;
+  self->show_apps_data = nullptr;
   if (self->label_timeout != 0) {
     g_source_remove (self->label_timeout);
     self->label_timeout = 0;

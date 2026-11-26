@@ -416,6 +416,7 @@ struct WpnDbCache {
   bool valid = false;
   WpnDbFileStamp db_stamp{};
   WpnDbFileStamp wal_stamp{};
+  std::chrono::steady_clock::time_point last_copy_tp{};
   std::vector<WinomeSystemNotification> items;
 };
 
@@ -441,11 +442,14 @@ bool read_wpn_database_fallback(std::vector<WinomeSystemNotification>* out) {
   if (!db_st.exists || db_st.size == 0)
     return false;
   const WpnDbFileStamp wal_st = stat_wide_file(src_wal);
+  const auto now_tp = std::chrono::steady_clock::now();
 
   {
     std::lock_guard<std::mutex> lk(g_wpn_cache.mu);
-    if (g_wpn_cache.valid && g_wpn_cache.db_stamp == db_st &&
-        g_wpn_cache.wal_stamp == wal_st) {
+    if (g_wpn_cache.valid &&
+        ((g_wpn_cache.db_stamp == db_st && g_wpn_cache.wal_stamp == wal_st) ||
+         (g_wpn_cache.last_copy_tp.time_since_epoch().count() != 0 &&
+          (now_tp - g_wpn_cache.last_copy_tp) < std::chrono::seconds(5)))) {
       *out = g_wpn_cache.items;
       return true;
     }
@@ -542,6 +546,7 @@ bool read_wpn_database_fallback(std::vector<WinomeSystemNotification>* out) {
     g_wpn_cache.valid = true;
     g_wpn_cache.db_stamp = db_st;
     g_wpn_cache.wal_stamp = wal_st;
+    g_wpn_cache.last_copy_tp = now_tp;
     g_wpn_cache.items = parsed;
   }
   *out = std::move(parsed);
@@ -1178,7 +1183,7 @@ bool winrt_get_notifications(std::vector<WinomeSystemNotification>* out,
       capability_set(SubsystemId::WinRtNotifications, CapabilityState::Active,
                      "WPN database read-only fallback");
       if (access_allowed != nullptr)
-        *access_allowed = true;
+        *access_allowed = false;
       return true;
     }
     if (access_allowed != nullptr)
@@ -1190,7 +1195,7 @@ bool winrt_get_notifications(std::vector<WinomeSystemNotification>* out,
       capability_set(SubsystemId::WinRtNotifications, CapabilityState::Active,
                      "WPN database read-only fallback");
       if (access_allowed != nullptr)
-        *access_allowed = true;
+        *access_allowed = false;
       return true;
     }
   }

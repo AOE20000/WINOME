@@ -31,12 +31,6 @@ constexpr wchar_t kShellExperienceHost[] = L"ShellExperienceHost.exe";
 constexpr int kClassBuffer = 256;
 constexpr int kPathBuffer = MAX_PATH;
 
-std::wstring window_class(HWND hwnd) {
-  wchar_t buffer[kClassBuffer] = {0};
-  int len = GetClassNameW(hwnd, buffer, kClassBuffer);
-  return std::wstring(buffer, static_cast<size_t>(len > 0 ? len : 0));
-}
-
 std::wstring window_title(HWND hwnd) {
   wchar_t buffer[kClassBuffer] = {0};
   int len = GetWindowTextW(hwnd, buffer, kClassBuffer);
@@ -116,11 +110,15 @@ void suppress_window(HWND hwnd) {
 }
 
 void on_window_event(DWORD event, HWND hwnd) {
+  wchar_t cls[kClassBuffer] = {0};
+  const int cls_len = GetClassNameW(hwnd, cls, kClassBuffer);
+  if (cls_len <= 0)
+    return;
+
   switch (event) {
     case EVENT_OBJECT_UNCLOAKED: {
       // Notification center / notification previews reappear uncloaked.
-      std::wstring cls = window_class(hwnd);
-      if (cls == kNotificationCenterClass &&
+      if (wcscmp(cls, kNotificationCenterClass) == 0 &&
           belongs_to_process(hwnd, kShellExperienceHost)) {
         ShowWindowAsync(hwnd, SW_HIDE);
       }
@@ -128,15 +126,17 @@ void on_window_event(DWORD event, HWND hwnd) {
     }
     case EVENT_OBJECT_SHOW:
     case EVENT_OBJECT_CREATE: {
-      std::wstring cls = window_class(hwnd);
-      HWND parent = GetParent(hwnd);
-      std::wstring parent_class =
-          parent != nullptr ? window_class(parent) : std::wstring();
-
-      bool is_taskbar = cls == kTaskbarClass ||
-                        cls == kSecondaryTaskbarClass ||
-                        parent_class == kTaskbarClass ||
-                        parent_class == kSecondaryTaskbarClass;
+      bool is_taskbar = wcscmp(cls, kTaskbarClass) == 0 ||
+                        wcscmp(cls, kSecondaryTaskbarClass) == 0;
+      if (!is_taskbar) {
+        if (HWND parent = GetParent(hwnd)) {
+          wchar_t pcls[kClassBuffer] = {0};
+          if (GetClassNameW(parent, pcls, kClassBuffer) > 0) {
+            is_taskbar = wcscmp(pcls, kTaskbarClass) == 0 ||
+                         wcscmp(pcls, kSecondaryTaskbarClass) == 0;
+          }
+        }
+      }
       if (is_taskbar) {
         NativeTaskbar::hide();
         break;
@@ -144,7 +144,7 @@ void on_window_event(DWORD event, HWND hwnd) {
 
       // Suppress XAML islands (flyouts, notification center) EXCEPT the
       // fullscreen Alt-Tab/Task View switcher, which must keep working.
-      if (cls == kXamlIslandClass && !covers_its_monitor(hwnd))
+      if (wcscmp(cls, kXamlIslandClass) == 0 && !covers_its_monitor(hwnd))
         suppress_window(hwnd);
       break;
     }
@@ -157,13 +157,12 @@ void CALLBACK win_event_proc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
                              LONG id_object, LONG id_child, DWORD thread,
                              DWORD time) {
   (void)hook;
-  (void)id_child;
   (void)thread;
   (void)time;
 
-  // Only react to whole-window events; id_child/thread-level events are
-  // irrelevant to the shell surfaces we hide.
-  if (id_object != OBJID_WINDOW || hwnd == nullptr)
+  // Only react to whole-window events; child-level events are irrelevant to
+  // the shell surfaces we hide.
+  if (id_object != OBJID_WINDOW || id_child != CHILDID_SELF || hwnd == nullptr)
     return;
 
   on_window_event(event, hwnd);

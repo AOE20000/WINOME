@@ -113,4 +113,9 @@ inline LONG_PTR strip_overlay_minimize_styles(LONG_PTR style) {
 // chrome) against accidental minimization on Win+D / display changes.
 void harden_shell_overlay_hwnd(HWND hwnd);
 
+// Detach, cloak, and make click-through GTK4's internal GdkWin32GL backing
+// swapchain HWNDs (created when GDK_WIN32_FORCE_DCOMP=1) so owner DWM uncloak
+// or SetWindowPos/BringWindowToTop can never expose them fullscreen above UI.
+void sanitize_gdk_gl_backing_windows();
+
 }  // namespace winome

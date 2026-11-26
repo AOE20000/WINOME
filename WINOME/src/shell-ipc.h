@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "dev-channel.h"
 #include "virtual-desktop.h"
 
 #include <windows.h>
@@ -43,8 +44,21 @@ struct IpcCallbacks {
   bool (*plugin_action)(const std::string& op,
                         const std::string& id,
                         std::string* out_err) = nullptr;
+  // Developer-mode test harness action dispatcher (e.g. win_tap_os, win_tap,
+  // esc_os, overview_open/close/toggle/grid, hot_corner, desktop_next/prev).
+  bool (*dev_test_action)(const std::string& action,
+                          std::string* out_err) = nullptr;
+  // Universal developer-mode shell subsystem operation dispatcher (shell.*).
+  DevShellOpCallback dev_shell_op;
   void (*quit)() = nullptr;
 };
+
+// Pure developer-test step parser & preset expander (unit-tested independently).
+bool ipc_expand_dev_test_steps(const std::string& steps_csv,
+                               const std::string& preset,
+                               int gap_ms,
+                               std::vector<std::string>* out_steps,
+                               std::string* out_err);
 
 // Pure SDDL builder & DACL helper tested independently of live pipes.
 std::wstring ipc_build_user_pipe_sddl(const wchar_t* user_sid_str);

@@ -158,8 +158,7 @@ winome_app_icon_set_texture (GtkWidget *widget, GdkTexture *texture)
   WinomeAppIcon *self = WINOME_APP_ICON (widget);
   if (g_set_object (&self->texture, texture)) {
     g_clear_object (&self->fallback);
-    if (gtk_widget_get_parent (widget) != nullptr &&
-        gtk_widget_get_root (widget) != nullptr) {
+    if (gtk_widget_get_mapped (widget)) {
       gtk_widget_queue_draw (widget);
     }
   }
@@ -899,14 +898,15 @@ on_icon_batch_idle (gpointer user_data)
       payload->alive && payload->alive->load (std::memory_order_acquire);
   if (alive && payload->self != nullptr && payload->self->async != nullptr) {
     AppGridAsyncState *st = payload->self->async;
-    bool matching_size = (payload->size == st->built_load_px);
+    const bool matching_gen =
+        (payload->gen == st->icon_gen && payload->size == st->built_load_px);
     for (RawDecodedIcon &raw : payload->items) {
       if (raw.bytes == nullptr)
         continue;
       GdkTexture *tex = app_icon_texture_from_raw (raw);
       if (tex != nullptr) {
         app_icon_cache_store (raw.id, raw.size, tex);
-        if (matching_size) {
+        if (matching_gen) {
           apply_texture_to_targets (st, raw.id, tex);
           ++payload->self->visual_version;
           if (payload->self->transition_frozen)
@@ -956,7 +956,7 @@ maybe_start_icon_worker (WinomeAppGrid *self)
   // Never spawn detached worker threads inside unmapped headless unit tests.
   if (!gtk_widget_get_realized (GTK_WIDGET (self)) && !st->prewarm_active)
     return;
-  if (st->active_workers > 0)
+  if (st->active_workers >= 2)
     return;
 
   int active_page = self->page;
@@ -2134,14 +2134,20 @@ app_grid_rebuild (GtkWidget *grid, int avail_w, int avail_h,
 
   if (self->async != nullptr && self->async->built_valid &&
       self->index_loaded && self->async->built_query == self->query_lower &&
-      self->async->built_avail_w == eff_w &&
-      self->async->built_avail_h == eff_h &&
+      std::abs (self->async->built_avail_w - eff_w) <= 4 &&
+      std::abs (self->async->built_avail_h - eff_h) <= 4 &&
       self->async->built_scale == scale &&
       self->async->built_revision == rev) {
-    if (refresh_running)
-      update_running_dots_in_place (self);
-    maybe_start_icon_worker (self);
-    return;
+    AppGridDimensions prev_dim = compute_app_grid_dimensions (
+        self->async->built_avail_w, self->async->built_avail_h);
+    AppGridDimensions next_dim = compute_app_grid_dimensions (eff_w, eff_h);
+    if (prev_dim.cols == next_dim.cols && prev_dim.rows == next_dim.rows &&
+        prev_dim.icon_size == next_dim.icon_size) {
+      if (refresh_running)
+        update_running_dots_in_place (self);
+      maybe_start_icon_worker (self);
+      return;
+    }
   }
 
   self->avail_w = eff_w;

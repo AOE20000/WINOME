@@ -10,11 +10,15 @@
 #include <dbghelp.h>
 #include <shellapi.h>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -22,6 +26,7 @@
 #include "app-index.h"
 #include "crash-dialog.h"
 #include "debug-runtime.h"
+#include "dev-channel.h"
 #include "end-session-dialog.h"
 #include "host-utils.h"
 #include "i18n.h"
@@ -517,10 +522,10 @@ idle_log_gsk_probe (gpointer data)
   GtkWidget *widget = GTK_WIDGET (data);
   if (widget == nullptr || !gtk_widget_get_realized (widget))
     return G_SOURCE_REMOVE;
-  GdkSurface *surface = gtk_native_get_surface (GTK_NATIVE (widget));
-  if (surface == nullptr)
-    return G_SOURCE_REMOVE;
-  GskRenderer *renderer = gsk_renderer_new_for_surface (surface);
+  // Query GTK's already-realized renderer directly instead of creating a
+  // throwaway second GskGLRenderer + GdkGLContext on the live panel surface
+  // (which stalls the GPU ICD for 50-300ms right after startup).
+  GskRenderer *renderer = gtk_native_get_renderer (GTK_NATIVE (widget));
   if (renderer == nullptr)
     return G_SOURCE_REMOVE;
 
@@ -528,33 +533,7 @@ idle_log_gsk_probe (gpointer data)
   const char *want = g_getenv ("GSK_RENDERER");
   g_print ("[gpu] GSK_RENDERER env=%s renderer=%s\n",
            want != nullptr ? want : "(unset)", type);
-
-  // If GTK picked the GL renderer, identify the underlying GL
-  // implementation: a hardware ICD (NVIDIA/Intel/AMD) means the widgets are
-  // genuinely GPU-accelerated, while llvmpipe/Microsoft GDI Generic means
-  // software rendering.
-  if (strstr (type, "GL") != nullptr) {
-    GError *error = nullptr;
-    GdkGLContext *ctx = gdk_surface_create_gl_context (surface, &error);
-    if (ctx != nullptr) {
-      gdk_gl_context_make_current (ctx);
-      const guchar *vendor = glGetString (GL_VENDOR);
-      const guchar *r = glGetString (GL_RENDERER);
-      const guchar *v = glGetString (GL_VERSION);
-      g_print ("[gpu] GL vendor=%s renderer=%s version=%s\n",
-               vendor ? (const char *)vendor : "?",
-               r ? (const char *)r : "?",
-               v ? (const char *)v : "?");
-      g_object_unref (ctx);
-    } else {
-      g_print ("[gpu] gl-context failed: %s\n",
-               error != nullptr ? error->message : "?");
-      if (error != nullptr)
-        g_error_free (error);
-    }
-  }
-
-  g_object_unref (renderer);
+  winome::sanitize_gdk_gl_backing_windows ();
   return G_SOURCE_REMOVE;
 }
 
@@ -642,7 +621,7 @@ position_panel (GtkWidget *panel)
   mm_cbs.register_panel = winome::register_panel_window;
   mm_cbs.unregister_panel = winome::unregister_panel_window;
   mm_cbs.is_panel_hidden_for_monitor = winome::panel_hidden_for_monitor;
-  mm_cbs.pin_window = [] (HWND w) { winome::vd::pin_window (w); };
+  mm_cbs.pin_window = [] (HWND w) { winome::vd::pin_window_async (w); };
   mm_cbs.on_session_lock_changed = [] (bool locked) {
     winome::set_session_locked (locked);
     if (!locked)
@@ -651,6 +630,7 @@ position_panel (GtkWidget *panel)
   mm_cbs.on_display_changed = [] (const RECT &primary_rect) {
     g_primary_monitor = primary_rect;
     save_recovery_workarea (g_primary_monitor);
+    winome::invalidate_brightness_cache ();
     winome::hot_corner_refresh_bounds ();
     winome::evaluate_fullscreen_state ();
     winome::ws::on_monitors_changed ();
@@ -951,8 +931,6 @@ apply_config_set_kv (const std::string &key, const std::string &val)
   winome::update_config (cfg);
   if (key == "developer_mode" && !cfg.developer_mode)
     winome::close_looking_glass ();
-  if (key == "unify_dark_titlebars" || key == "unify_rounded_corners")
-    winome::window_theming_sync_all ();
   return true;
 }
 
@@ -973,10 +951,17 @@ on_vd_changed_for_plugins (int count, int active, void *)
   winome::plugin_host_emit_desktop_changed (count, active);
 }
 
+static gint64 g_startup_gtk_run_t0_us = 0;
+static gint64 g_startup_activate_done_us = 0;
+
 static void
 on_activate (GtkApplication      *app,
              gpointer G_GNUC_UNUSED user_data)
 {
+  if (g_startup_gtk_run_t0_us > 0) {
+    winome::perf_record_phase_ms (
+        "gtk_init", (g_get_monotonic_time () - g_startup_gtk_run_t0_us) / 1000.0);
+  }
   g_gtk_app = app;
   // Match GNOME Shell / Mutter behavior on Windows: prevent GtkText boundary
   // edits (e.g. Backspace on empty search, arrow bounds, keynav-failed) from
@@ -1139,6 +1124,301 @@ on_activate (GtkApplication      *app,
   };
   g_main_ipc_cbs.plugin_list_json = winome::plugin_host_list_json;
   g_main_ipc_cbs.plugin_action = winome::plugin_host_action;
+  g_main_ipc_cbs.dev_test_action = +[] (const std::string &action,
+                                        std::string *out_err) -> bool {
+    if (action == "win_tap_os") {
+      winome::simulate_os_win_tap (25);
+      return true;
+    }
+    if (action == "win_tap") {
+      winome::simulate_bare_win_tap ();
+      return true;
+    }
+    if (action == "esc_os") {
+      winome::simulate_os_key_tap (VK_ESCAPE, 20);
+      return true;
+    }
+    if (action == "overview_open") {
+      g_idle_add (idle_ipc_overview_open, nullptr);
+      return true;
+    }
+    if (action == "overview_close") {
+      g_idle_add (idle_ipc_overview_close, nullptr);
+      return true;
+    }
+    if (action == "overview_toggle") {
+      g_idle_add (idle_ipc_overview_toggle, nullptr);
+      return true;
+    }
+    if (action == "overview_grid" || action == "overview_app_grid") {
+      winome::overview_shift_to_app_grid_async ();
+      return true;
+    }
+    if (action == "hot_corner") {
+      winome::open_overview ("dev-test-hot-corner");
+      return true;
+    }
+    if (action == "desktop_next" || action == "desktop_prev") {
+      const auto snap = winome::vd::cached_snapshot ();
+      if (!snap.valid || snap.count <= 1) {
+        if (out_err != nullptr)
+          *out_err = "virtual desktops unavailable or count <= 1";
+        return false;
+      }
+      const int delta = (action == "desktop_next") ? 1 : -1;
+      const int target = std::clamp (snap.active_index + delta, 0, snap.count - 1);
+      const bool ok = winome::vd::switch_to (target);
+      if (ok)
+        winome::vd::notify_change_hint_async ();
+      return ok;
+    }
+    if (action.rfind ("desktop_switch:", 0) == 0) {
+      const int idx = std::atoi (action.c_str () + 15);
+      const bool ok = winome::vd::switch_to (idx);
+      if (ok)
+        winome::vd::notify_change_hint_async ();
+      return ok;
+    }
+    if (out_err != nullptr)
+      *out_err = "unknown dev test action: " + action;
+    return false;
+  };
+  g_main_ipc_cbs.dev_shell_op =
+      [] (const std::string &op,
+          const std::map<std::string, std::string> &args,
+          std::string *out_data_json,
+          std::string *out_err) -> bool {
+    auto get_arg = [&] (const char *k, const char *def = "") -> std::string {
+      auto it = args.find (k);
+      return it != args.end () ? it->second : std::string (def);
+    };
+    auto marshal_main = [] (std::function<void ()> fn) {
+      if (g_main_context_is_owner (g_main_context_default ())) {
+        fn ();
+        return;
+      }
+      struct Box {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool done = false;
+        std::function<void ()> fn;
+      };
+      auto b = std::make_shared<Box> ();
+      b->fn = std::move (fn);
+      auto *h = new std::shared_ptr<Box> (b);
+      g_main_context_invoke_full (
+          g_main_context_default (), G_PRIORITY_HIGH_IDLE,
+          +[] (gpointer ud) -> gboolean {
+            auto *ptr = static_cast<std::shared_ptr<Box> *> (ud);
+            auto box = *ptr;
+            delete ptr;
+            if (box && box->fn)
+              box->fn ();
+            if (box) {
+              std::lock_guard<std::mutex> lk (box->mu);
+              box->done = true;
+              box->cv.notify_all ();
+            }
+            return G_SOURCE_REMOVE;
+          },
+          h, nullptr);
+      std::unique_lock<std::mutex> lk (b->mu);
+      b->cv.wait_for (lk, std::chrono::milliseconds (5000),
+                      [&] { return b->done; });
+    };
+
+    if (op == "shell.win_tap") {
+      winome::simulate_bare_win_tap ();
+      *out_data_json = "{\"triggered\":true}";
+      return true;
+    }
+    if (op == "shell.overview") {
+      const std::string act = get_arg ("action", "toggle");
+      if (act == "open") {
+        g_idle_add (idle_ipc_overview_open, nullptr);
+      } else if (act == "close") {
+        g_idle_add (idle_ipc_overview_close, nullptr);
+      } else if (act == "toggle") {
+        g_idle_add (idle_ipc_overview_toggle, nullptr);
+      } else if (act == "grid") {
+        winome::overview_shift_to_app_grid_async ();
+      } else if (act == "refresh") {
+        marshal_main ([] { winome::overview_refresh_all_open (); });
+      } else if (act == "restack") {
+        marshal_main ([] { winome::overview_restack (); });
+      } else if (act == "invalidate_wallpaper") {
+        marshal_main ([] { winome::overview_invalidate_wallpaper (); });
+      } else if (act == "reposition") {
+        marshal_main ([] { winome::overview_reposition (); });
+      } else {
+        *out_err = "unknown shell.overview action: " + act;
+        return false;
+      }
+      *out_data_json = "{\"action\":\"" + act + "\",\"open\":" +
+                       std::string (winome::overview_active () ? "true" : "false") + "}";
+      return true;
+    }
+    if (op == "shell.panel") {
+      const std::string act = get_arg ("action", "inspect");
+      if (act == "reload_theme") {
+        bool ok = false;
+        marshal_main ([&] { ok = winome_shell_reload_theme (); });
+        *out_data_json = std::string ("{\"reloaded\":") + (ok ? "true" : "false") + "}";
+        return ok;
+      }
+      if (act == "close_popovers") {
+        marshal_main ([] { winome_shell_panel_close_popovers (); });
+        *out_data_json = "{\"closed\":true}";
+        return true;
+      }
+      if (act == "inspect") {
+        *out_data_json = g_main_ipc_cbs.inspect_panel_json
+                             ? g_main_ipc_cbs.inspect_panel_json ()
+                             : "{}";
+        return true;
+      }
+      *out_err = "unknown shell.panel action: " + act;
+      return false;
+    }
+    if (op == "shell.ws") {
+      const std::string act = get_arg ("action", "list");
+      HMONITOR mon = winome::monitor_manager_active_monitor ();
+      if (act == "list") {
+        const int cnt = winome::ws::count_for_monitor (mon);
+        const int cur = winome::ws::active_for_monitor (mon);
+        char b[96];
+        std::snprintf (b, sizeof (b), "{\"count\":%d,\"active\":%d}", cnt, cur);
+        *out_data_json = b;
+        return true;
+      }
+      if (act == "next" || act == "prev") {
+        const int cnt = winome::ws::count_for_monitor (mon);
+        const int cur = winome::ws::active_for_monitor (mon);
+        const int dst = std::clamp (cur + (act == "next" ? 1 : -1), 0, std::max (cnt - 1, 0));
+        bool ok = winome::ws::switch_to (mon, dst);
+        *out_data_json = "{\"target\":" + std::to_string (dst) + "}";
+        return ok;
+      }
+      if (act == "switch") {
+        const int idx = std::atoi (get_arg ("index", "0").c_str ());
+        bool ok = winome::ws::switch_to (mon, idx);
+        *out_data_json = "{\"target\":" + std::to_string (idx) + "}";
+        return ok;
+      }
+      if (act == "create") {
+        bool ok = winome::ws::create_workspace (mon);
+        *out_data_json = std::string ("{\"created\":") + (ok ? "true" : "false") + "}";
+        return ok;
+      }
+      if (act == "remove") {
+        const int idx = std::atoi (get_arg ("index", "0").c_str ());
+        bool ok = winome::ws::remove_workspace (mon, idx);
+        *out_data_json = std::string ("{\"removed\":") + (ok ? "true" : "false") + "}";
+        return ok;
+      }
+      *out_err = "unknown shell.ws action: " + act;
+      return false;
+    }
+    if (op == "shell.dialog") {
+      const std::string tgt = get_arg ("target", "looking_glass");
+      const std::string act = get_arg ("action", "open");
+      if (tgt == "settings") {
+        std::string page = get_arg ("page");
+        g_idle_add (idle_open_settings_page, new std::string (page));
+      } else if (tgt == "looking_glass") {
+        if (act == "close")
+          marshal_main ([] { winome::close_looking_glass (); });
+        else
+          marshal_main ([] { winome::open_looking_glass (); });
+      } else if (tgt == "run") {
+        if (act == "close")
+          marshal_main ([] { winome::run_dialog_close (); });
+        else if (act == "open")
+          marshal_main ([] { winome::run_dialog_open (); });
+        else
+          winome::run_dialog_toggle_async ();
+      } else {
+        *out_err = "unknown shell.dialog target: " + tgt;
+        return false;
+      }
+      *out_data_json = "{\"target\":\"" + tgt + "\",\"action\":\"" + act + "\"}";
+      return true;
+    }
+    if (op == "shell.cache") {
+      const std::string act = get_arg ("action", "icon_trim");
+      if (act == "icon_clear") {
+        winome::app_icon_cache_clear ();
+      } else if (act == "icon_trim") {
+        const size_t keep = static_cast<size_t> (
+            std::max (0, std::atoi (get_arg ("keep", "64").c_str ())));
+        winome::app_icon_cache_trim (keep);
+      } else if (act == "app_refresh") {
+        winome::app_index_refresh_async (nullptr, nullptr);
+      } else if (act == "brightness_invalidate") {
+        winome::invalidate_brightness_cache ();
+      } else if (act == "systray_refresh") {
+        winome::systray_refresh_async (true);
+      } else {
+        *out_err = "unknown shell.cache action: " + act;
+        return false;
+      }
+      *out_data_json = "{\"action\":\"" + act + "\",\"icon_cache_count\":" +
+                       std::to_string (winome::app_icon_cache_count ()) + "}";
+      return true;
+    }
+    if (op == "shell.config") {
+      const std::string act = get_arg ("action", "get");
+      if (act == "reload") {
+        g_idle_add (idle_reload_config, nullptr);
+        *out_data_json = "{\"reloaded\":true}";
+        return true;
+      }
+      if (act == "set") {
+        const std::string k = get_arg ("key");
+        const std::string v = get_arg ("value");
+        if (k.empty ()) {
+          *out_err = "shell.config set requires key and value";
+          return false;
+        }
+        bool ok = false;
+        marshal_main ([&] { ok = apply_config_set_kv (k, v); });
+        if (!ok) {
+          *out_err = "invalid config key or value";
+          return false;
+        }
+        *out_data_json = "{\"updated\":true}";
+        return true;
+      }
+      if (act == "get") {
+        const auto cfg = winome::get_config ();
+        char b[384];
+        std::snprintf (
+            b, sizeof (b),
+            "{\"developer_mode\":%s,\"win_key_overview\":%s,"
+            "\"hot_corner_enabled\":%s,\"multi_monitor_panels\":%s,"
+            "\"multi_monitor_overview_linked\":%s,\"live_wallpaper_mode\":\"%s\","
+            "\"multi_monitor_workspace_mode\":\"%s\"}",
+            cfg.developer_mode ? "true" : "false",
+            cfg.win_key_overview ? "true" : "false",
+            cfg.hot_corner_enabled ? "true" : "false",
+            cfg.multi_monitor_panels ? "true" : "false",
+            cfg.multi_monitor_overview_linked ? "true" : "false",
+            cfg.live_wallpaper_mode.c_str (),
+            cfg.multi_monitor_workspace_mode.c_str ());
+        *out_data_json = b;
+        return true;
+      }
+      *out_err = "unknown shell.config action: " + act;
+      return false;
+    }
+    if (op == "shell.fullscreen") {
+      marshal_main ([] { winome::evaluate_fullscreen_state (); });
+      *out_data_json = "{\"evaluated\":true}";
+      return true;
+    }
+    *out_err = "unknown shell op: " + op;
+    return false;
+  };
   g_main_ipc_cbs.quit = +[] () {
     g_idle_add (idle_quit_app, nullptr);
   };
@@ -1234,8 +1514,9 @@ on_activate (GtkApplication      *app,
     g_idle_add (idle_open_settings, nullptr);
   }
 
+  g_startup_activate_done_us = g_get_monotonic_time ();
   winome::perf_record_phase_ms (
-      "activate", (g_get_monotonic_time () - act_t0) / 1000.0);
+      "activate", (g_startup_activate_done_us - act_t0) / 1000.0);
 
   g_deferred_plugins_idle = g_idle_add (
       +[] (gpointer data) -> gboolean {
@@ -1243,6 +1524,10 @@ on_activate (GtkApplication      *app,
         const auto *cbs =
             static_cast<const winome::PluginHostCallbacks *> (data);
         const gint64 plug_t0 = g_get_monotonic_time ();
+        if (g_startup_activate_done_us > 0) {
+          winome::perf_record_phase_ms (
+              "idle_wait", (plug_t0 - g_startup_activate_done_us) / 1000.0);
+        }
         winome::plugin_host_init (*cbs);
         winome::vd::add_change_listener (on_vd_changed_for_plugins, nullptr);
         winome::perf_record_phase_ms (
@@ -1404,6 +1689,7 @@ run_watchdog_mode (DWORD pid, bool show_ui)
 int
 main (int argc, char **argv)
 {
+  const gint64 proc_t0 = g_get_monotonic_time ();
   winome::perf_mark_process_start ();
 
   // Parse headless / recovery / watchdog flags first.
@@ -1602,6 +1888,14 @@ main (int argc, char **argv)
   winome::start_win_event_hook ();
   winome::start_overview_trigger ();
 
+  // GTK 4.22+ on Win32 requires DirectComposition for both GskGLRenderer and
+  // GskVulkanRenderer ("OpenGL requires Direct Composition"), yet leaves
+  // DirectComposition disabled unless GDK_WIN32_FORCE_DCOMP is set — causing
+  // silent fallback to CPU GskCairoRenderer (halving Overview FPS to ~30fps).
+  // Enable DirectComposition by default while respecting explicit overrides.
+  if (g_getenv ("GDK_WIN32_FORCE_DCOMP") == nullptr)
+    g_setenv ("GDK_WIN32_FORCE_DCOMP", "1", FALSE);
+
   GtkApplication *app;
 
   app = gtk_application_new ("org.winome.Shell",
@@ -1612,6 +1906,9 @@ main (int argc, char **argv)
   g_signal_connect (app, "shutdown",
                     G_CALLBACK (on_shutdown), NULL);
 
+  g_startup_gtk_run_t0_us = g_get_monotonic_time ();
+  winome::perf_record_phase_ms (
+      "pre_gtk", (g_startup_gtk_run_t0_us - proc_t0) / 1000.0);
   int status = g_application_run (G_APPLICATION (app), 1, argv);
 
   g_object_unref (app);

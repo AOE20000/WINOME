@@ -226,6 +226,215 @@ inline bool ctl_build_request_json(const std::vector<std::string>& args,
     *out_json = std::move(req);
     return true;
   }
+  if (sub == "test") {
+    if (args.size() < 2) {
+      if (out_err != nullptr)
+        *out_err = "test requires: trigger <action> | run [--steps S | --preset P] | begin | end";
+      return false;
+    }
+    const std::string& op = args[1];
+    if (op == "trigger") {
+      if (args.size() < 3) {
+        if (out_err != nullptr)
+          *out_err = "test trigger requires <action> [--wait ms] [--tag tags]";
+        return false;
+      }
+      const std::string& action = args[2];
+      int wait_ms = 450;
+      std::string tag;
+      for (size_t i = 3; i < args.size(); ++i) {
+        if ((args[i] == "--wait" || args[i] == "-w") && i + 1 < args.size())
+          wait_ms = std::atoi(args[++i].c_str());
+        else if (args[i] == "--tag" && i + 1 < args.size())
+          tag = args[++i];
+      }
+      std::string req = "{\"cmd\":\"test.trigger\",\"action\":";
+      append_json_str(action, &req);
+      req += ",\"wait_ms\":" + std::to_string(wait_ms);
+      if (!tag.empty()) {
+        req += ",\"tag\":";
+        append_json_str(tag, &req);
+      }
+      req += "}";
+      *out_json = std::move(req);
+      return true;
+    }
+    if (op == "run") {
+      std::string steps;
+      std::string preset;
+      std::string tag;
+      int gap_ms = -1;
+      int settle_ms = 500;
+      int repeat = 1;
+      for (size_t i = 2; i < args.size(); ++i) {
+        if (args[i] == "--steps" && i + 1 < args.size())
+          steps = args[++i];
+        else if (args[i] == "--preset" && i + 1 < args.size())
+          preset = args[++i];
+        else if (args[i] == "--gap" && i + 1 < args.size())
+          gap_ms = std::atoi(args[++i].c_str());
+        else if (args[i] == "--settle" && i + 1 < args.size())
+          settle_ms = std::atoi(args[++i].c_str());
+        else if (args[i] == "--repeat" && i + 1 < args.size())
+          repeat = std::atoi(args[++i].c_str());
+        else if (args[i] == "--tag" && i + 1 < args.size())
+          tag = args[++i];
+      }
+      if (steps.empty() && preset.empty()) {
+        if (out_err != nullptr)
+          *out_err = "test run requires --steps <csv> or --preset <name>";
+        return false;
+      }
+      std::string req = "{\"cmd\":\"test.run\"";
+      if (!steps.empty()) {
+        req += ",\"steps\":";
+        append_json_str(steps, &req);
+      }
+      if (!preset.empty()) {
+        req += ",\"preset\":";
+        append_json_str(preset, &req);
+      }
+      if (gap_ms >= 0)
+        req += ",\"gap_ms\":" + std::to_string(gap_ms);
+      req += ",\"settle_ms\":" + std::to_string(settle_ms);
+      req += ",\"repeat\":" + std::to_string(repeat);
+      if (!tag.empty()) {
+        req += ",\"tag\":";
+        append_json_str(tag, &req);
+      }
+      req += "}";
+      *out_json = std::move(req);
+      return true;
+    }
+    if (op == "begin" || op == "end") {
+      std::string tag;
+      for (size_t i = 2; i < args.size(); ++i) {
+        if (args[i] == "--tag" && i + 1 < args.size())
+          tag = args[++i];
+      }
+      std::string req = "{\"cmd\":\"test." + op + "\"";
+      if (!tag.empty()) {
+        req += ",\"tag\":";
+        append_json_str(tag, &req);
+      }
+      req += "}";
+      *out_json = std::move(req);
+      return true;
+    }
+    if (out_err != nullptr)
+      *out_err = "unknown test subcommand (use trigger, run, begin, or end)";
+    return false;
+  }
+  if (sub == "dev") {
+    if (args.size() < 2) {
+      if (out_err != nullptr)
+        *out_err = "dev requires: help | op <op> [k=v ...] | batch (--ops <str> | --json <arr>)";
+      return false;
+    }
+    const std::string& dsub = args[1];
+    if (dsub == "help") {
+      *out_json = "{\"cmd\":\"dev.help\"}";
+      return true;
+    }
+    if (dsub == "op") {
+      if (args.size() < 3) {
+        if (out_err != nullptr)
+          *out_err = "dev op requires <op> [k=v ...] [--wait ms] [--logs] [--tag T]";
+        return false;
+      }
+      const std::string& op_name = args[2];
+      int wait_ms = 0;
+      bool capture_logs = false;
+      std::string tag;
+      std::vector<std::pair<std::string, std::string>> kv_args;
+      for (size_t i = 3; i < args.size(); ++i) {
+        if (args[i] == "--wait" && i + 1 < args.size()) {
+          wait_ms = std::atoi(args[++i].c_str());
+        } else if (args[i] == "--logs") {
+          capture_logs = true;
+        } else if (args[i] == "--tag" && i + 1 < args.size()) {
+          tag = args[++i];
+          capture_logs = true;
+        } else {
+          size_t eq = args[i].find('=');
+          if (eq != std::string::npos && eq > 0) {
+            kv_args.emplace_back(args[i].substr(0, eq), args[i].substr(eq + 1));
+          } else if (kv_args.empty()) {
+            kv_args.emplace_back("action", args[i]);
+          }
+        }
+      }
+      std::string req = "{\"cmd\":\"dev.op\",\"op\":";
+      append_json_str(op_name, &req);
+      req += ",\"args\":{";
+      for (size_t i = 0; i < kv_args.size(); ++i) {
+        if (i > 0)
+          req.push_back(',');
+        append_json_str(kv_args[i].first, &req);
+        req.push_back(':');
+        append_json_str(kv_args[i].second, &req);
+      }
+      req += "}";
+      if (wait_ms > 0)
+        req += ",\"wait_ms\":" + std::to_string(wait_ms);
+      if (capture_logs)
+        req += ",\"capture_logs\":true";
+      if (!tag.empty()) {
+        req += ",\"tag\":";
+        append_json_str(tag, &req);
+      }
+      req += "}";
+      *out_json = std::move(req);
+      return true;
+    }
+    if (dsub == "batch") {
+      std::string ops_shorthand;
+      std::string ops_json;
+      std::string tag;
+      bool capture_logs = false;
+      bool stop_on_error = false;
+      for (size_t i = 2; i < args.size(); ++i) {
+        if (args[i] == "--ops" && i + 1 < args.size()) {
+          ops_shorthand = args[++i];
+        } else if (args[i] == "--json" && i + 1 < args.size()) {
+          ops_json = args[++i];
+        } else if (args[i] == "--logs") {
+          capture_logs = true;
+        } else if (args[i] == "--stop-on-error") {
+          stop_on_error = true;
+        } else if (args[i] == "--tag" && i + 1 < args.size()) {
+          tag = args[++i];
+          capture_logs = true;
+        } else if (ops_shorthand.empty() && ops_json.empty()) {
+          ops_shorthand = args[i];
+        }
+      }
+      if (ops_shorthand.empty() && ops_json.empty()) {
+        if (out_err != nullptr)
+          *out_err = "dev batch requires --ops \"op1 ...; op2 ...\" or --json '[...]'";
+        return false;
+      }
+      std::string req = "{\"cmd\":\"dev.batch\",\"ops\":";
+      if (!ops_json.empty())
+        req += ops_json;
+      else
+        append_json_str(ops_shorthand, &req);
+      if (capture_logs)
+        req += ",\"capture_logs\":true";
+      if (stop_on_error)
+        req += ",\"stop_on_error\":true";
+      if (!tag.empty()) {
+        req += ",\"tag\":";
+        append_json_str(tag, &req);
+      }
+      req += "}";
+      *out_json = std::move(req);
+      return true;
+    }
+    if (out_err != nullptr)
+      *out_err = "unknown dev subcommand (use help, op, or batch)";
+    return false;
+  }
   if (sub == "quit") {
     *out_json = "{\"cmd\":\"quit\"}";
     return true;

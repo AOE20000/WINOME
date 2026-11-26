@@ -48,6 +48,12 @@ bool get_brightness(double* out);
 // Set current screen brightness as 0..1 fraction.
 bool set_brightness(double fraction);
 
+// Non-blocking latest-value coalesced brightness write (for slider drag).
+void set_brightness_async(double fraction);
+
+// Invalidate cached DDC/CI brightness capability (e.g. on display change).
+void invalidate_brightness_cache();
+
 // Get/set Windows dark mode via fine-grained Personalize registry flags
 // (AppsUseLightTheme / SystemUsesLightTheme). Never writes or applies
 // Windows .theme files and never alters desktop wallpaper/slideshow settings.

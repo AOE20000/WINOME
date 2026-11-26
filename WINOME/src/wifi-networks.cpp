@@ -845,9 +845,15 @@ winome_wifi_trigger_scan_async (void)
 gboolean
 winome_wifi_disconnect (void)
 {
-  HANDLE client = nullptr;
-  if (!ensure_client (&client))
+  if (!load_api ())
     return FALSE;
+
+  DWORD negotiated = 0;
+  HANDLE client = nullptr;
+  if (g_api.OpenHandle (2, nullptr, &negotiated, &client) != ERROR_SUCCESS ||
+      client == nullptr) {
+    return FALSE;
+  }
 
   PWLAN_INTERFACE_INFO_LIST list = nullptr;
   gboolean ok = FALSE;
@@ -858,19 +864,28 @@ winome_wifi_disconnect (void)
            == ERROR_SUCCESS;
     g_api.FreeMemory (list);
   }
+  g_api.CloseHandle (client, nullptr);
   return ok;
 }
 
 gboolean
 winome_wifi_set_enabled (gboolean enabled)
 {
-  HANDLE client = nullptr;
-  if (!ensure_client (&client) || g_api.SetInterface == nullptr)
+  if (!load_api () || g_api.SetInterface == nullptr)
     return FALSE;
 
-  PWLAN_INTERFACE_INFO_LIST list = nullptr;
-  if (!enum_interfaces (client, &list))
+  DWORD negotiated = 0;
+  HANDLE client = nullptr;
+  if (g_api.OpenHandle (2, nullptr, &negotiated, &client) != ERROR_SUCCESS ||
+      client == nullptr) {
     return FALSE;
+  }
+
+  PWLAN_INTERFACE_INFO_LIST list = nullptr;
+  if (!enum_interfaces (client, &list)) {
+    g_api.CloseHandle (client, nullptr);
+    return FALSE;
+  }
 
   gboolean ok = FALSE;
   const WLAN_INTERFACE_INFO *info = pick_interface (list);
@@ -906,6 +921,7 @@ winome_wifi_set_enabled (gboolean enabled)
   }
 
   g_api.FreeMemory (list);
+  g_api.CloseHandle (client, nullptr);
   return ok;
 }
 

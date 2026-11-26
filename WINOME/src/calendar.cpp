@@ -74,60 +74,51 @@ cal_events_list_spacing (void)
   return 6;
 }
 
-static int
-cal_msg_controls_spacing (void)
+struct CalThemeMetrics {
+  bool resolved = false;
+  int controls_spacing = 6;
+  int header_spacing = 6;
+  int source_icon_size = 16;
+  int box_spacing = 6;
+  int content_spacing = 4;
+  int media_icon_size = 32;
+};
+
+static const CalThemeMetrics &
+cal_theme_metrics (void)
 {
-  return lookup_cal_length (nullptr, "message-list-controls", "spacing", 6);
+  static CalThemeMetrics m;
+  if (!m.resolved) {
+    m.resolved = true;
+    m.controls_spacing = lookup_cal_length (nullptr, "message-list-controls", "spacing", 6);
+    m.header_spacing = lookup_cal_length ("message", "message-header", "spacing", 6);
+    m.box_spacing = lookup_cal_length ("message", "message-box", "spacing", 6);
+    m.media_icon_size = lookup_cal_length ("media-message", "message-icon message-themed-icon",
+                                           "icon-size", 32);
+    if (winome::StEngine *e = winome::StEngine::get ()) {
+      winome::StEngine::Node msg (*e, nullptr, "", "message", "");
+      winome::StEngine::Node hdr (*e, &msg, "", "message-header", "");
+      winome::StEngine::Node icon (*e, &hdr, "", "message-source-icon", "");
+      double v = 0.0;
+      if (icon.lookup_length ("icon-size", &v) && v > 0.0)
+        m.source_icon_size = (int)(v + 0.5);
+
+      winome::StEngine::Node box (*e, &msg, "", "message-box", "");
+      winome::StEngine::Node content (*e, &box, "", "message-content", "");
+      v = 0.0;
+      if (content.lookup_length ("spacing", &v) && v > 0.0)
+        m.content_spacing = (int)(v + 0.5);
+    }
+  }
+  return m;
 }
 
-static int
-cal_msg_header_spacing (void)
-{
-  return lookup_cal_length ("message", "message-header", "spacing", 6);
-}
-
-static int
-cal_msg_source_icon_size (void)
-{
-  winome::StEngine *e = winome::StEngine::get ();
-  if (e == nullptr)
-    return 16;
-  winome::StEngine::Node msg (*e, nullptr, "", "message", "");
-  winome::StEngine::Node hdr (*e, &msg, "", "message-header", "");
-  winome::StEngine::Node icon (*e, &hdr, "", "message-source-icon", "");
-  double v = 0.0;
-  if (icon.lookup_length ("icon-size", &v) && v > 0.0)
-    return (int)(v + 0.5);
-  return 16;
-}
-
-static int
-cal_msg_box_spacing (void)
-{
-  return lookup_cal_length ("message", "message-box", "spacing", 6);
-}
-
-static int
-cal_msg_content_spacing (void)
-{
-  winome::StEngine *e = winome::StEngine::get ();
-  if (e == nullptr)
-    return 4;
-  winome::StEngine::Node msg (*e, nullptr, "", "message", "");
-  winome::StEngine::Node box (*e, &msg, "", "message-box", "");
-  winome::StEngine::Node content (*e, &box, "", "message-content", "");
-  double v = 0.0;
-  if (content.lookup_length ("spacing", &v) && v > 0.0)
-    return (int)(v + 0.5);
-  return 4;
-}
-
-static int
-cal_media_icon_size (void)
-{
-  return lookup_cal_length ("media-message", "message-icon message-themed-icon",
-                            "icon-size", 32);
-}
+static int cal_msg_controls_spacing (void) { return cal_theme_metrics ().controls_spacing; }
+static int cal_msg_header_spacing (void)   { return cal_theme_metrics ().header_spacing; }
+static int cal_msg_source_icon_size (void) { return cal_theme_metrics ().source_icon_size; }
+static int cal_msg_box_spacing (void)      { return cal_theme_metrics ().box_spacing; }
+static int cal_msg_content_spacing (void)  { return cal_theme_metrics ().content_spacing; }
+static int cal_media_icon_size (void)      { return cal_theme_metrics ().media_icon_size; }
 
 // Calendar state.
 typedef struct {
@@ -149,6 +140,8 @@ typedef struct {
   GtkWidget *placeholder;
   GtkWidget *clear_btn;
   uint64_t last_notif_gen;
+  int64_t last_age_minute;
+  bool messages_dirty;
 } CalendarData;
 
 static void calendar_rebuild (CalendarData *data);
@@ -681,22 +674,36 @@ create_notification_card (const winome::ShellNotification &notif,
 }
 
 static void
+set_cal_label_if_changed (GtkWidget *label, const char *text)
+{
+  if (label == nullptr || text == nullptr)
+    return;
+  if (g_strcmp0 (gtk_label_get_text (GTK_LABEL (label)), text) != 0)
+    gtk_label_set_text (GTK_LABEL (label), text);
+}
+
+static void
 rebuild_message_list (CalendarData *data, bool force = false)
 {
   if (data == nullptr || data->message_view == nullptr)
     return;
 
   const uint64_t gen = winome::notifications_generation ();
-  if (!force && data->last_notif_gen == gen)
+  const int64_t now_unix = static_cast<int64_t> (std::time (nullptr));
+  const int64_t now_minute = now_unix / 60;
+  if (!force && !data->messages_dirty && data->last_notif_gen == gen &&
+      data->last_age_minute == now_minute) {
     return;
+  }
   data->last_notif_gen = gen;
+  data->last_age_minute = now_minute;
+  data->messages_dirty = false;
 
   while (GtkWidget *child = gtk_widget_get_first_child (data->message_view))
     gtk_box_remove (GTK_BOX (data->message_view), child);
 
   const winome::WinomeMediaInfo media = winome::notifications_get_media ();
   const auto notifs = winome::notifications_get_all ();
-  const int64_t now_unix = static_cast<int64_t> (std::time (nullptr));
 
   if (media.active)
     gtk_box_append (GTK_BOX (data->message_view), create_media_card (media));
@@ -727,7 +734,13 @@ on_calendar_notifications_changed (void *user_data)
     return;
   CalendarData *data = static_cast<CalendarData *> (
       g_object_get_data (G_OBJECT (cal), "calendar-data"));
-  if (data != nullptr && data->dnd_switch != nullptr) {
+  if (data == nullptr)
+    return;
+  if (!gtk_widget_get_mapped (cal)) {
+    data->messages_dirty = true;
+    return;
+  }
+  if (data->dnd_switch != nullptr) {
     bool dnd_on = false;
     if (winome::get_do_not_disturb (&dnd_on)) {
       gboolean want = dnd_on ? TRUE : FALSE;
@@ -1088,10 +1101,17 @@ winome_calendar_reset_to_today (GtkWidget *calendar)
   GDateTime *now = g_date_time_new_now_local ();
   if (now == nullptr)
     return;
-  data->selected_year = g_date_time_get_year (now);
-  data->selected_month = g_date_time_get_month (now) - 1;
-  data->selected_day = g_date_time_get_day_of_month (now);
+  const int y = g_date_time_get_year (now);
+  const int m = g_date_time_get_month (now) - 1;
+  const int d = g_date_time_get_day_of_month (now);
   g_date_time_unref (now);
+  if (data->selected_year == y && data->selected_month == m &&
+      data->selected_day == d) {
+    return;
+  }
+  data->selected_year = y;
+  data->selected_month = m;
+  data->selected_day = d;
   update_month_label (data);
   calendar_rebuild (data);
 }
@@ -1115,9 +1135,8 @@ winome_calendar_refresh (GtkWidget *calendar)
                                     "Thursday", "Friday", "Saturday", "Sunday"};
     int idx = (dow >= 1 && dow <= 7) ? (dow - 1) : 0;
 
-    if (data->day_header_label != nullptr)
-      gtk_label_set_text (GTK_LABEL (data->day_header_label),
-                          is_zh () ? zh_days[idx] : en_days[idx]);
+    set_cal_label_if_changed (data->day_header_label,
+                              is_zh () ? zh_days[idx] : en_days[idx]);
 
     if (data->date_header_label != nullptr) {
       int y = g_date_time_get_year (now);
@@ -1131,7 +1150,7 @@ winome_calendar_refresh (GtkWidget *calendar)
         snprintf (date_buf, sizeof (date_buf), "%s %d, %d",
                   month_name (m_idx), d, y);
       }
-      gtk_label_set_text (GTK_LABEL (data->date_header_label), date_buf);
+      set_cal_label_if_changed (data->date_header_label, date_buf);
     }
     g_date_time_unref (now);
   }
@@ -1142,7 +1161,7 @@ winome_calendar_refresh (GtkWidget *calendar)
       gchar utc_buf[16];
       snprintf (utc_buf, sizeof (utc_buf), "%02d:%02d",
                 g_date_time_get_hour (utc), g_date_time_get_minute (utc));
-      gtk_label_set_text (GTK_LABEL (data->utc_time_label), utc_buf);
+      set_cal_label_if_changed (data->utc_time_label, utc_buf);
       g_date_time_unref (utc);
     }
   }
@@ -1162,5 +1181,5 @@ winome_calendar_refresh (GtkWidget *calendar)
     }
   }
 
-  rebuild_message_list (data, true);
+  rebuild_message_list (data, false);
 }

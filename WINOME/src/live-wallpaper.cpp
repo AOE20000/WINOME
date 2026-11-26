@@ -746,30 +746,55 @@ void worker_main(LiveWallpaperTarget target,
                     if (SUCCEEDED(d3d_ctx->Map(staging, 0, D3D11_MAP_READ, 0,
                                                &mapped)) &&
                         mapped.pData != nullptr) {
-                      const size_t dst_stride = static_cast<size_t>(cw) * 4u;
+                      // Cap live-wallpaper upload resolution to <=1280x720 so
+                      // 1440p/4K displays don't churn 14-33MB/frame at 30 FPS.
+                      int out_w = cw;
+                      int out_h = ch;
+                      constexpr int kMaxLiveW = 1280;
+                      constexpr int kMaxLiveH = 720;
+                      if (out_w > kMaxLiveW || out_h > kMaxLiveH) {
+                        const double sx = static_cast<double>(kMaxLiveW) / cw;
+                        const double sy = static_cast<double>(kMaxLiveH) / ch;
+                        const double sc = std::min(sx, sy);
+                        out_w = std::max(1, static_cast<int>(cw * sc + 0.5));
+                        out_h = std::max(1, static_cast<int>(ch * sc + 0.5));
+                      }
+                      const size_t dst_stride = static_cast<size_t>(out_w) * 4u;
                       auto* packed = static_cast<uint8_t*>(g_try_malloc_n(
-                          static_cast<gsize>(ch),
+                          static_cast<gsize>(out_h),
                           static_cast<gsize>(dst_stride)));
                       if (packed != nullptr) {
                         const auto* sbase =
                             static_cast<const uint8_t*>(mapped.pData);
-                        for (int y = 0; y < ch; ++y) {
-                          std::memcpy(
-                              packed + static_cast<size_t>(y) * dst_stride,
-                              sbase + static_cast<size_t>(y) * mapped.RowPitch,
-                              dst_stride);
+                        if (out_w == cw && out_h == ch) {
+                          for (int y = 0; y < ch; ++y) {
+                            std::memcpy(
+                                packed + static_cast<size_t>(y) * dst_stride,
+                                sbase + static_cast<size_t>(y) * mapped.RowPitch,
+                                dst_stride);
+                          }
+                        } else {
+                          for (int y = 0; y < out_h; ++y) {
+                            const int sy_idx = (y * ch) / out_h;
+                            const auto* srow = reinterpret_cast<const uint32_t*>(
+                                sbase + static_cast<size_t>(sy_idx) * mapped.RowPitch);
+                            auto* drow = reinterpret_cast<uint32_t*>(
+                                packed + static_cast<size_t>(y) * dst_stride);
+                            for (int x = 0; x < out_w; ++x)
+                              drow[x] = srow[(x * cw) / out_w];
+                          }
                         }
                         auto frame = std::make_unique<CapturedFrameBuffers>();
-                        frame->full_w = cw;
-                        frame->full_h = ch;
+                        frame->full_w = out_w;
+                        frame->full_h = out_h;
                         frame->full_stride = dst_stride;
                         if (delivered_count == 0 || (delivered_count % 4 == 0)) {
                           frame->thumb_bytes = downsample_bgrx_thumb(
-                              packed, cw, ch, dst_stride, &frame->thumb_w,
+                              packed, out_w, out_h, dst_stride, &frame->thumb_w,
                               &frame->thumb_h, &frame->thumb_stride);
                         }
                         frame->full_bytes = g_bytes_new_take(
-                            packed, static_cast<gsize>(ch) * dst_stride);
+                            packed, static_cast<gsize>(out_h) * dst_stride);
                         publish_frame(std::move(frame), gen);
                         ++delivered_count;
                         last_deliver = now;
@@ -807,7 +832,10 @@ void worker_main(LiveWallpaperTarget target,
     }
   }
 
-  g_session.running.store(false, std::memory_order_release);
+  if (gen == g_session.session_gen.load(std::memory_order_acquire))
+    g_session.running.store(false, std::memory_order_release);
+  if (stop_event != nullptr)
+    CloseHandle(stop_event);
 }
 
 }  // namespace
@@ -1013,24 +1041,24 @@ void live_wallpaper_set_paused(bool paused) {
 }
 
 void live_wallpaper_stop() {
-  std::thread to_join;
-  HANDLE ev = nullptr;
+  std::thread to_retire;
   {
     std::lock_guard<std::mutex> lk(g_session.mu);
     g_session.session_gen.fetch_add(1, std::memory_order_acq_rel);
     g_session.running.store(false, std::memory_order_release);
-    ev = g_session.stop_event;
-    g_session.stop_event = nullptr;
-    if (ev != nullptr)
-      SetEvent(ev);
-    to_join = std::move(g_session.worker);
+    // worker_main() owns and closes its stop_event handle on exit; just signal
+    // it and detach the retiring thread so closing Overview never blocks the
+    // GTK main loop waiting on D3D11/WGC/PrintWindow teardown.
+    if (g_session.stop_event != nullptr) {
+      SetEvent(g_session.stop_event);
+      g_session.stop_event = nullptr;
+    }
+    to_retire = std::move(g_session.worker);
     g_session.on_frame = nullptr;
     g_session.user_data = nullptr;
   }
-  if (to_join.joinable())
-    to_join.join();
-  if (ev != nullptr)
-    CloseHandle(ev);
+  if (to_retire.joinable())
+    to_retire.detach();
   {
     std::lock_guard<std::mutex> lk(g_session.mailbox_mu);
     g_session.latest_frame.reset();

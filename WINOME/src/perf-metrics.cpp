@@ -56,7 +56,13 @@ void perf_record_phase_ms(const char* phase, double elapsed_ms) {
     return;
   auto& s = store();
   std::lock_guard<std::mutex> lock(s.mu);
-  if (std::strcmp(phase, "fontmap") == 0) {
+  if (std::strcmp(phase, "pre_gtk") == 0) {
+    s.startup.pre_gtk_ms = elapsed_ms;
+  } else if (std::strcmp(phase, "gtk_init") == 0) {
+    s.startup.gtk_init_ms = elapsed_ms;
+  } else if (std::strcmp(phase, "idle_wait") == 0) {
+    s.startup.idle_wait_ms = elapsed_ms;
+  } else if (std::strcmp(phase, "fontmap") == 0) {
     s.startup.fontmap_ms = elapsed_ms;
   } else if (std::strcmp(phase, "panel") == 0) {
     s.startup.panel_ms = elapsed_ms;
@@ -100,13 +106,15 @@ void perf_finish_startup() {
 
   ProcessTelemetry mem = perf_sample_process_telemetry();
   g_print(
-      "[perf] startup total=%.1fms (recovery=%.1fms, fontmap=%.1fms[%d/%d], "
-      "panel=%.1fms, overview=%.1fms, theming=%.1fms, plugins=%.1fms, "
-      "ipc=%.1fms, activate=%.1fms) | mem private=%.1fMB ws=%.1fMB gdi=%u user=%u\n",
-      copy.total_startup_ms, copy.recovery_ms, copy.fontmap_ms,
+      "[perf] startup total=%.1fms (pre_gtk=%.1fms, gtk_init=%.1fms, "
+      "recovery=%.1fms, fontmap=%.1fms[%d/%d], panel=%.1fms, overview=%.1fms, "
+      "theming=%.1fms, plugins=%.1fms, ipc=%.1fms, activate=%.1fms, "
+      "idle_wait=%.1fms) | mem private=%.1fMB ws=%.1fMB gdi=%u user=%u\n",
+      copy.total_startup_ms, copy.pre_gtk_ms, copy.gtk_init_ms,
+      copy.recovery_ms, copy.fontmap_ms,
       copy.fonts_loaded_files, copy.fonts_family_count, copy.panel_ms,
       copy.overview_init_ms, copy.theming_ms, copy.plugins_ms, copy.ipc_ms,
-      copy.gtk_activate_ms,
+      copy.gtk_activate_ms, copy.idle_wait_ms,
       static_cast<double>(mem.private_bytes) / (1024.0 * 1024.0),
       static_cast<double>(mem.working_set_bytes) / (1024.0 * 1024.0),
       mem.gdi_objects, mem.user_objects);

@@ -56,6 +56,7 @@
 #include "app-grid.h"
 #include "app-index.h"
 #include "config.h"
+#include "debug-runtime.h"
 #include "easing.h"
 #include "fullscreen-watcher.h"
 #include "host-utils.h"
@@ -121,44 +122,40 @@ constexpr int kOverlayIdleHideMs = 750;  // WINDOW_OVERLAY_IDLE_HIDE_TIMEOUT
 // WINDOW_ACTIVE_SIZE_INC, in logical px.
 constexpr double kWindowPickerSpacing = 6.0;
 
-static int
-close_button_size ()
+struct OvThemeMetrics {
+  bool resolved = false;
+  int close_btn = kCloseButtonSize;
+  int close_ico = kCloseIconSize;
+  double picker_spacing = kWindowPickerSpacing;
+};
+
+static const OvThemeMetrics &
+ov_theme_metrics (void)
 {
-  StEngine *engine = StEngine::get ();
-  if (engine != nullptr) {
-    StEngine::Node node (*engine, nullptr, "", "window-close", "");
-    double v = 0;
-    if (node.lookup_length ("width", &v) && v > 0)
-      return (int)(v + 0.5);
+  static OvThemeMetrics m;
+  if (!m.resolved) {
+    m.resolved = true;
+    if (StEngine *engine = StEngine::get ()) {
+      StEngine::Node close_node (*engine, nullptr, "", "window-close", "");
+      double v = 0;
+      if (close_node.lookup_length ("width", &v) && v > 0)
+        m.close_btn = (int)(v + 0.5);
+      v = 0;
+      if (close_node.lookup_length ("icon-size", &v) && v > 0)
+        m.close_ico = (int)(v + 0.5);
+
+      StEngine::Node picker_node (*engine, nullptr, "", "window-picker", "");
+      v = 0;
+      if (picker_node.lookup_length ("spacing", &v) && v >= 0)
+        m.picker_spacing = v;
+    }
   }
-  return kCloseButtonSize;
+  return m;
 }
 
-static int
-close_icon_size ()
-{
-  StEngine *engine = StEngine::get ();
-  if (engine != nullptr) {
-    StEngine::Node node (*engine, nullptr, "", "window-close", "");
-    double v = 0;
-    if (node.lookup_length ("icon-size", &v) && v > 0)
-      return (int)(v + 0.5);
-  }
-  return kCloseIconSize;
-}
-
-static double
-window_picker_spacing ()
-{
-  StEngine *engine = StEngine::get ();
-  if (engine != nullptr) {
-    StEngine::Node node (*engine, nullptr, "", "window-picker", "");
-    double v = 0;
-    if (node.lookup_length ("spacing", &v) && v >= 0)
-      return v;
-  }
-  return kWindowPickerSpacing;
-}
+static int close_button_size () { return ov_theme_metrics ().close_btn; }
+static int close_icon_size () { return ov_theme_metrics ().close_ico; }
+static double window_picker_spacing () { return ov_theme_metrics ().picker_spacing; }
 
 // overviewControls.js & workspacesView.js constants.
 constexpr double kVerticalSpacingRatio = 0.02;
@@ -1334,10 +1331,14 @@ on_async_wallpaper_ready (gpointer user_data)
   return G_SOURCE_REMOVE;
 }
 
+static std::atomic<bool> g_wallpaper_prewarm_in_flight{false};
+
 static void
 start_wallpaper_prewarm_async (void)
 {
   if (g_wallpaper != nullptr || !g_overview_alive)
+    return;
+  if (g_wallpaper_prewarm_in_flight.exchange (true, std::memory_order_acq_rel))
     return;
   int max_w = GetSystemMetrics (SM_CXSCREEN);
   int max_h = GetSystemMetrics (SM_CYSCREEN);
@@ -1349,6 +1350,11 @@ start_wallpaper_prewarm_async (void)
   const int target_h = std::max (max_h, 720);
   std::shared_ptr<std::atomic<bool>> alive = g_overview_alive;
   std::thread ([alive, target_w, target_h] () {
+    struct PrewarmResetGuard {
+      ~PrewarmResetGuard () {
+        g_wallpaper_prewarm_in_flight.store (false, std::memory_order_release);
+      }
+    } reset_guard;
     if (!alive->load (std::memory_order_acquire))
       return;
     wchar_t path[MAX_PATH] = L"";
@@ -2349,6 +2355,17 @@ struct OverviewView {
   bool m_dwm_frame_pending = false;
   bool m_dwm_pending_has_mini = false;
   BYTE m_dwm_pending_mini_opacity = 0;
+  gint64 m_anim_tick_cpu_max_us = 0;
+  gint64 m_anim_dwm_flush_max_us = 0;
+  int m_anim_panel_dirty_frames = 0;
+  bool m_gl_backing_sanitized = false;
+  bool m_open_perf_pending = false;
+  gint64 m_open_perf_show_us = 0;
+  gint64 m_open_perf_trans_us = 0;
+  gint64 m_open_perf_tick0_enter_us = 0;
+  gint64 m_open_perf_tick0_exit_us = 0;
+  gint64 m_open_perf_paint0_us = 0;
+  gint64 m_open_perf_tick1_enter_us = 0;
 
   RECT m_bg_full = {0, 0, 0, 0};
   RECT m_bg_picker = {0, 0, 0, 0};
@@ -2374,6 +2391,7 @@ struct OverviewView {
   std::vector<MiniSlot> m_mini_slots;
 
   int m_monitor_w = 0, m_monitor_h = 0;
+  int m_last_layout_w = 0, m_last_layout_h = 0;
   int m_placed_scale = 0;
   int m_placed_search_h = 0;
   int m_dash_top = 0;
@@ -2437,7 +2455,9 @@ struct OverviewView {
   {
     if (m_cloaked_for_open) {
       m_cloaked_for_open = false;
+      winome::sanitize_gdk_gl_backing_windows ();
       set_hwnd_cloaked (m_hwnd, false);
+      winome::sanitize_gdk_gl_backing_windows ();
     }
   }
 
@@ -2685,11 +2705,17 @@ hover_layout_chrome (void)
 
   const SlotEntry &slot = m_slots[index];
   RECT disp = hover_display_rect ();
+  const bool chrome_changed =
+      (g_chrome_target != slot.target || g_chrome_owner_view != this ||
+       !is_visible_hwnd (g_chrome_hwnd));
   g_chrome_target = slot.target;
   chrome_show_at (this, disp);
   icon_show_at (this, disp, slot.target);
   caption_show_at (this, disp);
-  restack_locked ();
+  // Skip expensive EnumDisplayMonitors + 48-HWND Z-order scans on pure
+  // hover-scale animation frames when chrome is already visible for this slot.
+  if (chrome_changed)
+    restack_locked ();
 }
 
 // Frame-clock driver for the hover scale + caption fade animations: locked
@@ -3213,6 +3239,7 @@ flush_pending_dwm_frame (void)
 {
   if (!m_dwm_frame_pending)
     return;
+  const gint64 dwm_t0 = g_get_monotonic_time ();
   m_dwm_frame_pending = false;
   for (SlotEntry &s : m_slots) {
     if (s.has_pending_dwm) {
@@ -3224,6 +3251,9 @@ flush_pending_dwm_frame (void)
     m_dwm_pending_has_mini = false;
     set_mini_opacity (m_dwm_pending_mini_opacity);
   }
+  const gint64 dwm_dt = g_get_monotonic_time () - dwm_t0;
+  if (dwm_dt > m_anim_dwm_flush_max_us)
+    m_anim_dwm_flush_max_us = dwm_dt;
 }
 
 void
@@ -3239,6 +3269,14 @@ void
 on_overview_after_paint (GdkFrameClock *clock G_GNUC_UNUSED,
                          gpointer user_data G_GNUC_UNUSED)
 {
+  if (!m_gl_backing_sanitized) {
+    m_gl_backing_sanitized = true;
+    winome::sanitize_gdk_gl_backing_windows ();
+  }
+  if (m_open_perf_pending && m_open_perf_tick0_exit_us != 0 &&
+      m_open_perf_paint0_us == 0) {
+    m_open_perf_paint0_us = g_get_monotonic_time ();
+  }
   flush_pending_dwm_frame ();
 }
 
@@ -3699,22 +3737,8 @@ apply_ws_boxes (const std::vector<RECT> &boxes, bool sync_mini = true)
       }
     }
   }
-  if (same) {
-    if (settled && (!m_ws_hist1_boxes.empty () || !m_ws_hist2_boxes.empty ())) {
-      m_ws_hist1_boxes.clear ();
-      m_ws_hist2_boxes.clear ();
-      if (sync_mini)
-        sync_mini_previews_visibility (m_mini_target_opacity);
-    }
+  if (same)
     return false;
-  }
-  if (settled) {
-    m_ws_hist1_boxes.clear ();
-    m_ws_hist2_boxes.clear ();
-  } else {
-    m_ws_hist2_boxes = std::move (m_ws_hist1_boxes);
-    m_ws_hist1_boxes = m_ws_cur_boxes;
-  }
   m_ws_cur_boxes = boxes;
   m_bg_cur = active_rect;
   m_ws_bg_last_radius = m_bg_radius;
@@ -3734,20 +3758,7 @@ apply_bg_rect (const RECT &rect, bool sync_mini = true)
   if (m_ws_cur_boxes.size () <= 1 && EqualRect (&m_bg_cur, &rect) &&
       m_ws_bg_last_radius == m_bg_radius &&
       m_ws_bg_settled_shadow_drawn == settled) {
-    if (settled && (!m_ws_hist1_boxes.empty () || !m_ws_hist2_boxes.empty ())) {
-      m_ws_hist1_boxes.clear ();
-      m_ws_hist2_boxes.clear ();
-      if (sync_mini)
-        sync_mini_previews_visibility (m_mini_target_opacity);
-    }
     return false;
-  }
-  if (settled) {
-    m_ws_hist1_boxes.clear ();
-    m_ws_hist2_boxes.clear ();
-  } else {
-    m_ws_hist2_boxes = std::move (m_ws_hist1_boxes);
-    m_ws_hist1_boxes = m_ws_cur_boxes;
   }
   m_bg_cur = rect;
   if (m_ws_cur_boxes.size () <= 1) {
@@ -4090,7 +4101,7 @@ place_overview_locked (bool opening, int switch_dir = 0,
       gtk_fixed_move (GTK_FIXED (m_root), m_app_grid, m_grid_x, m_grid_y);
     }
     const bool need_grid_now =
-        !opening || m_app_grid_mode ||
+        m_app_grid_mode ||
         m_pending_show_state == ControlsState::APP_GRID ||
         !m_search_query.empty ();
     if (need_grid_now)
@@ -4438,7 +4449,8 @@ place_overview_locked (bool opening, int switch_dir = 0,
         set_hover (slot_at_cursor ());
     }
   }
-  dump_zorder (this, "placed");
+  if (debug_get_flags ().zorder_trace)
+    dump_zorder (this, "placed");
 }
 
 void
@@ -4485,6 +4497,13 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
   (void)user_data;
   Animation &anim = m_anim;
 
+  const gint64 tick_t0 = g_get_monotonic_time ();
+  if (m_open_perf_pending) {
+    if (!anim.started && m_open_perf_tick0_enter_us == 0)
+      m_open_perf_tick0_enter_us = tick_t0;
+    else if (anim.started && m_open_perf_tick1_enter_us == 0)
+      m_open_perf_tick1_enter_us = tick_t0;
+  }
   flush_pending_dwm_frame ();
   ensure_after_paint_hook (clock);
 
@@ -4496,6 +4515,9 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
   if (!anim.started) {
     anim.started = true;
     anim.start_us = now - 8000;
+    m_anim_tick_cpu_max_us = 0;
+    m_anim_dwm_flush_max_us = 0;
+    m_anim_panel_dirty_frames = 0;
   }
   g_anim_tracker.record_frame_time_us (now);
   double t = (now - anim.start_us) / 1000.0 / (double)anim.duration_ms;
@@ -4514,15 +4536,28 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
 
   RECT bg = lerp_rect (anim.bg_from, anim.bg_to, e);
   m_bg_radius = anim.radius_from + (anim.radius_to - anim.radius_from) * e;
-  m_panel_cur_progress =
+  // Only push panel progress at animation endpoints and coarse mid-steps so
+  // the separate Panel Win32 OpenGL surface does not serialize a second VSync
+  // wglSwapBuffers on every single Overview animation frame (which halves FPS
+  // from 60fps to 30fps on Intel iGPUs).
+  const double next_panel_p =
       std::clamp (anim.panel_from + (anim.panel_to - anim.panel_from) * e,
                   0.0, 1.0);
-  winome_shell_panel_set_overview_progress_for_monitor (
-      resolve_monitor (), m_panel_cur_progress);
+  const bool panel_endpoint = (t <= 0.0 || t >= 1.0);
+  if (panel_endpoint || std::fabs (next_panel_p - m_panel_cur_progress) >= 0.45) {
+    if (std::fabs (next_panel_p - m_panel_cur_progress) > 1e-4 || panel_endpoint) {
+      m_panel_cur_progress = next_panel_p;
+      ++m_anim_panel_dirty_frames;
+      winome_shell_panel_set_overview_progress_for_monitor (
+          m_monitor != nullptr ? m_monitor : resolve_monitor (),
+          m_panel_cur_progress);
+    }
+  }
   bool gtk_will_paint = false;
   if (!m_ws_anim_to_boxes.empty () &&
       m_ws_anim_from_boxes.size () == m_ws_anim_to_boxes.size ()) {
-    std::vector<RECT> cur_boxes (m_ws_anim_to_boxes.size ());
+    static thread_local std::vector<RECT> cur_boxes;
+    cur_boxes.resize (m_ws_anim_to_boxes.size ());
     for (size_t i = 0; i < m_ws_anim_to_boxes.size (); ++i)
       cur_boxes[i] =
           lerp_rect (m_ws_anim_from_boxes[i], m_ws_anim_to_boxes[i], e);
@@ -4627,20 +4662,62 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
       set_mini_opacity (desired_mini_op);
   }
 
+  const gint64 tick_dt = g_get_monotonic_time () - tick_t0;
+  if (tick_dt > m_anim_tick_cpu_max_us)
+    m_anim_tick_cpu_max_us = tick_dt;
+
   if (t >= 1.0) {
     anim.source = 0;
     anim.started = false;
     auto fstats = g_anim_tracker.snapshot ();
     if (fstats.frames > 0) {
       perf_record_overview_frame_stats (fstats);
-      g_print ("[perf] overview anim frames=%llu dropped=%llu avg=%.2fms p95=%.2fms max=%.2fms\n",
+      g_print ("[perf] overview anim frames=%llu dropped=%llu avg=%.2fms "
+               "p95=%.2fms max=%.2fms tick_max=%.2fms dwm_max=%.2fms "
+               "panel_draws=%d\n",
                static_cast<unsigned long long> (fstats.frames),
                static_cast<unsigned long long> (fstats.dropped_frames),
-               fstats.avg_frame_ms, fstats.p95_frame_ms, fstats.max_frame_ms);
+               fstats.avg_frame_ms, fstats.p95_frame_ms, fstats.max_frame_ms,
+               m_anim_tick_cpu_max_us / 1000.0,
+               m_anim_dwm_flush_max_us / 1000.0,
+               m_anim_panel_dirty_frames);
     }
     if (anim.to_state == ControlsState::HIDDEN) {
       finish_hide ();
       return G_SOURCE_REMOVE;
+    }
+    if (m_open_perf_pending) {
+      m_open_perf_pending = false;
+      const gint64 settle_us = g_get_monotonic_time ();
+      const double total_ms = (settle_us - m_open_perf_show_us) / 1000.0;
+      if (total_ms > 320.0) {
+        const double setup_ms =
+            m_open_perf_trans_us > m_open_perf_show_us
+                ? (m_open_perf_trans_us - m_open_perf_show_us) / 1000.0
+                : -1.0;
+        const double wait0_ms =
+            (m_open_perf_tick0_enter_us > 0 && m_open_perf_trans_us > 0)
+                ? (m_open_perf_tick0_enter_us - m_open_perf_trans_us) / 1000.0
+                : -1.0;
+        const double tick0_ms =
+            (m_open_perf_tick0_exit_us > 0 && m_open_perf_tick0_enter_us > 0)
+                ? (m_open_perf_tick0_exit_us - m_open_perf_tick0_enter_us) / 1000.0
+                : -1.0;
+        const double paint0_ms =
+            (m_open_perf_paint0_us > 0 && m_open_perf_tick0_exit_us > 0)
+                ? (m_open_perf_paint0_us - m_open_perf_tick0_exit_us) / 1000.0
+                : -1.0;
+        const double wait1_ms =
+            (m_open_perf_tick1_enter_us > 0 && m_open_perf_paint0_us > 0)
+                ? (m_open_perf_tick1_enter_us - m_open_perf_paint0_us) / 1000.0
+                : ((m_open_perf_tick1_enter_us > 0 && m_open_perf_tick0_exit_us > 0)
+                       ? (m_open_perf_tick1_enter_us - m_open_perf_tick0_exit_us) / 1000.0
+                       : -1.0);
+        g_print ("[ov-perf] slow_open total=%.1fms setup=%.1fms wait_tick0=%.1fms "
+                 "tick0=%.1fms paint0=%.1fms wait_tick1=%.1fms frames=%llu\n",
+                 total_ms, setup_ms, wait0_ms, tick0_ms, paint0_ms, wait1_ms,
+                 static_cast<unsigned long long> (fstats.frames));
+      }
     }
     // Re-draw settled workspace boxes once anim.source == 0 to paint drop-shadows.
     bool settle_painted = false;
@@ -4679,7 +4756,8 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
       }
       m_grid_cur_opacity = 1.0;
       m_grid_cur_slide_y = 0.0;
-      if (g_live_wallpaper_owner == this) live_wallpaper_set_paused (false);
+      if (g_live_wallpaper_owner == this && !m_search_mode)
+        live_wallpaper_set_paused (false);
       apply_pending_desktop_sync_if_any ();
       recheck_overview_search_focus_on_settle ("app-grid");
       return G_SOURCE_REMOVE;
@@ -4713,11 +4791,13 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
       apply_pending_desktop_sync_if_any ();
     else
       schedule_settle_hover (140);
-    if (m_anim.source == 0 && m_switch_source == 0)
+    if (m_anim.source == 0 && m_switch_source == 0 && !m_search_mode)
       if (g_live_wallpaper_owner == this) live_wallpaper_set_paused (false);
     recheck_overview_search_focus_on_settle ("picker");
     return G_SOURCE_REMOVE;
   }
+  if (m_open_perf_pending && m_open_perf_tick0_exit_us == 0)
+    m_open_perf_tick0_exit_us = g_get_monotonic_time ();
   return G_SOURCE_CONTINUE;
 }
 
@@ -5221,6 +5301,12 @@ start_state_transition (ControlsState to_state, guint duration_ms)
   m_ws_hist2_boxes.clear ();
 
   restack_locked ();
+  if (to_state == ControlsState::HIDDEN) {
+    m_open_perf_pending = false;
+  } else if (m_open_perf_pending && prev_target == ControlsState::HIDDEN &&
+             m_open_perf_trans_us == 0) {
+    m_open_perf_trans_us = g_get_monotonic_time ();
+  }
   m_anim.start_us = g_get_monotonic_time ();
   g_anim_tracker.reset ();
   m_anim.source =
@@ -5239,6 +5325,8 @@ finish_hide (void)
     live_wallpaper_stop ();
     g_using_live_wallpaper = false;
     g_live_wallpaper_owner = nullptr;
+    g_clear_object (&g_live_wallpaper);
+    g_clear_object (&g_live_wallpaper_thumb);
   }
   clear_pending_dwm_frame ();
   cancel_focus_verify ();
@@ -5254,6 +5342,7 @@ finish_hide (void)
       (m_hwnd != nullptr && GetForegroundWindow () == m_hwnd);
   if (m_window != nullptr && gtk_widget_get_visible (m_window))
     gtk_widget_set_visible (m_window, FALSE);
+  winome::sanitize_gdk_gl_backing_windows ();
   winome_shell_panel_set_overview_progress_for_monitor (
       resolve_monitor (), 0.0);
   destroy_previews ();
@@ -5483,10 +5572,7 @@ drag_scale_tick (GtkWidget *widget G_GNUC_UNUSED, GdkFrameClock *clock,
     return G_SOURCE_REMOVE;
   }
   const gint64 now = gdk_frame_clock_get_frame_time (clock);
-  if (!update_dragged_slot_transform (now)) {
-    m_drag_tick_source = 0;
-    return G_SOURCE_REMOVE;
-  }
+  update_dragged_slot_transform (now);
   return G_SOURCE_CONTINUE;
 }
 
@@ -5679,7 +5765,8 @@ on_drag_update (GtkGestureDrag *drag G_GNUC_UNUSED, double dx, double dy,
     }
   }
 
-  update_dragged_slot_transform (g_get_monotonic_time ());
+  if (m_drag_tick_source == 0)
+    update_dragged_slot_transform (g_get_monotonic_time ());
 
   POINT screen_pt{};
   HMONITOR cur_mon = nullptr;
@@ -6261,15 +6348,20 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
 
 void
 on_overview_surface_layout (GdkSurface *surface G_GNUC_UNUSED,
-                            int width G_GNUC_UNUSED,
-                            int height G_GNUC_UNUSED,
+                            int width,
+                            int height,
                             gpointer user_data G_GNUC_UNUSED)
 {
   if (m_window == nullptr || !gtk_widget_get_visible (m_window))
     return;
   if (m_anim.source != 0 || m_switch_source != 0)
     return;
-  restack_locked ();
+  const bool size_changed =
+      (width != m_last_layout_w || height != m_last_layout_h);
+  m_last_layout_w = width;
+  m_last_layout_h = height;
+  if (!m_placed || size_changed)
+    restack_locked ();
   if (m_placed && m_target_state != ControlsState::HIDDEN) {
     int scale = std::max (gtk_widget_get_scale_factor (m_window), 1);
     int cur_search_h = m_placed_search_h;
@@ -6462,13 +6554,13 @@ on_app_grid_pins_changed (void *user_data G_GNUC_UNUSED)
 
 // Relayout without animation (window closed via the chrome button etc.).
 void
-rebuild_now (void)
+rebuild_now (const SharedOpenSnapshot *shared_snap = nullptr)
 {
   if (m_window == nullptr || !gtk_widget_get_visible (m_window))
     return;
   if (m_target_state == ControlsState::HIDDEN)
     return;
-  place_overview_locked (false);
+  place_overview_locked (false, 0, shared_snap);
 }
 
 void
@@ -6611,16 +6703,17 @@ apply_search_fade_progress (double p)
       base_op = 76;
     BYTE op = static_cast<BYTE> (
         std::clamp<long> (std::lround (base_op * inv), 0, 255));
-    apply_thumb_rect (s, s.rect, op, true);
+    apply_thumb_rect (s, s.rect, op, false);
   }
 }
 
 gboolean
 search_fade_tick (GtkWidget *widget G_GNUC_UNUSED,
-                  GdkFrameClock *clock G_GNUC_UNUSED,
+                  GdkFrameClock *clock,
                   gpointer user_data G_GNUC_UNUSED)
 {
-  const gint64 now = g_get_monotonic_time ();
+  const gint64 now = clock != nullptr ? gdk_frame_clock_get_frame_time (clock)
+                                      : g_get_monotonic_time ();
   const double elapsed_ms =
       static_cast<double> (now - m_search_fade_start_us) / 1000.0;
   const double raw_t =
@@ -6734,12 +6827,18 @@ sync_search_mode_ui (void)
 
   if (want_search) {
     set_hover (-1, true);
+    if (g_live_wallpaper_owner == this)
+      live_wallpaper_set_paused (true);
     if (!prev_mode && m_app_grid != nullptr)
       app_grid_close_open_folder (m_app_grid);
     if (m_search_view != nullptr)
       overview_search_view_set_query (m_search_view, m_search_raw_text);
     start_search_fade (true);
   } else {
+    if (g_live_wallpaper_owner == this && m_anim.source == 0 &&
+        m_switch_source == 0) {
+      live_wallpaper_set_paused (false);
+    }
     start_search_fade (false);
   }
 }
@@ -7219,6 +7318,18 @@ on_overview_key_pressed (GtkEventControllerKey *controller,
   {
     if (m_window == nullptr)
       return;
+
+    m_gl_backing_sanitized = false;
+    const bool opening_from_hidden =
+        !gtk_widget_get_visible (m_window) ||
+        m_target_state == ControlsState::HIDDEN;
+    m_open_perf_pending = opening_from_hidden;
+    m_open_perf_show_us = opening_from_hidden ? g_get_monotonic_time () : 0;
+    m_open_perf_trans_us = 0;
+    m_open_perf_tick0_enter_us = 0;
+    m_open_perf_tick0_exit_us = 0;
+    m_open_perf_paint0_us = 0;
+    m_open_perf_tick1_enter_us = 0;
 
     m_want_focus_on_open = take_focus;
     if (take_focus) {
@@ -8313,33 +8424,53 @@ caption_show_at (OverviewView *v, const RECT &preview_rect)
       std::max ((int)(mi.rcMonitor.right - mi.rcMonitor.left) / scale, 120);
   int preview_w_logical =
       std::max ((int)(preview_rect.right - preview_rect.left) / scale, 120);
-  int max_cap_w = std::min (mon_w_logical - 24,
-                            std::max (preview_w_logical + 96, 280));
+  // Quantize max_cap_w to 16px buckets so hover scale-up animation doesn't
+  // invalidate caption size/measure on every single VSync frame.
+  int raw_max_cap_w = std::min (mon_w_logical - 24,
+                                std::max (preview_w_logical + 96, 280));
+  int max_cap_w = std::min (mon_w_logical - 24, ((raw_max_cap_w + 15) / 16) * 16);
 
-  gtk_widget_set_size_request (g_caption, -1, -1);
-  gtk_widget_set_size_request (g_caption_wrap, -1, -1);
-  int min_w = 0, nat_w = 0;
-  gtk_widget_measure (g_caption, GTK_ORIENTATION_HORIZONTAL, -1, &min_w, &nat_w,
-                      nullptr, nullptr);
-  if (nat_w <= 0) {
-    caption_hide ();
-    return;
-  }
-  int want_def_w = std::clamp (nat_w + 4, std::min (min_w + 4, max_cap_w),
-                               std::max (max_cap_w, 32));
-  int min_h = 0, nat_h = 0;
-  gtk_widget_measure (g_caption, GTK_ORIENTATION_VERTICAL, want_def_w, &min_h,
-                      &nat_h, nullptr, nullptr);
-  int want_def_h = std::max (nat_h, 1);
+  static std::string s_cap_txt;
+  static int s_cap_scale = 0;
+  static int s_cap_max_w = 0;
+  static int s_cap_w = 0;
+  static int s_cap_h = 0;
 
-  gtk_widget_set_size_request (g_caption_wrap, want_def_w, want_def_h);
-  int cur_def_w = 0, cur_def_h = 0;
-  gtk_window_get_default_size (GTK_WINDOW (g_caption_window), &cur_def_w,
-                               &cur_def_h);
-  if (cur_def_w != want_def_w || cur_def_h != want_def_h) {
-    gtk_window_set_default_size (GTK_WINDOW (g_caption_window), want_def_w,
-                                 want_def_h);
-    gtk_widget_queue_resize (g_caption_window);
+  int want_def_w = s_cap_w;
+  int want_def_h = s_cap_h;
+  if (s_cap_w <= 0 || s_cap_h <= 0 || s_cap_scale != scale ||
+      s_cap_max_w != max_cap_w || s_cap_txt != txt) {
+    gtk_widget_set_size_request (g_caption, -1, -1);
+    gtk_widget_set_size_request (g_caption_wrap, -1, -1);
+    int min_w = 0, nat_w = 0;
+    gtk_widget_measure (g_caption, GTK_ORIENTATION_HORIZONTAL, -1, &min_w,
+                        &nat_w, nullptr, nullptr);
+    if (nat_w <= 0) {
+      caption_hide ();
+      return;
+    }
+    want_def_w = std::clamp (nat_w + 4, std::min (min_w + 4, max_cap_w),
+                             std::max (max_cap_w, 32));
+    int min_h = 0, nat_h = 0;
+    gtk_widget_measure (g_caption, GTK_ORIENTATION_VERTICAL, want_def_w, &min_h,
+                        &nat_h, nullptr, nullptr);
+    want_def_h = std::max (nat_h, 1);
+
+    s_cap_txt = txt;
+    s_cap_scale = scale;
+    s_cap_max_w = max_cap_w;
+    s_cap_w = want_def_w;
+    s_cap_h = want_def_h;
+
+    gtk_widget_set_size_request (g_caption_wrap, want_def_w, want_def_h);
+    int cur_def_w = 0, cur_def_h = 0;
+    gtk_window_get_default_size (GTK_WINDOW (g_caption_window), &cur_def_w,
+                                 &cur_def_h);
+    if (cur_def_w != want_def_w || cur_def_h != want_def_h) {
+      gtk_window_set_default_size (GTK_WINDOW (g_caption_window), want_def_w,
+                                   want_def_h);
+      gtk_widget_queue_resize (g_caption_window);
+    }
   }
 
   int w = want_def_w * scale;
@@ -8408,34 +8539,35 @@ overview_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
   OverviewView *v = reinterpret_cast<OverviewView *> (
       GetPropW (hwnd, kOverviewViewProp));
-  HWND active_panel = v != nullptr ? v->panel_hwnd_for_view () : g_panel_hwnd;
 
-  if (msg == WM_WINDOWPOSCHANGING && lParam != 0 &&
-      (GetWindowLongPtrW (hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0 &&
-      active_panel != nullptr && IsWindow (active_panel) &&
-      IsWindowVisible (active_panel) &&
-      (GetWindowLongPtrW (active_panel, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0) {
-    auto *wp = reinterpret_cast<WINDOWPOS *> (lParam);
-    if ((wp->flags & SWP_NOZORDER) == 0) {
-      HWND folder_hwnd = active_folder_hwnd ();
-      HWND allowed_anchor = active_panel;
-      HWND chrome_layers[] = {folder_hwnd, g_chrome_hwnd, g_icon_hwnd,
-                              g_caption_hwnd};
-      for (HWND h : chrome_layers) {
-        if (is_visible_hwnd (h) &&
-            (GetWindowLongPtrW (h, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0) {
-          allowed_anchor = h;
+  if (msg == WM_WINDOWPOSCHANGING && lParam != 0) {
+    HWND active_panel = v != nullptr ? v->panel_hwnd_for_view () : g_panel_hwnd;
+    if ((GetWindowLongPtrW (hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0 &&
+        active_panel != nullptr && IsWindow (active_panel) &&
+        IsWindowVisible (active_panel) &&
+        (GetWindowLongPtrW (active_panel, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0) {
+      auto *wp = reinterpret_cast<WINDOWPOS *> (lParam);
+      if ((wp->flags & SWP_NOZORDER) == 0) {
+        HWND folder_hwnd = active_folder_hwnd ();
+        HWND allowed_anchor = active_panel;
+        HWND chrome_layers[] = {folder_hwnd, g_chrome_hwnd, g_icon_hwnd,
+                                g_caption_hwnd};
+        for (HWND h : chrome_layers) {
+          if (is_visible_hwnd (h) &&
+              (GetWindowLongPtrW (h, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0) {
+            allowed_anchor = h;
+          }
         }
-      }
-      if (wp->hwndInsertAfter != active_panel &&
-          wp->hwndInsertAfter != folder_hwnd &&
-          wp->hwndInsertAfter != g_chrome_hwnd &&
-          wp->hwndInsertAfter != g_icon_hwnd &&
-          wp->hwndInsertAfter != g_caption_hwnd &&
-          !is_any_panel_hwnd (wp->hwndInsertAfter) &&
-          !is_any_overview_view_hwnd (wp->hwndInsertAfter)) {
-        wp->hwndInsertAfter = allowed_anchor;
-        wp->flags |= SWP_NOOWNERZORDER;
+        if (wp->hwndInsertAfter != active_panel &&
+            wp->hwndInsertAfter != folder_hwnd &&
+            wp->hwndInsertAfter != g_chrome_hwnd &&
+            wp->hwndInsertAfter != g_icon_hwnd &&
+            wp->hwndInsertAfter != g_caption_hwnd &&
+            !is_any_panel_hwnd (wp->hwndInsertAfter) &&
+            !is_any_overview_view_hwnd (wp->hwndInsertAfter)) {
+          wp->hwndInsertAfter = allowed_anchor;
+          wp->flags |= SWP_NOOWNERZORDER;
+        }
       }
     }
   }
@@ -8784,6 +8916,7 @@ restack_locked (void)
     return;
   if (!zorder_drifted (panels, overviews))
     return;
+  winome::sanitize_gdk_gl_backing_windows ();
 
   HWND panel_popover =
       static_cast<HWND> (winome_shell_panel_top_popover_hwnd ());
@@ -8945,8 +9078,17 @@ static gboolean
 overview_idle_trim_cb (gpointer user_data G_GNUC_UNUSED)
 {
   g_idle_trim_timer = 0;
-  if (!overview_any_open ())
+  if (!overview_any_open ()) {
     app_icon_cache_trim (64);
+    for (auto &up : g_views) {
+      if (up && up->m_app_grid_clip != nullptr) {
+        WinomeAppGridClip *clip = WINOME_APP_GRID_CLIP (up->m_app_grid_clip);
+        app_grid_clip_cancel_capture (clip);
+        g_clear_object (&clip->cached_page0_tex);
+        clip->cached_page0_version = 0;
+      }
+    }
+  }
   return G_SOURCE_REMOVE;
 }
 
@@ -9564,6 +9706,21 @@ overview_handle_escape (HMONITOR preferred_monitor)
 void
 overview_refresh_all_open (void)
 {
+  int open_count = 0;
+  for (const auto &up : g_views) {
+    if (up && up->is_open ())
+      ++open_count;
+  }
+  if (open_count == 0)
+    return;
+  if (open_count >= 2) {
+    SharedOpenSnapshot snap = capture_shared_open_snapshot ();
+    for (auto &up : g_views) {
+      if (up && up->is_open ())
+        up->rebuild_now (&snap);
+    }
+    return;
+  }
   for (auto &up : g_views) {
     if (up && up->is_open ())
       up->rebuild_now ();

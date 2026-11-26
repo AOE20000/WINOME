@@ -24,6 +24,7 @@
 
 #include <cstdio>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace winome {
@@ -772,7 +773,43 @@ void on_diag_refresh_clicked(GtkButton* btn G_GNUC_UNUSED, gpointer ud G_GNUC_UN
   populate_diagnostics_box();
 }
 
-void on_export_diagnostics_clicked(GtkButton* btn G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
+struct DiagExportUiResult {
+  GtkWidget* btn = nullptr;
+  DiagnosticsExportResult res;
+};
+
+gboolean idle_diag_export_done(gpointer user_data) {
+  auto* r = static_cast<DiagExportUiResult*>(user_data);
+  if (r->btn != nullptr) {
+    gtk_widget_set_sensitive(r->btn, TRUE);
+    g_object_unref(r->btn);
+  }
+  if (g_ui.diag_export_status != nullptr && GTK_IS_LABEL(g_ui.diag_export_status)) {
+    if (r->res.ok) {
+      std::string msg = std::string(tr("Exported (", "已导出排障包（共 ")) +
+                        std::to_string(r->res.file_count) +
+                        tr(" files): ", " 个文件）：") +
+                        utf8_from_wide(r->res.zip_path);
+      gtk_label_set_text(GTK_LABEL(g_ui.diag_export_status), msg.c_str());
+    } else {
+      std::string msg = std::string(tr("Export failed: ", "导出失败：")) + r->res.error;
+      gtk_label_set_text(GTK_LABEL(g_ui.diag_export_status), msg.c_str());
+    }
+    gtk_widget_set_visible(g_ui.diag_export_status, TRUE);
+  }
+  delete r;
+  return G_SOURCE_REMOVE;
+}
+
+void shell_open_async(std::wstring target) {
+  std::thread([t = std::move(target)] {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    ShellExecuteW(nullptr, L"open", t.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    CoUninitialize();
+  }).detach();
+}
+
+void on_export_diagnostics_clicked(GtkButton* btn, gpointer ud G_GNUC_UNUSED) {
   debug_flush_log_repeats();
 
   const ProcessTelemetry tel = perf_sample_process_telemetry();
@@ -822,28 +859,30 @@ void on_export_diagnostics_clicked(GtkButton* btn G_GNUC_UNUSED, gpointer ud G_G
     opts.extra_files.push_back(
         {"debug/live-logs.json", debug_logs_to_json(live_logs)});
   }
-  const auto wins = debug_inspect_windows();
-  if (!wins.empty()) {
-    opts.extra_files.push_back(
-        {"debug/zorder-windows.json", debug_windows_to_json(wins)});
-  }
 
-  const DiagnosticsExportResult res = export_diagnostics_bundle(opts);
-  if (res.ok) {
-    reveal_file_in_explorer(res.zip_path);
-    if (g_ui.diag_export_status != nullptr) {
-      std::string msg = std::string(tr("Exported (", "已导出排障包（共 ")) +
-                        std::to_string(res.file_count) +
-                        tr(" files): ", " 个文件）：") +
-                        utf8_from_wide(res.zip_path);
-      gtk_label_set_text(GTK_LABEL(g_ui.diag_export_status), msg.c_str());
-      gtk_widget_set_visible(g_ui.diag_export_status, TRUE);
-    }
-  } else if (g_ui.diag_export_status != nullptr) {
-    std::string msg = std::string(tr("Export failed: ", "导出失败：")) + res.error;
-    gtk_label_set_text(GTK_LABEL(g_ui.diag_export_status), msg.c_str());
+  GtkWidget* btn_ref = btn != nullptr ? GTK_WIDGET(g_object_ref(G_OBJECT(btn))) : nullptr;
+  if (btn_ref != nullptr)
+    gtk_widget_set_sensitive(btn_ref, FALSE);
+  if (g_ui.diag_export_status != nullptr) {
+    gtk_label_set_text(GTK_LABEL(g_ui.diag_export_status),
+                       tr("Exporting diagnostics…", "正在导出排障包…"));
     gtk_widget_set_visible(g_ui.diag_export_status, TRUE);
   }
+
+  std::thread([opts = std::move(opts), btn_ref]() mutable {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const auto wins = debug_inspect_windows();
+    if (!wins.empty()) {
+      opts.extra_files.push_back(
+          {"debug/zorder-windows.json", debug_windows_to_json(wins)});
+    }
+    DiagnosticsExportResult res = export_diagnostics_bundle(opts);
+    if (res.ok)
+      reveal_file_in_explorer(res.zip_path);
+    CoUninitialize();
+    auto* ui_res = new DiagExportUiResult{btn_ref, std::move(res)};
+    g_idle_add(idle_diag_export_done, ui_res);
+  }).detach();
 }
 
 void on_stack_page_changed(GObject* obj, GParamSpec* pspec G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
@@ -853,13 +892,13 @@ void on_stack_page_changed(GObject* obj, GParamSpec* pspec G_GNUC_UNUSED, gpoint
 }
 
 void on_open_win_settings(GtkButton* btn G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
-  ShellExecuteW(nullptr, L"open", L"ms-settings:", nullptr, nullptr, SW_SHOWNORMAL);
+  shell_open_async(L"ms-settings:");
 }
 
 void on_open_config_folder(GtkButton* btn G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
   std::wstring dir = local_app_winome_dir(nullptr);
   CreateDirectoryW(dir.c_str(), nullptr);
-  ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  shell_open_async(std::move(dir));
 }
 
 void on_open_crashes_folder(GtkButton* btn G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
@@ -867,7 +906,7 @@ void on_open_crashes_folder(GtkButton* btn G_GNUC_UNUSED, gpointer ud G_GNUC_UNU
   CreateDirectoryW(root.c_str(), nullptr);
   std::wstring crashes = local_app_winome_dir(L"crashes");
   CreateDirectoryW(crashes.c_str(), nullptr);
-  ShellExecuteW(nullptr, L"open", crashes.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  shell_open_async(std::move(crashes));
 }
 
 void on_reset_defaults(GtkButton* btn G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {

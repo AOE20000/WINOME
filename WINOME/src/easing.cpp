@@ -129,19 +129,30 @@ apply_value (GtkWidget *widget, const TweenTarget &target, double value)
 {
   switch (target.kind) {
   case TweenTarget::Kind::opacity:
-    gtk_widget_set_opacity (widget, value);
+    if (std::fabs (gtk_widget_get_opacity (widget) - value) > 1e-4)
+      gtk_widget_set_opacity (widget, value);
     break;
-  case TweenTarget::Kind::width:
-    gtk_widget_set_size_request (widget, (int) (value + 0.5), -1);
+  case TweenTarget::Kind::width: {
+    const int want = (int) (value + 0.5);
+    int cur_w = -1, cur_h = -1;
+    gtk_widget_get_size_request (widget, &cur_w, &cur_h);
+    if (cur_w != want)
+      gtk_widget_set_size_request (widget, want, -1);
     break;
-  case TweenTarget::Kind::height:
-    gtk_widget_set_size_request (widget, -1, (int) (value + 0.5));
+  }
+  case TweenTarget::Kind::height: {
+    const int want = (int) (value + 0.5);
+    int cur_w = -1, cur_h = -1;
+    gtk_widget_get_size_request (widget, &cur_w, &cur_h);
+    if (cur_h != want)
+      gtk_widget_set_size_request (widget, -1, want);
     break;
+  }
   }
 }
 
 gboolean
-on_tick (GtkWidget *widget, GdkFrameClock *clock G_GNUC_UNUSED, gpointer data)
+on_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
 {
   auto *st = static_cast<TweenState *> (data);
   if (st->widget == nullptr)
@@ -149,7 +160,8 @@ on_tick (GtkWidget *widget, GdkFrameClock *clock G_GNUC_UNUSED, gpointer data)
 
   g_object_ref (widget);
 
-  const gint64 now = g_get_monotonic_time ();
+  const gint64 now = clock != nullptr ? gdk_frame_clock_get_frame_time (clock)
+                                      : g_get_monotonic_time ();
   if (st->start_us == 0)
     st->start_us = now;
 
@@ -160,11 +172,10 @@ on_tick (GtkWidget *widget, GdkFrameClock *clock G_GNUC_UNUSED, gpointer data)
   if (progress >= 1.0)
     progress = 1.0;
 
-  const double eased = ease_sample (st->ease, progress);
-  apply_value (widget, st->target,
-               st->target.from + (st->target.to - st->target.from) * eased);
-
   if (progress < 1.0) {
+    const double eased = ease_sample (st->ease, progress);
+    apply_value (widget, st->target,
+                 st->target.from + (st->target.to - st->target.from) * eased);
     g_object_unref (widget);
     return G_SOURCE_CONTINUE;
   }

@@ -116,9 +116,12 @@ WINOME 作为独立程序运行，不修改系统文件、不向 `explorer.exe` 
 
 ### 性能优化措施
 
-- **动画走帧时钟与帧预算监控**：概览开合、悬停 chrome、菜单开合均使用 `gtk_widget_add_tick_callback`（对齐显示器 vblank），`overview.cpp` 以 `FrameTimeTracker(20000)` 统计平均/P95/最大帧耗时与掉帧计数。
+- **动画走帧时钟与帧预算监控**：概览开合、悬停 chrome、菜单开合均使用 `gtk_widget_add_tick_callback`（对齐显示器 vblank），`overview.cpp` 以 `FrameTimeTracker(20000)` 统计平均/P95/最大帧耗时、掉帧计数、`tick_max`、`dwm_max` 与 `panel_draws`；概览动画期间节流顶栏进度的跨 GL 窗口推送，避免双 Win32 OpenGL Surface 串行 VSync 将帧率腰斩至 30fps。
 - **z-order 漂移门控与事件化自愈**：`fullscreen-watcher` 接入 `EVENT_SYSTEM_MINIMIZEEND` 与工作区变更即时重断言，并将后台维护巡检 `maintenance_tick` 放宽至 `10s`；重断言前校验 `popover > panel > chrome > overview` 链，链路完整即跳过 `SetWindowPos`。
-- **隔离 Fontconfig 与空闲纹理收缩**：`fonts.cpp` 使用 `FcConfigCreate()` 隔离 Fontconfig 实例并加载捆绑字体与精选 CJK/Emoji 回退链（测试进程 `winome-tests` 测得 `57.8ms`–`58.3ms`，主宿主场景实测 `1226.1ms`）；概览关闭闲置 `15s` 后收敛图标缓存至 256 条并收缩桌面壁纸按屏解码，纯透明淡入跳过 `gtk_fixed_move`。
+- **隔离 Fontconfig 与空闲纹理收缩**：`fonts.cpp` 使用 `FcConfigCreate()` 隔离 Fontconfig 实例并配置 `%LOCALAPPDATA%\WINOME\fontconfig-cache` 持久化缓存目录与精选 CJK/Emoji 回退链；概览关闭闲置后收敛图标缓存至 64 条（按 `128`/`256` 规范分桶并带负缓存）并释放 `WinomeAppGridClip::cached_page0_tex` 与实时壁纸引用。
+- **开发者模式自动化测试与通用调试操作通道（`winome-ctl test` / `winome-ctl dev` / Looking Glass）**：当 `developer_mode` 开启时，`\\.\pipe\WINOME_Shell_IPC` 与 Looking Glass 同时提供：
+  - **自动化测试接口（`test.*`）**：`test.trigger`（单次触发单次返回）、`test.run`（连续/预设步骤聚合返回，内置 `slow-double-win` 与 `overview-bench`）及 `test.begin`/`test.end`（跨命令追踪会话），自动汇总时间轴日志、内存增量与 `[perf] overview anim` 帧率统计；
+  - **通用调试操作通道（`dev.*`，[dev-channel.cpp](../WINOME/src/dev-channel.cpp)）**：`dev.help` / `dev.op` / `dev.batch` 覆盖 OS 级任意键鼠与文本注入（`key.*`、`type`、`mouse.*`）、Win32 窗口直控（`win.*`）、GTK4 实时窗口/渲染器/控件树/CSS 热注入与点击（`gtk.*`）、WINOME 全子系统直调（`shell.*`）及性能/日志快照（`perf.snapshot`、`log.*`），支持多步流水线与过程日志捕获。
 - **GPU 渲染与产物基线**：
   - 关键窗口由 OpenGL（`GskGLRenderer` / `ngl`）硬件绘制，`[gpu]` 启动日志记录渲染器与 GL 厂商；
   - **测试构建（`test` / `debugoptimized`）**：`winome.exe` 约 `22MB`；

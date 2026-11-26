@@ -60,7 +60,10 @@ uintptr_t hwnd_key(HWND h) {
   return reinterpret_cast<uintptr_t>(h);
 }
 
-bool is_manageable_user_window(HWND hwnd, bool use_blacklist) {
+bool is_manageable_user_window(HWND hwnd,
+                               bool use_blacklist,
+                               DWORD* out_cloaked = nullptr,
+                               RECT* out_rect = nullptr) {
   if (hwnd == nullptr || !IsWindow(hwnd))
     return false;
   DWORD pid = 0;
@@ -95,7 +98,13 @@ bool is_manageable_user_window(HWND hwnd, bool use_blacklist) {
     if (!GetWindowRect(hwnd, &r))
       return false;
   }
-  return r.right > r.left && r.bottom > r.top;
+  if (r.right <= r.left || r.bottom <= r.top)
+    return false;
+  if (out_cloaked != nullptr)
+    *out_cloaked = cloaked;
+  if (out_rect != nullptr)
+    *out_rect = r;
+  return true;
 }
 
 HMONITOR monitor_of_window(HWND hwnd) {
@@ -124,11 +133,13 @@ struct EnumLiveCtx {
 
 BOOL CALLBACK enum_live_windows_proc(HWND hwnd, LPARAM lp) {
   auto* ctx = reinterpret_cast<EnumLiveCtx*>(lp);
-  if (!is_manageable_user_window(hwnd, ctx->use_blacklist))
-    return TRUE;
   DWORD cloaked = 0;
-  DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
-  HMONITOR mon = monitor_of_window(hwnd);
+  RECT rect{};
+  if (!is_manageable_user_window(hwnd, ctx->use_blacklist, &cloaked, &rect))
+    return TRUE;
+  HMONITOR mon = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+  if (mon == nullptr)
+    mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
   if (mon == nullptr)
     return TRUE;
   LiveWindowSnapshot snap{};
@@ -224,7 +235,7 @@ void unpin_all_auto_pinned_locked(std::vector<HWND>* out_to_unpin) {
 
 void sync_primary_only_secondary_pins() {
   const auto monitors = enumerate_monitors();
-  if (monitors.size() <= 1 || !vd::available())
+  if (monitors.size() <= 1 || !vd::cached_snapshot().valid)
     return;
   HMONITOR primary = monitor_manager_primary_monitor();
   if (primary == nullptr)
@@ -329,7 +340,7 @@ void apply_mode_transition() {
       } else if (target == MultiMonitorWorkspaceMode::PrimaryOnly &&
                  g_ws.primary_only_sync_timer == 0) {
         g_ws.primary_only_sync_timer =
-            g_timeout_add(900, primary_only_sync_tick, nullptr);
+            g_timeout_add(3000, primary_only_sync_tick, nullptr);
       }
     } else if (target == MultiMonitorWorkspaceMode::Independent) {
       for (const auto& m : monitors)
@@ -364,6 +375,18 @@ void apply_mode_transition() {
 
 void on_ws_config_changed(void* data) {
   (void)data;
+  const WinomeConfig& cfg = get_config();
+  static bool initialized = false;
+  static std::string last_mode;
+  static bool last_sync_primary = false;
+  if (initialized &&
+      cfg.multi_monitor_workspace_mode == last_mode &&
+      cfg.sync_windows_primary_display == last_sync_primary) {
+    return;
+  }
+  initialized = true;
+  last_mode = cfg.multi_monitor_workspace_mode;
+  last_sync_primary = cfg.sync_windows_primary_display;
   apply_mode_transition();
 }
 
@@ -728,11 +751,13 @@ bool move_window_to_workspace(HWND hwnd, HMONITOR mon, int target_index) {
       vd::pin_window_async(hwnd);
       return true;
     }
+    bool need_unpin = false;
     {
       std::lock_guard<std::mutex> lk(g_ws.mu);
-      if (g_ws.auto_pinned_secondary.erase(hwnd) > 0)
-        vd::unpin_window(hwnd);
+      need_unpin = (g_ws.auto_pinned_secondary.erase(hwnd) > 0);
     }
+    if (need_unpin)
+      vd::unpin_window(hwnd);
     return vd::move_window_to_desktop(hwnd, target_index);
   }
   return vd::move_window_to_desktop(hwnd, target_index);

@@ -122,17 +122,19 @@ shell_open_utf8 (const std::string &target, HMONITOR target_monitor = nullptr)
                      ? target_monitor
                      : monitor_manager_active_monitor ();
   watch_launched_window_for_monitor (mon);
-  SHELLEXECUTEINFOW sei {};
-  sei.cbSize = sizeof (sei);
-  sei.fMask = SEE_MASK_FLAG_NO_UI;
-  if (mon != nullptr) {
-    sei.fMask |= SEE_MASK_HMONITOR;
-    sei.hMonitor = mon;
-  }
-  sei.lpVerb = L"open";
-  sei.lpFile = wide.c_str ();
-  sei.nShow = SW_SHOWNORMAL;
-  ShellExecuteExW (&sei);
+  std::thread ([wide = std::move (wide), mon] () {
+    SHELLEXECUTEINFOW sei {};
+    sei.cbSize = sizeof (sei);
+    sei.fMask = SEE_MASK_FLAG_NO_UI;
+    if (mon != nullptr) {
+      sei.fMask |= SEE_MASK_HMONITOR;
+      sei.hMonitor = mon;
+    }
+    sei.lpVerb = L"open";
+    sei.lpFile = wide.c_str ();
+    sei.nShow = SW_SHOWNORMAL;
+    ShellExecuteExW (&sei);
+  }).detach ();
 }
 
 void
@@ -720,6 +722,7 @@ struct WinomeSearchView {
   int grid_count = 0;
   int selected_idx = -1;
   bool async_files_pending = false;
+  guint sync_debounce_timer = 0;
   guint async_debounce_timer = 0;
 
   uint64_t gen = 0;
@@ -1231,6 +1234,10 @@ cancel_async_search (WinomeSearchView *self)
 {
   if (self == nullptr)
     return;
+  if (self->sync_debounce_timer != 0) {
+    g_source_remove (self->sync_debounce_timer);
+    self->sync_debounce_timer = 0;
+  }
   if (self->async_debounce_timer != 0) {
     g_source_remove (self->async_debounce_timer);
     self->async_debounce_timer = 0;
@@ -1317,10 +1324,17 @@ rebuild_sync_providers (WinomeSearchView *self)
     gtk_widget_set_margin_top (grid_row, 8);
     gtk_widget_set_margin_bottom (grid_row, 10);
 
-    const std::vector<RunningWindow> running_wins =
-        app_index_enumerate_running_windows ();
+    static std::vector<RunningWindow> s_cached_running_wins;
+    static gint64 s_cached_running_wins_us = 0;
+    const gint64 now_us = g_get_monotonic_time ();
+    if (s_cached_running_wins_us == 0 ||
+        (now_us - s_cached_running_wins_us) > 1000LL * 1000) {
+      s_cached_running_wins = app_index_enumerate_running_windows ();
+      s_cached_running_wins_us = now_us;
+    }
+    const std::vector<RunningWindow> &running_wins = s_cached_running_wins;
     const int icon_px = 76;
-    const int load_px = std::clamp (icon_px * std::max (scale, 2), 96, 192);
+    const int load_px = (scale >= 2) ? 256 : 128;
 
     size_t added = 0;
     for (size_t i = 0;
@@ -1510,8 +1524,12 @@ rebuild_sync_providers (WinomeSearchView *self)
         if (!wc.process_name.empty ())
           desc += " · " + wc.process_name;
 
-        GdkTexture *tex =
-            app_icon_for_window (wc.hwnd, L"", kListItemIconSize * scale);
+        std::string win_key = !wc.process_name.empty ()
+                                  ? ("win:" + wc.process_name)
+                                  : ("hwnd:" + std::to_string (
+                                        reinterpret_cast<uintptr_t> (wc.hwnd)));
+        GdkTexture *tex = app_icon_for_window (
+            wc.hwnd, L"", kListItemIconSize * scale, win_key);
         GtkWidget *row = make_list_row_button (
             self, tex, "application-x-executable", title, desc, item_idx);
         if (tex != nullptr)
@@ -2033,6 +2051,25 @@ overview_search_view_new (const OverviewSearchCallbacks &cbs)
   return GTK_WIDGET (self);
 }
 
+static gboolean
+on_sync_debounce_fire (gpointer user_data)
+{
+  WinomeSearchView *self = WINOME_SEARCH_VIEW (user_data);
+  self->sync_debounce_timer = 0;
+  rebuild_sync_providers (self);
+  return G_SOURCE_REMOVE;
+}
+
+static void
+flush_sync_debounce_if_pending (WinomeSearchView *self)
+{
+  if (self != nullptr && self->sync_debounce_timer != 0) {
+    g_source_remove (self->sync_debounce_timer);
+    self->sync_debounce_timer = 0;
+    rebuild_sync_providers (self);
+  }
+}
+
 void
 overview_search_view_set_query (GtkWidget *view, const std::string &raw_query)
 {
@@ -2046,9 +2083,19 @@ overview_search_view_set_query (GtkWidget *view, const std::string &raw_query)
   }
   if (raw_query == self->raw_query && next_terms == self->terms)
     return;
+  const bool was_empty = self->terms.empty ();
   self->raw_query = raw_query;
   self->terms = std::move (next_terms);
-  rebuild_sync_providers (self);
+  if (self->sync_debounce_timer != 0) {
+    g_source_remove (self->sync_debounce_timer);
+    self->sync_debounce_timer = 0;
+  }
+  if (was_empty) {
+    rebuild_sync_providers (self);
+  } else {
+    self->sync_debounce_timer =
+        g_timeout_add (45, on_sync_debounce_fire, self);
+  }
 }
 
 void
@@ -2076,6 +2123,7 @@ overview_search_view_navigate (GtkWidget *view, guint keyval,
   if (view == nullptr)
     return false;
   WinomeSearchView *self = WINOME_SEARCH_VIEW (view);
+  flush_sync_debounce_if_pending (self);
   if (self->items.empty ())
     return false;
 
@@ -2125,6 +2173,7 @@ overview_search_view_activate_selected (GtkWidget *view, bool new_instance)
   if (view == nullptr)
     return false;
   WinomeSearchView *self = WINOME_SEARCH_VIEW (view);
+  flush_sync_debounce_if_pending (self);
   if (self->items.empty ())
     return false;
   int idx = self->selected_idx >= 0 ? self->selected_idx : 0;

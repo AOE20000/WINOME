@@ -10,9 +10,10 @@
 #include <dwmapi.h>
 #include <glib.h>
 
+#include <cstdint>
 #include <cwchar>
 #include <mutex>
-#include <set>
+#include <unordered_map>
 
 namespace winome {
 namespace {
@@ -22,6 +23,16 @@ constexpr DWORD kDwmWindowCornerPreference = 33;
 constexpr DWORD kDwmCornerDefault = 0;
 constexpr DWORD kDwmCornerRound = 2;
 
+constexpr uint8_t kFlagDark = 1u << 0;
+constexpr uint8_t kFlagCorners = 1u << 1;
+
+struct EnumApplyParams {
+  bool dark = false;
+  bool reset_dark = false;
+  bool corners = false;
+  bool reset_corners = false;
+};
+
 struct ThemingState {
   std::mutex mu;
   HWINEVENTHOOK show_hook = nullptr;
@@ -30,7 +41,7 @@ struct ThemingState {
   bool corners_enabled = false;
   bool prev_dark_enabled = false;
   bool prev_corners_enabled = false;
-  std::set<HWND> touched_hwnds;
+  std::unordered_map<HWND, uint8_t> applied_flags;
 };
 
 ThemingState g_theming;
@@ -53,6 +64,19 @@ void apply_dwm_to_hwnd(HWND hwnd, bool set_dark, bool reset_dark,
   if (hwnd == nullptr || !IsWindow(hwnd))
     return;
 
+  const uint8_t want_mask =
+      (set_dark ? kFlagDark : 0u) | (set_corners ? kFlagCorners : 0u);
+  const bool any_reset = reset_dark || reset_corners;
+
+  // Fast path: if we already applied the exact requested flags to this HWND
+  // and nothing is being reset, skip Win32 style queries and DWM RPCs.
+  if (!any_reset) {
+    std::lock_guard<std::mutex> lock(g_theming.mu);
+    auto it = g_theming.applied_flags.find(hwnd);
+    if (it != g_theming.applied_flags.end() && it->second == want_mask)
+      return;
+  }
+
   DWORD pid = 0;
   GetWindowThreadProcessId(hwnd, &pid);
   const bool own = (pid == GetCurrentProcessId());
@@ -65,12 +89,15 @@ void apply_dwm_to_hwnd(HWND hwnd, bool set_dark, bool reset_dark,
   if (!should_apply_dwm_theming_to_hwnd_info(cls, style, ex_style, visible, own))
     return;
 
+  uint8_t next_mask = 0;
   bool touched = false;
   if (set_dark || reset_dark) {
     BOOL val = set_dark ? TRUE : FALSE;
     if (SUCCEEDED(DwmSetWindowAttribute(hwnd, kDwmUseImmersiveDarkMode,
                                         &val, sizeof(val)))) {
       touched = true;
+      if (set_dark)
+        next_mask |= kFlagDark;
     }
   }
   if (set_corners || reset_corners) {
@@ -78,31 +105,35 @@ void apply_dwm_to_hwnd(HWND hwnd, bool set_dark, bool reset_dark,
     if (SUCCEEDED(DwmSetWindowAttribute(hwnd, kDwmWindowCornerPreference,
                                         &pref, sizeof(pref)))) {
       touched = true;
+      if (set_corners)
+        next_mask |= kFlagCorners;
     }
   }
 
   if (touched) {
     std::lock_guard<std::mutex> lock(g_theming.mu);
-    if (set_dark || set_corners) {
-      g_theming.touched_hwnds.insert(hwnd);
+    if (next_mask != 0) {
+      g_theming.applied_flags[hwnd] = next_mask;
+      if (g_theming.applied_flags.size() > 256) {
+        for (auto it = g_theming.applied_flags.begin();
+             it != g_theming.applied_flags.end();) {
+          if (!IsWindow(it->first))
+            it = g_theming.applied_flags.erase(it);
+          else
+            ++it;
+        }
+      }
+    } else {
+      g_theming.applied_flags.erase(hwnd);
     }
   }
 }
 
 BOOL CALLBACK enum_apply_proc(HWND hwnd, LPARAM lparam) {
-  (void)lparam;
-  bool dark = false, reset_dark = false;
-  bool corners = false, reset_corners = false;
-  {
-    std::lock_guard<std::mutex> lock(g_theming.mu);
-    dark = g_theming.dark_enabled;
-    reset_dark = !dark && g_theming.prev_dark_enabled;
-    corners = g_theming.corners_enabled;
-    reset_corners = !corners && g_theming.prev_corners_enabled;
-  }
-  if (!dark && !reset_dark && !corners && !reset_corners)
+  const auto* p = reinterpret_cast<const EnumApplyParams*>(lparam);
+  if (p == nullptr || (!p->dark && !p->reset_dark && !p->corners && !p->reset_corners))
     return TRUE;
-  apply_dwm_to_hwnd(hwnd, dark, reset_dark, corners, reset_corners);
+  apply_dwm_to_hwnd(hwnd, p->dark, p->reset_dark, p->corners, p->reset_corners);
   return TRUE;
 }
 
@@ -222,15 +253,16 @@ void window_theming_sync_all() {
   ensure_hooks_for_state();
 
   if (want_dark || want_corners) {
-    EnumWindows(enum_apply_proc, 0);
+    EnumApplyParams params{want_dark, reset_dark, want_corners, reset_corners};
+    EnumWindows(enum_apply_proc, reinterpret_cast<LPARAM>(&params));
   } else if (reset_dark || reset_corners) {
-    std::set<HWND> snapshot;
+    std::unordered_map<HWND, uint8_t> snapshot;
     {
       std::lock_guard<std::mutex> lock(g_theming.mu);
-      snapshot.swap(g_theming.touched_hwnds);
+      snapshot.swap(g_theming.applied_flags);
     }
-    for (HWND h : snapshot)
-      apply_dwm_to_hwnd(h, false, reset_dark, false, reset_corners);
+    for (const auto& kv : snapshot)
+      apply_dwm_to_hwnd(kv.first, false, reset_dark, false, reset_corners);
   }
 }
 
@@ -245,7 +277,7 @@ void window_theming_shutdown() {
   HWINEVENTHOOK to_unhook_fg = nullptr;
   bool reset_dark = false;
   bool reset_corners = false;
-  std::set<HWND> snapshot;
+  std::unordered_map<HWND, uint8_t> snapshot;
   {
     std::lock_guard<std::mutex> lock(g_theming.mu);
     to_unhook_show = g_theming.show_hook;
@@ -256,15 +288,15 @@ void window_theming_shutdown() {
     reset_corners = g_theming.corners_enabled;
     g_theming.dark_enabled = false;
     g_theming.corners_enabled = false;
-    snapshot.swap(g_theming.touched_hwnds);
+    snapshot.swap(g_theming.applied_flags);
   }
   if (to_unhook_show != nullptr)
     UnhookWinEvent(to_unhook_show);
   if (to_unhook_fg != nullptr)
     UnhookWinEvent(to_unhook_fg);
   if (reset_dark || reset_corners) {
-    for (HWND h : snapshot)
-      apply_dwm_to_hwnd(h, false, reset_dark, false, reset_corners);
+    for (const auto& kv : snapshot)
+      apply_dwm_to_hwnd(kv.first, false, reset_dark, false, reset_corners);
   }
 }
 

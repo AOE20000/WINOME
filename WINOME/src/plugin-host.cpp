@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -466,10 +467,16 @@ struct PluginRun : std::enable_shared_from_this<PluginRun> {
   HANDLE stderr_r = nullptr;
 
   std::atomic<bool> stop_requested{false};
+  std::condition_variable stdin_cv;
+  std::deque<std::string> stdin_queue;
+  bool stdin_closed = false;
+  std::thread stdin_thread;
   std::mutex wait_state_mutex;
   std::thread stdout_thread;
   std::thread stderr_thread;
   std::thread wait_thread;
+
+  static constexpr size_t kMaxStdinQueue = 128;
 
   ~PluginRun() {
     if (hProcessExitedEvent != nullptr) {
@@ -478,31 +485,73 @@ struct PluginRun : std::enable_shared_from_this<PluginRun> {
     }
   }
 
+  // Non-blocking enqueue so a hung plugin filling its 4 KB pipe buffer can
+  // never freeze the GTK main thread or deadlock stdout_thread.
   bool write_line(const std::string& line) {
-    std::lock_guard<std::mutex> lock(stdin_mutex);
-    if (stdin_w == nullptr)
-      return false;
     std::string buf = line;
     if (buf.empty() || buf.back() != '\n')
       buf.push_back('\n');
-    const char* ptr = buf.data();
-    size_t rem = buf.size();
-    while (rem > 0) {
-      DWORD written = 0;
-      if (!WriteFile(stdin_w, ptr, static_cast<DWORD>(rem), &written, nullptr) ||
-          written == 0) {
+    {
+      std::lock_guard<std::mutex> lock(stdin_mutex);
+      if (stdin_closed || stdin_w == nullptr || stdin_queue.size() >= kMaxStdinQueue)
         return false;
-      }
-      ptr += written;
-      rem -= written;
+      stdin_queue.push_back(std::move(buf));
     }
+    stdin_cv.notify_one();
     return true;
   }
 
   void close_stdin_locked() {
-    if (stdin_w != nullptr) {
-      CloseHandle(stdin_w);
-      stdin_w = nullptr;
+    stdin_closed = true;
+    stdin_cv.notify_all();
+  }
+
+  void stdin_writer_loop() {
+    for (;;) {
+      std::string msg;
+      HANDLE pipe = nullptr;
+      {
+        std::unique_lock<std::mutex> lock(stdin_mutex);
+        stdin_cv.wait(lock, [this] {
+          return stdin_closed || !stdin_queue.empty();
+        });
+        if (!stdin_queue.empty()) {
+          msg = std::move(stdin_queue.front());
+          stdin_queue.pop_front();
+          pipe = stdin_w;
+        } else if (stdin_closed) {
+          if (stdin_w != nullptr) {
+            CloseHandle(stdin_w);
+            stdin_w = nullptr;
+          }
+          break;
+        }
+      }
+      if (pipe == nullptr)
+        break;
+      const char* ptr = msg.data();
+      size_t rem = msg.size();
+      bool ok = true;
+      while (rem > 0) {
+        DWORD written = 0;
+        if (!WriteFile(pipe, ptr, static_cast<DWORD>(rem), &written, nullptr) ||
+            written == 0) {
+          ok = false;
+          break;
+        }
+        ptr += written;
+        rem -= written;
+      }
+      if (!ok) {
+        std::lock_guard<std::mutex> lock(stdin_mutex);
+        stdin_closed = true;
+        stdin_queue.clear();
+        if (stdin_w != nullptr) {
+          CloseHandle(stdin_w);
+          stdin_w = nullptr;
+        }
+        break;
+      }
     }
   }
 };
@@ -967,6 +1016,8 @@ void wait_worker(std::shared_ptr<PluginRun> run) {
     run->close_stdin_locked();
   }
 
+  if (run->stdin_thread.joinable())
+    run->stdin_thread.join();
   if (run->stdout_thread.joinable())
     run->stdout_thread.join();
   if (run->stderr_thread.joinable())
@@ -1160,6 +1211,7 @@ bool launch_plugin_locked(PluginRecord* rec, std::string* out_err) {
   }
   {
     std::lock_guard<std::mutex> lock_ws(run->wait_state_mutex);
+    run->stdin_thread = std::thread([run]() { run->stdin_writer_loop(); });
     run->stdout_thread = std::thread(read_pipe_lines, run->stdout_r, false, run);
     run->stderr_thread = std::thread(read_pipe_lines, run->stderr_r, true, run);
     run->wait_thread = std::thread(wait_worker, run);

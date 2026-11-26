@@ -82,6 +82,7 @@ std::vector<DebugLogEntry> debug_get_logs_since(uint64_t after_seq,
                                                 const std::string& tag_filter,
                                                 size_t max_count);
 uint64_t debug_latest_log_seq();
+uint64_t debug_oldest_log_seq();
 void debug_clear_logs();
 
 DebugFlags debug_get_flags();

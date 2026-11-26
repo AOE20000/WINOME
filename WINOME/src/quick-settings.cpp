@@ -962,15 +962,19 @@ on_volume_mute_clicked (GtkButton *button G_GNUC_UNUSED, gpointer user_data)
 static void
 on_brightness_changed (GtkWidget *slider, gpointer G_GNUC_UNUSED user_data)
 {
-  winome::set_brightness (quick_slider_get_value (slider));
+  winome::set_brightness_async (quick_slider_get_value (slider));
 }
 
 static void
 on_screenshot_clicked (GtkButton *button G_GNUC_UNUSED,
                        gpointer G_GNUC_UNUSED user_data)
 {
-  ShellExecuteW (nullptr, L"open", L"ms-screenclip:", nullptr, nullptr,
-                 SW_SHOWNORMAL);
+  std::thread ([] {
+    CoInitializeEx (nullptr, COINIT_APARTMENTTHREADED);
+    ShellExecuteW (nullptr, L"open", L"ms-screenclip:", nullptr, nullptr,
+                   SW_SHOWNORMAL);
+    CoUninitialize ();
+  }).detach ();
 }
 
 static void
@@ -1242,22 +1246,49 @@ build_ws_mode_menu (gpointer user_data)
 static void wifi_menu_refresh_async (struct WifiMenu *m, gboolean trigger_scan);
 static void bluetooth_menu_refresh_async (struct BluetoothMenu *m, bool issue_inquiry);
 
-static void
-on_wlan_toggled (GtkToggleButton *button, gpointer user_data)
+struct WlanToggleTaskResult {
+  GtkWidget *panel;
+  GtkWidget *button;
+  gboolean   active;
+};
+
+static gboolean
+idle_wlan_toggle_done (gpointer user_data)
 {
-  gboolean active = gtk_toggle_button_get_active (button);
-  winome_wifi_set_enabled (active);
-  if (user_data != nullptr) {
-    GtkWidget *qs = GTK_WIDGET (user_data);
-    winome_quick_settings_refresh (qs);
-    GtkWidget *drawer = quick_settings_open_drawer_child (qs);
+  auto *res = static_cast<WlanToggleTaskResult *> (user_data);
+  if (res->button != nullptr) {
+    gtk_widget_set_sensitive (res->button, TRUE);
+    g_object_unref (res->button);
+  }
+  if (res->panel != nullptr) {
+    winome_quick_settings_refresh (res->panel);
+    GtkWidget *drawer = quick_settings_open_drawer_child (res->panel);
     if (drawer != nullptr) {
       auto *wm = static_cast<WifiMenu *> (
           g_object_get_data (G_OBJECT (drawer), "wifi-menu"));
       if (wm != nullptr)
-        wifi_menu_refresh_async (wm, active);
+        wifi_menu_refresh_async (wm, res->active);
     }
+    g_object_unref (res->panel);
   }
+  delete res;
+  return G_SOURCE_REMOVE;
+}
+
+static void
+on_wlan_toggled (GtkToggleButton *button, gpointer user_data)
+{
+  const gboolean active = gtk_toggle_button_get_active (button);
+  gtk_widget_set_sensitive (GTK_WIDGET (button), FALSE);
+  GtkWidget *panel = user_data != nullptr
+                         ? GTK_WIDGET (g_object_ref (G_OBJECT (user_data)))
+                         : nullptr;
+  GtkWidget *btn = GTK_WIDGET (g_object_ref (G_OBJECT (button)));
+  std::thread ([active, panel, btn] () {
+    winome_wifi_set_enabled (active);
+    auto *res = new WlanToggleTaskResult{panel, btn, active};
+    g_idle_add (idle_wlan_toggle_done, res);
+  }).detach ();
 }
 
 struct BluetoothTaskResult {
@@ -1326,12 +1357,41 @@ on_dnd_toggled (GtkToggleButton *button, gpointer G_GNUC_UNUSED user_data)
   winome::notifications_notify_dnd_changed ();
 }
 
+struct AirplaneToggleTaskResult {
+  GtkWidget *panel;
+  GtkWidget *button;
+};
+
+static gboolean
+idle_airplane_toggle_done (gpointer user_data)
+{
+  auto *res = static_cast<AirplaneToggleTaskResult *> (user_data);
+  if (res->button != nullptr) {
+    gtk_widget_set_sensitive (res->button, TRUE);
+    g_object_unref (res->button);
+  }
+  if (res->panel != nullptr) {
+    winome_quick_settings_refresh (res->panel);
+    g_object_unref (res->panel);
+  }
+  delete res;
+  return G_SOURCE_REMOVE;
+}
+
 static void
 on_airplane_toggled (GtkToggleButton *button, gpointer user_data)
 {
-  winome::set_airplane_mode (gtk_toggle_button_get_active (button) != FALSE);
-  if (user_data != nullptr)
-    winome_quick_settings_refresh (GTK_WIDGET (user_data));
+  const bool active = gtk_toggle_button_get_active (button) != FALSE;
+  gtk_widget_set_sensitive (GTK_WIDGET (button), FALSE);
+  GtkWidget *panel = user_data != nullptr
+                         ? GTK_WIDGET (g_object_ref (G_OBJECT (user_data)))
+                         : nullptr;
+  GtkWidget *btn = GTK_WIDGET (g_object_ref (G_OBJECT (button)));
+  std::thread ([active, panel, btn] () {
+    winome::set_airplane_mode (active);
+    auto *res = new AirplaneToggleTaskResult{panel, btn};
+    g_idle_add (idle_airplane_toggle_done, res);
+  }).detach ();
 }
 
 static void
@@ -2871,9 +2931,8 @@ build_wifi_menu (gpointer user_data)
 
   WinomeWifiNetwork *list = nullptr;
   guint count = 0;
-  if (st.enabled) {
-    winome_wifi_query_snapshot_threadsafe (&st, &list, &count, FALSE);
-  }
+  // Build the drawer immediately without blocking the GTK main thread on
+  // synchronous WLAN RPCs; wifi_menu_refresh_async() below populates live APs.
 
   GtkWidget *menu = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class (menu, "quick-toggle-menu");
@@ -3181,9 +3240,9 @@ build_bluetooth_menu (gpointer user_data)
                                 sizeof (bt_name));
 
   winome::BluetoothDevice devs[24] = {};
-  int count = bt_enabled ? winome::get_bluetooth_devices (devs, 24) : 0;
-  if (count < 0)
-    count = 0;
+  int count = 0;
+  // Open immediately without blocking the GTK main thread on synchronous
+  // Bluetooth device enumeration; bluetooth_menu_refresh_async() populates live.
 
   GtkWidget *menu = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class (menu, "quick-toggle-menu");
@@ -3697,6 +3756,24 @@ winome_quick_settings_plugin_remove (const char *key)
   }
 }
 
+static void
+set_qs_label_if_changed (GtkWidget *label, const char *text)
+{
+  if (label == nullptr || text == nullptr)
+    return;
+  if (g_strcmp0 (gtk_label_get_text (GTK_LABEL (label)), text) != 0)
+    gtk_label_set_text (GTK_LABEL (label), text);
+}
+
+static void
+set_qs_icon_if_changed (GtkWidget *image, const char *name)
+{
+  if (image == nullptr || name == nullptr)
+    return;
+  if (g_strcmp0 (gtk_image_get_icon_name (GTK_IMAGE (image)), name) != 0)
+    gtk_image_set_from_icon_name (GTK_IMAGE (image), name);
+}
+
 void
 winome_quick_settings_refresh (GtkWidget *quick_settings)
 {
@@ -3736,15 +3813,14 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
       && winome::get_battery_status (&battery)) {
     gchar text[16];
     snprintf (text, sizeof (text), "%d%%", battery.percentage);
-    gtk_label_set_text (GTK_LABEL (power_title), text);
-
-    gtk_image_set_from_icon_name (GTK_IMAGE (power_icon),
-                                  battery_icon_name (battery));
+    set_qs_label_if_changed (power_title, text);
+    set_qs_icon_if_changed (power_icon, battery_icon_name (battery));
 
     // Native keeps the PowerToggle hidden when there is no battery/UPS and
     // shows the action buttons pushed to the right edge instead.
-    gtk_widget_set_visible (power_toggle, TRUE);
-  } else if (power_toggle) {
+    if (!gtk_widget_get_visible (power_toggle))
+      gtk_widget_set_visible (power_toggle, TRUE);
+  } else if (power_toggle && gtk_widget_get_visible (power_toggle)) {
     gtk_widget_set_visible (power_toggle, FALSE);
   }
 
@@ -3759,14 +3835,14 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
 
     if (volume_icon) {
       winome::get_mute (&muted);
-      gtk_image_set_from_icon_name (GTK_IMAGE (volume_icon),
-                                    volume_icon_name (volume, muted));
+      set_qs_icon_if_changed (volume_icon, volume_icon_name (volume, muted));
     }
   }
 
   double brightness = 0.5;
   const bool has_brightness = winome::get_brightness (&brightness);
-  if (brightness_row)
+  if (brightness_row &&
+      gtk_widget_get_visible (brightness_row) != (has_brightness ? TRUE : FALSE))
     gtk_widget_set_visible (brightness_row, has_brightness ? TRUE : FALSE);
   if (brightness_slider && has_brightness) {
     g_signal_handlers_block_by_func (brightness_slider,
@@ -3791,7 +3867,7 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
                             : ((wifi_st.connected && wifi_st.ssid[0] != '\0')
                                    ? wifi_st.ssid
                                    : tr ("Not Connected", "未连接"));
-      gtk_label_set_text (GTK_LABEL (parts->subtitle_label), sub);
+      set_qs_label_if_changed (parts->subtitle_label, sub);
     }
   }
 
@@ -3800,7 +3876,8 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
     char bt_name[249] = "";
     winome::get_bluetooth_status (&bt_present, &bt_enabled, bt_name,
                                   sizeof (bt_name));
-    gtk_widget_set_visible (bluetooth_toggle, bt_present ? TRUE : FALSE);
+    if (gtk_widget_get_visible (bluetooth_toggle) != (bt_present ? TRUE : FALSE))
+      gtk_widget_set_visible (bluetooth_toggle, bt_present ? TRUE : FALSE);
     set_toggle_active_blocked (bluetooth_toggle,
                                bt_enabled ? TRUE : FALSE,
                                G_CALLBACK (on_bluetooth_toggled), quick_settings);
@@ -3812,7 +3889,7 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
                             ? bt_name
                             : (bt_enabled ? tr ("On", "已开启")
                                           : tr ("Off", "已关闭"));
-      gtk_label_set_text (GTK_LABEL (parts->subtitle_label), sub);
+      set_qs_label_if_changed (parts->subtitle_label, sub);
     }
   }
 
@@ -3831,14 +3908,9 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
                                active != WINOME_POWER_BALANCED,
                                G_CALLBACK (on_power_mode_toggled), quick_settings);
     if (parts) {
-      if (parts->subtitle_label) {
-        gtk_label_set_text (GTK_LABEL (parts->subtitle_label),
-                            winome_power_mode_label (active));
-      }
-      if (parts->icon) {
-        gtk_image_set_from_icon_name (GTK_IMAGE (parts->icon),
-                                      winome_power_mode_icon (active));
-      }
+      set_qs_label_if_changed (parts->subtitle_label,
+                               winome_power_mode_label (active));
+      set_qs_icon_if_changed (parts->icon, winome_power_mode_icon (active));
     }
   }
 
@@ -3864,8 +3936,8 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
       MenuToggleParts *parts = static_cast<MenuToggleParts *> (
           g_object_get_data (G_OBJECT (darkmode_toggle), "menu-toggle-parts"));
       if (parts && parts->subtitle_label) {
-        gtk_label_set_text (GTK_LABEL (parts->subtitle_label),
-                            dark_mode_subtitle (apps_dark, sys_dark));
+        set_qs_label_if_changed (parts->subtitle_label,
+                                 dark_mode_subtitle (apps_dark, sys_dark));
       }
     }
   }
@@ -3892,7 +3964,8 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
       if (g != nullptr && g->drawer_anchor == wsmode_toggle)
         winome_quick_settings_close_menu (quick_settings, FALSE);
     }
-    gtk_widget_set_visible (wsmode_toggle, show_ws_mode ? TRUE : FALSE);
+    if (gtk_widget_get_visible (wsmode_toggle) != (show_ws_mode ? TRUE : FALSE))
+      gtk_widget_set_visible (wsmode_toggle, show_ws_mode ? TRUE : FALSE);
     if (show_ws_mode) {
       const auto &cfg = winome::get_config ();
       const std::string &cur = cfg.multi_monitor_workspace_mode;
@@ -3903,15 +3976,10 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
       MenuToggleParts *parts = static_cast<MenuToggleParts *> (
           g_object_get_data (G_OBJECT (wsmode_toggle), "menu-toggle-parts"));
       if (parts) {
-        if (parts->subtitle_label) {
-          gtk_label_set_text (
-              GTK_LABEL (parts->subtitle_label),
-              ws_mode_pill_subtitle (cfg.multi_monitor_overview_linked, cur));
-        }
-        if (parts->icon) {
-          gtk_image_set_from_icon_name (GTK_IMAGE (parts->icon),
-                                        ws_mode_icon (cur));
-        }
+        set_qs_label_if_changed (
+            parts->subtitle_label,
+            ws_mode_pill_subtitle (cfg.multi_monitor_overview_linked, cur));
+        set_qs_icon_if_changed (parts->icon, ws_mode_icon (cur));
       }
     }
   }

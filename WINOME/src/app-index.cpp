@@ -130,10 +130,19 @@ natural_name_less (const std::wstring &a, const std::wstring &b)
   return _wcsicmp (a.c_str (), b.c_str ()) < 0;
 }
 
+int
+canonical_icon_cache_size (int size)
+{
+  if (size <= 128)
+    return 128;
+  return 256;
+}
+
 std::string
 make_sized_key (const std::string &key, int size)
 {
-  return normalize_app_id (key) + "#" + std::to_string (size);
+  return normalize_app_id (key) + "#" +
+         std::to_string (canonical_icon_cache_size (size));
 }
 
 std::wstring
@@ -1451,10 +1460,24 @@ watch_thread_proc ()
     // Coalesce burst file writes (shortcut installers / Start Menu saves).
     if (WaitForSingleObject (handles[0], 500) == WAIT_OBJECT_0)
       break;
-    for (size_t i = 1; i < handles.size (); ++i) {
-      while (WaitForSingleObject (handles[i], 0) == WAIT_OBJECT_0)
-        FindNextChangeNotification (handles[i]);
+    for (size_t i = 1; i < handles.size (); ) {
+      bool handle_broken = false;
+      int drain_guard = 0;
+      while (WaitForSingleObject (handles[i], 0) == WAIT_OBJECT_0) {
+        if (!FindNextChangeNotification (handles[i]) || ++drain_guard > 64) {
+          handle_broken = true;
+          break;
+        }
+      }
+      if (handle_broken) {
+        FindCloseChangeNotification (handles[i]);
+        handles.erase (handles.begin () + static_cast<ptrdiff_t> (i));
+      } else {
+        ++i;
+      }
     }
+    if (handles.size () <= 1)
+      break;
     app_index_refresh_async (nullptr, nullptr);
   }
 
@@ -2149,6 +2172,35 @@ app_index_debug_dump_json ()
   return out;
 }
 
+std::unordered_map<std::string, size_t> g_id_index;
+
+void
+rebuild_id_index_locked (void)
+{
+  g_id_index.clear ();
+  g_id_index.reserve (g_entries.size () * 3 + 16);
+  for (size_t i = 0; i < g_entries.size (); ++i) {
+    const AppEntry &e = g_entries[i];
+    if (!e.id.empty ())
+      g_id_index.emplace (e.id, i);
+    if (!e.aumid.empty ()) {
+      std::string a = normalize_app_id (app_wide_to_utf8 (e.aumid));
+      if (!a.empty ())
+        g_id_index.emplace (std::move (a), i);
+    }
+    if (!e.target_exe.empty ()) {
+      std::string t = normalize_app_id (app_wide_to_utf8 (e.target_exe));
+      if (!t.empty ())
+        g_id_index.emplace (std::move (t), i);
+    }
+    if (!e.launch_path.empty ()) {
+      std::string lp = normalize_app_id (app_wide_to_utf8 (e.launch_path));
+      if (!lp.empty ())
+        g_id_index.emplace (std::move (lp), i);
+    }
+  }
+}
+
 void
 app_index_refresh_async (void (*on_ready) (void *), void *user_data)
 {
@@ -2173,6 +2225,7 @@ app_index_refresh_async (void (*on_ready) (void *), void *user_data)
       std::lock_guard<std::mutex> lock (g_index_mu);
       g_entries = std::move (fresh);
       g_pinned_layout = std::move (fresh_pinned);
+      rebuild_id_index_locked ();
       g_index_populated = true;
       g_index_revision.fetch_add (1, std::memory_order_release);
     }
@@ -2189,7 +2242,7 @@ app_index_get_all (void)
 {
   {
     std::lock_guard<std::mutex> lock (g_index_mu);
-    if (g_index_populated)
+    if (g_index_populated || g_refresh_running.load (std::memory_order_acquire))
       return g_entries;
   }
   std::vector<AppEntry> fresh = scan_start_menu_sync ();
@@ -2200,6 +2253,7 @@ app_index_get_all (void)
     if (!g_index_populated) {
       g_entries = std::move (fresh);
       g_pinned_layout = std::move (fresh_pinned);
+      rebuild_id_index_locked ();
       g_index_populated = true;
       g_index_revision.fetch_add (1, std::memory_order_release);
     }
@@ -2212,7 +2266,7 @@ app_index_get_pinned_layout ()
 {
   {
     std::lock_guard<std::mutex> lock (g_index_mu);
-    if (g_index_populated)
+    if (g_index_populated || g_refresh_running.load (std::memory_order_acquire))
       return g_pinned_layout;
   }
   app_index_get_all ();
@@ -2233,15 +2287,26 @@ app_index_find_by_id (const std::string &id_or_aumid, AppEntry *out)
   if (norm.empty ())
     return false;
 
-  std::vector<AppEntry> all = app_index_get_all ();
-  for (const AppEntry &e : all) {
-    if (e.id == norm || normalize_app_id (app_wide_to_utf8 (e.aumid)) == norm ||
-        normalize_app_id (app_wide_to_utf8 (e.target_exe)) == norm ||
-        normalize_app_id (app_wide_to_utf8 (e.launch_path)) == norm) {
-      if (out != nullptr)
-        *out = e;
-      return true;
+  {
+    std::lock_guard<std::mutex> lock (g_index_mu);
+    if (g_index_populated || g_refresh_running.load (std::memory_order_acquire)) {
+      auto it = g_id_index.find (norm);
+      if (it != g_id_index.end () && it->second < g_entries.size ()) {
+        if (out != nullptr)
+          *out = g_entries[it->second];
+        return true;
+      }
+      return false;
     }
+  }
+
+  (void)app_index_get_all ();
+  std::lock_guard<std::mutex> lock (g_index_mu);
+  auto it = g_id_index.find (norm);
+  if (it != g_id_index.end () && it->second < g_entries.size ()) {
+    if (out != nullptr)
+      *out = g_entries[it->second];
+    return true;
   }
   return false;
 }
@@ -2510,6 +2575,42 @@ texture_from_hbitmap (HBITMAP bmp)
   return texture;
 }
 
+namespace {
+constexpr size_t kMaxNegIconCacheEntries = 512;
+std::unordered_map<std::string, uint64_t> g_neg_icon_cache;
+
+bool
+is_neg_icon_cached (const std::string &cache_key, int size)
+{
+  if (cache_key.empty () || size <= 0)
+    return false;
+  const std::string skey = make_sized_key (cache_key, size);
+  const uint64_t rev = g_index_revision.load (std::memory_order_acquire);
+  std::lock_guard<std::mutex> lock (g_cache_mu);
+  auto it = g_neg_icon_cache.find (skey);
+  if (it == g_neg_icon_cache.end ())
+    return false;
+  if (it->second != rev) {
+    g_neg_icon_cache.erase (it);
+    return false;
+  }
+  return true;
+}
+
+void
+store_neg_icon_cache (const std::string &cache_key, int size)
+{
+  if (cache_key.empty () || size <= 0)
+    return;
+  const std::string skey = make_sized_key (cache_key, size);
+  const uint64_t rev = g_index_revision.load (std::memory_order_acquire);
+  std::lock_guard<std::mutex> lock (g_cache_mu);
+  if (g_neg_icon_cache.size () >= kMaxNegIconCacheEntries)
+    g_neg_icon_cache.clear ();
+  g_neg_icon_cache[skey] = rev;
+}
+}  // namespace
+
 GdkTexture *
 app_icon_cache_lookup (const std::string &cache_key, int size)
 {
@@ -2534,6 +2635,7 @@ app_icon_cache_store (const std::string &cache_key, int size,
     return;
   std::string skey = make_sized_key (cache_key, size);
   std::lock_guard<std::mutex> lock (g_cache_mu);
+  g_neg_icon_cache.erase (skey);
   auto it = g_cache_map.find (skey);
   if (it != g_cache_map.end ()) {
     g_clear_object (&it->second->texture);
@@ -2562,6 +2664,7 @@ app_icon_cache_clear (void)
     g_clear_object (&item.texture);
   g_cache_lru.clear ();
   g_cache_map.clear ();
+  g_neg_icon_cache.clear ();
 }
 
 void
@@ -2599,10 +2702,14 @@ app_icon_for_path (const std::wstring &path, int size,
       !cache_key.empty () ? cache_key : app_wide_to_utf8 (path);
   if (GdkTexture *cached = app_icon_cache_lookup (effective_key, size))
     return cached;
+  if (is_neg_icon_cached (effective_key, size))
+    return nullptr;
 
   GdkTexture *tex = load_shell_image_for_path (path, size);
   if (tex != nullptr)
     app_icon_cache_store (effective_key, size, tex);
+  else
+    store_neg_icon_cache (effective_key, size);
   return tex;
 }
 
@@ -2613,12 +2720,16 @@ app_icon_for_entry (const AppEntry &entry, int size)
     return nullptr;
   if (GdkTexture *cached = app_icon_cache_lookup (entry.id, size))
     return cached;
+  if (is_neg_icon_cached (entry.id, size))
+    return nullptr;
 
   RawDecodedIcon raw = app_icon_decode_entry_raw (entry, size);
   GdkTexture *tex = app_icon_texture_from_raw (raw);
   app_icon_raw_clear (raw);
   if (tex != nullptr)
     app_icon_cache_store (entry.id, size, tex);
+  else
+    store_neg_icon_cache (entry.id, size);
   return tex;
 }
 
@@ -2630,10 +2741,15 @@ app_icon_for_window (HWND hwnd, const std::wstring &exe, int size,
   if (!key.empty ()) {
     if (GdkTexture *cached = app_icon_cache_lookup (key, size))
       return cached;
+    if (is_neg_icon_cached (key, size))
+      return nullptr;
   }
 
   GdkTexture *texture = nullptr;
-  if (hwnd != nullptr && IsWindow (hwnd)) {
+  // WM_GETICON / GCLP_HICON return 32x32 icons that would be discarded when
+  // requesting high-DPI icons (>48px) and an executable path is available.
+  // Skip the cross-process 100ms SendMessageTimeoutW round-trip in that case.
+  if (hwnd != nullptr && IsWindow (hwnd) && (size <= 48 || exe.empty ())) {
     HICON icon = (HICON)SendMessageTimeoutW (hwnd, WM_GETICON, ICON_BIG, 0,
                                              SMTO_ABORTIFHUNG, 100, nullptr);
     bool owned = false;
@@ -2654,6 +2770,8 @@ app_icon_for_window (HWND hwnd, const std::wstring &exe, int size,
 
   if (!exe.empty ())
     texture = app_icon_for_path (exe, size, key);
+  if (texture == nullptr && !key.empty ())
+    store_neg_icon_cache (key, size);
   return texture;
 }
 

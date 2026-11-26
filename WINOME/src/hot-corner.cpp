@@ -34,12 +34,11 @@ struct HotCornerSnapshot {
 
 struct HotCornerShared {
   std::atomic<HWND> panel_hwnd{nullptr};
-  // SeqLock-protected monitor bounds so WH_MOUSE_LL reads consistent,
-  // untorn monitor RECTs across all displays without ever blocking on a mutex.
+  // Double-buffered monitor snapshots so WH_MOUSE_LL reads wait-free with
+  // zero spinning and zero priority inversion against the GTK main thread.
   std::mutex bounds_write_mu;
-  std::atomic<uint64_t> bounds_seq{0};
-  HotCornerMonitor monitors[kMaxHotCornerMonitors]{};
-  size_t monitor_count = 0;
+  HotCornerSnapshot snapshots[2]{};
+  std::atomic<int> active_snap{0};
   std::atomic<bool> suppressed{false};
   std::atomic<int> in_corner_idx{-1};
   std::atomic<ULONGLONG> in_corner_since_tick{0};
@@ -84,37 +83,19 @@ gboolean invoke_open_overview(gpointer data) {
 
 void store_cached_monitors(const std::vector<HotCornerMonitor>& list) {
   std::lock_guard<std::mutex> lk(g_hc.bounds_write_mu);
-  const uint64_t s = g_hc.bounds_seq.load(std::memory_order_relaxed);
-  g_hc.bounds_seq.store(s + 1, std::memory_order_relaxed);
-  std::atomic_thread_fence(std::memory_order_seq_cst);
+  const int cur = g_hc.active_snap.load(std::memory_order_relaxed);
+  const int next = 1 - cur;
   const size_t n =
       list.size() < kMaxHotCornerMonitors ? list.size() : kMaxHotCornerMonitors;
   for (size_t i = 0; i < n; ++i)
-    g_hc.monitors[i] = list[i];
-  g_hc.monitor_count = n;
-  std::atomic_thread_fence(std::memory_order_seq_cst);
-  g_hc.bounds_seq.store(s + 2, std::memory_order_release);
+    g_hc.snapshots[next].monitors[i] = list[i];
+  g_hc.snapshots[next].count = n;
+  g_hc.active_snap.store(next, std::memory_order_release);
 }
 
 HotCornerSnapshot load_cached_monitors() {
-  HotCornerSnapshot out{};
-  for (;;) {
-    const uint64_t s1 = g_hc.bounds_seq.load(std::memory_order_acquire);
-    if ((s1 & 1u) != 0u) {
-      YieldProcessor();
-      continue;
-    }
-    const size_t n = g_hc.monitor_count < kMaxHotCornerMonitors
-                         ? g_hc.monitor_count
-                         : kMaxHotCornerMonitors;
-    out.count = n;
-    for (size_t i = 0; i < n; ++i)
-      out.monitors[i] = g_hc.monitors[i];
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    const uint64_t s2 = g_hc.bounds_seq.load(std::memory_order_relaxed);
-    if (s1 == s2)
-      return out;
-  }
+  const int idx = g_hc.active_snap.load(std::memory_order_acquire);
+  return g_hc.snapshots[idx];
 }
 
 BOOL CALLBACK enum_hot_corner_monitors_proc(HMONITOR hmon,
@@ -156,6 +137,9 @@ void process_hot_corner_point(int x, int y) {
   const HotCornerSnapshot snap = load_cached_monitors();
   const int hit_idx = hot_corner_hit_test_monitors(
       x, y, snap.monitors.data(), snap.count, kCornerSize);
+  const int cur_idx = g_hc.in_corner_idx.load(std::memory_order_relaxed);
+  if (hit_idx == cur_idx)
+    return;
   const int prev_idx =
       g_hc.in_corner_idx.exchange(hit_idx, std::memory_order_acq_rel);
   if (hit_idx != prev_idx) {
@@ -300,23 +284,9 @@ void sync_hook_install_on_hook_thread(bool force_reinstall = false) {
           g_hc.in_corner_since_tick.store(0, std::memory_order_relaxed);
         }
       }
-      const ULONGLONG now_tick = GetTickCount64();
-      const ULONGLONG last_ev =
-          g_hc.last_hook_event_tick.load(std::memory_order_relaxed);
-      if (g_hc.in_corner_idx.load(std::memory_order_relaxed) < 0 &&
-          should_reinstall_ll_hook(true, now_tick, last_ev,
-                                   g_hc.last_reinstall_tick, 5000, 2500)) {
-        HHOOK fresh =
-            SetWindowsHookExW(WH_MOUSE_LL, hot_corner_mouse_proc, self_mod, 0);
-        if (fresh != nullptr) {
-          UnhookWindowsHookEx(g_hc.mouse_hook);
-          g_hc.mouse_hook = fresh;
-          g_hc.last_reinstall_tick = now_tick;
-        } else {
-          g_print("[hot] SetWindowsHookExW(WH_MOUSE_LL) reinstall failed gle=%lu\n",
-                  GetLastError());
-        }
-      }
+      // Do not churn UnhookWindowsHookEx/SetWindowsHookExW every 2.5s while the
+      // user is idle; healthy WH_MOUSE_LL hooks stay installed without periodic
+      // re-registration.
     }
   } else if (g_hc.mouse_hook != nullptr) {
     UnhookWindowsHookEx(g_hc.mouse_hook);
@@ -346,13 +316,19 @@ void hook_thread_main() {
   }
 
   const bool self_elevated = is_current_process_elevated();
-  HWINEVENTHOOK fg_hook = SetWinEventHook(
-      EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
-      on_hot_corner_fg_changed, 0, 0, WINEVENT_OUTOFCONTEXT);
+  // Only install foreground elevation probing when WINOME itself is NOT
+  // elevated (UIPI fallback); otherwise OpenProcessToken on every Alt-Tab
+  // runs uselessly on the WH_MOUSE_LL thread.
+  HWINEVENTHOOK fg_hook = nullptr;
   g_hc.fg_cache_init = false;
   g_hc.cached_fg_hwnd = nullptr;
   g_hc.cached_fg_elevated = false;
-  update_fg_elevation_cache(GetForegroundWindow());
+  if (!self_elevated) {
+    fg_hook = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
+        on_hot_corner_fg_changed, 0, 0, WINEVENT_OUTOFCONTEXT);
+    update_fg_elevation_cache(GetForegroundWindow());
+  }
 
   sync_hook_install_on_hook_thread();
   constexpr DWORD kWatchdogIntervalMs = 2500;
@@ -391,7 +367,7 @@ void hook_thread_main() {
     if (!running)
       break;
 
-    if (wait_rc == WAIT_TIMEOUT)
+    if (wait_rc == WAIT_TIMEOUT && !self_elevated)
       update_fg_elevation_cache(GetForegroundWindow());
 
     const bool want_now =

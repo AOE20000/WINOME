@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <unordered_set>
 #include <vector>
 
@@ -238,10 +239,20 @@ gboolean debounce_display_change(gpointer G_GNUC_UNUSED data) {
   return G_SOURCE_REMOVE;
 }
 
+std::mutex g_mon_cache_mu;
+std::vector<MonitorDescriptor> g_mon_cache;
+gint64 g_mon_cache_ts_us = 0;
+
+void invalidate_monitor_cache() {
+  std::lock_guard<std::mutex> lock(g_mon_cache_mu);
+  g_mon_cache_ts_us = 0;
+}
+
 LRESULT CALLBACK watcher_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   switch (msg) {
     case WM_DISPLAYCHANGE:
     case WM_DPICHANGED:
+      invalidate_monitor_cache();
       if (g_mm.display_debounce_id != 0)
         g_source_remove(g_mm.display_debounce_id);
       g_mm.display_debounce_id = g_timeout_add(120, debounce_display_change, nullptr);
@@ -253,6 +264,7 @@ LRESULT CALLBACK watcher_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
       if (is_wallpaper) {
         g_idle_add(idle_handle_wallpaper_change, nullptr);
       } else if (wParam == SPI_SETWORKAREA) {
+        invalidate_monitor_cache();
         if (g_mm.workarea_idle_id == 0)
           g_mm.workarea_idle_id = g_idle_add(idle_handle_workarea_change, nullptr);
       } else if (area != nullptr &&
@@ -276,12 +288,35 @@ LRESULT CALLBACK watcher_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 }
 
 void on_monitor_config_changed(void* data G_GNUC_UNUSED) {
+  const WinomeConfig& cfg = get_config();
+  static bool initialized = false;
+  static bool last_panels = false;
+  static std::string last_ws_mode;
+  static bool last_sync_primary = false;
+  if (initialized &&
+      cfg.multi_monitor_panels == last_panels &&
+      cfg.multi_monitor_workspace_mode == last_ws_mode &&
+      cfg.sync_windows_primary_display == last_sync_primary) {
+    return;
+  }
+  initialized = true;
+  last_panels = cfg.multi_monitor_panels;
+  last_ws_mode = cfg.multi_monitor_workspace_mode;
+  last_sync_primary = cfg.sync_windows_primary_display;
   monitor_manager_sync();
 }
 
 }  // namespace
 
 std::vector<MonitorDescriptor> enumerate_monitors() {
+  const gint64 now = g_get_monotonic_time();
+  {
+    std::lock_guard<std::mutex> lock(g_mon_cache_mu);
+    if (g_mon_cache_ts_us > 0 && (now - g_mon_cache_ts_us) < 2000000 &&
+        !g_mon_cache.empty()) {
+      return g_mon_cache;
+    }
+  }
   std::vector<MonitorDescriptor> monitors;
   EnumDisplayMonitors(nullptr, nullptr, enum_monitors_proc,
                       reinterpret_cast<LPARAM>(&monitors));
@@ -289,6 +324,11 @@ std::vector<MonitorDescriptor> enumerate_monitors() {
                    [](const MonitorDescriptor& a, const MonitorDescriptor& b) {
                      return a.is_primary && !b.is_primary;
                    });
+  {
+    std::lock_guard<std::mutex> lock(g_mon_cache_mu);
+    g_mon_cache = monitors;
+    g_mon_cache_ts_us = now;
+  }
   return monitors;
 }
 
@@ -534,6 +574,7 @@ void monitor_manager_sync() {
   if (!g_mm.initialized)
     return;
 
+  invalidate_monitor_cache();
   std::vector<MonitorDescriptor> monitors = enumerate_monitors();
   if (monitors.empty())
     return;
@@ -690,10 +731,19 @@ bool is_manageable_launched_window(HWND hwnd) {
   return (rc.right - rc.left) >= 120 && (rc.bottom - rc.top) >= 80;
 }
 
+struct CollectLaunchCtx {
+  std::vector<HWND>* list = nullptr;
+  const std::unordered_set<HWND>* skip = nullptr;
+};
+
 BOOL CALLBACK collect_launch_windows_proc(HWND hwnd, LPARAM lp) {
-  auto* list = reinterpret_cast<std::vector<HWND>*>(lp);
+  auto* ctx = reinterpret_cast<CollectLaunchCtx*>(lp);
+  if (ctx == nullptr || ctx->list == nullptr)
+    return TRUE;
+  if (ctx->skip != nullptr && ctx->skip->find(hwnd) != ctx->skip->end())
+    return TRUE;
   if (is_manageable_launched_window(hwnd))
-    list->push_back(hwnd);
+    ctx->list->push_back(hwnd);
   return TRUE;
 }
 
@@ -706,13 +756,12 @@ gboolean launch_monitor_watch_tick(gpointer G_GNUC_UNUSED data) {
   }
 
   std::vector<HWND> current;
-  EnumWindows(collect_launch_windows_proc, reinterpret_cast<LPARAM>(&current));
+  CollectLaunchCtx ctx{&current, &g_mm.launch_baseline};
+  EnumWindows(collect_launch_windows_proc, reinterpret_cast<LPARAM>(&ctx));
 
   HWND fg = GetForegroundWindow();
   HWND cand = nullptr;
   for (HWND h : current) {
-    if (g_mm.launch_baseline.find(h) != g_mm.launch_baseline.end())
-      continue;
     if (h == fg) {
       cand = h;
       break;
@@ -793,7 +842,8 @@ void watch_launched_window_for_monitor(HMONITOR target_monitor) {
 
   cancel_launch_watch();
   std::vector<HWND> existing;
-  EnumWindows(collect_launch_windows_proc, reinterpret_cast<LPARAM>(&existing));
+  CollectLaunchCtx ctx{&existing, nullptr};
+  EnumWindows(collect_launch_windows_proc, reinterpret_cast<LPARAM>(&ctx));
   for (HWND h : existing)
     g_mm.launch_baseline.insert(h);
   g_mm.launch_target_mon = target_monitor;

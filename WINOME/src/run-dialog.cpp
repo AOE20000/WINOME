@@ -18,10 +18,12 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cwctype>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -213,6 +215,83 @@ void set_description_status(const std::string& text, bool is_error) {
     gtk_widget_remove_css_class(g_run.desc_label, "run-dialog-error-text");
 }
 
+struct PathExecCache {
+  std::mutex mu;
+  std::vector<std::string> execs;
+  int64_t updated_us = 0;
+  std::atomic<bool> scanning{false};
+};
+
+PathExecCache g_path_cache;
+
+void refresh_path_exec_cache_async() {
+  const int64_t now_us = g_get_monotonic_time();
+  {
+    std::lock_guard<std::mutex> lk(g_path_cache.mu);
+    if (g_path_cache.updated_us != 0 &&
+        (now_us - g_path_cache.updated_us) < 60LL * 1000 * 1000) {
+      return;
+    }
+  }
+  bool expected = false;
+  if (!g_path_cache.scanning.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    return;
+  }
+  std::thread([] {
+    std::vector<std::string> found;
+    found.reserve(256);
+    wchar_t path_buf[32768] = {};
+    const DWORD plen = GetEnvironmentVariableW(L"PATH", path_buf, 32768);
+    if (plen > 0 && plen < 32768) {
+      std::wstring path_env(path_buf, plen);
+      size_t start = 0;
+      int scanned_dirs = 0;
+      while (start < path_env.size() && scanned_dirs < 32) {
+        size_t semi = path_env.find(L';', start);
+        std::wstring dir = (semi == std::string::npos)
+                               ? path_env.substr(start)
+                               : path_env.substr(start, semi - start);
+        if (!dir.empty()) {
+          ++scanned_dirs;
+          if (dir.back() != L'\\' && dir.back() != L'/')
+            dir.push_back(L'\\');
+          std::wstring pattern = dir + L"*";
+          WIN32_FIND_DATAW fd{};
+          HANDLE hfind = FindFirstFileW(pattern.c_str(), &fd);
+          if (hfind != INVALID_HANDLE_VALUE) {
+            do {
+              if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+                continue;
+              const std::wstring name(fd.cFileName);
+              const size_t dot = name.rfind(L'.');
+              if (dot != std::wstring::npos) {
+                std::wstring ext = name.substr(dot);
+                for (wchar_t& ch : ext)
+                  ch = static_cast<wchar_t>(std::towlower(ch));
+                if (ext == L".exe" || ext == L".cmd" || ext == L".bat" ||
+                    ext == L".com") {
+                  found.push_back(wide_to_utf8(name));
+                }
+              }
+            } while (FindNextFileW(hfind, &fd) && found.size() < 4096);
+            FindClose(hfind);
+          }
+        }
+        if (semi == std::string::npos)
+          break;
+        start = semi + 1;
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lk(g_path_cache.mu);
+      g_path_cache.execs = std::move(found);
+      g_path_cache.updated_us = g_get_monotonic_time();
+    }
+    g_path_cache.scanning.store(false, std::memory_order_release);
+  }).detach();
+}
+
 std::vector<std::string> collect_completion_candidates(const std::string& prefix) {
   std::vector<std::string> cands;
   if (get_config().developer_mode) {
@@ -226,47 +305,25 @@ std::vector<std::string> collect_completion_candidates(const std::string& prefix
     if (h.compare(0, prefix.size(), prefix) == 0)
       cands.push_back(h);
   }
-  wchar_t path_buf[32768] = {};
-  const DWORD plen = GetEnvironmentVariableW(L"PATH", path_buf, 32768);
-  if (plen > 0 && plen < 32768) {
-    const std::wstring wprefix = utf8_to_wide(prefix);
-    std::wstring path_env(path_buf, plen);
-    size_t start = 0;
-    int scanned_dirs = 0;
-    while (start < path_env.size() && scanned_dirs < 32) {
-      size_t semi = path_env.find(L';', start);
-      std::wstring dir = (semi == std::string::npos)
-                             ? path_env.substr(start)
-                             : path_env.substr(start, semi - start);
-      if (!dir.empty()) {
-        ++scanned_dirs;
-        if (dir.back() != L'\\' && dir.back() != L'/')
-          dir.push_back(L'\\');
-        std::wstring pattern = dir + wprefix + L"*";
-        WIN32_FIND_DATAW fd{};
-        HANDLE hfind = FindFirstFileW(pattern.c_str(), &fd);
-        if (hfind != INVALID_HANDLE_VALUE) {
-          do {
-            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
-              continue;
-            const std::wstring name(fd.cFileName);
-            const size_t dot = name.rfind(L'.');
-            if (dot != std::wstring::npos) {
-              std::wstring ext = name.substr(dot);
-              for (wchar_t& ch : ext)
-                ch = static_cast<wchar_t>(std::towlower(ch));
-              if (ext == L".exe" || ext == L".cmd" || ext == L".bat" ||
-                  ext == L".com") {
-                cands.push_back(wide_to_utf8(name));
-              }
-            }
-          } while (FindNextFileW(hfind, &fd) && cands.size() < 200);
-          FindClose(hfind);
+  refresh_path_exec_cache_async();
+  std::lock_guard<std::mutex> lk(g_path_cache.mu);
+  std::string lprefix = prefix;
+  for (char& c : lprefix)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  for (const auto& name : g_path_cache.execs) {
+    if (name.size() >= lprefix.size()) {
+      bool match = true;
+      for (size_t i = 0; i < lprefix.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(name[i])) != lprefix[i]) {
+          match = false;
+          break;
         }
       }
-      if (semi == std::string::npos)
-        break;
-      start = semi + 1;
+      if (match) {
+        cands.push_back(name);
+        if (cands.size() >= 200)
+          break;
+      }
     }
   }
   return cands;
@@ -303,6 +360,16 @@ void on_entry_changed(GtkEditable* ed G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) 
   set_description_status(default_hint_text(), false);
 }
 
+}  // namespace
+
+bool execute_run_command_with_monitor(const std::string& raw_cmd,
+                                      bool in_terminal,
+                                      const RunDialogCallbacks& cbs,
+                                      HMONITOR target_mon,
+                                      std::string* out_err);
+
+namespace {
+
 void submit_run_command(const std::string& raw, bool in_terminal) {
   const std::string trimmed = trim_copy(raw);
   if (trimmed.empty()) {
@@ -314,16 +381,22 @@ void submit_run_command(const std::string& raw, bool in_terminal) {
   g_run.history = run_history_add_item(std::move(g_run.history), trimmed, kMaxHistoryItems);
   save_history();
 
-  if (!in_terminal &&
-      classify_run_internal_command(trimmed, get_config().developer_mode) !=
-          RunInternalAction::None) {
+  // Internal commands (lg/rt/r/debugexit) always invoke GTK UI callbacks and
+  // must run on the GTK main thread regardless of Ctrl+Enter (in_terminal).
+  if (classify_run_internal_command(trimmed, get_config().developer_mode) !=
+      RunInternalAction::None) {
     std::string err;
-    if (execute_run_command_string(trimmed, false, g_run.cbs, &err))
+    if (execute_run_command_with_monitor(trimmed, false, g_run.cbs, nullptr, &err))
       run_dialog_close();
     else
       set_description_status(err.empty() ? "Command failed" : err, true);
     return;
   }
+
+  // Resolve target monitor & arm launch watcher on the GTK main thread before
+  // spawning the worker thread (GTK/GDK and monitor-manager are main-thread only).
+  HMONITOR target_mon = monitor_manager_monitor_for_widget(g_run.window);
+  watch_launched_window_for_monitor(target_mon);
 
   const uint64_t gen = ++g_run.launch_gen;
   if (g_run.entry != nullptr)
@@ -331,11 +404,12 @@ void submit_run_command(const std::string& raw, bool in_terminal) {
   set_description_status(tr("Launching command...", "正在执行命令..."), false);
 
   const RunDialogCallbacks cbs_copy = g_run.cbs;
-  std::thread([trimmed, in_terminal, cbs_copy, gen]() {
+  std::thread([trimmed, in_terminal, cbs_copy, target_mon, gen]() {
     HRESULT hr = CoInitializeEx(
         nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     std::string err;
-    const bool ok = execute_run_command_string(trimmed, in_terminal, cbs_copy, &err);
+    const bool ok = execute_run_command_with_monitor(
+        trimmed, in_terminal, cbs_copy, target_mon, &err);
     if (SUCCEEDED(hr))
       CoUninitialize();
     struct Result {
@@ -559,10 +633,11 @@ std::string run_complete_prefix(const std::string& prefix,
   return common.substr(prefix.size());
 }
 
-bool execute_run_command_string(const std::string& raw_cmd,
-                                bool in_terminal,
-                                const RunDialogCallbacks& cbs,
-                                std::string* out_err) {
+bool execute_run_command_with_monitor(const std::string& raw_cmd,
+                                      bool in_terminal,
+                                      const RunDialogCallbacks& cbs,
+                                      HMONITOR target_mon,
+                                      std::string* out_err) {
   if (out_err != nullptr)
     out_err->clear();
 
@@ -606,9 +681,6 @@ bool execute_run_command_string(const std::string& raw_cmd,
   }
 
   debug_append_log("run", std::string("[run] exec: ") + trimmed);
-
-  HMONITOR target_mon = monitor_manager_monitor_for_widget(g_run.window);
-  watch_launched_window_for_monitor(target_mon);
 
   if (in_terminal) {
     const std::wstring wargs = L"/k " + utf8_to_wide(trimmed);
@@ -674,6 +746,16 @@ bool execute_run_command_string(const std::string& raw_cmd,
   if (out_err != nullptr)
     *out_err = format_win32_error_utf8(err);
   return false;
+}
+
+bool execute_run_command_string(const std::string& raw_cmd,
+                                bool in_terminal,
+                                const RunDialogCallbacks& cbs,
+                                std::string* out_err) {
+  HMONITOR target_mon = monitor_manager_monitor_for_widget(g_run.window);
+  watch_launched_window_for_monitor(target_mon);
+  return execute_run_command_with_monitor(raw_cmd, in_terminal, cbs, target_mon,
+                                          out_err);
 }
 
 void run_dialog_init(const RunDialogCallbacks& cbs) {

@@ -45,6 +45,7 @@
 #include <zlib.h>
 
 #include <windows.h>
+#include <dwmapi.h>
 #include <glib.h>
 #include <pango/pangocairo.h>
 
@@ -652,6 +653,21 @@ void test_app_index_and_lru_cache() {
   CHECK(kept != nullptr);
   if (kept != nullptr)
     g_object_unref(kept);
+  // Canonical icon cache bucket sharing (<=128 -> 128, >128 -> 256).
+  {
+    GBytes *b2 = g_bytes_new(&px, sizeof(px));
+    GdkTexture *t2 = gdk_memory_texture_new(1, 1, GDK_MEMORY_B8G8R8A8_PREMULTIPLIED,
+                                            b2, 4);
+    g_bytes_unref(b2);
+    winome::app_icon_cache_store("bucket.app", 96, t2);
+    GdkTexture *hit = winome::app_icon_cache_lookup("bucket.app", 128);
+    CHECK(hit != nullptr);
+    if (hit != nullptr)
+      g_object_unref(hit);
+    GdkTexture *miss = winome::app_icon_cache_lookup("bucket.app", 256);
+    CHECK(miss == nullptr);
+    g_object_unref(t2);
+  }
   winome::app_icon_cache_clear();
   CHECK(winome::app_icon_cache_count() == 0);
 
@@ -3799,6 +3815,269 @@ int main() {
   test_overlay_wndproc_chaining_no_recursion();
   test_independent_per_monitor_workspace_engine();
   test_diagnostics_zip_export();
+
+  // Developer-mode test.* CLI translation, step expansion, single & aggregated execution.
+  {
+    std::string req, err;
+    CHECK(winome::ctl::ctl_build_request_json(
+        {"test", "trigger", "win_tap_os", "--wait", "380", "--tag", "perf,ov"},
+        &req, &err));
+    CHECK(req.find("\"cmd\":\"test.trigger\"") != std::string::npos);
+    CHECK(req.find("\"action\":\"win_tap_os\"") != std::string::npos);
+    CHECK(req.find("\"wait_ms\":380") != std::string::npos);
+
+    CHECK(winome::ctl::ctl_build_request_json(
+        {"test", "run", "--preset", "slow-double-win", "--gap", "360",
+         "--settle", "500", "--repeat", "3"},
+        &req, &err));
+    CHECK(req.find("\"cmd\":\"test.run\"") != std::string::npos);
+    CHECK(req.find("\"preset\":\"slow-double-win\"") != std::string::npos);
+    CHECK(req.find("\"gap_ms\":360") != std::string::npos);
+    CHECK(req.find("\"repeat\":3") != std::string::npos);
+
+    CHECK(winome::ctl::ctl_build_request_json({"test", "begin"}, &req, &err));
+    CHECK(req.find("\"cmd\":\"test.begin\"") != std::string::npos);
+    CHECK(winome::ctl::ctl_build_request_json({"test", "end"}, &req, &err));
+    CHECK(req.find("\"cmd\":\"test.end\"") != std::string::npos);
+
+    std::vector<std::string> expanded;
+    CHECK(winome::ipc_expand_dev_test_steps("", "slow-double-win", 380,
+                                            &expanded, &err));
+    CHECK(expanded.size() == 3);
+    CHECK(expanded[0] == "win_tap_os");
+    CHECK(expanded[1] == "sleep:380");
+    CHECK(expanded[2] == "win_tap_os");
+
+    // Verify developer_mode gate and single/aggregate/session flows.
+    const winome::WinomeConfig saved_cfg = winome::get_config();
+    winome::WinomeConfig cfg = saved_cfg;
+    cfg.developer_mode = false;
+    winome::update_config(cfg);
+
+    winome::IpcCallbacks dev_cbs{};
+    dev_cbs.dev_test_action = +[](const std::string& act, std::string*) -> bool {
+      if (act == "mock_anim") {
+        winome::debug_append_log(
+            "perf",
+            "[perf] overview anim frames=15 dropped=1 avg=16.40ms "
+            "p95=17.20ms max=21.10ms tick_max=1.20ms dwm_max=0.80ms panel_draws=1");
+        return true;
+      }
+      return act == "mock_noop";
+    };
+    const std::string denied = winome::ipc_dispatch_request_json(
+        "{\"cmd\":\"test.trigger\",\"action\":\"mock_anim\",\"wait_ms\":0}",
+        dev_cbs);
+    CHECK(denied.find("developer_mode_required") != std::string::npos);
+
+    cfg.developer_mode = true;
+    winome::update_config(cfg);
+
+    const std::string single = winome::ipc_dispatch_request_json(
+        "{\"cmd\":\"test.trigger\",\"action\":\"mock_anim\",\"wait_ms\":0,\"tag\":\"perf\"}",
+        dev_cbs);
+    CHECK(single.find("\"ok\":true") != std::string::npos);
+    CHECK(single.find("\"mode\":\"single\"") != std::string::npos);
+    CHECK(single.find("\"anim_runs\":1") != std::string::npos);
+    CHECK(single.find("\"total_frames\":15") != std::string::npos);
+    CHECK(single.find("\"total_dropped\":1") != std::string::npos);
+
+    const std::string agg = winome::ipc_dispatch_request_json(
+        "{\"cmd\":\"test.run\",\"steps\":\"mock_anim,sleep:5,mock_anim\","
+        "\"settle_ms\":0,\"repeat\":2,\"tag\":\"perf\"}",
+        dev_cbs);
+    CHECK(agg.find("\"ok\":true") != std::string::npos);
+    CHECK(agg.find("\"mode\":\"aggregate\"") != std::string::npos);
+    CHECK(agg.find("\"anim_runs\":4") != std::string::npos);
+    CHECK(agg.find("\"total_frames\":60") != std::string::npos);
+    CHECK(agg.find("\"total_dropped\":4") != std::string::npos);
+
+    const std::string s_beg = winome::ipc_dispatch_request_json(
+        "{\"cmd\":\"test.begin\",\"tag\":\"perf\"}", dev_cbs);
+    CHECK(s_beg.find("\"ok\":true") != std::string::npos);
+    (void)winome::ipc_dispatch_request_json(
+        "{\"cmd\":\"test.trigger\",\"action\":\"mock_anim\",\"wait_ms\":0}",
+        dev_cbs);
+    (void)winome::ipc_dispatch_request_json(
+        "{\"cmd\":\"test.trigger\",\"action\":\"mock_anim\",\"wait_ms\":0}",
+        dev_cbs);
+    const std::string s_end = winome::ipc_dispatch_request_json(
+        "{\"cmd\":\"test.end\"}", dev_cbs);
+    CHECK(s_end.find("\"ok\":true") != std::string::npos);
+    CHECK(s_end.find("\"mode\":\"session\"") != std::string::npos);
+    CHECK(s_end.find("\"anim_runs\":2") != std::string::npos);
+    CHECK(s_end.find("\"total_frames\":30") != std::string::npos);
+
+    winome::update_config(saved_cfg);
+  }
+
+  // Universal Developer Debug Operation Channel (dev.help / dev.op / dev.batch)
+  {
+    CHECK(winome::dev_resolve_vk("LWin") == VK_LWIN);
+    CHECK(winome::dev_resolve_vk("Esc") == VK_ESCAPE);
+    CHECK(winome::dev_resolve_vk("F2") == VK_F2);
+    CHECK(winome::dev_resolve_vk("a") == 'A');
+    CHECK(winome::dev_resolve_vk("0x5B") == VK_LWIN);
+    CHECK(winome::dev_resolve_vk("nonexistent_key_xyz") == 0);
+
+    winome::DevOpRequest parsed;
+    std::string perr;
+    CHECK(winome::dev_parse_op_shorthand("key.combo Win+Tab hold_ms=35", &parsed, &perr));
+    CHECK(parsed.op == "key.combo");
+    CHECK(parsed.args["keys"] == "Win+Tab");
+    CHECK(parsed.args["hold_ms"] == "35");
+
+    std::vector<winome::DevOpRequest> batch;
+    CHECK(winome::dev_parse_batch_shorthand(
+        "shell.overview open; sleep 10; perf.snapshot", &batch, &perr));
+    CHECK(batch.size() == 3);
+    CHECK(batch[0].op == "shell.overview");
+    CHECK(batch[0].args["action"] == "open");
+    CHECK(batch[1].op == "sleep");
+    CHECK(batch[1].args["ms"] == "10");
+    CHECK(batch[2].op == "perf.snapshot");
+
+    // CLI translation for winome-ctl dev help / op / batch
+    std::string req, err;
+    CHECK(winome::ctl::ctl_build_request_json({"dev", "help"}, &req, &err));
+    CHECK(req.find("\"cmd\":\"dev.help\"") != std::string::npos);
+
+    CHECK(winome::ctl::ctl_build_request_json(
+        {"dev", "op", "mouse.move", "x=10", "y=20", "--wait", "50", "--logs", "--tag", "perf"},
+        &req, &err));
+    CHECK(req.find("\"cmd\":\"dev.op\"") != std::string::npos);
+    CHECK(req.find("\"op\":\"mouse.move\"") != std::string::npos);
+    CHECK(req.find("\"x\":\"10\"") != std::string::npos);
+    CHECK(req.find("\"capture_logs\":true") != std::string::npos);
+
+    CHECK(winome::ctl::ctl_build_request_json(
+        {"dev", "batch", "--ops", "sleep 5; perf.snapshot", "--logs", "--stop-on-error"},
+        &req, &err));
+    CHECK(req.find("\"cmd\":\"dev.batch\"") != std::string::npos);
+    CHECK(req.find("\"stop_on_error\":true") != std::string::npos);
+
+    // Gate check + live IPC dispatch
+    const winome::WinomeConfig saved_cfg = winome::get_config();
+    winome::WinomeConfig cfg = saved_cfg;
+    cfg.developer_mode = false;
+    winome::update_config(cfg);
+
+    winome::IpcCallbacks dev_cbs{};
+    dev_cbs.dev_shell_op = [](const std::string& op,
+                              const std::map<std::string, std::string>& args,
+                              std::string* out_json,
+                              std::string* out_err) -> bool {
+      if (op == "shell.mock") {
+        auto it = args.find("v");
+        *out_json = "{\"echo\":\"" + (it != args.end() ? it->second : "") + "\"}";
+        return true;
+      }
+      *out_err = "mock_fail";
+      return false;
+    };
+    CHECK(winome::ipc_dispatch_request_json("{\"cmd\":\"dev.help\"}", dev_cbs)
+              .find("developer_mode is disabled") != std::string::npos);
+
+    cfg.developer_mode = true;
+    winome::update_config(cfg);
+
+    CHECK(winome::ipc_dispatch_request_json("{\"cmd\":\"dev.help\"}", dev_cbs)
+              .find("\"dev-universal\"") != std::string::npos);
+
+    const std::string op_res = winome::ipc_dispatch_request_json(
+        "{\"cmd\":\"dev.op\",\"op\":\"shell.mock\",\"args\":{\"v\":\"ok42\"},\"capture_logs\":true}",
+        dev_cbs);
+    CHECK(op_res.find("\"ok\":true") != std::string::npos);
+    CHECK(op_res.find("\"echo\":\"ok42\"") != std::string::npos);
+
+    const std::string snap_res = winome::ipc_dispatch_request_json(
+        "{\"cmd\":\"dev.op\",\"op\":\"perf.snapshot\"}", dev_cbs);
+    CHECK(snap_res.find("\"ok\":true") != std::string::npos);
+    CHECK(snap_res.find("\"memory\":") != std::string::npos);
+
+    const std::string batch_res = winome::ipc_dispatch_request_json(
+        "{\"cmd\":\"dev.batch\",\"ops\":["
+        "{\"op\":\"shell.mock\",\"args\":{\"v\":\"a\"}},"
+        "{\"op\":\"sleep\",\"args\":{\"ms\":5}},"
+        "{\"op\":\"shell.bad\"},"
+        "{\"op\":\"perf.snapshot\"}],"
+        "\"stop_on_error\":true,\"capture_logs\":true}",
+        dev_cbs);
+    CHECK(batch_res.find("\"ok\":false") != std::string::npos);
+    CHECK(batch_res.find("\"executed\":3") != std::string::npos);
+    CHECK(batch_res.find("\"total\":4") != std::string::npos);
+
+    winome::update_config(saved_cfg);
+  }
+
+  // Test sanitize_gdk_gl_backing_windows detaches owner, drops topmost,
+  // re-cloaks, and enforces click-through/non-activatable styles on GdkWin32GL.
+  {
+    HINSTANCE hinst = GetModuleHandleW(nullptr);
+    WNDCLASSEXW wc_owner{};
+    wc_owner.cbSize = sizeof(wc_owner);
+    wc_owner.lpfnWndProc = DefWindowProcW;
+    wc_owner.hInstance = hinst;
+    wc_owner.lpszClassName = L"WinomeSanitizeOwnerTest";
+    const ATOM owner_atom = RegisterClassExW(&wc_owner);
+
+    WNDCLASSEXW wc_gl{};
+    wc_gl.cbSize = sizeof(wc_gl);
+    wc_gl.lpfnWndProc = DefWindowProcW;
+    wc_gl.hInstance = hinst;
+    wc_gl.lpszClassName = L"GdkWin32GL";
+    const ATOM gl_atom = RegisterClassExW(&wc_gl);
+
+    HWND owner = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"WinomeSanitizeOwnerTest", L"Owner",
+        WS_POPUP, 0, 0, 120, 120, nullptr, nullptr, hinst, nullptr);
+    HWND gl = CreateWindowExW(
+        0, L"GdkWin32GL", L"", WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+        0, 0, 120, 120, owner, nullptr, hinst, nullptr);
+    CHECK(owner != nullptr);
+    CHECK(gl != nullptr);
+    if (owner != nullptr && gl != nullptr) {
+      BOOL cloak_true = TRUE;
+      BOOL cloak_false = FALSE;
+      DwmSetWindowAttribute(gl, DWMWA_CLOAK, &cloak_true, sizeof(cloak_true));
+      ShowWindow(gl, SW_SHOWNOACTIVATE);
+      // Simulate Overview cloaking owner, showing, uncloaking owner, and
+      // promoting owner to topmost (which uncloaks/promotes owned popup).
+      DwmSetWindowAttribute(owner, DWMWA_CLOAK, &cloak_true, sizeof(cloak_true));
+      ShowWindow(owner, SW_SHOWNOACTIVATE);
+      DwmSetWindowAttribute(owner, DWMWA_CLOAK, &cloak_false, sizeof(cloak_false));
+      SetWindowPos(owner, HWND_TOPMOST, 0, 0, 0, 0,
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+      winome::sanitize_gdk_gl_backing_windows();
+
+      CHECK(GetWindowLongPtrW(gl, GWLP_HWNDPARENT) == 0);
+      const LONG_PTR ex = GetWindowLongPtrW(gl, GWL_EXSTYLE);
+      CHECK((ex & WS_EX_TOPMOST) == 0);
+      CHECK((ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT)) ==
+            (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT));
+      DWORD cloaked_after = 0;
+      DwmGetWindowAttribute(gl, DWMWA_CLOAKED, &cloaked_after,
+                            sizeof(cloaked_after));
+      CHECK(cloaked_after != 0);
+
+      // Subsequent owner cloak->uncloak must no longer touch detached GL HWND.
+      DwmSetWindowAttribute(owner, DWMWA_CLOAK, &cloak_true, sizeof(cloak_true));
+      DwmSetWindowAttribute(owner, DWMWA_CLOAK, &cloak_false, sizeof(cloak_false));
+      DWORD cloaked_persist = 0;
+      DwmGetWindowAttribute(gl, DWMWA_CLOAKED, &cloaked_persist,
+                            sizeof(cloaked_persist));
+      CHECK(cloaked_persist != 0);
+    }
+    if (gl != nullptr)
+      DestroyWindow(gl);
+    if (owner != nullptr)
+      DestroyWindow(owner);
+    if (gl_atom != 0)
+      UnregisterClassW(L"GdkWin32GL", hinst);
+    if (owner_atom != 0)
+      UnregisterClassW(L"WinomeSanitizeOwnerTest", hinst);
+  }
 
   if (g_failures == 0)
     std::printf("ALL WINOME UNIT TESTS PASSED\n");

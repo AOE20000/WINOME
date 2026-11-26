@@ -163,10 +163,9 @@ draw_osd (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   if (g_count <= 0 || width <= 0 || height <= 0)
     return;
 
-  // Everything fades together (upstream fades the whole actor's opacity).
-  double f = g_fade;
-  if (f <= 0.0)
-    return;
+  // Draw the OSD pill at full alpha=1.0; fade_tick() animates GPU widget
+  // opacity via gtk_widget_set_opacity() so fading never re-rasterizes Cairo.
+  const double f = 1.0;
 
   // Capsule panel ($forced_circular_radius 999px clamps to ch/2) centered
   // inside the transparent shadow gutter.
@@ -232,7 +231,8 @@ fade_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
   if (t > 1.0)
     t = 1.0;
   g_fade = g_fade_from + (g_fade_to - g_fade_from) * ease_out_quad (t);
-  gtk_widget_queue_draw (g_area);
+  if (g_area != nullptr)
+    gtk_widget_set_opacity (g_area, std::clamp (g_fade, 0.0, 1.0));
   if (t >= 1.0) {
     g_fade_source = 0;
     if (g_fade_to <= 0.0 && g_window != nullptr)
@@ -253,12 +253,18 @@ fade_to (double to)
   g_fade_to = to;
   g_fade_duration_ms = kAnimMs;
   g_fade_start_us = g_get_monotonic_time ();
+  if (g_area != nullptr)
+    gtk_widget_set_opacity (g_area, std::clamp (g_fade, 0.0, 1.0));
   g_fade_source =
       gtk_widget_add_tick_callback (g_window, fade_tick, nullptr, nullptr);
 }
 
 static HMONITOR g_osd_monitor = nullptr;
 static std::unordered_map<HMONITOR, int> g_last_index_by_mon;
+static int g_osd_last_w = -1;
+static int g_osd_last_h = -1;
+static int g_osd_last_x = INT_MIN;
+static int g_osd_last_y = INT_MIN;
 
 // (Re)position the window for the current workspace count and show it.
 static void
@@ -272,8 +278,14 @@ osd_present (void)
   int w = (int)(2 * (m.padding_x + kShadowPad) + n * m.unit +
                 (n - 1) * m.spacing + 0.5);
   int h = (int)(2 * (m.padding_y + kShadowPad) + m.unit + 0.5);
-  gtk_widget_set_size_request (g_area, w, h);
-  gtk_window_set_default_size (GTK_WINDOW (g_window), w, h);
+  if (w != g_osd_last_w || h != g_osd_last_h) {
+    gtk_widget_set_size_request (g_area, w, h);
+    gtk_window_set_default_size (GTK_WINDOW (g_window), w, h);
+    g_osd_last_w = w;
+    g_osd_last_h = h;
+    g_osd_last_x = INT_MIN;
+    g_osd_last_y = INT_MIN;
+  }
 
   if (g_hwnd == nullptr || !IsWindow (g_hwnd))
     return;
@@ -294,8 +306,12 @@ osd_present (void)
           pw / 2;
   int y = mi.rcMonitor.bottom - margin - ph;
 
-  SetWindowPos (g_hwnd, HWND_TOPMOST, x, y, pw, ph,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  if (x != g_osd_last_x || y != g_osd_last_y || !IsWindowVisible (g_hwnd)) {
+    g_osd_last_x = x;
+    g_osd_last_y = y;
+    SetWindowPos (g_hwnd, HWND_TOPMOST, x, y, pw, ph,
+                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  }
 }
 
 static gboolean

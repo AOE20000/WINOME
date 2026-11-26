@@ -16,6 +16,8 @@ namespace winome {
 // --- Startup & runtime performance telemetry ---------------------------------
 
 struct StartupTimings {
+  double pre_gtk_ms = 0.0;
+  double gtk_init_ms = 0.0;
   double fontmap_ms = 0.0;
   double panel_ms = 0.0;
   double overview_init_ms = 0.0;
@@ -24,6 +26,7 @@ struct StartupTimings {
   double theming_ms = 0.0;
   double plugins_ms = 0.0;
   double gtk_activate_ms = 0.0;
+  double idle_wait_ms = 0.0;
   double total_startup_ms = 0.0;
   int fonts_loaded_files = 0;
   int fonts_family_count = 0;

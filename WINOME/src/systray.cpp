@@ -316,7 +316,12 @@ void scan_classic_toolbar(HWND toolbar,
   if (IsWow64Process(proc.h, &is_wow64) && is_wow64)
     return;
 
-  const LRESULT count = SendMessageW(toolbar, TB_BUTTONCOUNT, 0, 0);
+  DWORD_PTR count_res = 0;
+  if (!SendMessageTimeoutW(toolbar, TB_BUTTONCOUNT, 0, 0,
+                           SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &count_res)) {
+    return;
+  }
+  const LRESULT count = static_cast<LRESULT>(count_res);
   if (count <= 0 || count > 256)
     return;
 
@@ -328,8 +333,11 @@ void scan_classic_toolbar(HWND toolbar,
   }
 
   for (LRESULT i = 0; i < count; ++i) {
-    if (!SendMessageW(toolbar, TB_GETBUTTON, static_cast<WPARAM>(i),
-                      reinterpret_cast<LPARAM>(remote_tb.ptr))) {
+    DWORD_PTR get_ok = 0;
+    if (!SendMessageTimeoutW(toolbar, TB_GETBUTTON, static_cast<WPARAM>(i),
+                             reinterpret_cast<LPARAM>(remote_tb.ptr),
+                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &get_ok) ||
+        get_ok == 0) {
       continue;
     }
 
@@ -348,9 +356,14 @@ void scan_classic_toolbar(HWND toolbar,
       continue;
 
     std::string title;
-    LRESULT text_len = SendMessageW(toolbar, TB_GETBUTTONTEXTW,
-                                    static_cast<WPARAM>(tb.idCommand),
-                                    reinterpret_cast<LPARAM>(remote_text.ptr));
+    DWORD_PTR text_len_res = 0;
+    const LRESULT text_len =
+        SendMessageTimeoutW(toolbar, TB_GETBUTTONTEXTW,
+                            static_cast<WPARAM>(tb.idCommand),
+                            reinterpret_cast<LPARAM>(remote_text.ptr),
+                            SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &text_len_res)
+            ? static_cast<LRESULT>(text_len_res)
+            : 0;
     if (text_len > 0 && text_len < 256) {
       wchar_t buf[256] = {};
       if (ReadProcessMemory(proc.h, remote_text.ptr, buf, sizeof(buf), nullptr)) {
@@ -374,9 +387,37 @@ void scan_classic_toolbar(HWND toolbar,
     entry.u_id = td.uID;
     entry.version = td.reserved[0];
 
-    if (td.hIcon != nullptr)
-      hicon_to_rgba(td.hIcon, &entry.icon_width, &entry.icon_height,
-                    &entry.rgba_pixels);
+    if (td.hIcon != nullptr) {
+      struct ClassicIconCacheEntry {
+        HICON hicon = nullptr;
+        int w = 0;
+        int h = 0;
+        std::vector<uint8_t> rgba;
+      };
+      static std::mutex s_classic_icon_mu;
+      static std::unordered_map<uint64_t, ClassicIconCacheEntry> s_classic_icons;
+      bool hit = false;
+      {
+        std::lock_guard<std::mutex> lk(s_classic_icon_mu);
+        auto it = s_classic_icons.find(entry.id);
+        if (it != s_classic_icons.end() && it->second.hicon == td.hIcon &&
+            !it->second.rgba.empty()) {
+          entry.icon_width = it->second.w;
+          entry.icon_height = it->second.h;
+          entry.rgba_pixels = it->second.rgba;
+          hit = true;
+        }
+      }
+      if (!hit &&
+          hicon_to_rgba(td.hIcon, &entry.icon_width, &entry.icon_height,
+                        &entry.rgba_pixels)) {
+        std::lock_guard<std::mutex> lk(s_classic_icon_mu);
+        if (s_classic_icons.size() > 128)
+          s_classic_icons.clear();
+        s_classic_icons[entry.id] = ClassicIconCacheEntry{
+            td.hIcon, entry.icon_width, entry.icon_height, entry.rgba_pixels};
+      }
+    }
 
     out->push_back(std::move(entry));
   }
@@ -1591,11 +1632,10 @@ void scan_worker_main() {
       if (g_tray.stop)
         break;
       do_scan = g_tray.scan_pending || first_scan;
-      const auto now = std::chrono::steady_clock::now();
-      const bool xo_stale =
-          g_tray.last_xo_probe.time_since_epoch().count() == 0 ||
-          (now - g_tray.last_xo_probe) >= std::chrono::seconds(30);
-      do_probe = g_tray.force_probe || first_scan || xo_stale;
+      // Avoid periodic background 30s Explorer taskbar cloak/show probes
+      // (which force Explorer taskbar layout churn and DWM repaints); only
+      // probe on startup or when explicitly requested (e.g. tray popover open).
+      do_probe = g_tray.force_probe || first_scan;
       g_tray.scan_pending = false;
       g_tray.force_probe = false;
       if (!do_scan)

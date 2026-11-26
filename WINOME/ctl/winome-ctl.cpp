@@ -20,7 +20,7 @@
 namespace {
 
 constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\WINOME_Shell_IPC";
-constexpr size_t kMaxPayloadBytes = 262144;
+constexpr size_t kMaxPayloadBytes = 4 * 1024 * 1024;
 
 bool query_pipe(const std::string& req_json,
                 std::string* out_resp,
@@ -122,6 +122,16 @@ void print_usage() {
       "  settings [page]                       Open Settings (diagnostics, appearance, ...)\n"
       "  lg                                    Open Looking Glass console (requires Dev Mode)\n"
       "  notify <title> [body]                 Trigger shell toast notification\n"
+      "  test trigger <act> [--wait ms] [--tag T]\n"
+      "                                        [Dev] Trigger single action & return logs\n"
+      "  test run (--steps CSV | --preset P) [--gap ms] [--settle ms] [--repeat N] [--tag T]\n"
+      "                                        [Dev] Run action sequence & return aggregated report\n"
+      "  test begin [--tag T] / test end       [Dev] Aggregate logs across multiple triggers\n"
+      "  dev help                              [Dev] List all universal debug channel ops\n"
+      "  dev op <op> [k=v ...] [--wait ms] [--logs] [--tag T]\n"
+      "                                        [Dev] Execute any input/win/gtk/shell/perf op\n"
+      "  dev batch (--ops \"op1; op2\" | --json '[...]') [--logs] [--stop-on-error] [--tag T]\n"
+      "                                        [Dev] Execute multi-step universal op pipeline\n"
       "  cmd <json|cmd_name>                   Send raw JSON request to IPC server\n"
       "  quit                                  Gracefully exit WINOME\n");
 }
@@ -241,7 +251,11 @@ int main(int argc, char** argv) {
 
   std::string resp;
   bool timed_out = false;
-  if (!query_pipe(req, &resp, 3000, &timed_out)) {
+  // Multi-step developer test sequences (test run / trigger) can legitimately
+  // span many seconds; scale client reply timeout accordingly.
+  const int pipe_timeout_ms =
+      (args[0] == "test" || args[0] == "dev") ? 60000 : 3000;
+  if (!query_pipe(req, &resp, pipe_timeout_ms, &timed_out)) {
     std::fprintf(stderr, "{\"ok\":false,\"error\":\"%s\"}\n",
                  timed_out ? "ipc_reply_timeout" : "not_running");
     std::fflush(stderr);

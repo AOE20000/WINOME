@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace winome {
@@ -36,27 +37,39 @@ HWINEVENTHOOK g_loc_hook = nullptr;
 HWINEVENTHOOK g_state_hook = nullptr;
 HWINEVENTHOOK g_movesize_hook = nullptr;
 
-bool belongs_to_process(HWND hwnd, const wchar_t* name) {
-  DWORD pid = 0;
-  GetWindowThreadProcessId(hwnd, &pid);
+struct CachedPidName {
+  std::wstring base;
+  int64_t checked_us = 0;
+};
+std::unordered_map<DWORD, CachedPidName> g_pid_name_cache;
+
+bool belongs_to_process_pid(DWORD pid, const wchar_t* name) {
   if (pid == 0)
     return false;
 
+  const int64_t now_us = g_get_monotonic_time();
+  auto it = g_pid_name_cache.find(pid);
+  if (it != g_pid_name_cache.end() &&
+      (now_us - it->second.checked_us) < 10LL * 1000 * 1000) {
+    return _wcsicmp(it->second.base.c_str(), name) == 0;
+  }
+
   HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-  if (process == nullptr)
-    return false;
-
-  wchar_t path[MAX_PATH] = {0};
-  DWORD len = MAX_PATH;
-  bool ok = QueryFullProcessImageNameW(process, 0, path, &len) != 0;
-  CloseHandle(process);
-  if (!ok)
-    return false;
-
-  std::wstring full(path);
-  size_t sep = full.find_last_of(L'\\');
-  std::wstring base = (sep != std::wstring::npos) ? full.substr(sep + 1) : full;
-  return _wcsicmp(base.c_str(), name) == 0;
+  std::wstring base;
+  if (process != nullptr) {
+    wchar_t path[MAX_PATH] = {0};
+    DWORD len = MAX_PATH;
+    if (QueryFullProcessImageNameW(process, 0, path, &len) != 0) {
+      std::wstring full(path, len);
+      size_t sep = full.find_last_of(L'\\');
+      base = (sep != std::wstring::npos) ? full.substr(sep + 1) : full;
+    }
+    CloseHandle(process);
+  }
+  if (g_pid_name_cache.size() >= 128)
+    g_pid_name_cache.clear();
+  g_pid_name_cache[pid] = CachedPidName{base, now_us};
+  return !base.empty() && _wcsicmp(base.c_str(), name) == 0;
 }
 
 volatile LONG g_expected_panel_height = 32;
@@ -66,6 +79,8 @@ guint g_workarea_settle_eval_id = 0;
 guint g_unhide_debounce_id = 0;
 guint g_hide_debounce_id = 0;
 guint g_drag_trailing_eval_id = 0;
+int64_t g_drag_trailing_deadline_us = 0;
+guint g_location_eval_id = 0;
 
 int64_t monotonic_ms() {
   return g_get_monotonic_time() / 1000;
@@ -233,6 +248,11 @@ void cancel_hide_debounce() {
 
 void cancel_drag_trailing_eval() {
   safe_remove_source(&g_drag_trailing_eval_id);
+  g_drag_trailing_deadline_us = 0;
+}
+
+void cancel_location_eval() {
+  safe_remove_source(&g_location_eval_id);
 }
 
 void reassert_primary_workarea_and_styles();
@@ -291,14 +311,33 @@ void schedule_hide_debounce(int delay_ms) {
 }
 
 gboolean drag_trailing_eval_cb(gpointer G_GNUC_UNUSED data) {
+  const int64_t now_us = g_get_monotonic_time();
+  if (now_us < g_drag_trailing_deadline_us) {
+    const guint remain_ms = static_cast<guint>(
+        std::max<int64_t>(20, (g_drag_trailing_deadline_us - now_us) / 1000));
+    g_drag_trailing_eval_id = g_timeout_add(remain_ms, drag_trailing_eval_cb, nullptr);
+    return G_SOURCE_REMOVE;
+  }
   g_drag_trailing_eval_id = 0;
   evaluate_fullscreen_state();
   return G_SOURCE_REMOVE;
 }
 
 void schedule_drag_trailing_eval() {
-  cancel_drag_trailing_eval();
-  g_drag_trailing_eval_id = g_timeout_add(120, drag_trailing_eval_cb, nullptr);
+  g_drag_trailing_deadline_us = g_get_monotonic_time() + 120LL * 1000;
+  if (g_drag_trailing_eval_id == 0)
+    g_drag_trailing_eval_id = g_timeout_add(120, drag_trailing_eval_cb, nullptr);
+}
+
+gboolean location_eval_cb(gpointer G_GNUC_UNUSED data) {
+  g_location_eval_id = 0;
+  evaluate_fullscreen_state();
+  return G_SOURCE_REMOVE;
+}
+
+void schedule_location_eval() {
+  if (g_location_eval_id == 0)
+    g_location_eval_id = g_timeout_add(40, location_eval_cb, nullptr);
 }
 
 bool strip_panel_resize_styles(HWND hwnd) {
@@ -457,7 +496,7 @@ void detect_fullscreen_state(bool* all_locked, HMONITOR* fullscreen_mon) {
   if (fg_pid == GetCurrentProcessId())
     return;
 
-  if (belongs_to_process(fg, L"LogonUI.exe")) {
+  if (belongs_to_process_pid(fg_pid, L"LogonUI.exe")) {
     *all_locked = true;
     return;
   }
@@ -473,9 +512,6 @@ void detect_fullscreen_state(bool* all_locked, HMONITOR* fullscreen_mon) {
   }
 
   if (is_desktop_window(fg))
-    return;
-
-  if (belongs_to_process(fg, L"winome.exe"))
     return;
 
   LONG_PTR style = GetWindowLongPtrW(fg, GWL_STYLE);
@@ -550,6 +586,10 @@ void CALLBACK fg_win_event_proc(HWINEVENTHOOK hook G_GNUC_UNUSED,
       schedule_drag_trailing_eval();
       return;
     }
+    // Coalesce high-frequency non-GUI_INMOVESIZE location storms (e.g.
+    // Chromium/Electron/VS Code custom titlebar drags and window animations).
+    schedule_location_eval();
+    return;
   } else {
     // Repair workarea before evaluating maximized/fullscreen bounds on focus
     // changes (e.g. closing an Explorer tray popup or restoring a window).
@@ -578,6 +618,8 @@ void evaluate_fullscreen_state(void) {
     cancel_workarea_retry();
     cancel_workarea_settle_eval();
     cancel_drag_trailing_eval();
+  cancel_location_eval();
+  g_pid_name_cache.clear();
     return;
   }
 
@@ -800,6 +842,8 @@ void stop_fullscreen_watcher(void) {
   cancel_workarea_retry();
   cancel_workarea_settle_eval();
   cancel_drag_trailing_eval();
+  cancel_location_eval();
+  g_pid_name_cache.clear();
   safe_remove_source(&g_tick_source);
   if (g_fg_hook != nullptr) {
     UnhookWinEvent(g_fg_hook);

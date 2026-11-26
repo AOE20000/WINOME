@@ -18,10 +18,13 @@
 #include <shellapi.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace winome {
@@ -31,6 +34,7 @@ constexpr UINT kDwmUseImmersiveDarkMode = 20;
 
 struct LookingGlassState {
   LookingGlassCallbacks cbs{};
+  std::shared_ptr<std::atomic<bool>> alive;
   GtkWidget* window = nullptr;
   GtkWidget* stack = nullptr;
 
@@ -38,6 +42,16 @@ struct LookingGlassState {
   GtkWidget* cmd_entry = nullptr;
   GtkTextBuffer* cmd_buf = nullptr;
   GtkWidget* cmd_timing_lbl = nullptr;
+
+  // Test Runner page
+  GtkWidget* test_steps_entry = nullptr;
+  GtkWidget* test_gap_spin = nullptr;
+  GtkWidget* test_settle_spin = nullptr;
+  GtkWidget* test_repeat_spin = nullptr;
+  GtkWidget* test_tag_entry = nullptr;
+  GtkWidget* test_status_lbl = nullptr;
+  GtkTextBuffer* test_buf = nullptr;
+  bool test_busy = false;
 
   // Logs page
   GtkWidget* log_tag_drop = nullptr;
@@ -127,6 +141,17 @@ void apply_dark_frame(GtkWidget* win) {
   }
 }
 
+std::string escape_lg_json(const std::string& s) {
+  std::string out;
+  out.reserve(s.size() + 8);
+  for (char c : s) {
+    if (c == '"' || c == '\\')
+      out.push_back('\\');
+    out.push_back(c);
+  }
+  return out;
+}
+
 std::string normalize_cmd_to_json(const std::string& raw) {
   size_t s = 0;
   while (s < raw.size() && std::isspace(static_cast<unsigned char>(raw[s])))
@@ -148,13 +173,105 @@ std::string normalize_cmd_to_json(const std::string& raw) {
   const std::string arg = trimmed.substr(sp + 1);
   if (cmd == "desktop.switch" || cmd == "desktop.remove")
     return "{\"cmd\":\"" + cmd + "\",\"index\":" + arg + "}";
+  if (cmd == "test.trigger")
+    return "{\"cmd\":\"test.trigger\",\"action\":\"" + escape_lg_json(arg) +
+           "\",\"wait_ms\":450,\"tag\":\"trig,ov,perf,dev-test\"}";
+  if (cmd == "test.run") {
+    if (arg == "slow-double-win" || arg == "overview-bench") {
+      return "{\"cmd\":\"test.run\",\"preset\":\"" + arg +
+             "\",\"tag\":\"trig,ov,perf,dev-test\"}";
+    }
+    return "{\"cmd\":\"test.run\",\"steps\":\"" + escape_lg_json(arg) +
+           "\",\"tag\":\"trig,ov,perf,dev-test\"}";
+  }
+  if (cmd == "test.begin")
+    return "{\"cmd\":\"test.begin\",\"tag\":\"" + escape_lg_json(arg) + "\"}";
+  if (cmd == "dev.op") {
+    return "{\"cmd\":\"dev.op\",\"action\":\"" + escape_lg_json(arg) +
+           "\",\"capture_logs\":true}";
+  }
+  if (cmd == "dev.batch") {
+    return "{\"cmd\":\"dev.batch\",\"ops\":\"" + escape_lg_json(arg) +
+           "\",\"capture_logs\":true}";
+  }
   if (cmd == "subsystem.trip" || cmd == "subsystem.recover" ||
       cmd == "plugin.restart" || cmd == "plugin.enable" ||
       cmd == "plugin.disable" || cmd == "plugin.reset" ||
       cmd == "run.exec") {
-    return "{\"cmd\":\"" + cmd + "\",\"name\":\"" + arg + "\"}";
+    return "{\"cmd\":\"" + cmd + "\",\"name\":\"" + escape_lg_json(arg) + "\"}";
   }
-  return "{\"cmd\":\"" + cmd + "\",\"page\":\"" + arg + "\"}";
+  return "{\"cmd\":\"" + cmd + "\",\"page\":\"" + escape_lg_json(arg) + "\"}";
+}
+
+struct AsyncLgCmdResult {
+  std::shared_ptr<std::atomic<bool>> alive;
+  std::string req;
+  std::string resp;
+  double elapsed_ms = 0.0;
+  bool to_test_tab = false;
+};
+
+gboolean on_async_lg_cmd_done(gpointer ud) {
+  std::unique_ptr<AsyncLgCmdResult> res(static_cast<AsyncLgCmdResult*>(ud));
+  if (!res || !res->alive || !res->alive->load(std::memory_order_acquire) ||
+      g_lg.window == nullptr) {
+    return G_SOURCE_REMOVE;
+  }
+  char hdr[256];
+  std::snprintf(hdr, sizeof(hdr), "%.2f ms  |  %s", res->elapsed_ms,
+                res->req.c_str());
+  if (res->to_test_tab) {
+    g_lg.test_busy = false;
+    if (g_lg.test_status_lbl != nullptr)
+      gtk_label_set_text(GTK_LABEL(g_lg.test_status_lbl), hdr);
+    if (g_lg.test_buf != nullptr) {
+      gtk_text_buffer_set_text(g_lg.test_buf, res->resp.c_str(),
+                               static_cast<int>(res->resp.size()));
+    }
+  } else {
+    if (g_lg.cmd_timing_lbl != nullptr)
+      gtk_label_set_text(GTK_LABEL(g_lg.cmd_timing_lbl), hdr);
+    if (g_lg.cmd_buf != nullptr) {
+      gtk_text_buffer_set_text(g_lg.cmd_buf, res->resp.c_str(),
+                               static_cast<int>(res->resp.size()));
+    }
+  }
+  return G_SOURCE_REMOVE;
+}
+
+void dispatch_lg_request_async(const std::string& req, bool to_test_tab) {
+  if (g_lg.window == nullptr || req.empty())
+    return;
+  if (to_test_tab) {
+    if (g_lg.test_busy)
+      return;
+    g_lg.test_busy = true;
+    if (g_lg.test_status_lbl != nullptr) {
+      gtk_label_set_text(GTK_LABEL(g_lg.test_status_lbl),
+                         tr("Running test sequence...", "正在执行测试序列..."));
+    }
+  } else if (g_lg.cmd_timing_lbl != nullptr) {
+    gtk_label_set_text(GTK_LABEL(g_lg.cmd_timing_lbl),
+                       tr("Executing asynchronously...", "正在后台异步执行..."));
+  }
+
+  auto dispatch_fn = g_lg.cbs.dispatch_cmd;
+  auto alive = g_lg.alive;
+  std::thread([dispatch_fn, alive, req, to_test_tab]() {
+    const gint64 t0 = g_get_monotonic_time();
+    const std::string resp =
+        dispatch_fn ? dispatch_fn(req)
+                    : "{\"ok\":false,\"error\":\"no_dispatcher\"}";
+    const double elapsed_ms =
+        static_cast<double>(g_get_monotonic_time() - t0) / 1000.0;
+    auto* payload = new AsyncLgCmdResult();
+    payload->alive = alive;
+    payload->req = req;
+    payload->resp = resp;
+    payload->elapsed_ms = elapsed_ms;
+    payload->to_test_tab = to_test_tab;
+    g_idle_add(on_async_lg_cmd_done, payload);
+  }).detach();
 }
 
 void exec_console_command(const char* text) {
@@ -163,6 +280,17 @@ void exec_console_command(const char* text) {
   const std::string req = normalize_cmd_to_json(text);
   if (req.empty())
     return;
+
+  // test.trigger / test.run / dev.op / dev.batch may sleep or drive OS input
+  // while GTK animates and collects logs; run off the GTK main thread so
+  // animations remain 100% live & responsive.
+  if (req.find("\"test.trigger\"") != std::string::npos ||
+      req.find("\"test.run\"") != std::string::npos ||
+      req.find("\"dev.op\"") != std::string::npos ||
+      req.find("\"dev.batch\"") != std::string::npos) {
+    dispatch_lg_request_async(req, false);
+    return;
+  }
 
   const gint64 t0 = g_get_monotonic_time();
   const std::string resp =
@@ -203,7 +331,8 @@ std::string current_log_filter() {
     return "all";
   guint idx = gtk_drop_down_get_selected(GTK_DROP_DOWN(g_lg.log_tag_drop));
   static const char* const kTags[] = {
-      "all", "perf", "vd", "ipc", "abi", "trig", "plugin", "run"};
+      "all", "perf", "ov", "ov-focus", "trig", "dev-test", "vd", "ipc", "abi",
+      "plugin", "run"};
   if (idx < std::size(kTags))
     return kTags[idx];
   return "all";
@@ -708,6 +837,8 @@ void on_subsys_refresh_clicked(GtkButton* b G_GNUC_UNUSED, gpointer ud G_GNUC_UN
 }
 
 void on_lg_destroy(GtkWidget* w G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
+  if (g_lg.alive)
+    g_lg.alive->store(false, std::memory_order_release);
   if (g_lg.log_timer_id != 0) {
     g_source_remove(g_lg.log_timer_id);
     g_lg.log_timer_id = 0;
@@ -717,6 +848,14 @@ void on_lg_destroy(GtkWidget* w G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
   g_lg.cmd_entry = nullptr;
   g_lg.cmd_buf = nullptr;
   g_lg.cmd_timing_lbl = nullptr;
+  g_lg.test_steps_entry = nullptr;
+  g_lg.test_gap_spin = nullptr;
+  g_lg.test_settle_spin = nullptr;
+  g_lg.test_repeat_spin = nullptr;
+  g_lg.test_tag_entry = nullptr;
+  g_lg.test_status_lbl = nullptr;
+  g_lg.test_buf = nullptr;
+  g_lg.test_busy = false;
   g_lg.log_tag_drop = nullptr;
   g_lg.log_pause_btn = nullptr;
   g_lg.log_buf = nullptr;
@@ -729,6 +868,220 @@ void on_lg_destroy(GtkWidget* w G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
   g_lg.plugins_box = nullptr;
 }
 
+std::string current_test_tags() {
+  if (g_lg.test_tag_entry == nullptr)
+    return "trig,ov,perf,dev-test";
+  const char* txt = gtk_editable_get_text(GTK_EDITABLE(g_lg.test_tag_entry));
+  return txt != nullptr ? std::string(txt) : std::string();
+}
+
+void on_test_single_clicked(GtkButton* btn G_GNUC_UNUSED, gpointer data) {
+  const char* action = static_cast<const char*>(data);
+  if (action == nullptr)
+    return;
+  const int settle =
+      g_lg.test_settle_spin != nullptr
+          ? gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(g_lg.test_settle_spin))
+          : 500;
+  char req[512];
+  std::snprintf(
+      req, sizeof(req),
+      "{\"cmd\":\"test.trigger\",\"action\":\"%s\",\"wait_ms\":%d,\"tag\":\"%s\"}",
+      action, settle, escape_lg_json(current_test_tags()).c_str());
+  dispatch_lg_request_async(req, true);
+}
+
+void on_test_preset_clicked(GtkButton* btn G_GNUC_UNUSED, gpointer data) {
+  const char* preset = static_cast<const char*>(data);
+  if (preset == nullptr)
+    return;
+  const int gap =
+      g_lg.test_gap_spin != nullptr
+          ? gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(g_lg.test_gap_spin))
+          : 500;
+  const int settle =
+      g_lg.test_settle_spin != nullptr
+          ? gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(g_lg.test_settle_spin))
+          : 600;
+  const int repeat =
+      g_lg.test_repeat_spin != nullptr
+          ? gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(g_lg.test_repeat_spin))
+          : 1;
+  char req[512];
+  std::snprintf(
+      req, sizeof(req),
+      "{\"cmd\":\"test.run\",\"preset\":\"%s\",\"gap_ms\":%d,"
+      "\"settle_ms\":%d,\"repeat\":%d,\"tag\":\"%s\"}",
+      preset, gap, settle, repeat, escape_lg_json(current_test_tags()).c_str());
+  dispatch_lg_request_async(req, true);
+}
+
+void on_test_custom_run_clicked(GtkButton* btn G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
+  if (g_lg.test_steps_entry == nullptr)
+    return;
+  const char* steps = gtk_editable_get_text(GTK_EDITABLE(g_lg.test_steps_entry));
+  if (steps == nullptr || steps[0] == '\0')
+    return;
+  const int settle =
+      g_lg.test_settle_spin != nullptr
+          ? gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(g_lg.test_settle_spin))
+          : 500;
+  const int repeat =
+      g_lg.test_repeat_spin != nullptr
+          ? gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(g_lg.test_repeat_spin))
+          : 1;
+  std::string req =
+      std::string("{\"cmd\":\"test.run\",\"steps\":\"") +
+      escape_lg_json(steps) + "\",\"settle_ms\":" + std::to_string(settle) +
+      ",\"repeat\":" + std::to_string(repeat) + ",\"tag\":\"" +
+      escape_lg_json(current_test_tags()) + "\"}";
+  dispatch_lg_request_async(req, true);
+}
+
+void on_test_session_begin_clicked(GtkButton* btn G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
+  std::string req = std::string("{\"cmd\":\"test.begin\",\"tag\":\"") +
+                    escape_lg_json(current_test_tags()) + "\"}";
+  dispatch_lg_request_async(req, true);
+}
+
+void on_test_session_end_clicked(GtkButton* btn G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
+  dispatch_lg_request_async("{\"cmd\":\"test.end\"}", true);
+}
+
+GtkWidget* build_tests_page() {
+  GtkWidget* page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+  gtk_widget_set_name(page, "winomeLgBody");
+
+  // 1. Preset & session bar
+  GtkWidget* preset_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  GtkWidget* slow_win_btn = gtk_button_new_with_label(
+      tr("Slow Double Win (OS)", "慢速双击 Win 键 (OS)"));
+  g_signal_connect(slow_win_btn, "clicked", G_CALLBACK(on_test_preset_clicked),
+                   const_cast<char*>("slow-double-win"));
+  GtkWidget* bench_btn = gtk_button_new_with_label(
+      tr("Overview Bench", "概览开合压测"));
+  g_signal_connect(bench_btn, "clicked", G_CALLBACK(on_test_preset_clicked),
+                   const_cast<char*>("overview-bench"));
+  GtkWidget* beg_btn = gtk_button_new_with_label(tr("Begin Session", "开始会话"));
+  g_signal_connect(beg_btn, "clicked",
+                   G_CALLBACK(on_test_session_begin_clicked), nullptr);
+  GtkWidget* end_btn = gtk_button_new_with_label(tr("End & Aggregate", "结束并聚合"));
+  g_signal_connect(end_btn, "clicked",
+                   G_CALLBACK(on_test_session_end_clicked), nullptr);
+  gtk_box_append(GTK_BOX(preset_row), slow_win_btn);
+  gtk_box_append(GTK_BOX(preset_row), bench_btn);
+  gtk_box_append(GTK_BOX(preset_row), beg_btn);
+  gtk_box_append(GTK_BOX(preset_row), end_btn);
+  gtk_box_append(GTK_BOX(page), preset_row);
+
+  // 2. Single-trigger buttons
+  GtkWidget* single_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  struct SingleSpec {
+    const char* label;
+    const char* action;
+  } singles[] = {
+      {"win_tap_os", "win_tap_os"},
+      {"win_tap", "win_tap"},
+      {"esc_os", "esc_os"},
+      {"overview_open", "overview_open"},
+      {"overview_close", "overview_close"},
+      {"overview_grid", "overview_grid"},
+  };
+  for (const auto& sp : singles) {
+    GtkWidget* b = gtk_button_new_with_label(sp.label);
+    g_signal_connect(b, "clicked", G_CALLBACK(on_test_single_clicked),
+                     const_cast<char*>(sp.action));
+    gtk_box_append(GTK_BOX(single_row), b);
+  }
+  gtk_box_append(GTK_BOX(page), single_row);
+
+  // 2b. Universal developer debug channel quick ops (dev.help / dev.op)
+  GtkWidget* dev_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  struct DevQuickSpec {
+    const char* label;
+    const char* json;
+  } dev_quicks[] = {
+      {tr("GTK Windows", "GTK 窗口/渲染器"),
+       "{\"cmd\":\"dev.op\",\"op\":\"gtk.windows\"}"},
+      {tr("Perf Snapshot", "性能快照"),
+       "{\"cmd\":\"dev.op\",\"op\":\"perf.snapshot\"}"},
+      {tr("Foreground Win", "前景窗口"),
+       "{\"cmd\":\"dev.op\",\"op\":\"win.fg\"}"},
+      {tr("Clear Icon Cache", "清图标缓存"),
+       "{\"cmd\":\"dev.op\",\"op\":\"shell.cache\",\"args\":{\"action\":\"icon_clear\"}}"},
+      {tr("Dev Ops Help", "通用操作手册"),
+       "{\"cmd\":\"dev.help\"}"},
+  };
+  for (const auto& dq : dev_quicks) {
+    GtkWidget* b = gtk_button_new_with_label(dq.label);
+    g_signal_connect(
+        b, "clicked",
+        G_CALLBACK(+[](GtkButton* G_GNUC_UNUSED, gpointer data) {
+          const char* j = static_cast<const char*>(data);
+          if (j != nullptr)
+            dispatch_lg_request_async(j, true);
+        }),
+        const_cast<char*>(dq.json));
+    gtk_box_append(GTK_BOX(dev_row), b);
+  }
+  gtk_box_append(GTK_BOX(page), dev_row);
+
+  // 3. Parameters & custom step sequence
+  GtkWidget* param_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  g_lg.test_gap_spin = gtk_spin_button_new_with_range(50, 5000, 50);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(g_lg.test_gap_spin), 500);
+  g_lg.test_settle_spin = gtk_spin_button_new_with_range(0, 5000, 50);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(g_lg.test_settle_spin), 600);
+  g_lg.test_repeat_spin = gtk_spin_button_new_with_range(1, 20, 1);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(g_lg.test_repeat_spin), 1);
+  g_lg.test_tag_entry = gtk_entry_new();
+  gtk_editable_set_text(GTK_EDITABLE(g_lg.test_tag_entry),
+                        "trig,ov,perf,dev-test");
+  gtk_widget_set_hexpand(g_lg.test_tag_entry, TRUE);
+
+  gtk_box_append(GTK_BOX(param_row), gtk_label_new("gap(ms):"));
+  gtk_box_append(GTK_BOX(param_row), g_lg.test_gap_spin);
+  gtk_box_append(GTK_BOX(param_row), gtk_label_new("settle(ms):"));
+  gtk_box_append(GTK_BOX(param_row), g_lg.test_settle_spin);
+  gtk_box_append(GTK_BOX(param_row), gtk_label_new("repeat:"));
+  gtk_box_append(GTK_BOX(param_row), g_lg.test_repeat_spin);
+  gtk_box_append(GTK_BOX(param_row), gtk_label_new("tags:"));
+  gtk_box_append(GTK_BOX(param_row), g_lg.test_tag_entry);
+  gtk_box_append(GTK_BOX(page), param_row);
+
+  GtkWidget* steps_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  g_lg.test_steps_entry = gtk_entry_new();
+  gtk_widget_set_hexpand(g_lg.test_steps_entry, TRUE);
+  gtk_editable_set_text(GTK_EDITABLE(g_lg.test_steps_entry),
+                        "win_tap_os,sleep:500,win_tap_os");
+  GtkWidget* run_steps_btn =
+      gtk_button_new_with_label(tr("Run Steps", "运行步骤序列"));
+  g_signal_connect(run_steps_btn, "clicked",
+                   G_CALLBACK(on_test_custom_run_clicked), nullptr);
+  gtk_box_append(GTK_BOX(steps_row), g_lg.test_steps_entry);
+  gtk_box_append(GTK_BOX(steps_row), run_steps_btn);
+  gtk_box_append(GTK_BOX(page), steps_row);
+
+  g_lg.test_status_lbl = gtk_label_new(
+      tr("Ready — runs asynchronously while WINOME stays live",
+         "就绪 — 后台异步触发，保持 WINOME 实时运行并返回过程日志与帧率汇总"));
+  gtk_widget_set_name(g_lg.test_status_lbl, "winomeLgDim");
+  gtk_label_set_xalign(GTK_LABEL(g_lg.test_status_lbl), 0.0f);
+  gtk_box_append(GTK_BOX(page), g_lg.test_status_lbl);
+
+  GtkWidget* tv = gtk_text_view_new();
+  gtk_widget_set_name(tv, "winomeLgMono");
+  gtk_text_view_set_editable(GTK_TEXT_VIEW(tv), FALSE);
+  gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(tv), GTK_WRAP_WORD_CHAR);
+  g_lg.test_buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(tv));
+
+  GtkWidget* sc = gtk_scrolled_window_new();
+  gtk_widget_set_vexpand(sc, TRUE);
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sc), tv);
+  gtk_box_append(GTK_BOX(page), sc);
+  return page;
+}
+
 GtkWidget* build_console_page() {
   GtkWidget* page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
   gtk_widget_set_name(page, "winomeLgBody");
@@ -738,8 +1091,8 @@ GtkWidget* build_console_page() {
   gtk_widget_set_hexpand(g_lg.cmd_entry, TRUE);
   gtk_entry_set_placeholder_text(
       GTK_ENTRY(g_lg.cmd_entry),
-      tr("Command or JSON, e.g. status | desktop.list | {\"cmd\":\"desktop.switch\",\"index\":1}",
-         "输入指令或 JSON，例如 status | desktop.list | {\"cmd\":\"desktop.switch\",\"index\":1}"));
+      tr("Command or JSON, e.g. status | test.run slow-double-win | test.trigger win_tap_os",
+         "输入指令或 JSON，例如 status | test.run slow-double-win | test.trigger win_tap_os"));
   g_signal_connect(g_lg.cmd_entry, "activate",
                    G_CALLBACK(on_cmd_entry_activate), nullptr);
 
@@ -751,7 +1104,7 @@ GtkWidget* build_console_page() {
 
   GtkWidget* quick = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
   static const char* const kQuickCmds[] = {
-      "status", "overview.toggle", "desktop.list", "inspect.windows", "theme.reload", "plugin.list"};
+      "status", "overview.toggle", "test.run slow-double-win", "test.trigger win_tap_os", "inspect.windows", "theme.reload"};
   for (const char* qc : kQuickCmds) {
     GtkWidget* b = gtk_button_new_with_label(qc);
     g_signal_connect(b, "clicked", G_CALLBACK(on_quick_cmd_clicked),
@@ -784,7 +1137,8 @@ GtkWidget* build_logs_page() {
 
   GtkWidget* bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
   const char* const tags[] = {
-      "all", "perf", "vd", "ipc", "abi", "trig", "plugin", "run", nullptr};
+      "all", "perf", "ov", "ov-focus", "trig", "dev-test", "vd", "ipc", "abi",
+      "plugin", "run", nullptr};
   g_lg.log_tag_drop = gtk_drop_down_new_from_strings(tags);
   g_signal_connect(g_lg.log_tag_drop, "notify::selected",
                    G_CALLBACK(on_log_filter_changed), nullptr);
@@ -960,6 +1314,7 @@ bool open_looking_glass() {
   }
 
   ensure_lg_css();
+  g_lg.alive = std::make_shared<std::atomic<bool>>(true);
 
   GtkWidget* win = gtk_window_new();
   g_lg.window = win;
@@ -967,7 +1322,7 @@ bool open_looking_glass() {
   gtk_window_set_title(GTK_WINDOW(win),
                        tr("WINOME Developer Console (Looking Glass)",
                           "WINOME 开发者控制台 (Looking Glass)"));
-  gtk_window_set_default_size(GTK_WINDOW(win), 880, 560);
+  gtk_window_set_default_size(GTK_WINDOW(win), 920, 580);
   gtk_window_set_resizable(GTK_WINDOW(win), TRUE);
   install_bundled_fonts(win);
 
@@ -983,6 +1338,8 @@ bool open_looking_glass() {
 
   gtk_stack_add_titled(GTK_STACK(stack), build_console_page(),
                        "console", tr("Command", "指令台"));
+  gtk_stack_add_titled(GTK_STACK(stack), build_tests_page(),
+                       "tests", tr("Actions & Tests", "动作测试"));
   gtk_stack_add_titled(GTK_STACK(stack), build_logs_page(),
                        "logs", tr("Logs", "实时日志"));
   gtk_stack_add_titled(GTK_STACK(stack), build_inspector_page(),

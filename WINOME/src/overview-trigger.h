@@ -247,4 +247,15 @@ void sync_overview_active_state(bool active);
 void set_overview_change_callback(OverviewStateCallback callback,
                                   void *user_data);
 
+// Developer-mode automated testing helpers:
+// - simulate_bare_win_tap(): directly enqueues a BareWinUp action into the
+//   real trigger state machine (deterministic, bypasses OS input queue).
+// - simulate_os_win_tap(): injects a real untagged VK_LWIN down/up via
+//   SendInput so Windows routes it end-to-end through WH_KEYBOARD_LL.
+// - simulate_os_key_tap(): injects an arbitrary untagged VK down/up via
+//   SendInput (e.g. VK_ESCAPE).
+void simulate_bare_win_tap();
+void simulate_os_win_tap(int hold_ms = 25);
+void simulate_os_key_tap(unsigned vk, int hold_ms = 20);
+
 }  // namespace winome

@@ -105,27 +105,12 @@ window_center_y (const OvWindowInfo *w)
 
 // UnalignedLayoutStrategy.computeLayout
 void
-compute_layout (const std::vector<OvWindowInfo> &windows, int num_rows,
+compute_layout (const std::vector<const OvWindowInfo *> &sorted,
+                double total_width, int num_rows,
                 double monitor_height, Layout *layout)
 {
   std::vector<Row> &rows = layout->rows;
-
-  double total_width = 0;
-  for (const OvWindowInfo &window : windows) {
-    double w = std::max ((double)(window.rect.right - window.rect.left), 0.0);
-    total_width += w * compute_window_scale (window, monitor_height);
-  }
   double ideal_row_width = num_rows > 0 ? total_width / num_rows : total_width;
-
-  // Sort windows vertically to minimize travel distance.
-  std::vector<const OvWindowInfo *> sorted;
-  sorted.reserve (windows.size ());
-  for (const OvWindowInfo &w : windows)
-    sorted.push_back (&w);
-  std::stable_sort (sorted.begin (), sorted.end (),
-                    [] (const OvWindowInfo *a, const OvWindowInfo *b) {
-                      return window_center_y (a) < window_center_y (b);
-                    });
 
   size_t window_idx = 0;
   for (int i = 0; i < num_rows && window_idx < sorted.size (); ++i) {
@@ -348,6 +333,20 @@ overview_compute_slots (const std::vector<OvWindowInfo> &windows,
 
   double monitor_height = monitor_rect.bottom - monitor_rect.top;
 
+  // Precompute total width & vertical sort once across all num_rows trials.
+  double total_width = 0.0;
+  std::vector<const OvWindowInfo *> sorted;
+  sorted.reserve (windows.size ());
+  for (const OvWindowInfo &w : windows) {
+    double ww = std::max ((double)(w.rect.right - w.rect.left), 0.0);
+    total_width += ww * compute_window_scale (w, monitor_height);
+    sorted.push_back (&w);
+  }
+  std::stable_sort (sorted.begin (), sorted.end (),
+                    [] (const OvWindowInfo *a, const OvWindowInfo *b) {
+                      return window_center_y (a) < window_center_y (b);
+                    });
+
   // WorkspaceLayout._createBestLayout: search row counts, keep the best
   // scale/space trade-off.
   Layout last;
@@ -369,14 +368,14 @@ overview_compute_slots (const std::vector<OvWindowInfo> &windows,
     Layout layout;
     layout.rowSpacing = row_spacing;
     layout.columnSpacing = column_spacing;
-    compute_layout (windows, num_rows, monitor_height, &layout);
+    compute_layout (sorted, total_width, num_rows, monitor_height, &layout);
     compute_scale_and_space (&layout, workarea);
 
     if (have_last &&
         !is_better_layout (last.scale, last.space, layout.scale, layout.space))
       break;
 
-    last = layout;
+    last = std::move (layout);
     last_num_columns = num_columns;
     have_last = true;
   }

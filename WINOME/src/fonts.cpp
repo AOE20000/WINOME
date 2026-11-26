@@ -50,8 +50,6 @@ const wchar_t *const kFallbackSystemFontFiles[] = {
   L"segoeuib.ttf",  // Segoe UI Bold
   L"seguisym.ttf",  // Segoe UI Symbol
   L"seguiemj.ttf",  // Segoe UI Emoji
-  L"YuGothR.ttc",   // Yu Gothic (JP)
-  L"malgun.ttf",    // Malgun Gothic (KR)
 };
 
 // Minimal in-memory Fontconfig rules providing Cantarell -> CJK/Symbol/Emoji
@@ -202,13 +200,40 @@ bundled_font_map (void)
   char *dir = fonts_cache_dir ();
   g_mkdir_with_parents (dir, 0700);
 
+  std::string fc_cache_dir;
+  {
+    std::string base = winome::app_data_dir_ascii ();
+    if (!base.empty ()) {
+      char *cdir = g_build_filename (base.c_str (), "fontconfig-cache", NULL);
+      if (cdir != NULL) {
+        g_mkdir_with_parents (cdir, 0700);
+        fc_cache_dir = cdir;
+        g_free (cdir);
+      }
+    }
+  }
+
+  std::string fc_xml (kIsolatedFontconfigXml);
+  if (!fc_cache_dir.empty ()) {
+    gchar *esc = g_markup_escape_text (fc_cache_dir.c_str (), -1);
+    if (esc != nullptr) {
+      const char *marker = "<fontconfig>";
+      const size_t pos = fc_xml.find (marker);
+      if (pos != std::string::npos) {
+        fc_xml.insert (pos + strlen (marker),
+                       std::string ("\n  <cachedir>") + esc + "</cachedir>");
+      }
+      g_free (esc);
+    }
+  }
+
   FcConfig *config = FcConfigCreate ();
   bool owns_config = (config != nullptr);
   bool isolated_ok = false;
   if (config != nullptr &&
       FcConfigParseAndLoadFromMemory (
           config,
-          reinterpret_cast<const FcChar8 *> (kIsolatedFontconfigXml),
+          reinterpret_cast<const FcChar8 *> (fc_xml.c_str ()),
           FcTrue)) {
     isolated_ok = true;
   } else {

@@ -57,80 +57,58 @@ panel_engine (void)
   return winome::StEngine::get ();
 }
 
-// #panel { height: 2.2em } -> 32px ("Sans 11" at 96dpi).
-static int
-panel_height (void)
-{
-  winome::StEngine *e = panel_engine ();
-  if (e == nullptr)
-    return 32;
+struct PanelThemeMetrics {
+  bool resolved = false;
+  int panel_h = 32;
+  int status_icon = 16;
+  int indicators_spacing = 4;
+  int ws_dot = 8;
+};
 
-  winome::StEngine::Node panel (*e, nullptr, "panel", "", "");
-  double v = 0.0;
-  if (panel.lookup_length ("height", &v))
-    return (int)(v + 0.5);
-  return 32;
+static PanelThemeMetrics g_panel_metrics;
+
+static const PanelThemeMetrics &
+panel_metrics (void)
+{
+  if (!g_panel_metrics.resolved) {
+    g_panel_metrics.resolved = true;
+    g_panel_metrics.panel_h = 32;
+    g_panel_metrics.status_icon = 16;
+    g_panel_metrics.indicators_spacing = 4;
+    g_panel_metrics.ws_dot = 8;
+    if (winome::StEngine *e = panel_engine ()) {
+      winome::StEngine::Node panel (*e, nullptr, "panel", "", "");
+      double v = 0.0;
+      if (panel.lookup_length ("height", &v))
+        g_panel_metrics.panel_h = (int)(v + 0.5);
+
+      winome::StEngine::Node button (*e, &panel, "", "panel-button", "");
+      winome::StEngine::Node icon (*e, &button, "", "system-status-icon", "");
+      v = 0.0;
+      if (icon.lookup_length ("icon-size", &v))
+        g_panel_metrics.status_icon = (int)(v + 0.5);
+
+      winome::StEngine::Node box (*e, &button, "",
+                                  "panel-status-indicators-box", "");
+      v = 0.0;
+      if (box.lookup_length ("spacing", &v))
+        g_panel_metrics.indicators_spacing = (int)(v + 0.5);
+
+      winome::StEngine::Node act_btn (*e, &panel, "panelActivities",
+                                      "panel-button", "");
+      winome::StEngine::Node dot (*e, &act_btn, "", "workspace-dot", "");
+      v = 0.0;
+      if (dot.lookup_length ("min-width", &v))
+        g_panel_metrics.ws_dot = (int)(v + 0.5);
+    }
+  }
+  return g_panel_metrics;
 }
 
-// The GNOME status icon size (16px), resolved from the selector
-// #panel .panel-button .system-status-icon { icon-size: 1.091em; }.
-static int
-status_icon_size (void)
-{
-  winome::StEngine *e = panel_engine ();
-  if (e == nullptr)
-    return 16;
-
-  winome::StEngine::Node panel (*e, nullptr, "panel", "", "");
-  winome::StEngine::Node button (*e, &panel, "", "panel-button", "");
-  winome::StEngine::Node icon (*e, &button, "", "system-status-icon", "");
-
-  double v = 0.0;
-  if (icon.lookup_length ("icon-size", &v))
-    return (int)(v + 0.5);
-  return 16;
-}
-
-// Spacing between status indicators, from
-// #panel .panel-button .panel-status-indicators-box { spacing: 4px; }.
-static int
-status_indicators_spacing (void)
-{
-  winome::StEngine *e = panel_engine ();
-  if (e == nullptr)
-    return 4;
-
-  winome::StEngine::Node panel (*e, nullptr, "panel", "", "");
-  winome::StEngine::Node button (*e, &panel, "", "panel-button", "");
-  winome::StEngine::Node box (*e, &button, "",
-                              "panel-status-indicators-box", "");
-
-  double v = 0.0;
-  if (box.lookup_length ("spacing", &v))
-    return (int)(v + 0.5);
-  return 4;
-}
-
-// The workspace dot base size, from
-// #panel .panel-button#panelActivities .workspace-dot { min-width: 0.5455em; }
-// -> 8px.
-static int
-workspace_dot_size (void)
-{
-  winome::StEngine *e = panel_engine ();
-  if (e == nullptr)
-    return 8;
-
-  winome::StEngine::Node panel (*e, nullptr, "panel", "", "");
-  winome::StEngine::Node button (*e, &panel, "panelActivities", "panel-button",
-                                 "");
-  winome::StEngine::Node dot (*e, &button, "", "workspace-dot", "");
-
-  double v = 0.0;
-  if (dot.lookup_length ("min-width", &v))
-    return (int)(v + 0.5);
-  return 8;
-}
+static int panel_height (void) { return panel_metrics ().panel_h; }
+static int status_icon_size (void) { return panel_metrics ().status_icon; }
+static int status_indicators_spacing (void) { return panel_metrics ().indicators_spacing; }
+static int workspace_dot_size (void) { return panel_metrics ().ws_dot; }
 
 // --- Activities button & continuous workspace indicators --------------------
 //
@@ -878,10 +856,17 @@ is_24h_clock (void)
   if (cfg.clock_format == "12h")
     return FALSE;
 
+  static gboolean s_cached_24h = FALSE;
+  static gint64 s_cached_at_us = 0;
+  const gint64 now_us = g_get_monotonic_time ();
+  if (s_cached_at_us != 0 && (now_us - s_cached_at_us) < 30LL * 1000 * 1000)
+    return s_cached_24h;
+
   wchar_t buf[8] = {};
   DWORD size = sizeof (buf);
   DWORD type = 0;
   HKEY key = NULL;
+  gboolean result = FALSE;
 
   if (RegOpenKeyExW (HKEY_CURRENT_USER,
                      L"Control Panel\\International", 0, KEY_READ, &key)
@@ -891,10 +876,12 @@ is_24h_clock (void)
                                        reinterpret_cast<BYTE *> (buf), &size);
     RegCloseKey (key);
     if (status == ERROR_SUCCESS && type == REG_SZ)
-      return buf[0] == L'1';
+      result = (buf[0] == L'1') ? TRUE : FALSE;
   }
 
-  return FALSE;
+  s_cached_24h = result;
+  s_cached_at_us = now_us;
+  return result;
 }
 
 static gboolean
@@ -952,6 +939,7 @@ typedef struct {
   int win_x;               // last positioned left edge in physical px
   gint raise_attempts;     // post-map re-assert counter (GDK re-lates late)
   guint raise_source_id;   // pending g_idle/g_timeout id for popover_raise_idle
+  guint stale_hover_id;    // pending 200ms timer for clear_stale_hover
   uint64_t anim_gen;       // invalidates stale open/close fade callbacks
 } PanelPopover;
 
@@ -1265,6 +1253,10 @@ panel_popover_close_ex (PanelPopover *pp, const char *reason, gboolean immediate
   pp->open = FALSE;
   const uint64_t gen = ++pp->anim_gen;
   panel_popover_cancel_raise (pp);
+  if (pp->stale_hover_id != 0) {
+    g_source_remove (pp->stale_hover_id);
+    pp->stale_hover_id = 0;
+  }
   gtk_widget_remove_css_class (pp->button, "open");
 
   if (pp->child != NULL)
@@ -1283,8 +1275,24 @@ panel_popover_close_ex (PanelPopover *pp, const char *reason, gboolean immediate
     gtk_widget_unset_state_flags (p, GTK_STATE_FLAG_PRELIGHT);
     p = gtk_widget_get_parent (p);
   }
-  g_timeout_add_full (G_PRIORITY_DEFAULT, 200, clear_stale_hover,
-                      g_object_ref (pp->button), g_object_unref);
+  if (pp->stale_hover_id != 0) {
+    g_source_remove (pp->stale_hover_id);
+    pp->stale_hover_id = 0;
+  }
+  pp->stale_hover_id = g_timeout_add_full (
+      G_PRIORITY_DEFAULT, 200,
+      +[] (gpointer data) -> gboolean {
+        PanelPopover *p = static_cast<PanelPopover *> (data);
+        if (std::find (g_live_popovers.begin (), g_live_popovers.end (), p) ==
+            g_live_popovers.end () || p->button == nullptr) {
+          return G_SOURCE_REMOVE;
+        }
+        gboolean cont = clear_stale_hover (p->button);
+        if (!cont)
+          p->stale_hover_id = 0;
+        return cont;
+      },
+      pp, nullptr);
 
   const double cur_op = pp->wrap != nullptr ? gtk_widget_get_opacity (pp->wrap) : 0.0;
   if (immediate || pp->wrap == nullptr || cur_op <= 0.01) {
@@ -1393,6 +1401,10 @@ on_popover_map (GtkWidget *widget, gpointer data)
   if (!pp->open)
     return;
   panel_popover_cancel_raise (pp);
+  if (pp->stale_hover_id != 0) {
+    g_source_remove (pp->stale_hover_id);
+    pp->stale_hover_id = 0;
+  }
   pp->raise_source_id = g_idle_add (popover_raise_idle, pp);
 }
 
@@ -1489,6 +1501,10 @@ panel_popover_open (PanelPopover *pp)
   // popover_raise_idle): the first map demotes the window out of the
   // topmost band, hiding it below the overview.
   panel_popover_cancel_raise (pp);
+  if (pp->stale_hover_id != 0) {
+    g_source_remove (pp->stale_hover_id);
+    pp->stale_hover_id = 0;
+  }
   pp->raise_source_id = g_idle_add (popover_raise_idle, pp);
 
   g_open_popovers = g_list_append (g_open_popovers, pp);
@@ -1822,6 +1838,10 @@ on_popover_button_destroy (GtkWidget *button, gpointer data)
   pp->open = FALSE;
   ++pp->anim_gen;
   panel_popover_cancel_raise (pp);
+  if (pp->stale_hover_id != 0) {
+    g_source_remove (pp->stale_hover_id);
+    pp->stale_hover_id = 0;
+  }
   g_open_popovers = g_list_remove (g_open_popovers, pp);
   if (g_open_popovers == nullptr && g_popover_mouse_hook != nullptr) {
     UnhookWindowsHookEx (g_popover_mouse_hook);
@@ -2326,18 +2346,35 @@ update_battery_icon (PanelStatus *st)
     if (winome::get_config ().show_battery_percentage) {
       char pct[16];
       snprintf (pct, sizeof (pct), "%d%%", battery.percentage);
-      gtk_label_set_text (GTK_LABEL (st->battery_label), pct);
-      gtk_widget_set_visible (st->battery_label, TRUE);
-    } else {
+      if (g_strcmp0 (gtk_label_get_text (GTK_LABEL (st->battery_label)), pct) != 0)
+        gtk_label_set_text (GTK_LABEL (st->battery_label), pct);
+      if (!gtk_widget_get_visible (st->battery_label))
+        gtk_widget_set_visible (st->battery_label, TRUE);
+    } else if (gtk_widget_get_visible (st->battery_label)) {
       gtk_widget_set_visible (st->battery_label, FALSE);
     }
   } else {
     // No battery/UPS: like status/system.js, show the power icon instead.
-    gtk_widget_set_visible (st->battery_box, TRUE);
+    if (!gtk_widget_get_visible (st->battery_box))
+      gtk_widget_set_visible (st->battery_box, TRUE);
     set_icon_name_if_changed (GTK_IMAGE (st->battery_icon),
                                "system-shutdown-symbolic");
-    gtk_widget_set_visible (st->battery_label, FALSE);
+    if (gtk_widget_get_visible (st->battery_label))
+      gtk_widget_set_visible (st->battery_label, FALSE);
   }
+}
+
+static bool
+is_panel_child_popover_open (GtkWidget *child)
+{
+  if (child == nullptr)
+    return false;
+  for (GList *l = g_open_popovers; l != nullptr; l = l->next) {
+    PanelPopover *pp = static_cast<PanelPopover *> (l->data);
+    if (pp != nullptr && pp->open && pp->child == child)
+      return true;
+  }
+  return false;
 }
 
 static gboolean
@@ -2362,10 +2399,16 @@ refresh_status (gpointer data)
     update_volume_icon (st->volume_icon);
   if (st->battery_box != nullptr)
     update_battery_icon (st);
-  if (st->quick_settings != nullptr)
+  // Popovers refresh immediately on open (panel_popover_open); never waste
+  // main-thread COM/I2C/widget rebuild work while they are closed.
+  if (st->quick_settings != nullptr &&
+      is_panel_child_popover_open (st->quick_settings)) {
     winome_quick_settings_refresh (st->quick_settings);
-  if (st->date_menu != nullptr)
+  }
+  if (st->date_menu != nullptr &&
+      is_panel_child_popover_open (st->date_menu)) {
     winome_calendar_refresh (st->date_menu);
+  }
 
   return G_SOURCE_CONTINUE;
 }
@@ -2865,6 +2908,7 @@ winome_shell_reload_theme (void)
   bool st_ok = true;
   if (winome::StEngine *eng = winome::StEngine::get ())
     st_ok = eng->load_stylesheet_resource ("resource:///org/winome/theme/gnome-shell-dark.css");
+  g_panel_metrics.resolved = false;
   winome::set_expected_panel_height (panel_height ());
   g_print ("[theme] theme reloaded (st_ok=%d)\n", st_ok ? 1 : 0);
   return st_ok;
@@ -2922,9 +2966,40 @@ on_panel_config_changed (void *data)
 }
 
 static void
-on_panel_status_event (void *data)
+on_panel_volume_event (void *data)
 {
-  refresh_status (data);
+  auto *st = static_cast<PanelStatus *> (data);
+  if (st == nullptr || st->destroyed)
+    return;
+  if (st->volume_icon != nullptr)
+    update_volume_icon (st->volume_icon);
+  if (st->quick_settings != nullptr &&
+      is_panel_child_popover_open (st->quick_settings)) {
+    winome_quick_settings_refresh (st->quick_settings);
+  }
+}
+
+static void
+on_panel_wifi_event (void *data)
+{
+  auto *st = static_cast<PanelStatus *> (data);
+  if (st == nullptr || st->destroyed)
+    return;
+  if (st->network_icon != nullptr)
+    update_network_icon (st->network_icon);
+  if (st->quick_settings != nullptr &&
+      is_panel_child_popover_open (st->quick_settings)) {
+    winome_quick_settings_refresh (st->quick_settings);
+  }
+}
+
+static void
+on_panel_notifications_event (void *data)
+{
+  auto *st = static_cast<PanelStatus *> (data);
+  if (st == nullptr || st->destroyed)
+    return;
+  update_messages_indicator (st);
 }
 
 struct PanelPluginSlotSpec {
@@ -3076,10 +3151,10 @@ on_panel_destroy (GtkWidget *panel, gpointer user_data G_GNUC_UNUSED)
     clear_glib_source (&st->clock_timer_id);
     winome::ws::remove_change_listener (on_panel_desktop_changed, st);
     winome::remove_config_listener (on_panel_config_changed, st);
-    winome::notifications_remove_listener (on_panel_status_event, st);
+    winome::notifications_remove_listener (on_panel_notifications_event, st);
     winome::systray_remove_listener (on_systray_changed, st);
-    winome::remove_volume_listener (on_panel_status_event, st);
-    winome_wifi_remove_listener (on_panel_status_event, st);
+    winome::remove_volume_listener (on_panel_volume_event, st);
+    winome_wifi_remove_listener (on_panel_wifi_event, st);
     track_panel_widget (&st->activities_indicators, nullptr);
     track_panel_widget (&st->clock_label, nullptr);
     track_panel_widget (&st->messages_indicator, nullptr);
@@ -3199,10 +3274,10 @@ build_shell_panel (bool primary)
   // WLAN, notifications, and VD push event callbacks.
   status->status_timer_id = g_timeout_add_seconds (10, refresh_status, status);
   winome::systray_add_listener (on_systray_changed, status);
-  winome::add_volume_listener (on_panel_status_event, status);
-  winome_wifi_add_listener (on_panel_status_event, status);
+  winome::add_volume_listener (on_panel_volume_event, status);
+  winome_wifi_add_listener (on_panel_wifi_event, status);
   winome::add_config_listener (on_panel_config_changed, status);
-  winome::notifications_add_listener (on_panel_status_event, status);
+  winome::notifications_add_listener (on_panel_notifications_event, status);
   g_signal_connect (panel, "destroy", G_CALLBACK (on_panel_destroy), nullptr);
 
   // Give the panel its own font map so the bundled Cantarell font is used.

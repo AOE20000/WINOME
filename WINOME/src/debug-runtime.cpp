@@ -21,7 +21,7 @@
 namespace winome {
 namespace {
 
-constexpr size_t kMaxLogRingEntries = 512;
+constexpr size_t kMaxLogRingEntries = 2048;
 
 struct DebugStore {
   std::mutex mu;
@@ -380,6 +380,34 @@ void debug_append_log(const char* tag, const std::string& text) {
   push_line_locked(s, tag, text);
 }
 
+static bool tag_matches_filter(const std::string& entry_tag,
+                               const std::string& filter) {
+  if (filter.empty() || filter == "all")
+    return true;
+  if (filter.find(',') == std::string::npos)
+    return entry_tag.compare(0, filter.size(), filter) == 0;
+  size_t pos = 0;
+  while (pos < filter.size()) {
+    size_t comma = filter.find(',', pos);
+    const size_t end = (comma == std::string::npos) ? filter.size() : comma;
+    size_t s = pos;
+    while (s < end && filter[s] == ' ') ++s;
+    size_t e = end;
+    while (e > s && filter[e - 1] == ' ') --e;
+    if (e > s) {
+      const size_t len = e - s;
+      if ((len == 3 && filter.compare(s, 3, "all") == 0) ||
+          entry_tag.compare(0, len, filter, s, len) == 0) {
+        return true;
+      }
+    }
+    if (comma == std::string::npos)
+      break;
+    pos = comma + 1;
+  }
+  return false;
+}
+
 std::vector<DebugLogEntry> debug_get_logs_since(uint64_t after_seq,
                                                 const std::string& tag_filter,
                                                 size_t max_count) {
@@ -389,10 +417,8 @@ std::vector<DebugLogEntry> debug_get_logs_since(uint64_t after_seq,
   for (const auto& e : s.logs) {
     if (e.seq <= after_seq)
       continue;
-    if (!tag_filter.empty() && tag_filter != "all" &&
-        e.tag.compare(0, tag_filter.size(), tag_filter) != 0) {
+    if (!tag_matches_filter(e.tag, tag_filter))
       continue;
-    }
     matched.push_back(e);
   }
   if (max_count > 0 && matched.size() > max_count) {
@@ -406,6 +432,12 @@ uint64_t debug_latest_log_seq() {
   auto& s = dstore();
   std::lock_guard<std::mutex> lock(s.mu);
   return s.next_seq - 1;
+}
+
+uint64_t debug_oldest_log_seq() {
+  auto& s = dstore();
+  std::lock_guard<std::mutex> lock(s.mu);
+  return s.logs.empty() ? 0 : s.logs.front().seq;
 }
 
 void debug_clear_logs() {
