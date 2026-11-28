@@ -3,6 +3,7 @@
 // GNOME-style calendar (matches js/ui/calendar.js Calendar widget).
 
 #include "quick-settings.h"
+#include "host-utils.h"
 #include "i18n.h"
 #include "notifications.h"
 #include "shell-panel.h"
@@ -125,6 +126,7 @@ typedef struct {
   int selected_year;
   int selected_month;   // 0..11
   int selected_day;
+  int week_start;       // 0=Sunday..6=Saturday
 
   GtkWidget *grid;
   GtkWidget *month_label;
@@ -134,6 +136,7 @@ typedef struct {
   GtkWidget *events_title_label;
   GtkWidget *dnd_switch;
   GtkWidget *utc_time_label;
+  GtkWidget *utc_offset_label;
 
   GtkWidget *message_scroll;
   GtkWidget *message_view;
@@ -143,6 +146,20 @@ typedef struct {
   int64_t last_age_minute;
   bool messages_dirty;
 } CalendarData;
+
+static int
+resolve_user_week_start_sun0 (void)
+{
+  DWORD win_first = 0;
+  if (GetLocaleInfoEx (LOCALE_NAME_USER_DEFAULT,
+                       LOCALE_IFIRSTDAYOFWEEK | LOCALE_RETURN_NUMBER,
+                       reinterpret_cast<LPWSTR> (&win_first),
+                       sizeof (win_first) / sizeof (wchar_t)) > 0) {
+    // Win32 LOCALE_IFIRSTDAYOFWEEK uses 0=Monday..6=Sunday; convert to 0=Sunday..6=Saturday.
+    return static_cast<int> ((win_first + 1) % 7);
+  }
+  return 0;
+}
 
 static void calendar_rebuild (CalendarData *data);
 
@@ -278,7 +295,8 @@ on_prev_month (GtkButton *b G_GNUC_UNUSED, gpointer user_data)
   } else {
     data->selected_month--;
   }
-  data->selected_day = 1;
+  data->selected_day = winome::clamp_day_for_month (
+      data->selected_year, data->selected_month + 1, data->selected_day);
   update_month_label (data);
   calendar_rebuild (data);
 }
@@ -293,9 +311,23 @@ on_next_month (GtkButton *b G_GNUC_UNUSED, gpointer user_data)
   } else {
     data->selected_month++;
   }
-  data->selected_day = 1;
+  data->selected_day = winome::clamp_day_for_month (
+      data->selected_year, data->selected_month + 1, data->selected_day);
   update_month_label (data);
   calendar_rebuild (data);
+}
+
+static gboolean
+on_calendar_scroll (GtkEventControllerScroll *ctrl G_GNUC_UNUSED,
+                    double dx,
+                    double dy,
+                    gpointer user_data)
+{
+  if (dx < 0.0 || dy < 0.0)
+    on_prev_month (nullptr, user_data);
+  else if (dx > 0.0 || dy > 0.0)
+    on_next_month (nullptr, user_data);
+  return TRUE;
 }
 
 static void
@@ -787,19 +819,17 @@ calendar_rebuild (CalendarData *data)
   GDateTime *first = g_date_time_new_local (data->selected_year,
                                             data->selected_month + 1, 1,
                                             0, 0, 0.0);
-  int first_dow = g_date_time_get_day_of_week (first);  // 1=Mon..7=Sun
-
-  // GNOME starts the grid at the beginning of the week containing the 1st
-  // (week starts Sunday; convert dow so 0=Sunday).
-  int sunday_dow = first_dow % 7;  // 0=Sunday
-  // Begin date = first - sunday_dow days.
-  GDateTime *iter = g_date_time_add_days (first, -sunday_dow);
+  const int first_dow_sun0 = g_date_time_get_day_of_week (first) % 7;
+  const int lead =
+      winome::compute_calendar_grid_lead_days (first_dow_sun0, data->week_start);
+  GDateTime *iter = g_date_time_add_days (first, -lead);
 
   for (int row = 2; row < 8; row++) {
     for (int col = 0; col < 7; col++) {
       int y = g_date_time_get_year (iter);
       int m = g_date_time_get_month (iter);
       int d = g_date_time_get_day_of_month (iter);
+      int iter_dow = g_date_time_get_day_of_week (iter);  // 1=Mon..7=Sun
 
       GtkWidget *button = gtk_button_new ();
       gchar label[8];
@@ -810,18 +840,18 @@ calendar_rebuild (CalendarData *data)
       gtk_widget_set_halign (button, GTK_ALIGN_CENTER);
       gtk_widget_set_valign (button, GTK_ALIGN_CENTER);
       const bool is_today = (y == now_y && m == now_m && d == now_d);
-      const bool is_weekend = (col == 0 || col == 6);
+      const bool is_weekend = (iter_dow == 6 || iter_dow == 7);
       if (is_weekend)
         gtk_widget_add_css_class (button, "calendar-weekend");
       else
         gtk_widget_add_css_class (button, "calendar-weekday");
-      if (m != data->selected_month + 1)
-        gtk_widget_add_css_class (button, "calendar-other-month");
       if (is_today)
         gtk_widget_add_css_class (button, "calendar-today");
+      else if (m != data->selected_month + 1)
+        gtk_widget_add_css_class (button, "calendar-other-month");
 
       if (y == data->selected_year && m == data->selected_month + 1 &&
-          d == data->selected_day && !is_today) {
+          d == data->selected_day) {
         gtk_widget_add_css_class (button, "selected");
         gtk_widget_set_state_flags (button, GTK_STATE_FLAG_SELECTED, FALSE);
       } else {
@@ -861,9 +891,17 @@ winome_calendar_new (void)
   data->selected_year = now->tm_year + 1900;
   data->selected_month = now->tm_mon;
   data->selected_day = now->tm_mday;
+  data->week_start = resolve_user_week_start_sun0 ();
 
   GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class (box, "calendar");
+  GtkEventController *scroll_ctrl = gtk_event_controller_scroll_new (
+      static_cast<GtkEventControllerScrollFlags> (
+          GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES |
+          GTK_EVENT_CONTROLLER_SCROLL_DISCRETE));
+  g_signal_connect (scroll_ctrl, "scroll", G_CALLBACK (on_calendar_scroll),
+                    data);
+  gtk_widget_add_controller (box, scroll_ctrl);
 
   data->grid = gtk_grid_new ();
   gtk_widget_add_css_class (data->grid, "calendar-grid");
@@ -885,6 +923,8 @@ winome_calendar_new (void)
   data->month_label = gtk_label_new ("");
   gtk_widget_add_css_class (data->month_label, "calendar-month-label");
   gtk_label_set_justify (GTK_LABEL (data->month_label), GTK_JUSTIFY_CENTER);
+  gtk_widget_set_halign (data->month_label, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (data->month_label, GTK_ALIGN_CENTER);
   gtk_widget_set_hexpand (data->month_label, TRUE);
   gtk_box_append (GTK_BOX (top_box), data->month_label);
 
@@ -894,9 +934,10 @@ winome_calendar_new (void)
   g_signal_connect (forward, "clicked", G_CALLBACK (on_next_month), data);
   gtk_box_append (GTK_BOX (top_box), forward);
 
-  // Weekday labels row (0=Sunday).
+  // Weekday labels row honoring locale week_start.
   for (int col = 0; col < 7; col++) {
-    GtkWidget *heading = gtk_label_new (weekday_abbrev (col));
+    const int day_idx = (data->week_start + col) % 7;
+    GtkWidget *heading = gtk_label_new (weekday_abbrev (day_idx));
     gtk_widget_add_css_class (heading, "calendar-day-heading");
     gtk_widget_set_halign (heading, GTK_ALIGN_CENTER);
     gtk_grid_attach (GTK_GRID (data->grid), heading, col, 1, 1, 1);
@@ -991,7 +1032,7 @@ winome_calendar_new (void)
                     G_CALLBACK (on_today_button_clicked), data);
   data->today_btn = today_btn;
 
-  GtkWidget *today_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
+  GtkWidget *today_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   data->day_header_label = gtk_label_new ("");
   gtk_widget_add_css_class (data->day_header_label, "day-label");
   gtk_widget_set_halign (data->day_header_label, GTK_ALIGN_START);
@@ -1006,9 +1047,20 @@ winome_calendar_new (void)
 
   gtk_box_append (GTK_BOX (cal_col), box);
 
+  GtkWidget *displays_scroll = gtk_scrolled_window_new ();
+  gtk_widget_add_css_class (displays_scroll, "datemenu-displays-section");
+  gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (displays_scroll),
+                                  GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+  gtk_scrolled_window_set_propagate_natural_height (
+      GTK_SCROLLED_WINDOW (displays_scroll), TRUE);
+  gtk_scrolled_window_set_max_content_height (
+      GTK_SCROLLED_WINDOW (displays_scroll), 240);
+
   GtkWidget *displays_box = gtk_box_new (GTK_ORIENTATION_VERTICAL,
                                        cal_displays_spacing ());
   gtk_widget_add_css_class (displays_box, "datemenu-displays-box");
+  gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (displays_scroll),
+                                 displays_box);
 
   GtkWidget *events_btn = gtk_button_new ();
   gtk_widget_add_css_class (events_btn, "events-button");
@@ -1016,7 +1068,7 @@ winome_calendar_new (void)
   g_signal_connect (events_btn, "clicked",
                     G_CALLBACK (on_events_or_clocks_clicked), NULL);
 
-  GtkWidget *events_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 4);
+  GtkWidget *events_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class (events_box, "events-box");
   GtkWidget *events_title = gtk_label_new (is_zh () ? "今天" : "Today");
   gtk_widget_add_css_class (events_title, "events-title");
@@ -1041,12 +1093,6 @@ winome_calendar_new (void)
   g_signal_connect (clocks_btn, "clicked",
                     G_CALLBACK (on_events_or_clocks_clicked), NULL);
 
-  GtkWidget *clocks_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
-  GtkWidget *clocks_header = gtk_label_new (is_zh () ? "世界时钟" : "World Clocks");
-  gtk_widget_add_css_class (clocks_header, "world-clocks-header");
-  gtk_widget_set_halign (clocks_header, GTK_ALIGN_START);
-  gtk_box_append (GTK_BOX (clocks_box), clocks_header);
-
   GtkWidget *clocks_grid = gtk_grid_new ();
   gtk_widget_add_css_class (clocks_grid, "world-clocks-grid");
   gtk_grid_set_column_spacing (
@@ -1058,22 +1104,34 @@ winome_calendar_new (void)
       lookup_cal_length ("world-clocks-button", "world-clocks-grid",
                          "spacing-rows", 6));
 
-  GtkWidget *utc_tz = gtk_label_new ("UTC");
-  gtk_widget_add_css_class (utc_tz, "world-clocks-timezone");
-  gtk_widget_set_halign (utc_tz, GTK_ALIGN_START);
-  gtk_widget_set_hexpand (utc_tz, TRUE);
-  gtk_grid_attach (GTK_GRID (clocks_grid), utc_tz, 0, 0, 1, 1);
+  GtkWidget *clocks_header = gtk_label_new (is_zh () ? "世界时钟" : "World Clocks");
+  gtk_widget_add_css_class (clocks_header, "world-clocks-header");
+  gtk_widget_set_halign (clocks_header, GTK_ALIGN_START);
+  gtk_grid_attach (GTK_GRID (clocks_grid), clocks_header, 0, 0, 3, 1);
+
+  GtkWidget *utc_city = gtk_label_new ("UTC");
+  gtk_widget_add_css_class (utc_city, "world-clocks-city");
+  gtk_widget_set_halign (utc_city, GTK_ALIGN_START);
+  gtk_widget_set_valign (utc_city, GTK_ALIGN_CENTER);
+  gtk_widget_set_hexpand (utc_city, TRUE);
+  gtk_grid_attach (GTK_GRID (clocks_grid), utc_city, 0, 1, 1, 1);
 
   data->utc_time_label = gtk_label_new ("00:00");
   gtk_widget_add_css_class (data->utc_time_label, "world-clocks-time");
   gtk_widget_set_halign (data->utc_time_label, GTK_ALIGN_END);
-  gtk_grid_attach (GTK_GRID (clocks_grid), data->utc_time_label, 1, 0, 1, 1);
+  gtk_widget_set_valign (data->utc_time_label, GTK_ALIGN_CENTER);
+  gtk_grid_attach (GTK_GRID (clocks_grid), data->utc_time_label, 1, 1, 1, 1);
 
-  gtk_box_append (GTK_BOX (clocks_box), clocks_grid);
-  gtk_button_set_child (GTK_BUTTON (clocks_btn), clocks_box);
+  data->utc_offset_label = gtk_label_new ("");
+  gtk_widget_add_css_class (data->utc_offset_label, "world-clocks-timezone");
+  gtk_widget_set_halign (data->utc_offset_label, GTK_ALIGN_END);
+  gtk_widget_set_valign (data->utc_offset_label, GTK_ALIGN_CENTER);
+  gtk_grid_attach (GTK_GRID (clocks_grid), data->utc_offset_label, 2, 1, 1, 1);
+
+  gtk_button_set_child (GTK_BUTTON (clocks_btn), clocks_grid);
   gtk_box_append (GTK_BOX (displays_box), clocks_btn);
 
-  gtk_box_append (GTK_BOX (cal_col), displays_box);
+  gtk_box_append (GTK_BOX (cal_col), displays_scroll);
   gtk_box_append (GTK_BOX (root), cal_col);
 
   // Attach the CalendarData to the root widget so its lifetime matches.
@@ -1151,6 +1209,23 @@ winome_calendar_refresh (GtkWidget *calendar)
                   month_name (m_idx), d, y);
       }
       set_cal_label_if_changed (data->date_header_label, date_buf);
+    }
+    if (data->utc_offset_label != nullptr) {
+      const GTimeSpan rel_mins = -g_date_time_get_utc_offset (now) / G_TIME_SPAN_MINUTE;
+      const int total_mins = static_cast<int> (rel_mins);
+      const char sign = total_mins > 0 ? '+' : (total_mins < 0 ? '-' : '\0');
+      const int abs_mins = total_mins < 0 ? -total_mins : total_mins;
+      const int h = abs_mins / 60;
+      const int m = abs_mins % 60;
+      gchar off_buf[32];
+      if (total_mins == 0) {
+        snprintf (off_buf, sizeof (off_buf), "0h");
+      } else if (m == 0) {
+        snprintf (off_buf, sizeof (off_buf), "%c%dh", sign, h);
+      } else {
+        snprintf (off_buf, sizeof (off_buf), "%c%dh%02d", sign, h, m);
+      }
+      set_cal_label_if_changed (data->utc_offset_label, off_buf);
     }
     g_date_time_unref (now);
   }

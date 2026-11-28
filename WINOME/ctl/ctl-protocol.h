@@ -39,6 +39,22 @@ inline void append_json_str(const std::string& s, std::string* out) {
   out->push_back('"');
 }
 
+// Map Win32 Named Pipe failure codes and timeout flags to distinct IPC error keys
+// so callers can distinguish sandbox access denial from "shell not running".
+inline const char* ctl_classify_pipe_error(unsigned long win32_err,
+                                           bool timed_out,
+                                           bool busy_timed_out = false) {
+  if (timed_out)
+    return "ipc_reply_timeout";
+  if (busy_timed_out)
+    return "ipc_pipe_busy_timeout";
+  if (win32_err == 2UL || win32_err == 3UL)  // ERROR_FILE_NOT_FOUND / PATH_NOT_FOUND
+    return "not_running";
+  if (win32_err == 5UL || win32_err == 1314UL)  // ERROR_ACCESS_DENIED / PRIVILEGE_NOT_HELD
+    return "ipc_access_denied";
+  return "ipc_error";
+}
+
 inline bool ctl_build_request_json(const std::vector<std::string>& args,
                                    std::string* out_json,
                                    std::string* out_err) {

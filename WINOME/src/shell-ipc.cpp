@@ -447,6 +447,12 @@ std::string build_status_json(const IpcCallbacks& cbs) {
   char num[256];
   std::string out = std::string("{\"ok\":true,\"result\":{\"version\":\"") +
                     WINOME_VERSION + "\",";
+  const unsigned long shell_pid = static_cast<unsigned long>(GetCurrentProcessId());
+  const unsigned long wd_pid =
+      static_cast<unsigned long>(cbs.watchdog_pid ? cbs.watchdog_pid() : 0UL);
+  std::snprintf(num, sizeof(num), "\"pid\":%lu,\"watchdog_pid\":%lu,",
+                shell_pid, wd_pid);
+  out += num;
   out += ov_open ? "\"overview_open\":true," : "\"overview_open\":false,";
   out += is_safe_mode() ? "\"safe_mode\":true," : "\"safe_mode\":false,";
   out += get_config().developer_mode ? "\"developer_mode\":true,"

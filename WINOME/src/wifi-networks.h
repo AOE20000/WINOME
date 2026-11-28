@@ -93,3 +93,11 @@ void winome_wifi_shutdown_notifications (void);
 // SSIDs produce "".
 void winome_wifi_decode_ssid (const guint8 *bytes, gsize len,
                               char *out, gsize out_size);
+
+// Non-blocking snapshot cache so the Wi-Fi drawer seeds initial AP rows
+// immediately on open without blocking the GTK main thread on WlanScan RPCs.
+// Returned array is owned by caller (free with winome_wifi_free_networks).
+gboolean winome_wifi_get_cached_networks (WinomeWifiNetwork **out, guint *out_count);
+void winome_wifi_warm_cache_async (void);
+void winome_wifi_set_cached_networks_for_test (const WinomeWifiNetwork *nets,
+                                               guint count);

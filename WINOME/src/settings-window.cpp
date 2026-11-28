@@ -40,6 +40,7 @@ struct SettingsUi {
   GtkWidget* clock_fmt_drop = nullptr;
   GtkWidget* clock_sec_switch = nullptr;
   GtkWidget* battery_pct_switch = nullptr;
+  GtkWidget* tray_location_drop = nullptr;
   GtkWidget* multimon_switch = nullptr;
   GtkWidget* dark_titlebars_switch = nullptr;
   GtkWidget* rounded_corners_switch = nullptr;
@@ -383,6 +384,10 @@ void sync_ui_from_config() {
     gtk_switch_set_active(GTK_SWITCH(g_ui.battery_pct_switch),
                           cfg.show_battery_percentage ? TRUE : FALSE);
   }
+  if (g_ui.tray_location_drop != nullptr) {
+    guint sel = (cfg.tray_location == "quick_settings") ? 1u : 0u;
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(g_ui.tray_location_drop), sel);
+  }
   if (g_ui.multimon_switch != nullptr) {
     gtk_switch_set_active(GTK_SWITCH(g_ui.multimon_switch),
                           cfg.multi_monitor_panels ? TRUE : FALSE);
@@ -515,6 +520,15 @@ gboolean on_battery_pct_set(GtkSwitch* sw G_GNUC_UNUSED, gboolean state, gpointe
   cfg.show_battery_percentage = state != FALSE;
   update_config(cfg);
   return FALSE;
+}
+
+void on_tray_location_changed(GObject* obj, GParamSpec* pspec G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
+  if (g_ui.syncing)
+    return;
+  WinomeConfig cfg = get_config();
+  guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(obj));
+  cfg.tray_location = (sel == 1) ? "quick_settings" : "panel";
+  update_config(cfg);
 }
 
 gboolean on_multimon_set(GtkSwitch* sw G_GNUC_UNUSED, gboolean state, gpointer ud G_GNUC_UNUSED) {
@@ -927,6 +941,7 @@ void on_window_destroy(GtkWidget* widget G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSE
   g_ui.clock_fmt_drop = nullptr;
   g_ui.clock_sec_switch = nullptr;
   g_ui.battery_pct_switch = nullptr;
+  g_ui.tray_location_drop = nullptr;
   g_ui.multimon_switch = nullptr;
   g_ui.dark_titlebars_switch = nullptr;
   g_ui.rounded_corners_switch = nullptr;
@@ -1016,6 +1031,22 @@ GtkWidget* build_appearance_page() {
                tr("Display top bar on secondary monitors when connected",
                   "连接多个显示器时同步在副屏显示顶部状态栏"),
                g_ui.multimon_switch),
+      true);
+
+  const char* const tray_locs[] = {
+      tr("Top Bar Button (Default)", "顶栏独立按钮（默认）"),
+      tr("Quick Settings · Background Apps", "控制中心 · 后台应用"),
+      nullptr};
+  g_ui.tray_location_drop = gtk_drop_down_new_from_strings(tray_locs);
+  g_signal_connect(g_ui.tray_location_drop, "notify::selected",
+                   G_CALLBACK(on_tray_location_changed), nullptr);
+  append_row_to_card(
+      panel_card,
+      make_row(
+          tr("System Tray Location", "系统托盘位置"),
+          tr("Show a standalone top-bar tray button or merge tray apps into Quick Settings Background Apps",
+             "在顶栏独立显示系统托盘按钮，或将托盘应用合并到控制中心「后台应用」"),
+          g_ui.tray_location_drop),
       true);
 
   gtk_box_append(GTK_BOX(page), panel_card);

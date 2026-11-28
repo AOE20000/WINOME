@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
 #include <vector>
 
 namespace winome {
@@ -107,6 +108,40 @@ compute_panel_overview_colors (double overview_progress,
   }
 }
 
+// Decide whether overview.cpp's anim_tick should push a new panel overview
+// progress sample on this frame.
+// - On non-blocking composition renderers (default GskCairoRenderer +
+//   DirectComposition), push every frame where progress changes (> 1e-4)
+//   so the top bar backdrop (#000000 <-> #222226) and #panelActivities
+//   pill fade smoothly at 60fps in lockstep with the overview.
+// - Only when a blocking Win32 GL swap renderer (GskGLRenderer /
+//   GskNglRenderer) is explicitly active do we coarsen intermediate updates
+//   to avoid serializing two wglSwapBuffers VSync waits per frame.
+inline bool
+should_push_panel_overview_progress (double next_progress,
+                                     double current_progress,
+                                     bool first_frame,
+                                     double norm_t,
+                                     bool blocking_gl_swap)
+{
+  const double delta = std::fabs (next_progress - current_progress);
+  if (delta <= 1e-4)
+    return norm_t >= 1.0 && next_progress != current_progress;
+  if (!blocking_gl_swap)
+    return true;
+  const bool endpoint = (first_frame || norm_t <= 0.0 || norm_t >= 1.0);
+  return endpoint || delta >= 0.45;
+}
+
+// Whether a panel popover still occupies the topmost shell band (above the
+// panel and Activities overview): true while actively open OR while still
+// visible during its BOXPOPOVER_ANIMATION_TIME fade-out.
+inline bool
+popover_occupies_top_band (bool open, bool fading_out, bool window_visible)
+{
+  return open || (fading_out && window_visible);
+}
+
 }  // namespace winome
 
 // Create the full-width top panel window (Activities + clock + quick settings).
@@ -120,13 +155,14 @@ GtkWidget *winome_shell_panel_new_secondary (void);
 // scale 1.
 int winome_shell_panel_height (void);
 
-// HWND of the topmost open popover (quick settings / calendar), or NULL when
-// none is open. Used to enforce the layering contract popover > panel >
-// overview from overview_restack().
+// HWND of the topmost open or fading-out visible popover (quick settings /
+// calendar / tray), or NULL when none occupies the topmost band. Used to
+// enforce the layering contract popover > panel > overview from
+// overview_restack().
 void *winome_shell_panel_top_popover_hwnd (void);
 
-// Per-monitor variant: returns the topmost open popover anchored on @hmonitor
-// (or any open popover when @hmonitor == nullptr).
+// Per-monitor variant: returns the topmost open or fading-out visible popover
+// anchored on @hmonitor (or any matching popover when @hmonitor == nullptr).
 void *winome_shell_panel_top_popover_hwnd_for_monitor (void *hmonitor);
 
 // TRUE for a short window after a popover was dismissed by a click outside
@@ -139,6 +175,7 @@ int winome_shell_panel_popover_just_closed (void);
 void winome_shell_panel_close_popovers (void);
 void winome_shell_panel_close_popovers_for_monitor (void *hmonitor);
 void winome_shell_panel_close_popovers_immediate (void);
+void winome_shell_panel_sync_popover_size (GtkWidget *widget);
 
 // Reload GNOME theme stylesheet, optional developer user-debug.css, and StEngine.
 bool winome_shell_reload_theme (void);
@@ -171,3 +208,10 @@ void winome_shell_panel_plugin_upsert (const char *key,
                                        const char *text,
                                        const char *tooltip);
 void winome_shell_panel_plugin_remove (const char *key);
+
+// Request an asynchronous GTK redraw on all realized shell panels (e.g. after
+// fullscreen unhide or session unlock so DComp swapchains present fresh frames).
+void winome_shell_panel_queue_redraw_all (void);
+
+// Inspect registered panel HWNDs, Win32/DWM visibility state, and open popovers.
+std::string winome_shell_panel_inspect_json (void);

@@ -370,4 +370,79 @@ bool panel_hidden(void);
 // True while the panel covering @mon is hidden.
 bool panel_hidden_for_monitor(HMONITOR mon);
 
+// Pure helper: decide whether a pending panel HWND rect requires clamping to
+// @expected_mon_rect's top bar band given @raw_expected_h (returning TRUE and
+// populating *out_want when clamping is needed).
+inline bool compute_panel_band_clamp(const RECT& candidate,
+                                     const RECT& expected_mon_rect,
+                                     int raw_expected_h,
+                                     bool has_move_or_size,
+                                     bool candidate_matches_valid_monitor,
+                                     RECT* out_want) {
+  if (has_move_or_size && candidate_matches_valid_monitor)
+    return false;
+  const int canonical_h =
+      clamp_panel_height_for_monitor(expected_mon_rect, raw_expected_h, 32);
+  if (canonical_h <= 0 || out_want == nullptr)
+    return false;
+  *out_want = compute_primary_panel_rect(expected_mon_rect, canonical_h);
+  if (has_move_or_size && WorkareaAssertGuard::rects_equal(candidate, *out_want))
+    return false;
+  return true;
+}
+
+// Combine incoming WINDOWPOS move/size fields with @cur_rect for any omitted
+// SWP_NOMOVE / SWP_NOSIZE dimension so pure Z-order calls inspect the real
+// window rectangle instead of triggering a spurious move/resize clamp.
+inline bool resolve_panel_windowpos_rect(const RECT& cur_rect,
+                                         bool has_cur_rect,
+                                         int wp_x,
+                                         int wp_y,
+                                         int wp_cx,
+                                         int wp_cy,
+                                         UINT wp_flags,
+                                         RECT* out_effective) {
+  if (out_effective == nullptr)
+    return false;
+  const bool no_move = (wp_flags & SWP_NOMOVE) != 0;
+  const bool no_size = (wp_flags & SWP_NOSIZE) != 0;
+  if ((no_move || no_size) && !has_cur_rect)
+    return false;
+  const int x = no_move ? cur_rect.left : wp_x;
+  const int y = no_move ? cur_rect.top : wp_y;
+  const int w = no_size ? (cur_rect.right - cur_rect.left) : wp_cx;
+  const int h = no_size ? (cur_rect.bottom - cur_rect.top) : wp_cy;
+  *out_effective = RECT{x, y, x + w, y + h};
+  return true;
+}
+
+// Higher-ZBID / IME / tooltip / OS shell-overlay classes that sit above
+// desktop-band HWND_TOPMOST panels; zorder_drifted() must not fight them.
+inline bool is_system_zorder_overlay_class(const wchar_t* cls) {
+  if (cls == nullptr || cls[0] == L'\0')
+    return false;
+  static constexpr const wchar_t* kSystemClasses[] = {
+      L"Shell_TrayWnd",
+      L"Shell_SecondaryTrayWnd",
+      L"IME",
+      L"MSCTFIME UI",
+      L"tooltips_class32",
+      L"NotifyIconOverflowWindow",
+      L"TopLevelWindowForOverflowXamlIsland",
+      L"Windows.UI.Core.CoreWindow",
+      L"EdgeUiInputTopWndClass",
+      L"EdgeUiInputWndClass",
+      L"ForegroundStaging",
+      L"DummyDWMListenerWindow",
+      L"ThumbnailDeviceHelperWnd",
+      L"XamlExplorerHostIslandWindow",
+      L"MultitaskingViewFrame",
+  };
+  for (const wchar_t* sys : kSystemClasses) {
+    if (wcscmp(cls, sys) == 0)
+      return true;
+  }
+  return false;
+}
+
 }  // namespace winome

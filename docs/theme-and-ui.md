@@ -56,10 +56,10 @@ WINOME 直接以上游 GNOME Shell 样式表为视觉基准，结合构建期样
    - `pass-through`：声明为 GTK4 原生的属性必须真正进入输出；
    - `semantics`：同时设定 `min-width` + `max-width`（或 `min-height` + `max-height`）的规则不可丢失上限；
    - `transitions`：输出中所有带 `transition-duration` 的规则数不得超过带 `transition-property` 的规则数（采用**数量比较**而非存在性检查，防止面板硬编码或残留规则掩盖回归）。
-   - 当前基线：`OK  83 upstream properties all accounted for; 46 reached the GTK4 stylesheet.`
+   - 当前基线：`OK  83 upstream properties all accounted for; 48 reached the GTK4 stylesheet.`
 2. **控件类名结构检查**（[check-widget-classes.py](../WINOME/tools/check-widget-classes.py)）：
    - 交叉核对 `gnome-shell-gtk4.css` 中的作用域样式类与 C++ 源码中的 `gtk_widget_*_css_class` 调用，抓出「样式存在但代码未建节点」或「代码加了但样式表未定义的死类」。
-   - 当前基线：`OK  137 styled classes; 65 created by the source; 0 optional, 66 styled-but-unused.`
+   - 当前基线：`OK  139 styled classes; 68 created by the source; 0 optional, 65 styled-but-unused.`
 
 ---
 
@@ -88,7 +88,7 @@ GTK4 没有内置动画框架（无 `GtkAnimation`），而上游广泛依赖 `C
 
 ### 快速设置网格与二级菜单（`src/quick-settings.cpp`）
 
-- **网格顺序与 `colSpan`**（对齐 `panel.js:381-405`）：`N_QUICK_SETTINGS_COLUMNS = 2`。前 3 行（系统项、音量滑块、亮度滑块）占满 2 列；之后半行开关按网络、蓝牙、电源模式、夜间模式、深色主题、勿扰模式、键盘、飞行模式依次排列，维持固定 `12em` 胶囊视觉分组。
+- **网格顺序与 `colSpan`**（对齐 `panel.js:381-405`）：`N_QUICK_SETTINGS_COLUMNS = 2`。前 3 行（系统项、音量滑块、亮度滑块）占满 2 列；之后半行开关按网络、蓝牙、电源模式、夜间模式、深色主题、勿扰模式、副屏工作区、键盘、飞行模式依次排列，维持固定 `12em` 胶囊视觉分组；末尾固定挂载跨 2 列的 `.background-apps-quick-toggle`（「后台应用」折叠入口，无后台/托盘项且抽屉收起时自动隐藏，与 `tray_location` 联动）。
 - **自绘滑块 `WinomeQuickSlider`**：无完整 GTK 主题环境下，`GtkScale` 会退化为 2×2px 且难以拖动，故以 `GtkDrawingArea` + 拖动/点击手势自绘 accent 进度条与圆形手柄。
 - **`:checked` 状态误判排查结论**：早先曾怀疑 `:checked` 规则被转换器丢弃，后经源码与产物 CSS 对照确认 `.quick-toggle:checked { color: #fff; background-color: #3584e4 }` 与 `GTK_STATE_FLAG_CHECKED` 一切正常；此前“看着不像”的真正原因是二级菜单缺失 `.header` 以及 `max-width` 映射丢失。
 - **二级菜单结构（`QuickToggleMenu`）**：
@@ -120,10 +120,10 @@ GTK4 没有内置动画框架（无 `GtkAnimation`），而上游广泛依赖 `C
 
 ## 6. 视觉对齐与应用网格迭代（Post-Phase 11 汇总）
 
-- **内置图标资源与占位图（`src/theme/winome.gresource.xml`）**：随包嵌入 12 个上游 GNOME symbolic SVG（`carousel-arrow-*`、`cog-wheel`、`dark-mode`、`group-collapse`、`notification-expand`、`ornament-check`、`preview-close`、`screenshooter`、`check`、`message-indicator`、`no-notifications`）及 `calendar-today.svg`、`workspace-placeholder.svg`，彻底摆脱外部系统图标主题缺失导致的方块或尺寸错乱。
-- **顶栏、通知与快速设置细化**：`QuickSettings` 电源子菜单支持 `Quit WINOME`；Wi-Fi 加密接入改用模态密码弹窗（对齐 `.modal-dialog`）；`SettingsWindow` 采用深色 Adwaita 标题栏与设置页视觉风格；时钟指示器、今日圆点、通知列表空状态与折叠按钮对齐上游节点树。
+- **内置图标资源与占位图（`src/theme/winome.gresource.xml`）**：随包嵌入 13 个上游 GNOME symbolic SVG（`carousel-arrow-*`、`cog-wheel`、`dark-mode`、`group-collapse`、`notification-expand`、`ornament-check`、`preview-close`、`screenshooter`、`background-app-ghost`、`check`、`message-indicator`、`no-notifications`）及 `calendar-today.svg`、`workspace-placeholder.svg`，彻底摆脱外部系统图标主题缺失导致的方块或尺寸错乱。
+- **顶栏、通知与快速设置细化**：`QuickSettings` 电源子菜单支持 `Quit WINOME`、底部新增上游 `.background-apps-quick-toggle` 与 `.background-app-item` 折叠抽屉；Wi-Fi 加密接入改用模态密码弹窗（对齐 `.modal-dialog`）；`SettingsWindow` 采用深色 Adwaita 标题栏与设置页视觉风格；时钟指示器、今日圆点、通知列表空状态与折叠按钮对齐上游节点树。
 - **概览 Chrome 与应用网格 / 文件夹编组对齐**：修复概览悬停标题被 DWM 缩略图遮挡与标题过长省略、`workspace-placeholder` 空桌面占位；为 `AppGrid` 接入自定义 `WinomeAppIcon`（`GSK_SCALING_FILTER_TRILINEAR`）、应用文件夹瓦片（`.overview-tile.app-folder` 2×2 预览）与居中 `.app-folder-dialog`（`.folder-name-container`、`.folder-name-label`、`.icon-grid` 与 `.icon-button`）、应用右键 AppMenu popover（白字对比度、打开的窗口分组、管理员启动、固定到 Dash 与打开位置）以及双击 Win 键平滑切入 `APP_GRID`。
-- **CSS 覆盖与回归校验**：`convert-st-css.py` 扩展了 `APP_GRID`、上下文 popover、模态窗及 `QuickToggleMenu` 所需规则，由 `tests/test-css-converter.py` 自动回归保护；全套上游 St 属性已有 `46 / 83` 进入转换后 GTK4 样式表。
+- **CSS 覆盖与回归校验**：`convert-st-css.py` 扩展了 `APP_GRID`、上下文 popover、模态窗、后台应用折叠按钮与 `QuickToggleMenu` 所需规则，由 `tests/test-css-converter.py` 自动回归保护；全套上游 St 属性已有 `48 / 83` 进入转换后 GTK4 样式表。
 - **阶段 1 新增 UI 组件**：
   - **EndSession 60 秒确认弹窗**（`src/end-session-dialog.{h,cpp}`）：复用 `.modal-dialog`、`.modal-dialog-content-box`、`.message-dialog-content`、`.message-dialog-title`、`.message-dialog-description` 与 `.modal-dialog-button-box`，内置 1s 倒计时更新、`Esc` 取消、工作区居中置顶及中/英文单复数格式；
   - **Settings 外观统一与诊断页**（`src/settings-window.cpp`、`src/window-theming.{h,cpp}`）：外观页提供零注入可选开关（`unify_dark_titlebars`、`unify_rounded_corners`），行为页提供 `end_session_confirm`、`developer_mode`（「Open Console」直开控制台）开关与快捷键一览（含 `Alt+F2`），`Diagnostics` 标签页展示实时遥测、`--safe-mode` 提示与 `SubsystemId` 健康熔断状态。

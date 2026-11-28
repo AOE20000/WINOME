@@ -24,6 +24,7 @@
 
 #include "ws-osd.h"
 #include "fonts.h"
+#include "fullscreen-watcher.h"
 #include "host-utils.h"
 #include "monitor-manager.h"
 #include "overview.h"
@@ -263,12 +264,124 @@ static HMONITOR g_osd_monitor = nullptr;
 static std::unordered_map<HMONITOR, int> g_last_index_by_mon;
 static int g_osd_last_w = -1;
 static int g_osd_last_h = -1;
-static int g_osd_last_x = INT_MIN;
-static int g_osd_last_y = INT_MIN;
+static RECT g_osd_want_rect = {0, 0, 0, 0};
+static guint g_osd_map_idle = 0;
 
-// (Re)position the window for the current workspace count and show it.
+static constexpr const wchar_t *kWsOsdOrigProcProp = L"WINOME_WsOsdOrigProc";
+
+static LRESULT CALLBACK
+osd_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+  if (msg == WM_ERASEBKGND)
+    return 1;
+  if (msg == WM_MOUSEACTIVATE)
+    return MA_NOACTIVATE;
+  if (msg == WM_STYLECHANGING && wParam == static_cast<WPARAM> (GWL_EXSTYLE) &&
+      lParam != 0) {
+    auto *ss = reinterpret_cast<STYLESTRUCT *> (lParam);
+    ss->styleNew = (static_cast<LONG_PTR> (ss->styleNew) |
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT) &
+                   ~WS_EX_APPWINDOW;
+  }
+  if (msg == WM_GETMINMAXINFO && lParam != 0 &&
+      g_osd_want_rect.right > g_osd_want_rect.left &&
+      g_osd_want_rect.bottom > g_osd_want_rect.top) {
+    auto *mmi = reinterpret_cast<MINMAXINFO *> (lParam);
+    const LONG want_w = g_osd_want_rect.right - g_osd_want_rect.left;
+    const LONG want_h = g_osd_want_rect.bottom - g_osd_want_rect.top;
+    mmi->ptMinTrackSize = POINT{want_w, want_h};
+    mmi->ptMaxTrackSize = POINT{want_w, want_h};
+    return 0;
+  }
+
+  if (msg == WM_WINDOWPOSCHANGING && lParam != 0) {
+    auto *wp = reinterpret_cast<WINDOWPOS *> (lParam);
+    wp->flags |= SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    if ((wp->flags & SWP_HIDEWINDOW) == 0 &&
+        g_osd_want_rect.right > g_osd_want_rect.left &&
+        g_osd_want_rect.bottom > g_osd_want_rect.top) {
+      RECT cur_rect{};
+      const bool has_cur = GetWindowRect (hwnd, &cur_rect) != FALSE;
+      RECT eff_rect{};
+      const bool has_eff = winome::resolve_panel_windowpos_rect (
+          cur_rect, has_cur, wp->x, wp->y, wp->cx, wp->cy, wp->flags,
+          &eff_rect);
+      if (!has_eff || !EqualRect (&eff_rect, &g_osd_want_rect)) {
+        const int want_w = g_osd_want_rect.right - g_osd_want_rect.left;
+        const int want_h = g_osd_want_rect.bottom - g_osd_want_rect.top;
+        const bool need_move =
+            !has_cur || (wp->flags & SWP_NOMOVE) == 0 ||
+            cur_rect.left != g_osd_want_rect.left ||
+            cur_rect.top != g_osd_want_rect.top;
+        const bool need_size =
+            !has_cur || (wp->flags & SWP_NOSIZE) == 0 ||
+            (cur_rect.right - cur_rect.left) != want_w ||
+            (cur_rect.bottom - cur_rect.top) != want_h;
+        if (need_move) {
+          wp->x = g_osd_want_rect.left;
+          wp->y = g_osd_want_rect.top;
+          wp->flags &= ~SWP_NOMOVE;
+        }
+        if (need_size) {
+          wp->cx = want_w;
+          wp->cy = want_h;
+          wp->flags &= ~SWP_NOSIZE;
+        }
+      }
+    }
+  }
+
+  WNDPROC orig = reinterpret_cast<WNDPROC> (
+      GetPropW (hwnd, kWsOsdOrigProcProp));
+  if (msg == WM_NCDESTROY) {
+    RemovePropW (hwnd, kWsOsdOrigProcProp);
+    if (orig != nullptr) {
+      if (GetWindowLongPtrW (hwnd, GWLP_WNDPROC) ==
+          reinterpret_cast<LONG_PTR> (osd_subclass_wndproc)) {
+        SetWindowLongPtrW (hwnd, GWLP_WNDPROC,
+                           reinterpret_cast<LONG_PTR> (orig));
+      }
+      return CallWindowProcW (orig, hwnd, msg, wParam, lParam);
+    }
+    return DefWindowProcW (hwnd, msg, wParam, lParam);
+  }
+  return orig != nullptr ? CallWindowProcW (orig, hwnd, msg, wParam, lParam)
+                         : DefWindowProcW (hwnd, msg, wParam, lParam);
+}
+
 static void
-osd_present (void)
+ensure_osd_subclass (HWND hwnd)
+{
+  if (hwnd == nullptr || !IsWindow (hwnd))
+    return;
+  if (GetPropW (hwnd, kWsOsdOrigProcProp) != nullptr)
+    return;
+  WNDPROC cur = reinterpret_cast<WNDPROC> (
+      GetWindowLongPtrW (hwnd, GWLP_WNDPROC));
+  if (cur != nullptr && cur != osd_subclass_wndproc) {
+    SetPropW (hwnd, kWsOsdOrigProcProp, reinterpret_cast<HANDLE> (cur));
+    SetWindowLongPtrW (hwnd, GWLP_WNDPROC,
+                       reinterpret_cast<LONG_PTR> (osd_subclass_wndproc));
+  }
+}
+
+static void
+unsubclass_osd_hwnd (HWND hwnd)
+{
+  if (hwnd == nullptr || !IsWindow (hwnd))
+    return;
+  WNDPROC orig = reinterpret_cast<WNDPROC> (
+      GetPropW (hwnd, kWsOsdOrigProcProp));
+  WNDPROC cur = reinterpret_cast<WNDPROC> (
+      GetWindowLongPtrW (hwnd, GWLP_WNDPROC));
+  if (orig != nullptr && cur == osd_subclass_wndproc)
+    SetWindowLongPtrW (hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR> (orig));
+  RemovePropW (hwnd, kWsOsdOrigProcProp);
+}
+
+// (Re)position the window for the current workspace count and optionally show it.
+static void
+osd_present (bool ensure_visible = true)
 {
   if (g_window == nullptr)
     return;
@@ -281,12 +394,13 @@ osd_present (void)
   if (w != g_osd_last_w || h != g_osd_last_h) {
     gtk_widget_set_size_request (g_area, w, h);
     gtk_window_set_default_size (GTK_WINDOW (g_window), w, h);
+    gtk_widget_queue_resize (g_window);
     g_osd_last_w = w;
     g_osd_last_h = h;
-    g_osd_last_x = INT_MIN;
-    g_osd_last_y = INT_MIN;
   }
 
+  if (!gtk_widget_get_realized (g_window))
+    gtk_widget_realize (g_window);
   if (g_hwnd == nullptr || !IsWindow (g_hwnd))
     return;
 
@@ -299,18 +413,35 @@ osd_present (void)
     return;
 
   int scale = std::max (1, gtk_widget_get_scale_factor (g_window));
-  int pw = w * scale, ph = h * scale;
-  // Offset by kShadowPad so the visible pill sits at exact margin_bottom (4em).
-  int margin = (int)(std::max (0.0, m.margin_bottom - kShadowPad) * scale);
-  int x = mi.rcMonitor.left + (mi.rcMonitor.right - mi.rcMonitor.left) / 2 -
-          pw / 2;
-  int y = mi.rcMonitor.bottom - margin - ph;
+  const RECT want = compute_ws_osd_hwnd_rect (
+      mi.rcMonitor, w, h, m.margin_bottom, kShadowPad, scale);
+  g_osd_want_rect = want;
 
-  if (x != g_osd_last_x || y != g_osd_last_y || !IsWindowVisible (g_hwnd)) {
-    g_osd_last_x = x;
-    g_osd_last_y = y;
-    SetWindowPos (g_hwnd, HWND_TOPMOST, x, y, pw, ph,
-                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  winome::vd::pin_window_async (g_hwnd);
+  DWORD cloaked = 0;
+  DwmGetWindowAttribute (g_hwnd, DWMWA_CLOAKED, &cloaked, sizeof (cloaked));
+  if ((cloaked & 0x2u /* DWM_CLOAKED_SHELL */) != 0) {
+    int target_vd = 0;
+    if (winome::ws::effective_mode () !=
+        winome::ws::MultiMonitorWorkspaceMode::Independent) {
+      const auto snap = winome::vd::cached_snapshot ();
+      target_vd = snap.valid ? snap.active_index : winome::vd::current_index ();
+    }
+    if (target_vd >= 0) {
+      winome::vd::move_window_to_desktop (g_hwnd, target_vd);
+      winome::vd::pin_window_async (g_hwnd);
+    }
+  }
+
+  RECT cur_rect{};
+  const bool has_cur = GetWindowRect (g_hwnd, &cur_rect) != FALSE;
+  const bool need_show = ensure_visible && !IsWindowVisible (g_hwnd);
+  if (!has_cur || !EqualRect (&cur_rect, &want) || need_show) {
+    UINT flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    if (ensure_visible)
+      flags |= SWP_SHOWWINDOW;
+    SetWindowPos (g_hwnd, HWND_TOPMOST, want.left, want.top,
+                  want.right - want.left, want.bottom - want.top, flags);
   }
 }
 
@@ -330,9 +461,12 @@ osd_display (int active)
   if (g_area != nullptr)
     gtk_widget_queue_draw (g_area);
 
+  // Realize, subclass, and lock g_osd_want_rect BEFORE GTK maps/shows the
+  // toplevel so GDK's initial configure cannot move the OSD to (0, 0).
+  osd_present (false);
   if (g_window != nullptr && !gtk_widget_get_visible (g_window))
     gtk_widget_set_visible (g_window, TRUE);
-  osd_present ();
+  osd_present (true);
 
   // Re-arm the display timeout; a visible popup just refreshes its dots
   // (upstream: duration 0 when already visible).
@@ -398,6 +532,8 @@ on_osd_realize (GtkWidget *widget, gpointer user_data)
   if (want != ex)
     SetWindowLongPtrW (g_hwnd, GWL_EXSTYLE, want);
   winome::harden_shell_overlay_hwnd (g_hwnd);
+  ensure_osd_subclass (g_hwnd);
+  winome::vd::pin_window_async (g_hwnd);
 
   // Suppress Windows 11 DWM rectangular shadow, border, and corner clipping so
   // only the transparent Cairo capsule renders.
@@ -415,17 +551,26 @@ on_osd_realize (GtkWidget *widget, gpointer user_data)
                          sizeof (kDwmColorNone));
 }
 
+static gboolean
+osd_post_map_idle (gpointer user_data G_GNUC_UNUSED)
+{
+  g_osd_map_idle = 0;
+  if (g_window != nullptr && gtk_widget_get_visible (g_window))
+    osd_present (true);
+  return G_SOURCE_REMOVE;
+}
+
 static void
 on_osd_map (GtkWidget *widget, gpointer user_data)
 {
   (void)widget;
   (void)user_data;
+  if (g_osd_map_idle != 0)
+    return;
   // GDK's first-map sequence positions the window itself; re-apply ours
-  // right after the map (same pattern as the overview chrome windows).
-  g_idle_add (+[] (gpointer) -> gboolean {
-    osd_present ();
-    return G_SOURCE_REMOVE;
-  }, nullptr);
+  // before the frame clock repaints.
+  g_osd_map_idle = g_idle_add_full (G_PRIORITY_HIGH_IDLE, osd_post_map_idle,
+                                    nullptr, nullptr);
 }
 
 }  // namespace
@@ -459,6 +604,13 @@ ws_osd_shutdown ()
   ws::remove_change_listener (on_ws_osd_desktop_changed, nullptr);
   g_last_index_by_mon.clear ();
   g_osd_monitor = nullptr;
+  g_osd_last_w = -1;
+  g_osd_last_h = -1;
+  g_osd_want_rect = RECT{0, 0, 0, 0};
+  if (g_osd_map_idle != 0) {
+    g_source_remove (g_osd_map_idle);
+    g_osd_map_idle = 0;
+  }
   if (g_timeout_id != 0) {
     g_source_remove (g_timeout_id);
     g_timeout_id = 0;
@@ -467,6 +619,8 @@ ws_osd_shutdown ()
     gtk_widget_remove_tick_callback (g_window, g_fade_source);
     g_fade_source = 0;
   }
+  if (g_hwnd != nullptr)
+    unsubclass_osd_hwnd (g_hwnd);
   if (g_window != nullptr) {
     gtk_window_destroy (GTK_WINDOW (g_window));
     g_window = nullptr;

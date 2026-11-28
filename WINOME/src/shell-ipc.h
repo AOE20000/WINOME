@@ -39,6 +39,7 @@ struct IpcCallbacks {
   bool (*looking_glass_open)() = nullptr;
   bool (*looking_glass_close)() = nullptr;
   std::string (*inspect_panel_json)() = nullptr;
+  DWORD (*watchdog_pid)() = nullptr;
   bool (*run_exec)(const std::string& cmdline, std::string* out_err) = nullptr;
   std::string (*plugin_list_json)() = nullptr;
   bool (*plugin_action)(const std::string& op,

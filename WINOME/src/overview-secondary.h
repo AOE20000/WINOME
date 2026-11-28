@@ -245,4 +245,29 @@ inline bool should_ignore_stale_desktop_echo(int incoming_active,
          elapsed_us < kStaleEchoGraceUs;
 }
 
+// Resolve which native Windows virtual desktop Overview HWNDs must live on if
+// Explorer shell-cloaked them onto another desktop. In Independent workspace
+// mode all monitors remain on native desktop 0 (desktop 1 is the parking
+// desktop); in Span/PrimaryOnly we follow the reported or cached active VD.
+inline int resolve_native_desktop_for_overview_rescue(
+    ws::MultiMonitorWorkspaceMode mode,
+    int reported_active_index,
+    int cached_vd_active_index) {
+  if (mode == ws::MultiMonitorWorkspaceMode::Independent)
+    return 0;
+  return (reported_active_index >= 0) ? reported_active_index
+                                      : cached_vd_active_index;
+}
+
+// True only when Overview is visibly open and Explorer has applied
+// DWM_CLOAKED_SHELL (0x2), ignoring WINOME's own DWM_CLOAKED_APP (0x1)
+// pre-paint open cloak.
+inline bool should_rescue_overview_vd_cloak(DWORD dwm_cloaked_flags,
+                                            bool window_visible,
+                                            bool target_is_open) {
+  constexpr DWORD kDwmCloakedShell = 0x2u;
+  return window_visible && target_is_open &&
+         ((dwm_cloaked_flags & kDwmCloakedShell) != 0u);
+}
+
 }  // namespace winome

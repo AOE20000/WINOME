@@ -30,6 +30,7 @@ winome_sources = files(
   'winrt-bridge.cpp',
   'notifications.cpp',
   'systray.cpp',
+  'background-apps.cpp',
   'settings-window.cpp',
   'quick-settings.cpp',
   'end-session-dialog.cpp',

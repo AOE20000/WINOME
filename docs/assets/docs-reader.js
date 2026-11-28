@@ -21,6 +21,7 @@
       groupEn: "Core Architecture",
       items: [
         { path: "architecture.md", zh: "系统架构与模块设计", en: "System Architecture", keywords: "overview watchdog ipc virtual desktop com systray multi-monitor" },
+        { path: "dev-channel.md", zh: "开发者调试通道与 winome-ctl 指南", en: "Dev Channel & winome-ctl Guide", keywords: "dev channel winome-ctl ipc gtk.tree gtk.css gtk.node_at gtk.redraw inspect.panel test" },
         { path: "theme-and-ui.md", zh: "St 双管线与 UI 规范", en: "Theme Pipeline & UI", keywords: "st-compat css gtk4 clutter quick settings theme" },
         { path: "pitfalls.md", zh: "工程硬约束与踩坑汇总", en: "Constraints & Pitfalls", keywords: "win32 gtk4 lto fontconfig bugs constraints" }
       ]

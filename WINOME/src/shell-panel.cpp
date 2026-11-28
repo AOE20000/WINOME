@@ -934,12 +934,16 @@ typedef struct {
   GtkWidget *card;
   GtkWidget *child;        // embedded content widget (quick settings / calendar / tray)
   gboolean open;
+  gboolean fading_out;
   gboolean centered;       // calendar: center on the button (quick settings right-aligns)
   RECT anchor_rect;        // the button's screen rect, for the close hook
   int win_x;               // last positioned left edge in physical px
+  int want_px_w;           // desired physical width for WM_GETMINMAXINFO
+  int want_px_h;           // desired physical height for WM_GETMINMAXINFO
   gint raise_attempts;     // post-map re-assert counter (GDK re-lates late)
   guint raise_source_id;   // pending g_idle/g_timeout id for popover_raise_idle
   guint stale_hover_id;    // pending 200ms timer for clear_stale_hover
+  guint vd_guard_id;       // optional per-popover VD guard timer id
   uint64_t anim_gen;       // invalidates stale open/close fade callbacks
 } PanelPopover;
 
@@ -947,9 +951,91 @@ static GList *g_open_popovers = NULL;
 static std::vector<PanelPopover *> g_live_popovers;
 static HHOOK g_popover_mouse_hook = NULL;
 static gboolean g_overview_hooked = FALSE;
+static guint g_vd_popover_guard_id = 0;
 // Monotonic time of the last popover dismissal by an outside click while the
 // overview was open (see popover_mouse_hook_proc).
 static gint64 g_popover_outside_close_us = 0;
+
+static constexpr const wchar_t *kPopoverOrigProcProp = L"WINOME_PopoverOrigProc";
+static constexpr const wchar_t *kPopoverPtrProp = L"WINOME_PopoverPtr";
+
+static LRESULT CALLBACK
+popover_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+  if (msg == WM_STYLECHANGING && wParam == static_cast<WPARAM> (GWL_EXSTYLE) &&
+      lParam != 0) {
+    auto *ss = reinterpret_cast<STYLESTRUCT *> (lParam);
+    ss->styleNew = (static_cast<LONG_PTR> (ss->styleNew) | WS_EX_TOOLWINDOW) &
+                   ~WS_EX_APPWINDOW;
+  }
+
+  WNDPROC orig = reinterpret_cast<WNDPROC> (
+      GetPropW (hwnd, kPopoverOrigProcProp));
+  PanelPopover *pp = reinterpret_cast<PanelPopover *> (
+      GetPropW (hwnd, kPopoverPtrProp));
+
+  if (msg == WM_NCDESTROY) {
+    RemovePropW (hwnd, kPopoverOrigProcProp);
+    RemovePropW (hwnd, kPopoverPtrProp);
+    if (orig != nullptr) {
+      if (GetWindowLongPtrW (hwnd, GWLP_WNDPROC) ==
+          reinterpret_cast<LONG_PTR> (popover_subclass_wndproc)) {
+        SetWindowLongPtrW (hwnd, GWLP_WNDPROC,
+                           reinterpret_cast<LONG_PTR> (orig));
+      }
+      return CallWindowProcW (orig, hwnd, msg, wParam, lParam);
+    }
+    return DefWindowProcW (hwnd, msg, wParam, lParam);
+  }
+
+  LRESULT res = orig != nullptr
+                    ? CallWindowProcW (orig, hwnd, msg, wParam, lParam)
+                    : DefWindowProcW (hwnd, msg, wParam, lParam);
+
+  if (msg == WM_GETMINMAXINFO && lParam != 0 && pp != nullptr &&
+      pp->want_px_w > 0 && pp->want_px_h > 0) {
+    auto *mmi = reinterpret_cast<MINMAXINFO *> (lParam);
+    mmi->ptMinTrackSize.x = std::min<LONG> (mmi->ptMinTrackSize.x, pp->want_px_w);
+    mmi->ptMinTrackSize.y = std::min<LONG> (mmi->ptMinTrackSize.y, pp->want_px_h);
+    if (mmi->ptMaxTrackSize.x > 0 && mmi->ptMaxTrackSize.x < pp->want_px_w)
+      mmi->ptMaxTrackSize.x = pp->want_px_w;
+    if (mmi->ptMaxTrackSize.y > 0 && mmi->ptMaxTrackSize.y < pp->want_px_h)
+      mmi->ptMaxTrackSize.y = pp->want_px_h;
+  }
+  return res;
+}
+
+static void
+ensure_popover_subclass (HWND hwnd, PanelPopover *pp)
+{
+  if (hwnd == nullptr || !IsWindow (hwnd))
+    return;
+  SetPropW (hwnd, kPopoverPtrProp, reinterpret_cast<HANDLE> (pp));
+  if (GetPropW (hwnd, kPopoverOrigProcProp) != nullptr)
+    return;
+  WNDPROC cur = reinterpret_cast<WNDPROC> (
+      GetWindowLongPtrW (hwnd, GWLP_WNDPROC));
+  if (cur != nullptr && cur != popover_subclass_wndproc) {
+    SetPropW (hwnd, kPopoverOrigProcProp, reinterpret_cast<HANDLE> (cur));
+    SetWindowLongPtrW (hwnd, GWLP_WNDPROC,
+                       reinterpret_cast<LONG_PTR> (popover_subclass_wndproc));
+  }
+}
+
+static void
+unsubclass_popover_hwnd (HWND hwnd)
+{
+  if (hwnd == nullptr || !IsWindow (hwnd))
+    return;
+  WNDPROC orig = reinterpret_cast<WNDPROC> (
+      GetPropW (hwnd, kPopoverOrigProcProp));
+  WNDPROC cur = reinterpret_cast<WNDPROC> (
+      GetWindowLongPtrW (hwnd, GWLP_WNDPROC));
+  if (orig != nullptr && cur == popover_subclass_wndproc)
+    SetWindowLongPtrW (hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR> (orig));
+  RemovePropW (hwnd, kPopoverOrigProcProp);
+  RemovePropW (hwnd, kPopoverPtrProp);
+}
 
 static void
 panel_popover_cancel_raise (PanelPopover *pp)
@@ -1143,7 +1229,7 @@ draw_popover_arrow (GtkDrawingArea *area, cairo_t *cr, int width, int height,
                     gpointer data)
 {
   PanelPopover *pp = static_cast<PanelPopover *> (data);
-  if (pp == nullptr || !pp->open || width <= 0 || height <= 0)
+  if (pp == nullptr || (!pp->open && !pp->fading_out) || width <= 0 || height <= 0)
     return;
 
   const BoxPointerTheme &t = boxpointer_theme ();
@@ -1227,14 +1313,18 @@ panel_popover_geometry (PanelPopover *pp, int width, int height,
 static void
 panel_popover_hide_now (PanelPopover *pp)
 {
+  pp->fading_out = FALSE;
   gtk_widget_set_visible (pp->window, FALSE);
   HWND hwnd = panel_popover_hwnd (pp);
   if (hwnd != nullptr)
     SetWindowPos (hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
-                  SWP_NOMOVE | SWP_NOSIZE);
+                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
   winome::evaluate_fullscreen_state ();
-  if (g_open_popovers == nullptr && winome::overview_active ())
+  if (g_open_popovers == nullptr &&
+      winome_shell_panel_top_popover_hwnd () == nullptr &&
+      winome::overview_active ()) {
     winome::overview_restore_focus_if_active ();
+  }
 }
 
 static void
@@ -1243,6 +1333,7 @@ panel_popover_close_ex (PanelPopover *pp, const char *reason, gboolean immediate
   if (!pp->open) {
     if (immediate) {
       ++pp->anim_gen;
+      pp->fading_out = FALSE;
       if (pp->window != nullptr && gtk_widget_get_visible (pp->window))
         panel_popover_hide_now (pp);
     }
@@ -1263,9 +1354,15 @@ panel_popover_close_ex (PanelPopover *pp, const char *reason, gboolean immediate
     winome_quick_settings_close_menu (pp->child, FALSE);
 
   g_open_popovers = g_list_remove (g_open_popovers, pp);
-  if (g_open_popovers == nullptr && g_popover_mouse_hook != nullptr) {
-    UnhookWindowsHookEx (g_popover_mouse_hook);
-    g_popover_mouse_hook = nullptr;
+  if (g_open_popovers == nullptr) {
+    if (g_popover_mouse_hook != nullptr) {
+      UnhookWindowsHookEx (g_popover_mouse_hook);
+      g_popover_mouse_hook = nullptr;
+    }
+    if (g_vd_popover_guard_id != 0) {
+      g_source_remove (g_vd_popover_guard_id);
+      g_vd_popover_guard_id = 0;
+    }
   }
 
   // Clear the stale :hover GTK leaves on the anchor button on Windows.
@@ -1296,10 +1393,12 @@ panel_popover_close_ex (PanelPopover *pp, const char *reason, gboolean immediate
 
   const double cur_op = pp->wrap != nullptr ? gtk_widget_get_opacity (pp->wrap) : 0.0;
   if (immediate || pp->wrap == nullptr || cur_op <= 0.01) {
+    pp->fading_out = FALSE;
     panel_popover_hide_now (pp);
     return;
   }
 
+  pp->fading_out = TRUE;
   winome::tween_opacity (
       pp->wrap, cur_op, 0.0, winome::BOXPOPOVER_ANIMATION_TIME,
       winome::Ease::ease_out_quad, [pp, gen] () {
@@ -1326,6 +1425,82 @@ panel_popover_close (PanelPopover *pp, const char *reason)
 // cached geometry — so the current rectangle must never be trusted, only
 // the anchor geometry. Re-runs for a short while because GDK may still
 // reconfigure right after the map.
+static void
+panel_popover_sync_size_ex (PanelPopover *pp, gboolean raise_topmost)
+{
+  if (pp == nullptr || pp->window == nullptr || pp->wrap == nullptr)
+    return;
+
+  int nat_w = 0;
+  int nat_h = 0;
+  gtk_widget_measure (pp->wrap, GTK_ORIENTATION_HORIZONTAL, -1,
+                      nullptr, &nat_w, nullptr, nullptr);
+  gtk_widget_measure (pp->wrap, GTK_ORIENTATION_VERTICAL, std::max (nat_w, 1),
+                      nullptr, &nat_h, nullptr, nullptr);
+  if (nat_w <= 0 || nat_h <= 0)
+    return;
+
+  int cur_def_w = 0, cur_def_h = 0;
+  gtk_window_get_default_size (GTK_WINDOW (pp->window), &cur_def_w, &cur_def_h);
+  if (cur_def_w != nat_w || cur_def_h != nat_h) {
+    gtk_window_set_default_size (GTK_WINDOW (pp->window), nat_w, nat_h);
+    gtk_widget_queue_resize (pp->window);
+  }
+
+  GdkSurface *surface = gtk_native_get_surface (GTK_NATIVE (pp->window));
+  HWND hwnd = surface != nullptr
+      ? static_cast<HWND> (gdk_win32_surface_get_handle (surface))
+      : nullptr;
+  if (hwnd == nullptr || !IsWindow (hwnd))
+    return;
+
+  const int scale = std::max (1, gdk_surface_get_scale_factor (surface));
+  const int px_w = nat_w * scale;
+  const int px_h = nat_h * scale;
+  pp->want_px_w = px_w;
+  pp->want_px_h = px_h;
+
+  if (!pp->open || pp->fading_out)
+    return;
+
+  int x = 0, y = 0;
+  if (!panel_popover_geometry (pp, px_w, px_h, &x, &y))
+    return;
+
+  if (pp->win_x != x) {
+    pp->win_x = x;
+    if (pp->arrow_area != nullptr)
+      gtk_widget_queue_draw (pp->arrow_area);
+  }
+
+  RECT cur{};
+  const bool has_cur = GetWindowRect (hwnd, &cur) != FALSE;
+  const bool geom_changed =
+      !has_cur || cur.left != x || cur.top != y ||
+      (cur.right - cur.left) != px_w || (cur.bottom - cur.top) != px_h;
+  if (raise_topmost) {
+    SetWindowPos (hwnd, HWND_TOPMOST, x, y, px_w, px_h,
+                  SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+  } else if (geom_changed) {
+    SetWindowPos (hwnd, nullptr, x, y, px_w, px_h,
+                  SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+  }
+}
+
+void
+winome_shell_panel_sync_popover_size (GtkWidget *widget)
+{
+  if (widget == nullptr)
+    return;
+  GtkRoot *root = gtk_widget_get_root (widget);
+  if (root == nullptr)
+    return;
+  PanelPopover *pp = static_cast<PanelPopover *> (
+      g_object_get_data (G_OBJECT (root), "panel-popover"));
+  if (pp != nullptr && pp->open && !pp->fading_out)
+    panel_popover_sync_size_ex (pp, FALSE);
+}
+
 static gboolean
 popover_raise_idle (gpointer data)
 {
@@ -1336,6 +1511,7 @@ popover_raise_idle (gpointer data)
 
   HWND hwnd = panel_popover_hwnd (pp);
   if (hwnd != nullptr) {
+    ensure_popover_subclass (hwnd, pp);
     LONG_PTR ex = GetWindowLongPtrW (hwnd, GWL_EXSTYLE);
     LONG_PTR want = (ex & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
     if (want != ex)
@@ -1351,21 +1527,11 @@ popover_raise_idle (gpointer data)
       // Pin the mapped popover HWND across all Windows virtual desktops so
       // switching workspaces on another monitor never cloaks/hides it.
       winome::vd::pin_window_async (hwnd);
-      // Recompute the position from the anchor; keep the current size (GTK
-      // has negotiated it by now).
-      int w = before.right - before.left;
-      int h = before.bottom - before.top;
-      int x = before.left, y = before.top;
-      g_print ("[pop] raise#%d rect=%ld,%ld %dx%d vis=%d cloak=%d\n",
-               pp->raise_attempts, before.left, before.top, w, h,
+      g_print ("[pop] raise#%d rect=%ld,%ld %ldx%ld vis=%d cloak=%d\n",
+               pp->raise_attempts, before.left, before.top,
+               before.right - before.left, before.bottom - before.top,
                (int)IsWindowVisible (hwnd), (int)cloaked);
-      if (w > 0 && h > 0 && panel_popover_geometry (pp, w, h, &x, &y)) {
-        pp->win_x = x;
-        if (pp->arrow_area != nullptr)
-          gtk_widget_queue_draw (pp->arrow_area);
-        SetWindowPos (hwnd, HWND_TOPMOST, x, y, w, h,
-                      SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
-      }
+      panel_popover_sync_size_ex (pp, TRUE);
     } else {
       // Subsequent follow-up passes only re-assert HWND_TOPMOST without
       // touching size/frame so inline drawer animations resize smoothly.
@@ -1416,17 +1582,21 @@ panel_popover_open (PanelPopover *pp)
   if (pp->open)
     return;
 
-  // Match upstream PanelMenu: opening one panel menu closes any sibling menu.
-  GList *siblings = g_list_copy (g_open_popovers);
-  for (GList *l = siblings; l != nullptr; l = l->next) {
-    PanelPopover *other = static_cast<PanelPopover *> (l->data);
-    if (other != pp && g_list_find (g_open_popovers, other) != nullptr)
+  // Match upstream PanelMenu: opening one panel menu closes any sibling menu
+  // (including any menu still mid-fade so a stale topmost popover never lingers).
+  std::vector<PanelPopover *> siblings = g_live_popovers;
+  for (PanelPopover *other : siblings) {
+    if (std::find (g_live_popovers.begin (), g_live_popovers.end (), other) ==
+        g_live_popovers.end ()) {
+      continue;
+    }
+    if (other != pp && (other->open || other->fading_out))
       panel_popover_close_ex (other, "switch", TRUE);
   }
-  g_list_free (siblings);
 
   g_print ("[pop] open\n");
   pp->open = TRUE;
+  pp->fading_out = FALSE;
   ++pp->anim_gen;
   pp->raise_attempts = 0;
   gtk_widget_add_css_class (pp->button, "open");
@@ -1442,15 +1612,19 @@ panel_popover_open (PanelPopover *pp)
 
   panel_popover_anchor_rect (pp);
 
-  // Measure natural size (card + shadow margin) for initial Win32 placement,
-  // while leaving default_size (-1, -1) on this non-resizable window so GTK4
-  // automatically grows and shrinks it when an inline QuickToggleMenu reveals.
+  // Measure natural size (card + shadow margin) for initial Win32 placement.
+  // Measure vertical height at the constrained nat_w (not -1) so height-for-
+  // width grids like WinomeQuickSettingsGrid do not report inflated heights,
+  // and set default_size + want_px_w/h before SetWindowPos so WM_GETMINMAXINFO
+  // allows the window to shrink cleanly back from a previous taller drawer.
   int nat_w, nat_h;
   gtk_widget_measure (pp->wrap, GTK_ORIENTATION_HORIZONTAL, -1,
                       nullptr, &nat_w, nullptr, nullptr);
-  gtk_widget_measure (pp->wrap, GTK_ORIENTATION_VERTICAL, -1,
+  gtk_widget_measure (pp->wrap, GTK_ORIENTATION_VERTICAL, std::max (nat_w, 1),
                       nullptr, &nat_h, nullptr, nullptr);
-  gtk_window_set_default_size (GTK_WINDOW (pp->window), -1, -1);
+  gtk_window_set_default_size (GTK_WINDOW (pp->window),
+                               std::max (nat_w, 1), std::max (nat_h, 1));
+  gtk_widget_queue_resize (pp->window);
 
   // Realize so the HWND exists, then place it at its final rect before
   // showing, so it never appears at GTK's default placement.
@@ -1460,15 +1634,19 @@ panel_popover_open (PanelPopover *pp)
       ? static_cast<HWND> (gdk_win32_surface_get_handle (surface))
       : nullptr;
   if (hwnd != nullptr) {
+    int scale = std::max (1, gdk_surface_get_scale_factor (surface));
+    int px_w = nat_w * scale;
+    int px_h = nat_h * scale;
+    pp->want_px_w = px_w;
+    pp->want_px_h = px_h;
+    ensure_popover_subclass (hwnd, pp);
+
     // Shell chrome: keep the popover out of Alt-Tab and the taskbar.
     LONG_PTR ex = GetWindowLongPtrW (hwnd, GWL_EXSTYLE);
     ex &= ~WS_EX_APPWINDOW;
     ex |= WS_EX_TOOLWINDOW;
     SetWindowLongPtrW (hwnd, GWL_EXSTYLE, ex);
 
-    int scale = gdk_surface_get_scale_factor (surface);
-    int px_w = nat_w * scale;
-    int px_h = nat_h * scale;
     int x = 0, y = 0;
     if (panel_popover_geometry (pp, px_w, px_h, &x, &y)) {
       pp->win_x = x;
@@ -1621,7 +1799,8 @@ popover_mouse_hook_proc (int nCode, WPARAM wParam, LPARAM lParam)
         g_popover_outside_close_us = g_get_monotonic_time ();
       POINT *pt_copy = g_new (POINT, 1);
       *pt_copy = pt;
-      g_idle_add (close_outside_popovers_idle, pt_copy);
+      g_idle_add_full (G_PRIORITY_HIGH, close_outside_popovers_idle, pt_copy,
+                       nullptr);
     }
   }
   return CallNextHookEx (nullptr, nCode, wParam, lParam);
@@ -1664,14 +1843,15 @@ panel_popover_monitor (PanelPopover *pp)
 // against Windows Virtual Desktop cloaking whenever another monitor switches
 // workspaces: re-pin and immediately restore any popover that Explorer cloaked.
 static void
-on_vd_changed_keep_popovers_visible (int count,
-                                     int active_index,
-                                     void *user_data)
+keep_popovers_visible_for_vd (int active_index)
 {
-  (void) count;
-  (void) user_data;
   if (g_open_popovers == nullptr)
     return;
+  int target_vd = active_index;
+  if (target_vd < 0) {
+    const auto snap = winome::vd::cached_snapshot ();
+    target_vd = snap.valid ? snap.active_index : winome::vd::current_index ();
+  }
   for (GList *l = g_open_popovers; l != nullptr; l = l->next) {
     PanelPopover *pp = static_cast<PanelPopover *> (l->data);
     if (pp == nullptr || !pp->open)
@@ -1682,14 +1862,38 @@ on_vd_changed_keep_popovers_visible (int count,
     winome::vd::pin_window_async (hwnd);
     DWORD cloaked = 0;
     DwmGetWindowAttribute (hwnd, DWMWA_CLOAKED, &cloaked, sizeof (cloaked));
-    if (cloaked != 0 && active_index >= 0) {
-      winome::vd::move_window_to_desktop (hwnd, active_index);
+    if ((cloaked & 0x2u /* DWM_CLOAKED_SHELL */) != 0 && target_vd >= 0) {
+      winome::vd::move_window_to_desktop (hwnd, target_vd);
       winome::vd::pin_window_async (hwnd);
     }
     SetWindowPos (hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
                       SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
   }
+}
+
+static gboolean
+on_vd_popover_guard_timeout (gpointer user_data G_GNUC_UNUSED)
+{
+  g_vd_popover_guard_id = 0;
+  keep_popovers_visible_for_vd (-1);
+  return G_SOURCE_REMOVE;
+}
+
+static void
+on_vd_changed_keep_popovers_visible (int count,
+                                     int active_index,
+                                     void *user_data)
+{
+  (void) count;
+  (void) user_data;
+  keep_popovers_visible_for_vd (active_index);
+  if (g_vd_popover_guard_id != 0) {
+    g_source_remove (g_vd_popover_guard_id);
+    g_vd_popover_guard_id = 0;
+  }
+  if (g_open_popovers != nullptr)
+    g_vd_popover_guard_id = g_timeout_add (90, on_vd_popover_guard_timeout, nullptr);
 }
 
 static void
@@ -1825,6 +2029,174 @@ winome_shell_panel_set_workspace_scroll (int count, double position)
   winome_shell_panel_set_workspace_scroll_for_monitor (ov_mon, count, position);
 }
 
+void
+winome_shell_panel_queue_redraw_all (void)
+{
+  for (GtkWidget *panel : g_registered_panels) {
+    if (panel == nullptr || !GTK_IS_WIDGET (panel))
+      continue;
+    gtk_widget_queue_draw (panel);
+    if (GtkWidget *child = gtk_window_get_child (GTK_WINDOW (panel)))
+      gtk_widget_queue_draw (child);
+    if (GdkSurface *surf = gtk_native_get_surface (GTK_NATIVE (panel))) {
+      HWND hwnd = static_cast<HWND> (gdk_win32_surface_get_handle (surf));
+      if (hwnd != nullptr && IsWindow (hwnd))
+        InvalidateRect (hwnd, nullptr, FALSE);
+    }
+  }
+}
+
+static void
+panel_append_json_str (const std::string &s, std::string *out)
+{
+  out->push_back ('"');
+  for (unsigned char c : s) {
+    switch (c) {
+      case '"':  *out += "\\\""; break;
+      case '\\': *out += "\\\\"; break;
+      case '\b': *out += "\\b"; break;
+      case '\f': *out += "\\f"; break;
+      case '\n': *out += "\\n"; break;
+      case '\r': *out += "\\r"; break;
+      case '\t': *out += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          char buf[8];
+          std::snprintf (buf, sizeof (buf), "\\u%04x", c);
+          *out += buf;
+        } else {
+          out->push_back (static_cast<char> (c));
+        }
+        break;
+    }
+  }
+  out->push_back ('"');
+}
+
+std::string
+winome_shell_panel_inspect_json (void)
+{
+  std::string out = "{\"panels\":[";
+  size_t panel_count = 0;
+  for (size_t i = 0; i < g_registered_panels.size (); ++i) {
+    GtkWidget *panel = g_registered_panels[i];
+    if (panel == nullptr || !GTK_IS_WIDGET (panel))
+      continue;
+    if (panel_count > 0)
+      out.push_back (',');
+    ++panel_count;
+
+    GdkSurface *surf = GTK_IS_NATIVE (panel)
+        ? gtk_native_get_surface (GTK_NATIVE (panel))
+        : nullptr;
+    HWND hwnd = surf != nullptr
+        ? static_cast<HWND> (gdk_win32_surface_get_handle (surf))
+        : nullptr;
+    const bool valid_hwnd = hwnd != nullptr && IsWindow (hwnd) != FALSE;
+    const bool w32_vis = valid_hwnd && IsWindowVisible (hwnd) != FALSE;
+    BOOL cloaked_val = FALSE;
+    if (valid_hwnd)
+      (void) DwmGetWindowAttribute (hwnd, DWMWA_CLOAKED, &cloaked_val, sizeof (cloaked_val));
+    const LONG_PTR ex = valid_hwnd ? GetWindowLongPtrW (hwnd, GWL_EXSTYLE) : 0;
+    const bool topmost = (ex & WS_EX_TOPMOST) != 0;
+    RECT rc {};
+    if (valid_hwnd)
+      GetWindowRect (hwnd, &rc);
+
+    double ov_progress = 0.0;
+    if (GtkWidget *child = gtk_window_get_child (GTK_WINDOW (panel))) {
+      if (G_TYPE_CHECK_INSTANCE_TYPE (child, winome_panel_layout_get_type ()))
+        ov_progress = WINOME_PANEL_LAYOUT (child)->overview_progress;
+    }
+
+    char buf[384];
+    std::snprintf (
+        buf, sizeof (buf),
+        "{\"index\":%zu,\"hwnd\":\"0x%llX\",\"visible\":%s,\"mapped\":%s,"
+        "\"opacity\":%.3f,\"w\":%d,\"h\":%d,"
+        "\"win32_visible\":%s,\"cloaked\":%s,\"topmost\":%s,"
+        "\"exstyle\":\"0x%llX\",\"rect\":{\"x\":%ld,\"y\":%ld,\"w\":%ld,\"h\":%ld},"
+        "\"overview_progress\":%.3f}",
+        i,
+        static_cast<unsigned long long> (reinterpret_cast<uintptr_t> (hwnd)),
+        gtk_widget_get_visible (panel) ? "true" : "false",
+        gtk_widget_get_mapped (panel) ? "true" : "false",
+        gtk_widget_get_opacity (panel),
+        gtk_widget_get_width (panel),
+        gtk_widget_get_height (panel),
+        w32_vis ? "true" : "false",
+        cloaked_val ? "true" : "false",
+        topmost ? "true" : "false",
+        static_cast<unsigned long long> (ex),
+        rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+        ov_progress);
+    out += buf;
+  }
+
+  out += "],\"panel_count\":";
+  out += std::to_string (panel_count);
+  out += ",\"open_popovers\":[";
+  size_t pop_count = 0;
+  for (GList *l = g_open_popovers; l != nullptr; l = l->next) {
+    PanelPopover *pp = static_cast<PanelPopover *> (l->data);
+    if (pp == nullptr)
+      continue;
+    if (pop_count > 0)
+      out.push_back (',');
+    ++pop_count;
+
+    const char *btn_name =
+        (pp->button != nullptr && GTK_IS_WIDGET (pp->button))
+            ? gtk_widget_get_name (pp->button)
+            : "";
+    GtkWidget *win = pp->window;
+    GdkSurface *surf = (win != nullptr && GTK_IS_NATIVE (win))
+        ? gtk_native_get_surface (GTK_NATIVE (win))
+        : nullptr;
+    HWND hwnd = surf != nullptr
+        ? static_cast<HWND> (gdk_win32_surface_get_handle (surf))
+        : nullptr;
+    const bool valid_hwnd = hwnd != nullptr && IsWindow (hwnd) != FALSE;
+    const bool w32_vis = valid_hwnd && IsWindowVisible (hwnd) != FALSE;
+    BOOL cloaked_val = FALSE;
+    if (valid_hwnd)
+      (void) DwmGetWindowAttribute (hwnd, DWMWA_CLOAKED, &cloaked_val, sizeof (cloaked_val));
+    const LONG_PTR ex = valid_hwnd ? GetWindowLongPtrW (hwnd, GWL_EXSTYLE) : 0;
+    RECT rc {};
+    if (valid_hwnd)
+      GetWindowRect (hwnd, &rc);
+
+    out += "{\"button\":";
+    panel_append_json_str (btn_name ? btn_name : "", &out);
+    char pbuf[320];
+    std::snprintf (
+        pbuf, sizeof (pbuf),
+        ",\"centered\":%s,\"hwnd\":\"0x%llX\",\"visible\":%s,\"mapped\":%s,"
+        "\"w\":%d,\"h\":%d,\"win32_visible\":%s,\"cloaked\":%s,\"topmost\":%s,"
+        "\"rect\":{\"x\":%ld,\"y\":%ld,\"w\":%ld,\"h\":%ld}}",
+        pp->centered ? "true" : "false",
+        static_cast<unsigned long long> (reinterpret_cast<uintptr_t> (hwnd)),
+        (win != nullptr && gtk_widget_get_visible (win)) ? "true" : "false",
+        (win != nullptr && gtk_widget_get_mapped (win)) ? "true" : "false",
+        win != nullptr ? gtk_widget_get_width (win) : 0,
+        win != nullptr ? gtk_widget_get_height (win) : 0,
+        w32_vis ? "true" : "false",
+        cloaked_val ? "true" : "false",
+        ((ex & WS_EX_TOPMOST) != 0) ? "true" : "false",
+        rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
+    out += pbuf;
+  }
+
+  out += "],\"open_popover_count\":";
+  out += std::to_string (pop_count);
+  out += ",\"safe_mode\":";
+  out += winome::is_safe_mode () ? "true" : "false";
+  out += ",\"developer_mode\":";
+  out += winome::get_config ().developer_mode ? "true" : "false";
+  out += "}";
+  return out;
+}
+
 static void
 on_popover_button_destroy (GtkWidget *button, gpointer data)
 {
@@ -1836,26 +2208,42 @@ on_popover_button_destroy (GtkWidget *button, gpointer data)
       std::remove (g_live_popovers.begin (), g_live_popovers.end (), pp),
       g_live_popovers.end ());
   pp->open = FALSE;
+  pp->fading_out = FALSE;
   ++pp->anim_gen;
   panel_popover_cancel_raise (pp);
   if (pp->stale_hover_id != 0) {
     g_source_remove (pp->stale_hover_id);
     pp->stale_hover_id = 0;
   }
+  if (pp->vd_guard_id != 0) {
+    g_source_remove (pp->vd_guard_id);
+    pp->vd_guard_id = 0;
+  }
   g_open_popovers = g_list_remove (g_open_popovers, pp);
-  if (g_open_popovers == nullptr && g_popover_mouse_hook != nullptr) {
-    UnhookWindowsHookEx (g_popover_mouse_hook);
-    g_popover_mouse_hook = nullptr;
+  if (g_open_popovers == nullptr) {
+    if (g_popover_mouse_hook != nullptr) {
+      UnhookWindowsHookEx (g_popover_mouse_hook);
+      g_popover_mouse_hook = nullptr;
+    }
+    if (g_vd_popover_guard_id != 0) {
+      g_source_remove (g_vd_popover_guard_id);
+      g_vd_popover_guard_id = 0;
+    }
   }
   pp->button = nullptr;
   GtkWidget *win = pp->window;
+  HWND hwnd = panel_popover_hwnd (pp);
+  if (hwnd != nullptr)
+    unsubclass_popover_hwnd (hwnd);
   pp->window = nullptr;
   pp->wrap = nullptr;
   pp->arrow_area = nullptr;
   pp->card = nullptr;
   pp->child = nullptr;
-  if (win != nullptr && GTK_IS_WINDOW (win))
+  if (win != nullptr && GTK_IS_WINDOW (win)) {
+    g_object_set_data (G_OBJECT (win), "panel-popover", nullptr);
     gtk_window_destroy (GTK_WINDOW (win));
+  }
   g_free (pp);
 }
 
@@ -1872,6 +2260,7 @@ make_panel_popover (GtkWidget *button, GtkWidget *child, gboolean centered)
   pp->centered = centered;
 
   pp->window = gtk_window_new ();
+  g_object_set_data (G_OBJECT (pp->window), "panel-popover", pp);
   gtk_window_set_title (GTK_WINDOW (pp->window), "WINOME Popover");
   gtk_window_set_decorated (GTK_WINDOW (pp->window), FALSE);
   gtk_window_set_resizable (GTK_WINDOW (pp->window), FALSE);
@@ -1939,6 +2328,22 @@ close_open_popovers_for_monitor (HMONITOR monitor, gboolean immediate)
     panel_popover_close_ex (pp, "dismiss", immediate);
   }
   g_list_free (snapshot);
+  if (immediate) {
+    std::vector<PanelPopover *> live_snap = g_live_popovers;
+    for (PanelPopover *pp : live_snap) {
+      if (std::find (g_live_popovers.begin (), g_live_popovers.end (), pp) ==
+              g_live_popovers.end () ||
+          pp == nullptr || !pp->fading_out) {
+        continue;
+      }
+      if (monitor != nullptr) {
+        HMONITOR pmon = panel_popover_monitor (pp);
+        if (pmon != nullptr && pmon != monitor)
+          continue;
+      }
+      panel_popover_close_ex (pp, "dismiss", TRUE);
+    }
+  }
 }
 
 void
@@ -2655,6 +3060,8 @@ create_tray_button (PanelStatus *st)
   gtk_widget_set_focus_on_click (button, FALSE);
   gtk_widget_set_vexpand (button, TRUE);
   gtk_widget_set_tooltip_text (button, winome::tr ("System Tray", "系统托盘"));
+  gtk_widget_set_visible (
+      button, winome::get_config ().tray_location == "panel" ? TRUE : FALSE);
   st->tray_button = button;
 
   st->tray_inline_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
@@ -2925,13 +3332,30 @@ winome_shell_panel_top_popover_hwnd (void)
 void *
 winome_shell_panel_top_popover_hwnd_for_monitor (void *hmonitor)
 {
-  if (g_open_popovers == nullptr)
-    return nullptr;
   HMONITOR target = static_cast<HMONITOR> (hmonitor);
   for (GList *l = g_list_last (g_open_popovers); l != nullptr; l = l->prev) {
     PanelPopover *pp = static_cast<PanelPopover *> (l->data);
     if (pp == nullptr || !pp->open)
       continue;
+    if (target != nullptr) {
+      HMONITOR pmon = panel_popover_monitor (pp);
+      if (pmon != nullptr && pmon != target)
+        continue;
+    }
+    HWND h = panel_popover_hwnd (pp);
+    if (h != nullptr)
+      return h;
+  }
+  for (auto it = g_live_popovers.rbegin (); it != g_live_popovers.rend (); ++it) {
+    PanelPopover *pp = *it;
+    if (pp == nullptr)
+      continue;
+    const bool win_vis =
+        pp->window != nullptr && gtk_widget_get_visible (pp->window) != FALSE;
+    if (!winome::popover_occupies_top_band (pp->open != FALSE,
+                                            pp->fading_out != FALSE, win_vis)) {
+      continue;
+    }
     if (target != nullptr) {
       HMONITOR pmon = panel_popover_monitor (pp);
       if (pmon != nullptr && pmon != target)
@@ -2961,8 +3385,20 @@ static void
 on_panel_config_changed (void *data)
 {
   auto *st = static_cast<PanelStatus *> (data);
+  if (st == nullptr || st->destroyed)
+    return;
+  if (st->tray_button != nullptr) {
+    const bool show_top_tray = (winome::get_config ().tray_location == "panel");
+    if (!show_top_tray && st->tray_menu != nullptr &&
+        is_panel_child_popover_open (st->tray_menu)) {
+      winome_shell_panel_close_popovers_immediate ();
+    }
+    gtk_widget_set_visible (st->tray_button, show_top_tray ? TRUE : FALSE);
+  }
   reschedule_clock_timer (st);
   refresh_status (data);
+  if (st->quick_settings != nullptr)
+    winome_quick_settings_refresh (st->quick_settings);
 }
 
 static void

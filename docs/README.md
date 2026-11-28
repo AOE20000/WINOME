@@ -8,6 +8,7 @@
 |------|----------|
 | [build-and-env.md](build-and-env.md) | MSYS2 UCRT64 开发环境、`build.sh` 三方案构建与已知构建问题 |
 | [architecture.md](architecture.md) | 宿主启动流程、任务栏隐藏、顶栏/弹出窗、Activities 概览、虚拟桌面 COM、数据源与性能基线 |
+| [dev-channel.md](dev-channel.md) | 开发者模式调试总手册：`winome-ctl` IPC 协议、错误分类、`dev.*`（36 个全通道原语）与 `test.*` 自动化测试 |
 | [theme-and-ui.md](theme-and-ui.md) | 双 CSS 管线（`st-compat` + `convert-st-css.py`）、构建期自检、Clutter 动效层与快速设置菜单规范 |
 | [pitfalls.md](pitfalls.md) | 工程硬约束、Win32/GTK4/GCC LTO 踩坑汇总、样式排查方法论与已评估暂缓项 |
 | [roadmap.md](roadmap.md) | 生产级完善开发计划（P0–P5 六阶段路线图、验收标准与已交付汇总） |
@@ -23,12 +24,12 @@
    - 概览（含统一多屏同时概览）、动态壁纸同步、应用索引与分页网格 → `WINOME/src/overview*.cpp`、`live-wallpaper.cpp`、`app-index.cpp`、`app-grid.cpp`
    - 顶栏、工作区保留与弹出窗窗口壳 → `WINOME/src/shell-panel.cpp`
    - 多显示器拓扑、全屏与锁屏监测 → `WINOME/src/monitor-manager.cpp`、`fullscreen-watcher.cpp`
-   - 快速设置面板与系统托盘 → `WINOME/src/quick-settings.cpp`、`systray.cpp`
+   - 快速设置面板、后台应用折叠栏与系统托盘 → `WINOME/src/quick-settings.cpp`、`background-apps.cpp`、`systray.cpp`
    - 日历、通知中心与媒体卡片 → `WINOME/src/calendar.cpp`、`notifications.cpp`、`winrt-bridge.cpp`
    - 多屏独立工作区引擎与虚拟桌面 COM → `WINOME/src/workspace-manager.cpp`、`virtual-desktop.cpp`
    - 系统数据源 → `WINOME/src/system-status.cpp`、`wifi-networks.cpp`、`power-modes.cpp`
    - 配置、国际化与设置窗口 → `WINOME/src/config.cpp`、`i18n.cpp`、`settings-window.cpp`
-   - 宿主通信、遥测/安全、崩溃弹窗、一键排障压缩包导出、调试台、运行弹窗与插件宿主机 → `WINOME/src/shell-ipc.cpp`、`perf-metrics.cpp`、`crash-dialog.cpp`、`diagnostics-export.cpp`、`debug-runtime.cpp`、`looking-glass.cpp`、`run-dialog.cpp`、`plugin-host.cpp` 及非提权控制端 `WINOME/ctl/winome-ctl.cpp`
+   - 宿主通信、遥测/安全、崩溃弹窗、一键排障压缩包导出、调试台/Dev 通道、运行弹窗与插件宿主机 → `WINOME/src/shell-ipc.cpp`、`dev-channel.cpp`、`perf-metrics.cpp`、`crash-dialog.cpp`、`diagnostics-export.cpp`、`debug-runtime.cpp`、`looking-glass.cpp`、`run-dialog.cpp`、`plugin-host.cpp` 及非提权控制端 `WINOME/ctl/winome-ctl.cpp`
    - 会话确认弹窗与 DWM 窗口统一样式 → `WINOME/src/end-session-dialog.cpp`、`window-theming.cpp`
 4. **构建清单同步**：新增源码文件必须同步加入 [WINOME/src/meson.build](../WINOME/src/meson.build) 的 `winome_sources`；引入新的 Win32 系统库须同步添加 `cc.find_library(...)`。
 5. **状态清单单一事实源**：功能完成状态统一维护在根目录 [README.md](../README.md)，避免多处 README 各自维护导致漂移。

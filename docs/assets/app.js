@@ -64,7 +64,7 @@
     tour_eyebrow: "03 · REAL CAPTURE & VISUAL FIDELITY",
     tour_title: "Faithful GNOME look, seamless Windows integration",
     tour_lead:
-      "Beyond Overview — top bar, calendar & notification center, system tray icons, volume/brightness/Wi-Fi/Bluetooth/power Quick Settings, and live wallpaper support for Wallpaper Engine & Lively.",
+      "Beyond Overview — top bar, calendar & notification center, system tray & background apps, volume/brightness/Wi-Fi/Bluetooth/power Quick Settings, and live wallpaper support for Wallpaper Engine & Lively.",
     shot_alt: "WINOME live desktop screenshot showing top bar, Activities overview, workspaces, Dash and Quick Settings",
     shot_zoom: "Click to view full resolution ⤢",
     ui_md_fallback:
@@ -89,7 +89,7 @@
     dev_lead:
       "No stale duplicate docs — every page in the Docs Center is loaded live from the repository's <code>docs/</code> folder so developers can dive straight in.",
     build_md_fallback:
-      "With MSYS2 (UCRT64 + GTK4), run <code>./build.sh release</code> in the repo root to compile the ~2.8 MB release build and package the portable zip.",
+      "With MSYS2 (UCRT64 + GTK4), run <code>./build.sh release</code> in the repo root to compile the ~4.8 MB release build and package the portable zip.",
     jump_build: "Read Build & Packaging Guide",
     jump_roadmap: "View Roadmap",
     dl_readme: "Documentation Index",

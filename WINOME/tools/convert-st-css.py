@@ -982,11 +982,61 @@ label.popup-menu-item.popup-inactive-menu-item:disabled {
   transform: scale(0.75);
 }
 
-/* Floating modal dialogs keep a transparent frame around rounded .modal-dialog. */
-window#winomeModalDialogWindow {
+/* Floating modal & run dialogs keep a transparent frame around rounded .modal-dialog. */
+window#winomeModalDialogWindow,
+window#winomeRunDialogWindow {
   background-color: transparent;
+  background-image: none;
   box-shadow: none;
+  color: #ffffff;
   font: 11pt "Cantarell";
+}
+.modal-dialog {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 8px 24px 0 rgba(0, 0, 0, 0.45);
+  color: #ffffff;
+}
+.modal-dialog.run-dialog {
+  min-width: 24em;
+  padding: 24px;
+}
+.modal-dialog.run-dialog .modal-dialog-content-box {
+  padding-top: 6px;
+}
+.modal-dialog.run-dialog entry.run-dialog-entry {
+  background-image: none;
+  border-image: none;
+  border: none;
+  outline-style: none;
+  outline-width: 0;
+  border-radius: 8px;
+  padding: 12px 9px;
+  min-height: 0;
+  background-color: #48484c;
+  color: #ffffff;
+  caret-color: #ffffff;
+  box-shadow: none;
+}
+.modal-dialog.run-dialog entry.run-dialog-entry:hover {
+  background-color: #525256;
+  color: #ffffff;
+}
+.modal-dialog.run-dialog entry.run-dialog-entry:focus,
+.modal-dialog.run-dialog entry.run-dialog-entry:focus-within {
+  background-color: #4b4d54;
+  color: #ffffff;
+  border: none;
+  outline-style: none;
+  outline-width: 0;
+  box-shadow: inset 0 0 0 2px rgba(133, 181, 238, 0.800);
+}
+.modal-dialog.run-dialog .run-dialog-description {
+  color: #cccccc;
+  font-size: 0.818em;
+  font-weight: 400;
+}
+.modal-dialog.run-dialog .run-dialog-description.run-dialog-error-text {
+  color: #ff7b72;
 }
 .prompt-dialog .prompt-dialog-password-entry {
   background-image: none;
@@ -1007,21 +1057,113 @@ window#winomeModalDialogWindow {
   margin: 0;
 }
 
+/* GNOME Background Apps collapsible footer toggle & rows (_quick-settings.scss). */
+.quick-toggle.background-apps-quick-toggle,
+.quick-toggle.background-apps-quick-toggle.button {
+  min-height: 2.728em;
+  color: #ffffff;
+  background-color: transparent;
+  background-image: none;
+  border-style: none;
+  box-shadow: none;
+  padding: 6px 12px;
+  border-radius: 999px;
+}
+.quick-toggle.background-apps-quick-toggle:hover,
+.quick-toggle.background-apps-quick-toggle.button:hover {
+  color: #ffffff;
+  background-color: rgba(255, 255, 255, 0.08);
+}
+.quick-toggle.background-apps-quick-toggle:active,
+.quick-toggle.background-apps-quick-toggle.button:active,
+.quick-toggle.background-apps-quick-toggle.button:active:hover {
+  color: #ffffff;
+  background-color: rgba(255, 255, 255, 0.14);
+}
+.quick-toggle.background-apps-quick-toggle:focus,
+.quick-toggle.background-apps-quick-toggle.button:focus {
+  color: #ffffff;
+}
+.quick-toggle.background-apps-quick-toggle:focus:not(:focus-visible) {
+  outline: none;
+  box-shadow: none;
+}
+.quick-toggle.background-apps-quick-toggle label,
+.quick-toggle.background-apps-quick-toggle image {
+  color: #ffffff;
+}
+.background-apps-desc {
+  font-size: 0.818em;
+  color: rgba(255, 255, 255, 0.65);
+  padding: 0 12px 8px 12px;
+}
+.background-app-item {
+  padding: 8px 12px;
+  border-radius: 12px;
+  color: #ffffff;
+}
+.background-app-item .title {
+  color: #ffffff;
+}
+.background-app-item .subtitle {
+  color: rgba(255, 255, 255, 0.65);
+}
+.quick-toggle-menu .bg-app-action-btn {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 4px;
+  border-radius: 999px;
+  background-image: none;
+  border-style: none;
+  box-shadow: none;
+  background-color: rgba(255, 255, 255, 0.13);
+  color: #ffffff;
+}
+.quick-toggle-menu .bg-app-action-btn:hover {
+  background-color: rgba(255, 255, 255, 0.22);
+}
+.quick-toggle-menu .bg-app-action-btn:active {
+  background-color: rgba(255, 255, 255, 0.31);
+}
+
 /* Non-interactive calendar container and label widgets extend %card_flat or
-   %flat_button; neutralize GTK4 pointer/focus pseudo-classes so GtkBox/GtkLabel
-   do not flash or show focus rings when the cursor moves across them. */
+   %flat_button; neutralize GTK4 pointer/focus pseudo-classes (including
+   compound states like :active:hover that GTK4 propagates to ancestor
+   GtkBox/GtkLabel widgets when clicking inside the calendar). */
 .calendar:hover,
 .calendar:active,
+.calendar:active:hover,
+.calendar:active:focus,
 .calendar:focus,
+.calendar:focus:hover,
 .calendar:focus-visible,
+.calendar:focus-within,
 .calendar .calendar-month-header .calendar-month-label:hover,
 .calendar .calendar-month-header .calendar-month-label:active,
+.calendar .calendar-month-header .calendar-month-label:active:hover,
+.calendar .calendar-month-header .calendar-month-label:active:focus,
 .calendar .calendar-month-header .calendar-month-label:focus,
+.calendar .calendar-month-header .calendar-month-label:focus:hover,
 .calendar .calendar-month-header .calendar-month-label:focus-visible,
+.calendar .calendar-month-header .calendar-month-label:selected,
+.calendar .calendar-month-header .calendar-month-label:selected:hover,
+.calendar .calendar-month-header .calendar-month-label:selected:focus,
+.calendar .calendar-month-header .calendar-month-label:checked,
+.calendar .calendar-month-header .calendar-month-label:checked:hover,
+.calendar .calendar-month-header .calendar-month-label:checked:active,
 .calendar .calendar-day-heading:hover,
 .calendar .calendar-day-heading:active,
+.calendar .calendar-day-heading:active:hover,
+.calendar .calendar-day-heading:active:focus,
 .calendar .calendar-day-heading:focus,
-.calendar .calendar-day-heading:focus-visible {
+.calendar .calendar-day-heading:focus:hover,
+.calendar .calendar-day-heading:focus-visible,
+.calendar .calendar-day-heading:selected,
+.calendar .calendar-day-heading:selected:hover,
+.calendar .calendar-day-heading:selected:focus,
+.calendar .calendar-day-heading:checked,
+.calendar .calendar-day-heading:checked:hover,
+.calendar .calendar-day-heading:checked:active {
   background-color: transparent;
   box-shadow: none;
   outline: none;
@@ -1056,20 +1198,23 @@ window#winomeModalDialogWindow {
 }
 /* Upstream DateMenu calendar column precision (_calendar.scss). */
 .datemenu-calendar-column {
-  margin-left: 10px;
+  margin-left: 6px;
 }
 .datemenu-today-button {
   margin: 0;
-  padding: 8px 10px;
+  padding: 9px;
   border-radius: 12px;
 }
 .datemenu-today-button.today-selected,
 .datemenu-today-button.today-selected:hover,
-.datemenu-today-button.today-selected:active {
+.datemenu-today-button.today-selected:active,
+.datemenu-today-button.today-selected:active:hover,
+.datemenu-today-button.today-selected:active:focus,
+.datemenu-today-button.today-selected:focus:hover {
   background-color: transparent;
 }
 .datemenu-today-button .day-label {
-  color: rgba(255, 255, 255, 0.72);
+  color: #ffffff;
   font-weight: 700;
 }
 .datemenu-today-button .date-label {
@@ -1081,10 +1226,17 @@ window#winomeModalDialogWindow {
   margin: 0;
   padding: 0;
 }
+.calendar .calendar-month-header .calendar-month-label {
+  background-color: transparent;
+  color: #ffffff;
+  font-weight: 700;
+  padding: 8px 0;
+}
 .calendar .calendar-month-header .pager-button {
   border-radius: 999px;
-  min-width: 34px;
-  min-height: 34px;
+  min-width: 36px;
+  min-height: 36px;
+  margin: 0 2px;
   padding: 0;
   background-color: transparent;
   color: #ffffff;
@@ -1097,19 +1249,30 @@ window#winomeModalDialogWindow {
 }
 .calendar .calendar-day-heading {
   background-color: transparent;
-  color: rgba(255, 255, 255, 0.65);
+  color: #ffffff;
+  font-size: 0.818em;
   font-weight: 700;
-  margin: 2px;
-  padding: 4px 0;
+  margin: 4px 2px;
+  padding: 3px 0;
 }
 .calendar .calendar-day {
   background-color: transparent;
+  color: #ffffff;
   border-radius: 999px;
-  min-width: 34px;
-  min-height: 34px;
+  min-width: 36px;
+  min-height: 36px;
   margin: 2px;
   padding: 0;
+  font-size: 0.818em;
   font-weight: 700;
+}
+.calendar .calendar-day.calendar-weekend {
+  color: #9b9b9d;
+}
+.calendar .calendar-day.calendar-other-month,
+.calendar .calendar-day.calendar-other-month.calendar-weekend {
+  color: rgba(255, 255, 255, 0.5);
+  font-weight: 400;
 }
 .calendar .calendar-day:hover {
   background-color: #47474c;
@@ -1143,9 +1306,9 @@ window#winomeModalDialogWindow {
 }
 .events-button,
 .world-clocks-button {
-  margin: 2px 0;
+  margin: 0;
   padding: 12px;
-  border-radius: 14px;
+  border-radius: 12px;
 }
 
 /* Floating AppFolderDialog toplevel sits cleanly above DWM miniature workspace

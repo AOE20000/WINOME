@@ -25,9 +25,15 @@ constexpr size_t kMaxPayloadBytes = 4 * 1024 * 1024;
 bool query_pipe(const std::string& req_json,
                 std::string* out_resp,
                 int timeout_ms = 2000,
-                bool* out_timed_out = nullptr) {
+                bool* out_timed_out = nullptr,
+                DWORD* out_last_err = nullptr,
+                bool* out_busy_timed_out = nullptr) {
   if (out_timed_out != nullptr)
     *out_timed_out = false;
+  if (out_last_err != nullptr)
+    *out_last_err = 0;
+  if (out_busy_timed_out != nullptr)
+    *out_busy_timed_out = false;
   if (out_resp == nullptr)
     return false;
   out_resp->clear();
@@ -36,16 +42,25 @@ bool query_pipe(const std::string& req_json,
       GetTickCount64() + static_cast<ULONGLONG>(std::max(100, timeout_ms));
   HANDLE pipe = INVALID_HANDLE_VALUE;
   for (;;) {
+    SetLastError(0);
     pipe = CreateFileW(kPipeName, GENERIC_READ | GENERIC_WRITE,
                        0, nullptr, OPEN_EXISTING, 0, nullptr);
     if (pipe != INVALID_HANDLE_VALUE)
       break;
     const DWORD err = GetLastError();
-    if (err != ERROR_PIPE_BUSY)
+    if (err != ERROR_PIPE_BUSY) {
+      if (out_last_err != nullptr)
+        *out_last_err = err;
       return false;
+    }
     const ULONGLONG now = GetTickCount64();
-    if (now >= connect_deadline)
+    if (now >= connect_deadline) {
+      if (out_last_err != nullptr)
+        *out_last_err = err;
+      if (out_busy_timed_out != nullptr)
+        *out_busy_timed_out = true;
       return false;
+    }
     WaitNamedPipeW(kPipeName,
                    std::min<DWORD>(static_cast<DWORD>(connect_deadline - now), 100));
   }
@@ -55,9 +70,12 @@ bool query_pipe(const std::string& req_json,
     framed.push_back('\n');
 
   DWORD written = 0;
+  SetLastError(0);
   BOOL wok = WriteFile(pipe, framed.data(), static_cast<DWORD>(framed.size()),
                        &written, nullptr);
   if (!wok || written != framed.size()) {
+    if (out_last_err != nullptr)
+      *out_last_err = GetLastError();
     CloseHandle(pipe);
     return false;
   }
@@ -69,8 +87,11 @@ bool query_pipe(const std::string& req_json,
   bool hit_nl = false;
   while (out_resp->size() < kMaxPayloadBytes && !hit_nl) {
     DWORD avail = 0;
+    SetLastError(0);
     if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr)) {
       const DWORD err = GetLastError();
+      if (out_resp->empty() && out_last_err != nullptr)
+        *out_last_err = err;
       if (err == ERROR_BROKEN_PIPE || err == ERROR_PIPE_NOT_CONNECTED)
         break;
       break;
@@ -86,9 +107,13 @@ bool query_pipe(const std::string& req_json,
     }
     const DWORD want = std::min<DWORD>(sizeof(buf), avail);
     DWORD got = 0;
+    SetLastError(0);
     BOOL rok = ReadFile(pipe, buf, want, &got, nullptr);
-    if (!rok || got == 0)
+    if (!rok || got == 0) {
+      if (!rok && out_resp->empty() && out_last_err != nullptr)
+        *out_last_err = GetLastError();
       break;
+    }
     for (DWORD i = 0; i < got; ++i) {
       if (buf[i] == '\n') {
         hit_nl = true;
@@ -175,8 +200,14 @@ int handle_logs_command(const std::vector<std::string>& args) {
     req += "}";
 
     std::string resp;
-    if (!query_pipe(req, &resp, 2000)) {
-      std::fprintf(stderr, "winome-ctl: WINOME shell is not reachable on %ls\n", kPipeName);
+    DWORD last_err = 0;
+    bool timed_out = false;
+    bool busy_timed_out = false;
+    if (!query_pipe(req, &resp, 2000, &timed_out, &last_err, &busy_timed_out)) {
+      const char* kind =
+          winome::ctl::ctl_classify_pipe_error(last_err, timed_out, busy_timed_out);
+      std::fprintf(stderr, "winome-ctl: %s (gle=%lu) on %ls\n",
+                   kind, static_cast<unsigned long>(last_err), kPipeName);
       return 1;
     }
     if (!follow) {
@@ -207,8 +238,15 @@ int handle_status_watch(const std::vector<std::string>& args) {
   }
   for (;;) {
     std::string resp;
-    if (!query_pipe("{\"cmd\":\"status\"}", &resp, 2000)) {
-      std::fprintf(stderr, "{\"ok\":false,\"error\":\"not_running\"}\n");
+    DWORD last_err = 0;
+    bool timed_out = false;
+    bool busy_timed_out = false;
+    if (!query_pipe("{\"cmd\":\"status\"}", &resp, 2000,
+                    &timed_out, &last_err, &busy_timed_out)) {
+      const char* kind =
+          winome::ctl::ctl_classify_pipe_error(last_err, timed_out, busy_timed_out);
+      std::fprintf(stderr, "{\"ok\":false,\"error\":\"%s\",\"gle\":%lu}\n",
+                   kind, static_cast<unsigned long>(last_err));
       return 1;
     }
     std::printf("%s\n", resp.c_str());
@@ -251,13 +289,18 @@ int main(int argc, char** argv) {
 
   std::string resp;
   bool timed_out = false;
+  DWORD last_err = 0;
+  bool busy_timed_out = false;
   // Multi-step developer test sequences (test run / trigger) can legitimately
   // span many seconds; scale client reply timeout accordingly.
   const int pipe_timeout_ms =
       (args[0] == "test" || args[0] == "dev") ? 60000 : 3000;
-  if (!query_pipe(req, &resp, pipe_timeout_ms, &timed_out)) {
-    std::fprintf(stderr, "{\"ok\":false,\"error\":\"%s\"}\n",
-                 timed_out ? "ipc_reply_timeout" : "not_running");
+  if (!query_pipe(req, &resp, pipe_timeout_ms,
+                  &timed_out, &last_err, &busy_timed_out)) {
+    const char* kind =
+        winome::ctl::ctl_classify_pipe_error(last_err, timed_out, busy_timed_out);
+    std::fprintf(stderr, "{\"ok\":false,\"error\":\"%s\",\"gle\":%lu}\n",
+                 kind, static_cast<unsigned long>(last_err));
     std::fflush(stderr);
     return 1;
   }

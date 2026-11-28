@@ -24,6 +24,8 @@
 #include "wifi-networks.h"
 #include "workspace-manager.h"
 #include "shell-panel.h"
+#include "background-apps.h"
+#include "systray.h"
 
 #include <gdk/win32/gdkwin32.h>
 #include <windows.h>
@@ -1423,6 +1425,7 @@ enum class DrawerPhase {
   OpeningHeight,
   OpeningFade,
   Open,
+  ResizingOpen,
   ClosingFade,
   ClosingHeight,
 };
@@ -1483,7 +1486,8 @@ grid_is_opening_or_open (WinomeQuickSettingsGrid *self)
 {
   return self->drawer_phase == DrawerPhase::OpeningHeight ||
          self->drawer_phase == DrawerPhase::OpeningFade ||
-         self->drawer_phase == DrawerPhase::Open;
+         self->drawer_phase == DrawerPhase::Open ||
+         self->drawer_phase == DrawerPhase::ResizingOpen;
 }
 
 static void
@@ -1535,7 +1539,6 @@ grid_current_slot_height (WinomeQuickSettingsGrid *self, int for_width,
     return 0;
 
   if (self->drawer_phase == DrawerPhase::Open ||
-      self->drawer_phase == DrawerPhase::OpeningFade ||
       self->drawer_phase == DrawerPhase::ClosingFade) {
     int menu_h = measure_drawer_content_height (self, for_width);
     if (menu_h <= 0)
@@ -1719,6 +1722,17 @@ grid_on_anim_tick (GtkWidget *widget, GdkFrameClock *clock,
     if (self->drawer_child != NULL)
       gtk_widget_set_opacity (self->drawer_child, 0.0);
     gtk_widget_queue_resize (widget);
+    winome_shell_panel_sync_popover_size (widget);
+    break;
+  case DrawerPhase::ResizingOpen:
+    self->drawer_slot_h = val;
+    if (self->drawer_child != NULL && self->drawer_opacity < 1.0) {
+      self->drawer_opacity =
+          MIN (1.0, self->drawer_opacity + (1.0 - self->drawer_opacity) * e);
+      gtk_widget_set_opacity (self->drawer_child, self->drawer_opacity);
+    }
+    gtk_widget_queue_resize (widget);
+    winome_shell_panel_sync_popover_size (widget);
     break;
   case DrawerPhase::OpeningFade:
   case DrawerPhase::ClosingFade:
@@ -1744,8 +1758,25 @@ grid_on_anim_tick (GtkWidget *widget, GdkFrameClock *clock,
     if (self->drawer_child != NULL)
       gtk_widget_set_can_target (self->drawer_child, TRUE);
     gtk_widget_queue_resize (widget);
-    grid_start_anim (self, DrawerPhase::OpeningFade, 0.0, 1.0,
-                     winome::QUICK_SETTINGS_ANIMATION_TIME / 2);
+    winome_shell_panel_sync_popover_size (widget);
+    int latest_h = grid_target_slot_height (self);
+    if (latest_h > 0 && fabs ((double)latest_h - self->drawer_slot_h) > 2.0) {
+      grid_start_anim (self, DrawerPhase::ResizingOpen, self->drawer_slot_h,
+                       (double)latest_h, 160);
+    } else {
+      grid_start_anim (self, DrawerPhase::OpeningFade, 0.0, 1.0,
+                       winome::QUICK_SETTINGS_ANIMATION_TIME / 2);
+    }
+  } else if (finished_phase == DrawerPhase::ResizingOpen) {
+    self->drawer_slot_h = self->anim_to;
+    self->drawer_opacity = 1.0;
+    self->drawer_phase = DrawerPhase::Open;
+    if (self->drawer_child != NULL) {
+      gtk_widget_set_opacity (self->drawer_child, 1.0);
+      gtk_widget_set_can_target (self->drawer_child, TRUE);
+    }
+    gtk_widget_queue_resize (widget);
+    winome_shell_panel_sync_popover_size (widget);
   } else if (finished_phase == DrawerPhase::OpeningFade) {
     self->drawer_phase = DrawerPhase::Open;
     self->drawer_opacity = 1.0;
@@ -1775,6 +1806,7 @@ grid_on_anim_tick (GtkWidget *widget, GdkFrameClock *clock,
     self->drawer_opacity = 0.0;
     self->drawer_phase = DrawerPhase::Closed;
     gtk_widget_queue_resize (widget);
+    winome_shell_panel_sync_popover_size (widget);
     if (self->pending_anchor != NULL && self->pending_child != NULL)
       grid_promote_pending (self, 0.0);
   }
@@ -2014,6 +2046,26 @@ winome_quick_settings_grid_detach (GtkWidget *grid, GtkWidget *child)
   }
 }
 
+static void
+winome_quick_settings_grid_move_to_end (GtkWidget *grid, GtkWidget *child)
+{
+  WinomeQuickSettingsGrid *self = WINOME_QUICK_SETTINGS_GRID (grid);
+  if (self == NULL || child == NULL || self->children == NULL)
+    return;
+  for (guint i = 0; i < self->children->len; i++) {
+    QuickGridChild *c =
+        static_cast<QuickGridChild *> (g_ptr_array_index (self->children, i));
+    if (c->widget == child) {
+      if (i + 1 < self->children->len) {
+        gpointer moved = g_ptr_array_steal_index (self->children, i);
+        g_ptr_array_add (self->children, moved);
+        gtk_widget_queue_resize (grid);
+      }
+      return;
+    }
+  }
+}
+
 static GtkWidget *
 find_quick_settings_root (GtkWidget *widget)
 {
@@ -2106,7 +2158,8 @@ quick_settings_toggle_inline_menu (GtkWidget *quick_settings,
   grid->pending_anchor = anchor;
   grid->pending_child = GTK_WIDGET (g_object_ref_sink (menu));
   if (grid->drawer_phase == DrawerPhase::Open ||
-      grid->drawer_phase == DrawerPhase::OpeningFade) {
+      grid->drawer_phase == DrawerPhase::OpeningFade ||
+      grid->drawer_phase == DrawerPhase::ResizingOpen) {
     gtk_widget_set_can_target (grid->drawer_child, FALSE);
     const int base_ms = winome::QUICK_SETTINGS_ANIMATION_TIME / 2;
     int fade_ms = MAX (60, (int)(MIN (140, base_ms) * grid->drawer_opacity + 0.5));
@@ -2146,6 +2199,7 @@ winome_quick_settings_close_menu (GtkWidget *quick_settings, gboolean animate)
     grid->drawer_opacity = 0.0;
     grid->drawer_phase = DrawerPhase::Closed;
     gtk_widget_queue_resize (GTK_WIDGET (grid));
+    winome_shell_panel_sync_popover_size (GTK_WIDGET (grid));
     return open_now;
   }
 
@@ -2166,6 +2220,42 @@ winome_quick_settings_close_menu (GtkWidget *quick_settings, gboolean animate)
                      0.0, ms);
   }
   return TRUE;
+}
+
+static void
+quick_settings_notify_drawer_content_changed (GtkWidget *quick_settings,
+                                              GtkWidget *drawer_widget)
+{
+  WinomeQuickSettingsGrid *grid = get_qs_grid (quick_settings);
+  if (grid == NULL || grid->drawer_child == NULL)
+    return;
+  if (drawer_widget != NULL && grid->drawer_child != drawer_widget)
+    return;
+
+  int target_h = grid_target_slot_height (grid);
+  if (target_h <= 0)
+    return;
+
+  if (grid->drawer_phase == DrawerPhase::OpeningHeight) {
+    if (fabs ((double)target_h - grid->anim_to) > 2.0) {
+      const int base_ms = winome::QUICK_SETTINGS_ANIMATION_TIME / 2;
+      double ratio = fabs ((double)target_h - grid->drawer_slot_h) /
+                     MAX ((double)target_h, MAX (1.0, grid->drawer_slot_h));
+      int dur_ms = CLAMP ((int)(base_ms * ratio + 0.5), 120, base_ms);
+      grid_start_anim (grid, DrawerPhase::OpeningHeight, grid->drawer_slot_h,
+                       (double)target_h, dur_ms);
+    }
+  } else if (grid->drawer_phase == DrawerPhase::OpeningFade ||
+             grid->drawer_phase == DrawerPhase::Open ||
+             grid->drawer_phase == DrawerPhase::ResizingOpen) {
+    if (fabs ((double)target_h - grid->drawer_slot_h) > 2.0 &&
+        (grid->drawer_phase != DrawerPhase::ResizingOpen ||
+         fabs ((double)target_h - grid->anim_to) > 2.0)) {
+      gtk_widget_set_can_target (grid->drawer_child, TRUE);
+      grid_start_anim (grid, DrawerPhase::ResizingOpen, grid->drawer_slot_h,
+                       (double)target_h, 160);
+    }
+  }
 }
 
 static void
@@ -2404,6 +2494,7 @@ struct WifiRowTarget {
 
 struct WifiMenu {
   GtkWidget *panel = nullptr;            // quick settings root, for refresh
+  GtkWidget *menu_root = nullptr;        // quick-toggle-menu widget
   GtkWidget *header_icon = nullptr;
   GtkWidget *header_subtitle = nullptr;
   GtkWidget *items_box = nullptr;
@@ -2416,6 +2507,9 @@ struct WifiMenu {
   guint debounce_id = 0;
   bool listener_registered = false;
   bool initial_scan_done = false;
+  bool populated = false;
+  bool last_enabled = false;
+  bool last_scanning = false;
 };
 
 static void on_wifi_menu_wlan_event (gpointer user_data);
@@ -2758,16 +2852,6 @@ wifi_menu_populate_rows (WifiMenu *m, const WinomeWifiStatus &st,
   if (m == nullptr || m->items_box == nullptr)
     return;
 
-  while (GtkWidget *ch = gtk_widget_get_first_child (m->items_box))
-    gtk_box_remove (GTK_BOX (m->items_box), ch);
-
-  if (m->rows != nullptr)
-    g_ptr_array_set_size (m->rows, 0);
-  if (m->labels != nullptr)
-    g_ptr_array_set_size (m->labels, 0);
-  if (m->networks != nullptr)
-    g_ptr_array_set_size (m->networks, 0);
-
   if (m->header_icon != nullptr) {
     if (st.enabled && st.connected)
       gtk_widget_add_css_class (m->header_icon, "active");
@@ -2784,6 +2868,46 @@ wifi_menu_populate_rows (WifiMenu *m, const WinomeWifiStatus &st,
     gtk_label_set_text (GTK_LABEL (m->header_subtitle), sub);
     gtk_widget_set_visible (m->header_subtitle, TRUE);
   }
+
+  const bool enabled_now = st.enabled != FALSE;
+  bool rows_unchanged = m->populated &&
+                        m->last_enabled == enabled_now &&
+                        m->last_scanning == scanning;
+  if (rows_unchanged && enabled_now) {
+    const guint existing_count = m->networks != nullptr ? m->networks->len : 0;
+    if (existing_count != count) {
+      rows_unchanged = false;
+    } else if (count > 0) {
+      if (list == nullptr) {
+        rows_unchanged = false;
+      } else {
+        for (guint i = 0; i < count; ++i) {
+          const WinomeWifiNetwork *cur = static_cast<const WinomeWifiNetwork *> (
+              g_ptr_array_index (m->networks, i));
+          if (cur == nullptr ||
+              strcmp (cur->ssid, list[i].ssid) != 0 ||
+              cur->signal_quality != list[i].signal_quality ||
+              (cur->secured != FALSE) != (list[i].secured != FALSE) ||
+              (cur->connected != FALSE) != (list[i].connected != FALSE)) {
+            rows_unchanged = false;
+            break;
+          }
+        }
+      }
+    }
+  }
+  if (rows_unchanged)
+    return;
+
+  while (GtkWidget *ch = gtk_widget_get_first_child (m->items_box))
+    gtk_box_remove (GTK_BOX (m->items_box), ch);
+
+  if (m->rows != nullptr)
+    g_ptr_array_set_size (m->rows, 0);
+  if (m->labels != nullptr)
+    g_ptr_array_set_size (m->labels, 0);
+  if (m->networks != nullptr)
+    g_ptr_array_set_size (m->networks, 0);
 
   if (!st.enabled) {
     WinomeMenuEntry e{};
@@ -2832,7 +2956,12 @@ wifi_menu_populate_rows (WifiMenu *m, const WinomeWifiStatus &st,
   settings.callback = on_wifi_settings_activate;
   gtk_box_append (GTK_BOX (m->items_box), make_quick_menu_item (&settings));
 
+  m->populated = true;
+  m->last_enabled = enabled_now;
+  m->last_scanning = scanning;
   gtk_widget_queue_resize (m->items_box);
+  if (m->panel != nullptr)
+    quick_settings_notify_drawer_content_changed (m->panel, m->menu_root);
 }
 
 static void
@@ -2931,8 +3060,11 @@ build_wifi_menu (gpointer user_data)
 
   WinomeWifiNetwork *list = nullptr;
   guint count = 0;
-  // Build the drawer immediately without blocking the GTK main thread on
-  // synchronous WLAN RPCs; wifi_menu_refresh_async() below populates live APs.
+  // Seed immediately from non-blocking snapshot cache when radio is on so the
+  // drawer animates straight to its real height without a placeholder twitch,
+  // while wifi_menu_refresh_async() below triggers a fresh scan in the background.
+  if (st.enabled)
+    winome_wifi_get_cached_networks (&list, &count);
 
   GtkWidget *menu = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class (menu, "quick-toggle-menu");
@@ -2965,6 +3097,7 @@ build_wifi_menu (gpointer user_data)
 
   auto *m = new WifiMenu ();
   m->panel = panel;
+  m->menu_root = menu;
   m->header_icon = header != nullptr
                        ? GTK_WIDGET (g_object_get_data (G_OBJECT (header),
                                                         "header-icon"))
@@ -3052,6 +3185,7 @@ build_power_mode_menu (gpointer user_data)
 
 struct BluetoothMenu {
   GtkWidget *panel = nullptr;
+  GtkWidget *menu_root = nullptr;
   GtkWidget *header_icon = nullptr;
   GtkWidget *header_subtitle = nullptr;
   GtkWidget *items_box = nullptr;
@@ -3159,6 +3293,8 @@ bluetooth_menu_populate_rows (BluetoothMenu *m,
   gtk_box_append (GTK_BOX (m->items_box), make_quick_menu_item (&settings));
 
   gtk_widget_queue_resize (m->items_box);
+  if (m->panel != nullptr)
+    quick_settings_notify_drawer_content_changed (m->panel, m->menu_root);
 }
 
 static void
@@ -3274,6 +3410,7 @@ build_bluetooth_menu (gpointer user_data)
 
   auto *m = new BluetoothMenu ();
   m->panel = panel;
+  m->menu_root = menu;
   m->header_icon = header != nullptr
                        ? GTK_WIDGET (g_object_get_data (G_OBJECT (header),
                                                         "header-icon"))
@@ -3300,6 +3437,494 @@ build_bluetooth_menu (gpointer user_data)
   g_object_set_data_full (G_OBJECT (menu), "bluetooth-menu", m,
                           bluetooth_menu_free);
   return menu;
+}
+
+// --- Background Apps Toggle & Drawer (js/ui/status/backgroundApps.js) ------
+
+struct BackgroundAppsMenu {
+  GtkWidget *panel = nullptr;
+  GtkWidget *menu_root = nullptr;
+  GtkWidget *header_subtitle = nullptr;
+  GtkWidget *desc_label = nullptr;
+  GtkWidget *items_box = nullptr;
+  std::shared_ptr<std::atomic<bool>> alive;
+  std::string last_digest;
+};
+
+static void
+background_apps_menu_free (gpointer data)
+{
+  auto *m = static_cast<BackgroundAppsMenu *> (data);
+  if (m != nullptr) {
+    if (m->alive)
+      m->alive->store (false, std::memory_order_release);
+    delete m;
+  }
+}
+
+static const winome::BackgroundAppEntry *
+bg_app_row_entry (GtkWidget *row)
+{
+  if (row == nullptr)
+    return nullptr;
+  return static_cast<const winome::BackgroundAppEntry *> (
+      g_object_get_data (G_OBJECT (row), "bg-app-entry"));
+}
+
+static void
+on_bg_app_row_primary_pressed (GtkGestureClick *gesture,
+                               int n_press G_GNUC_UNUSED,
+                               double x G_GNUC_UNUSED,
+                               double y G_GNUC_UNUSED,
+                               gpointer user_data)
+{
+  gtk_gesture_set_state (GTK_GESTURE (gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+  const auto *entry = bg_app_row_entry (GTK_WIDGET (user_data));
+  if (entry == nullptr)
+    return;
+  winome::BackgroundAppEntry copy = *entry;
+  POINT pt{};
+  GetCursorPos (&pt);
+  winome_shell_panel_close_popovers_immediate ();
+  winome::background_apps_activate (copy, false, pt.x, pt.y);
+}
+
+static void
+on_bg_app_row_secondary_pressed (GtkGestureClick *gesture,
+                                 int n_press G_GNUC_UNUSED,
+                                 double x G_GNUC_UNUSED,
+                                 double y G_GNUC_UNUSED,
+                                 gpointer user_data)
+{
+  gtk_gesture_set_state (GTK_GESTURE (gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+  const auto *entry = bg_app_row_entry (GTK_WIDGET (user_data));
+  if (entry == nullptr || entry->kind != winome::BackgroundAppKind::TrayApp)
+    return;
+  winome::BackgroundAppEntry copy = *entry;
+  POINT pt{};
+  GetCursorPos (&pt);
+  winome_shell_panel_close_popovers_immediate ();
+  winome::background_apps_activate (copy, true, pt.x, pt.y);
+}
+
+static void
+on_bg_app_tray_menu_clicked (GtkButton *button G_GNUC_UNUSED,
+                             gpointer user_data)
+{
+  const auto *entry = bg_app_row_entry (GTK_WIDGET (user_data));
+  if (entry == nullptr || entry->kind != winome::BackgroundAppKind::TrayApp)
+    return;
+  winome::BackgroundAppEntry copy = *entry;
+  POINT pt{};
+  GetCursorPos (&pt);
+  winome_shell_panel_close_popovers_immediate ();
+  winome::background_apps_activate (copy, true, pt.x, pt.y);
+}
+
+static void
+on_bg_app_quit_clicked (GtkButton *button, gpointer user_data)
+{
+  const auto *entry = bg_app_row_entry (GTK_WIDGET (user_data));
+  if (entry == nullptr)
+    return;
+  gtk_widget_set_sensitive (GTK_WIDGET (button), FALSE);
+  GtkWidget *spinner = gtk_spinner_new ();
+  gtk_widget_add_css_class (spinner, "spinner");
+  gtk_widget_set_size_request (spinner, 16, 16);
+  gtk_spinner_start (GTK_SPINNER (spinner));
+  gtk_button_set_child (button, spinner);
+  winome::background_apps_quit_async (*entry);
+}
+
+static void
+on_bg_apps_refresh_clicked (GtkButton *button G_GNUC_UNUSED,
+                            gpointer G_GNUC_UNUSED user_data)
+{
+  winome::background_apps_refresh_async (true);
+}
+
+static void
+on_bg_apps_native_tray_clicked (gpointer G_GNUC_UNUSED user_data)
+{
+  winome_shell_panel_close_popovers_immediate ();
+  AllowSetForegroundWindow (ASFW_ANY);
+  winome::systray_toggle_native_overflow ();
+}
+
+static void
+on_bg_apps_settings_clicked (gpointer user_data)
+{
+  on_settings_clicked (nullptr, user_data);
+}
+
+static GtkWidget *
+make_background_app_item_row (const winome::BackgroundAppEntry &entry)
+{
+  GtkWidget *row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 10);
+  gtk_widget_add_css_class (row, "popup-menu-item");
+  gtk_widget_add_css_class (row, "background-app-item");
+  gtk_widget_set_tooltip_text (
+      row, entry.tooltip.empty () ? entry.title.c_str () : entry.tooltip.c_str ());
+
+  auto *copy = new winome::BackgroundAppEntry (entry);
+  g_object_set_data_full (
+      G_OBJECT (row), "bg-app-entry", copy,
+      +[](gpointer p) { delete static_cast<winome::BackgroundAppEntry *> (p); });
+
+  GtkWidget *info_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 10);
+  gtk_widget_set_hexpand (info_box, TRUE);
+  gtk_widget_set_valign (info_box, GTK_ALIGN_CENTER);
+
+  GtkWidget *icon = nullptr;
+  GdkTexture *tex = winome::background_apps_create_icon_texture (entry, 24);
+  if (tex != nullptr) {
+    icon = gtk_image_new_from_paintable (GDK_PAINTABLE (tex));
+    g_object_unref (tex);
+  } else {
+    icon = gtk_image_new_from_icon_name (
+        entry.fallback_icon_name.empty () ? "application-x-executable-symbolic"
+                                          : entry.fallback_icon_name.c_str ());
+  }
+  gtk_image_set_pixel_size (GTK_IMAGE (icon), 24);
+  gtk_widget_add_css_class (icon, "popup-menu-icon");
+  gtk_widget_set_valign (icon, GTK_ALIGN_CENTER);
+  gtk_box_append (GTK_BOX (info_box), icon);
+
+  GtkWidget *text_col = gtk_box_new (GTK_ORIENTATION_VERTICAL, 1);
+  gtk_widget_set_hexpand (text_col, TRUE);
+  gtk_widget_set_valign (text_col, GTK_ALIGN_CENTER);
+
+  GtkWidget *title_lbl = gtk_label_new (entry.title.c_str ());
+  gtk_widget_add_css_class (title_lbl, "title");
+  gtk_label_set_xalign (GTK_LABEL (title_lbl), 0.0f);
+  gtk_label_set_single_line_mode (GTK_LABEL (title_lbl), TRUE);
+  gtk_label_set_ellipsize (GTK_LABEL (title_lbl), PANGO_ELLIPSIZE_END);
+  gtk_box_append (GTK_BOX (text_col), title_lbl);
+
+  const std::string sub = winome::format_background_app_subtitle (
+      entry.kind, entry.detail, winome::is_zh ());
+  GtkWidget *sub_lbl = gtk_label_new (sub.c_str ());
+  gtk_widget_add_css_class (sub_lbl, "subtitle");
+  gtk_label_set_xalign (GTK_LABEL (sub_lbl), 0.0f);
+  gtk_label_set_single_line_mode (GTK_LABEL (sub_lbl), TRUE);
+  gtk_label_set_ellipsize (GTK_LABEL (sub_lbl), PANGO_ELLIPSIZE_END);
+  gtk_box_append (GTK_BOX (text_col), sub_lbl);
+
+  gtk_box_append (GTK_BOX (info_box), text_col);
+  gtk_box_append (GTK_BOX (row), info_box);
+
+  // Bind row activation gestures only to info_box so right-side action buttons
+  // never trigger row activation alongside their own action.
+  GtkGesture *primary_click = gtk_gesture_click_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (primary_click),
+                                 GDK_BUTTON_PRIMARY);
+  g_signal_connect (primary_click, "pressed",
+                    G_CALLBACK (on_bg_app_row_primary_pressed), row);
+  gtk_widget_add_controller (info_box, GTK_EVENT_CONTROLLER (primary_click));
+
+  if (entry.kind == winome::BackgroundAppKind::TrayApp) {
+    GtkGesture *secondary_click = gtk_gesture_click_new ();
+    gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (secondary_click),
+                                   GDK_BUTTON_SECONDARY);
+    g_signal_connect (secondary_click, "pressed",
+                      G_CALLBACK (on_bg_app_row_secondary_pressed), row);
+    gtk_widget_add_controller (info_box, GTK_EVENT_CONTROLLER (secondary_click));
+  }
+
+  GtkWidget *actions_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 4);
+  gtk_widget_set_valign (actions_box, GTK_ALIGN_CENTER);
+
+  if (entry.kind == winome::BackgroundAppKind::TrayApp) {
+    GtkWidget *menu_btn = gtk_button_new_from_icon_name ("open-menu-symbolic");
+    gtk_widget_add_css_class (menu_btn, "icon-button");
+    gtk_widget_add_css_class (menu_btn, "bg-app-action-btn");
+    gtk_widget_set_focus_on_click (menu_btn, FALSE);
+    gtk_widget_set_tooltip_text (
+        menu_btn, tr ("Tray Menu (or Right-Click)", "托盘菜单（也可右键点击）"));
+    g_signal_connect (menu_btn, "clicked",
+                      G_CALLBACK (on_bg_app_tray_menu_clicked), row);
+    gtk_box_append (GTK_BOX (actions_box), menu_btn);
+  }
+
+  if (entry.kind == winome::BackgroundAppKind::BackgroundApp || entry.pid != 0) {
+    GtkWidget *quit_btn = gtk_button_new_from_icon_name ("window-close-symbolic");
+    gtk_widget_add_css_class (quit_btn, "icon-button");
+    gtk_widget_add_css_class (quit_btn, "bg-app-action-btn");
+    gtk_widget_set_focus_on_click (quit_btn, FALSE);
+    gtk_widget_set_tooltip_text (quit_btn, tr ("Quit App", "退出应用"));
+    g_signal_connect (quit_btn, "clicked",
+                      G_CALLBACK (on_bg_app_quit_clicked), row);
+    gtk_box_append (GTK_BOX (actions_box), quit_btn);
+  }
+
+  if (gtk_widget_get_first_child (actions_box) != nullptr)
+    gtk_box_append (GTK_BOX (row), actions_box);
+
+  return row;
+}
+
+static std::string
+compute_bg_menu_digest (const std::vector<winome::BackgroundAppEntry> &entries,
+                        bool show_native_tray)
+{
+  std::string out = show_native_tray ? "N1|" : "N0|";
+  for (const auto &e : entries) {
+    out += (e.kind == winome::BackgroundAppKind::TrayApp) ? "T:" : "B:";
+    out += e.key;
+    out += ':';
+    out += e.title;
+    out += ':';
+    out += e.detail;
+    out += ';';
+  }
+  return out;
+}
+
+static void
+background_apps_menu_populate (BackgroundAppsMenu *m,
+                               const std::vector<winome::BackgroundAppEntry> &entries,
+                               bool force_rebuild)
+{
+  if (m == nullptr || m->items_box == nullptr ||
+      !m->alive || !m->alive->load (std::memory_order_acquire)) {
+    return;
+  }
+
+  const bool show_native_tray = (winome::get_config ().tray_location != "panel");
+  const std::string digest = compute_bg_menu_digest (entries, show_native_tray);
+  if (!force_rebuild && m->last_digest == digest)
+    return;
+  m->last_digest = digest;
+
+  size_t tray_count = 0;
+  size_t bg_count = 0;
+  for (const auto &e : entries) {
+    if (e.kind == winome::BackgroundAppKind::TrayApp)
+      ++tray_count;
+    else
+      ++bg_count;
+  }
+
+  if (m->header_subtitle != nullptr) {
+    const std::string sub = winome::format_background_apps_header_subtitle (
+        tray_count, bg_count, winome::is_zh ());
+    gtk_label_set_text (GTK_LABEL (m->header_subtitle), sub.c_str ());
+    gtk_widget_set_visible (m->header_subtitle, TRUE);
+  }
+  if (m->desc_label != nullptr)
+    gtk_widget_set_visible (m->desc_label, entries.empty () ? FALSE : TRUE);
+
+  while (GtkWidget *ch = gtk_widget_get_first_child (m->items_box))
+    gtk_box_remove (GTK_BOX (m->items_box), ch);
+
+  if (entries.empty ()) {
+    WinomeMenuEntry empty_e{};
+    empty_e.label = tr ("No background or tray apps running",
+                        "当前无运行中的后台或托盘应用");
+    empty_e.icon_name = "background-app-ghost-symbolic";
+    GtkWidget *empty_row = make_quick_menu_item (&empty_e);
+    gtk_widget_add_css_class (empty_row, "background-app-item");
+    gtk_box_append (GTK_BOX (m->items_box), empty_row);
+  } else {
+    for (const auto &entry : entries)
+      gtk_box_append (GTK_BOX (m->items_box), make_background_app_item_row (entry));
+  }
+
+  WinomeMenuEntry sep{};
+  sep.label = nullptr;
+  gtk_box_append (GTK_BOX (m->items_box), make_quick_menu_item (&sep));
+
+  if (show_native_tray) {
+    WinomeMenuEntry native_e{};
+    native_e.label = tr ("Open Windows Native Tray", "打开 Windows 原生托盘");
+    native_e.icon_name = "open-menu-symbolic";
+    native_e.callback = on_bg_apps_native_tray_clicked;
+    gtk_box_append (GTK_BOX (m->items_box), make_quick_menu_item (&native_e));
+  }
+
+  WinomeMenuEntry settings_e{};
+  settings_e.label = tr ("App & Tray Settings", "后台与托盘设置");
+  settings_e.icon_name = "preferences-system-symbolic";
+  settings_e.callback = on_bg_apps_settings_clicked;
+  gtk_box_append (GTK_BOX (m->items_box), make_quick_menu_item (&settings_e));
+
+  gtk_widget_queue_resize (m->items_box);
+  if (m->panel != nullptr)
+    quick_settings_notify_drawer_content_changed (m->panel, m->menu_root);
+}
+
+static GtkWidget *
+build_background_apps_menu (gpointer user_data)
+{
+  GtkWidget *panel = GTK_WIDGET (user_data);
+  const std::vector<winome::BackgroundAppEntry> entries =
+      winome::background_apps_get_snapshot ();
+
+  size_t tray_count = 0;
+  size_t bg_count = 0;
+  for (const auto &e : entries) {
+    if (e.kind == winome::BackgroundAppKind::TrayApp)
+      ++tray_count;
+    else
+      ++bg_count;
+  }
+
+  GtkWidget *menu = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_add_css_class (menu, "quick-toggle-menu");
+  gtk_widget_set_hexpand (menu, TRUE);
+
+  const std::string hdr_sub = winome::format_background_apps_header_subtitle (
+      tray_count, bg_count, winome::is_zh ());
+  GtkWidget *header = build_quick_menu_header (
+      "background-app-ghost-symbolic",
+      tr ("Background Apps", "后台应用"),
+      hdr_sub.c_str (), FALSE);
+  if (header != nullptr) {
+    if (GtkWidget *hdr_row = gtk_widget_get_first_child (header)) {
+      GtkWidget *refresh_btn =
+          gtk_button_new_from_icon_name ("view-refresh-symbolic");
+      gtk_widget_add_css_class (refresh_btn, "icon-button");
+      gtk_widget_add_css_class (refresh_btn, "bg-app-action-btn");
+      gtk_widget_set_focus_on_click (refresh_btn, FALSE);
+      gtk_widget_set_valign (refresh_btn, GTK_ALIGN_CENTER);
+      gtk_widget_set_tooltip_text (refresh_btn, tr ("Refresh", "刷新列表"));
+      g_signal_connect (refresh_btn, "clicked",
+                        G_CALLBACK (on_bg_apps_refresh_clicked), nullptr);
+      gtk_box_append (GTK_BOX (hdr_row), refresh_btn);
+    }
+    gtk_box_append (GTK_BOX (menu), header);
+  }
+
+  GtkWidget *desc_label = gtk_label_new (
+      tr ("Apps running in the background or system tray",
+          "在后台运行或驻留系统托盘的应用"));
+  gtk_widget_add_css_class (desc_label, "background-apps-desc");
+  gtk_label_set_xalign (GTK_LABEL (desc_label), 0.0f);
+  gtk_label_set_wrap (GTK_LABEL (desc_label), TRUE);
+  gtk_widget_set_visible (desc_label, entries.empty () ? FALSE : TRUE);
+  gtk_box_append (GTK_BOX (menu), desc_label);
+
+  GtkWidget *scroll = gtk_scrolled_window_new ();
+  gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (scroll),
+                                  GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+  gtk_scrolled_window_set_propagate_natural_width (
+      GTK_SCROLLED_WINDOW (scroll), TRUE);
+  gtk_scrolled_window_set_propagate_natural_height (
+      GTK_SCROLLED_WINDOW (scroll), TRUE);
+  gtk_scrolled_window_set_max_content_height (
+      GTK_SCROLLED_WINDOW (scroll), 280);
+
+  GtkWidget *items_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
+  gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scroll), items_box);
+  gtk_box_append (GTK_BOX (menu), scroll);
+
+  auto *m = new BackgroundAppsMenu ();
+  m->panel = panel;
+  m->menu_root = menu;
+  m->header_subtitle = header != nullptr
+                           ? GTK_WIDGET (g_object_get_data (G_OBJECT (header),
+                                                            "header-subtitle"))
+                           : nullptr;
+  m->desc_label = desc_label;
+  m->items_box = items_box;
+  m->alive = std::make_shared<std::atomic<bool>> (true);
+
+  g_object_set_data_full (G_OBJECT (menu), "bg-apps-menu", m,
+                          background_apps_menu_free);
+  background_apps_menu_populate (m, entries, true);
+  winome::background_apps_refresh_async (false);
+  return menu;
+}
+
+static void
+on_bg_apps_toggle_clicked (GtkButton *button, gpointer user_data)
+{
+  GtkWidget *root = GTK_WIDGET (user_data);
+  if (root == nullptr)
+    root = find_quick_settings_root (GTK_WIDGET (button));
+  if (root == nullptr)
+    return;
+  GtkWidget *menu = build_background_apps_menu (root);
+  quick_settings_toggle_inline_menu (root, GTK_WIDGET (button), menu);
+}
+
+static GtkWidget *
+make_background_apps_toggle (GtkWidget *root)
+{
+  GtkWidget *btn = gtk_button_new ();
+  gtk_widget_add_css_class (btn, "quick-toggle");
+  gtk_widget_add_css_class (btn, "button");
+  gtk_widget_add_css_class (btn, "background-apps-quick-toggle");
+  gtk_widget_set_focus_on_click (btn, FALSE);
+  gtk_widget_set_hexpand (btn, TRUE);
+  gtk_widget_set_vexpand (btn, FALSE);
+
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_set_valign (box, GTK_ALIGN_CENTER);
+
+  GtkWidget *title = gtk_label_new ("");
+  gtk_widget_add_css_class (title, "quick-toggle-title");
+  gtk_label_set_xalign (GTK_LABEL (title), 0.0f);
+  gtk_label_set_ellipsize (GTK_LABEL (title), PANGO_ELLIPSIZE_END);
+  gtk_widget_set_hexpand (title, TRUE);
+  gtk_widget_set_valign (title, GTK_ALIGN_CENTER);
+
+  GtkWidget *arrow = gtk_image_new_from_icon_name ("go-next-symbolic");
+  gtk_image_set_pixel_size (GTK_IMAGE (arrow), QUICK_ICON_SIZE);
+  gtk_widget_set_valign (arrow, GTK_ALIGN_CENTER);
+
+  gtk_box_append (GTK_BOX (box), title);
+  gtk_box_append (GTK_BOX (box), arrow);
+  gtk_button_set_child (GTK_BUTTON (btn), box);
+
+  g_object_set_data (G_OBJECT (btn), "bg-apps-title", title);
+  g_signal_connect (btn, "clicked",
+                    G_CALLBACK (on_bg_apps_toggle_clicked), root);
+  gtk_widget_set_visible (btn, FALSE);
+  return btn;
+}
+
+static void set_qs_label_if_changed (GtkWidget *label, const char *text);
+
+static void
+sync_background_apps_toggle (GtkWidget *quick_settings)
+{
+  if (quick_settings == nullptr)
+    return;
+  GtkWidget *btn = GTK_WIDGET (
+      g_object_get_data (G_OBJECT (quick_settings), "bg-apps-toggle"));
+  if (btn == nullptr)
+    return;
+
+  const std::vector<winome::BackgroundAppEntry> entries =
+      winome::background_apps_get_snapshot ();
+
+  GtkWidget *title =
+      GTK_WIDGET (g_object_get_data (G_OBJECT (btn), "bg-apps-title"));
+  if (title != nullptr) {
+    const std::string label = winome::format_background_apps_toggle_title (
+        entries.size (), winome::is_zh ());
+    set_qs_label_if_changed (title, label.c_str ());
+  }
+
+  const bool drawer_open =
+      quick_settings_is_menu_open_for (quick_settings, btn);
+  const bool want_vis = drawer_open || !entries.empty ();
+  if (gtk_widget_get_visible (btn) != (want_vis ? TRUE : FALSE))
+    gtk_widget_set_visible (btn, want_vis ? TRUE : FALSE);
+
+  if (GtkWidget *drawer = quick_settings_open_drawer_child (quick_settings)) {
+    if (auto *m = static_cast<BackgroundAppsMenu *> (
+            g_object_get_data (G_OBJECT (drawer), "bg-apps-menu"))) {
+      background_apps_menu_populate (m, entries, false);
+    }
+  }
+}
+
+static void
+on_qs_background_apps_changed (void *data)
+{
+  sync_background_apps_toggle (GTK_WIDGET (data));
 }
 
 static void qs_register_and_sync_plugins (GtkWidget *root);
@@ -3522,8 +4147,12 @@ winome_quick_settings_new (void)
   g_object_set_data (G_OBJECT (root), "nightlight-toggle", nightlight);
   g_object_set_data (G_OBJECT (root), "darkmode-toggle", darkmode);
   g_object_set_data (G_OBJECT (root), "dnd-toggle", dnd);
+  GtkWidget *bg_apps = make_background_apps_toggle (root);
+  winome_quick_settings_grid_attach (grid, bg_apps, 2);
+
   g_object_set_data (G_OBJECT (root), "wsmode-toggle", wsmode);
   g_object_set_data (G_OBJECT (root), "airplane-toggle", airplane);
+  g_object_set_data (G_OBJECT (root), "bg-apps-toggle", bg_apps);
 
   qs_register_and_sync_plugins (root);
   winome_quick_settings_refresh (root);
@@ -3659,12 +4288,18 @@ sync_quick_settings_plugins (GtkWidget *quick_settings)
     winome_quick_settings_grid_attach (grid, row.button, 1);
     rows->push_back (std::move (row));
   }
+  if (GtkWidget *bg_apps = GTK_WIDGET (
+          g_object_get_data (G_OBJECT (quick_settings), "bg-apps-toggle"))) {
+    winome_quick_settings_grid_move_to_end (grid, bg_apps);
+  }
   gtk_widget_queue_resize (grid);
 }
 
 static void
 on_qs_root_destroy (GtkWidget *widget, gpointer G_GNUC_UNUSED data)
 {
+  winome::background_apps_remove_listener (on_qs_background_apps_changed,
+                                          widget);
   g_qs_root_instances.erase (
       std::remove (g_qs_root_instances.begin (), g_qs_root_instances.end (),
                    widget),
@@ -3693,6 +4328,7 @@ static void
 qs_register_and_sync_plugins (GtkWidget *root)
 {
   g_qs_root_instances.push_back (root);
+  winome::background_apps_add_listener (on_qs_background_apps_changed, root);
   g_signal_connect (root, "destroy", G_CALLBACK (on_qs_root_destroy), NULL);
   sync_quick_settings_plugins (root);
 }
@@ -3858,6 +4494,8 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
     set_toggle_active_blocked (wlan_toggle,
                                have_wifi && wifi_st.enabled,
                                G_CALLBACK (on_wlan_toggled), quick_settings);
+    if (have_wifi && wifi_st.enabled)
+      winome_wifi_warm_cache_async ();
 
     MenuToggleParts *parts = static_cast<MenuToggleParts *> (
         g_object_get_data (G_OBJECT (wlan_toggle), "menu-toggle-parts"));
@@ -3995,4 +4633,8 @@ winome_quick_settings_refresh (GtkWidget *quick_settings)
           (gpointer) on_airplane_toggled, quick_settings);
     }
   }
+
+  sync_background_apps_toggle (quick_settings);
+  if (gtk_widget_get_mapped (quick_settings))
+    winome::background_apps_refresh_async (false);
 }

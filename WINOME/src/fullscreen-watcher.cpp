@@ -355,6 +355,147 @@ bool strip_panel_resize_styles(HWND hwnd) {
   return false;
 }
 
+constexpr const wchar_t* kPanelOrigProcProp = L"WINOME_PanelOrigWndProc";
+guint g_panel_redraw_followup_id = 0;
+
+void cancel_panel_redraw_followup() {
+  safe_remove_source(&g_panel_redraw_followup_id);
+}
+
+gboolean panel_redraw_followup_cb(gpointer G_GNUC_UNUSED data) {
+  g_panel_redraw_followup_id = 0;
+  winome_shell_panel_queue_redraw_all();
+  return G_SOURCE_REMOVE;
+}
+
+void schedule_panel_redraw_followup(int delay_ms) {
+  cancel_panel_redraw_followup();
+  g_panel_redraw_followup_id = g_timeout_add(
+      static_cast<guint>(std::max(30, delay_ms)), panel_redraw_followup_cb,
+      nullptr);
+}
+
+bool rect_matches_any_monitor_panel_band(const RECT& r, int raw_expected_h) {
+  const int w = r.right - r.left;
+  const int h = r.bottom - r.top;
+  if (w <= 0 || h <= 0)
+    return false;
+  HMONITOR mon = MonitorFromPoint(POINT{r.left + 16, r.top + 1},
+                                  MONITOR_DEFAULTTONULL);
+  MONITORINFO mi{};
+  mi.cbSize = sizeof(mi);
+  if (mon == nullptr || !GetMonitorInfoW(mon, &mi))
+    return false;
+  const int canonical_h =
+      clamp_panel_height_for_monitor(mi.rcMonitor, raw_expected_h, 32);
+  if (canonical_h <= 0)
+    return false;
+  const RECT expected = compute_primary_panel_rect(mi.rcMonitor, canonical_h);
+  return WorkareaAssertGuard::rects_equal(r, expected);
+}
+
+LRESULT CALLBACK panel_subclass_wndproc(HWND hwnd, UINT msg, WPARAM wParam,
+                                        LPARAM lParam) {
+  WNDPROC orig = reinterpret_cast<WNDPROC>(GetPropW(hwnd, kPanelOrigProcProp));
+  if (msg == WM_ERASEBKGND) {
+    return 1;
+  } else if (msg == WM_MOUSEACTIVATE) {
+    return MA_NOACTIVATE;
+  } else if (msg == WM_STYLECHANGING && wParam == static_cast<WPARAM>(GWL_EXSTYLE) &&
+      lParam != 0) {
+    auto* ss = reinterpret_cast<STYLESTRUCT*>(lParam);
+    ss->styleNew = (static_cast<LONG_PTR>(ss->styleNew) | WS_EX_TOOLWINDOW |
+                    WS_EX_NOACTIVATE) &
+                   ~WS_EX_APPWINDOW;
+  } else if (msg == WM_STYLECHANGING && wParam == static_cast<WPARAM>(GWL_STYLE) &&
+             lParam != 0) {
+    auto* ss = reinterpret_cast<STYLESTRUCT*>(lParam);
+    ss->styleNew = static_cast<DWORD>(strip_overlay_minimize_styles(
+        static_cast<LONG_PTR>(ss->styleNew) & ~static_cast<LONG_PTR>(WS_THICKFRAME)));
+  } else if (msg == WM_WINDOWPOSCHANGING && lParam != 0) {
+    auto* wp = reinterpret_cast<WINDOWPOS*>(lParam);
+    wp->flags |= SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    if ((wp->flags & SWP_HIDEWINDOW) == 0 && !IsIconic(hwnd) &&
+        (IsWindowVisible(hwnd) || (wp->flags & SWP_SHOWWINDOW) != 0)) {
+      const int raw_expected = static_cast<int>(
+          InterlockedCompareExchange(&g_expected_panel_height, 0, 0));
+      RECT cur_rect{};
+      const bool has_cur_rect = GetWindowRect(hwnd, &cur_rect) != FALSE;
+      RECT eff_rect{};
+      const bool has_eff_rect = resolve_panel_windowpos_rect(
+          cur_rect, has_cur_rect, wp->x, wp->y, wp->cx, wp->cy, wp->flags,
+          &eff_rect);
+      const bool valid_other_mon =
+          has_eff_rect &&
+          rect_matches_any_monitor_panel_band(eff_rect, raw_expected);
+      HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+      MONITORINFO mi{};
+      mi.cbSize = sizeof(mi);
+      RECT want{};
+      if (mon != nullptr && GetMonitorInfoW(mon, &mi) &&
+          compute_panel_band_clamp(eff_rect, mi.rcMonitor, raw_expected,
+                                   has_eff_rect, valid_other_mon, &want)) {
+        const int want_w = want.right - want.left;
+        const int want_h = want.bottom - want.top;
+        const bool need_move =
+            !has_cur_rect || (wp->flags & SWP_NOMOVE) == 0 ||
+            cur_rect.left != want.left || cur_rect.top != want.top;
+        const bool need_size =
+            !has_cur_rect || (wp->flags & SWP_NOSIZE) == 0 ||
+            (cur_rect.right - cur_rect.left) != want_w ||
+            (cur_rect.bottom - cur_rect.top) != want_h;
+        if (need_move) {
+          wp->x = want.left;
+          wp->y = want.top;
+          wp->flags &= ~SWP_NOMOVE;
+        }
+        if (need_size) {
+          wp->cx = want_w;
+          wp->cy = want_h;
+          wp->flags &= ~SWP_NOSIZE;
+        }
+      }
+    }
+  } else if (msg == WM_SHOWWINDOW && wParam == TRUE) {
+    winome_shell_panel_queue_redraw_all();
+  } else if (msg == WM_DISPLAYCHANGE || msg == WM_DWMCOMPOSITIONCHANGED) {
+    winome_shell_panel_queue_redraw_all();
+  } else if (msg == WM_NCDESTROY) {
+    RemovePropW(hwnd, kPanelOrigProcProp);
+    if (orig != nullptr &&
+        GetWindowLongPtrW(hwnd, GWLP_WNDPROC) ==
+            reinterpret_cast<LONG_PTR>(panel_subclass_wndproc)) {
+      SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(orig));
+    }
+  }
+  return orig != nullptr ? CallWindowProcW(orig, hwnd, msg, wParam, lParam)
+                         : DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void attach_panel_subclass(HWND hwnd) {
+  if (hwnd == nullptr || !IsWindow(hwnd) ||
+      GetPropW(hwnd, kPanelOrigProcProp) != nullptr) {
+    return;
+  }
+  WNDPROC cur = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(hwnd, GWLP_WNDPROC));
+  if (cur != nullptr && cur != panel_subclass_wndproc) {
+    SetPropW(hwnd, kPanelOrigProcProp, reinterpret_cast<HANDLE>(cur));
+    SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
+                      reinterpret_cast<LONG_PTR>(panel_subclass_wndproc));
+  }
+}
+
+void detach_panel_subclass(HWND hwnd) {
+  if (hwnd == nullptr || !IsWindow(hwnd))
+    return;
+  WNDPROC orig = reinterpret_cast<WNDPROC>(RemovePropW(hwnd, kPanelOrigProcProp));
+  if (orig != nullptr &&
+      GetWindowLongPtrW(hwnd, GWLP_WNDPROC) ==
+          reinterpret_cast<LONG_PTR>(panel_subclass_wndproc)) {
+    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(orig));
+  }
+}
+
 void apply_primary_panel_geometry_and_workarea(HWND primary_hwnd,
                                                bool panel_hidden) {
   if (primary_hwnd == nullptr || !IsWindow(primary_hwnd))
@@ -711,8 +852,32 @@ void evaluate_fullscreen_state(void) {
               all_locked ? 1 : 0,
               static_cast<void*>(eval_out.effective_fullscreen_mon),
               ov_open ? 1 : 0);
-      ShowWindow(entry.hwnd, want_hide ? SW_HIDE : SW_SHOWNOACTIVATE);
-      if (!want_hide) {
+      if (want_hide) {
+        ShowWindow(entry.hwnd, SW_HIDE);
+      } else {
+        BOOL uncloaked = FALSE;
+        DwmSetWindowAttribute(entry.hwnd, DWMWA_CLOAK, &uncloaked,
+                              sizeof(uncloaked));
+        MONITORINFO pmi{};
+        pmi.cbSize = sizeof(pmi);
+        const int raw_expected = static_cast<int>(
+            InterlockedCompareExchange(&g_expected_panel_height, 0, 0));
+        if (pmon != nullptr && GetMonitorInfoW(pmon, &pmi)) {
+          const int canonical_h =
+              clamp_panel_height_for_monitor(pmi.rcMonitor, raw_expected, 32);
+          if (canonical_h > 0) {
+            const RECT want =
+                compute_primary_panel_rect(pmi.rcMonitor, canonical_h);
+            SetWindowPos(entry.hwnd, HWND_TOPMOST, want.left, want.top,
+                         want.right - want.left, want.bottom - want.top,
+                         SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+          }
+        }
+        ShowWindow(entry.hwnd, SW_SHOWNOACTIVATE);
+        RedrawWindow(entry.hwnd, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_UPDATENOW | RDW_FRAME);
+        winome_shell_panel_queue_redraw_all();
+        schedule_panel_redraw_followup(120);
         any_shown = true;
         if (entry.is_primary)
           schedule_workarea_retry(80);
@@ -747,6 +912,7 @@ void evaluate_fullscreen_state(void) {
 void register_panel_window(HWND panel_hwnd) {
   if (panel_hwnd == nullptr)
     return;
+  attach_panel_subclass(panel_hwnd);
   for (const auto& entry : g_panels) {
     if (entry.hwnd == panel_hwnd)
       return;
@@ -759,6 +925,7 @@ void register_panel_window(HWND panel_hwnd) {
 }
 
 void unregister_panel_window(HWND panel_hwnd) {
+  detach_panel_subclass(panel_hwnd);
   g_panels.erase(
       std::remove_if(g_panels.begin(), g_panels.end(),
                      [&](const PanelTrackEntry& e) {
@@ -772,6 +939,10 @@ void set_session_locked(bool locked) {
   if (locked)
     hot_corner_set_suppressed(true);
   evaluate_fullscreen_state();
+  if (!locked) {
+    winome_shell_panel_queue_redraw_all();
+    schedule_panel_redraw_followup(120);
+  }
 }
 
 void reassert_panel_workarea_now(void) {
@@ -801,6 +972,7 @@ bool panel_hidden_for_monitor(HMONITOR mon) {
 void start_fullscreen_watcher(HWND primary_panel_hwnd) {
   g_panels.clear();
   if (primary_panel_hwnd != nullptr) {
+    attach_panel_subclass(primary_panel_hwnd);
     PanelTrackEntry entry{};
     entry.hwnd = primary_panel_hwnd;
     entry.is_primary = true;
@@ -843,6 +1015,7 @@ void stop_fullscreen_watcher(void) {
   cancel_workarea_settle_eval();
   cancel_drag_trailing_eval();
   cancel_location_eval();
+  cancel_panel_redraw_followup();
   g_pid_name_cache.clear();
   safe_remove_source(&g_tick_source);
   if (g_fg_hook != nullptr) {
@@ -861,6 +1034,8 @@ void stop_fullscreen_watcher(void) {
     UnhookWinEvent(g_movesize_hook);
     g_movesize_hook = nullptr;
   }
+  for (const auto& entry : g_panels)
+    detach_panel_subclass(entry.hwnd);
   g_panels.clear();
   g_session_locked = false;
 }

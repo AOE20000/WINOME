@@ -307,6 +307,37 @@ query_radio_enabled (HANDLE client, const GUID &guid, bool fallback)
   return any_on;
 }
 
+struct WifiCacheState {
+  std::mutex mu;
+  std::vector<WinomeWifiNetwork> networks;
+  bool has_snapshot = false;
+  std::atomic<bool> warm_in_flight{false};
+  std::atomic<gint64> last_warm_us{0};
+};
+
+// Heap-allocated immortal singleton so detached worker threads never race with
+// C++ static destruction during process exit(0).
+WifiCacheState *
+wifi_cache ()
+{
+  static auto *s = new WifiCacheState ();
+  return s;
+}
+
+void
+store_wifi_cache (const WinomeWifiNetwork *nets, guint count, bool mark_snapshot = true)
+{
+  WifiCacheState *c = wifi_cache ();
+  std::lock_guard<std::mutex> lock (c->mu);
+  if (nets != nullptr && count > 0) {
+    c->networks.assign (nets, nets + count);
+    c->has_snapshot = true;
+  } else {
+    c->networks.clear ();
+    c->has_snapshot = mark_snapshot;
+  }
+}
+
 }  // namespace
 
 void
@@ -462,6 +493,7 @@ winome_wifi_scan (WinomeWifiNetwork **out, guint *out_count)
           count++;
         }
         winome_wifi_sort_networks (result, count);
+        store_wifi_cache (result, count, true);
         *out = result;
         if (out_count != nullptr)
           *out_count = count;
@@ -765,7 +797,9 @@ winome_wifi_query_snapshot_threadsafe (WinomeWifiStatus *status_out,
       if (trigger_scan && st.enabled && g_api.Scan != nullptr)
         g_api.Scan (client, &info->InterfaceGuid, nullptr, nullptr, nullptr);
 
-      if (nets_out != nullptr && st.enabled) {
+      if (!st.enabled) {
+        store_wifi_cache (nullptr, 0, true);
+      } else if (nets_out != nullptr) {
         PWLAN_AVAILABLE_NETWORK_LIST avail = nullptr;
         if (g_api.GetAvailableNetworkList (client, &info->InterfaceGuid, 0,
                                            nullptr, &avail) == ERROR_SUCCESS &&
@@ -806,6 +840,7 @@ winome_wifi_query_snapshot_threadsafe (WinomeWifiStatus *status_out,
               count++;
             }
             winome_wifi_sort_networks (result, count);
+            store_wifi_cache (result, count, true);
             *nets_out = result;
             if (count_out != nullptr)
               *count_out = count;
@@ -818,6 +853,68 @@ winome_wifi_query_snapshot_threadsafe (WinomeWifiStatus *status_out,
   }
   g_api.CloseHandle (client, nullptr);
   return ok;
+}
+
+gboolean
+winome_wifi_get_cached_networks (WinomeWifiNetwork **out, guint *out_count)
+{
+  if (out != nullptr)
+    *out = nullptr;
+  if (out_count != nullptr)
+    *out_count = 0;
+  if (out == nullptr)
+    return FALSE;
+
+  WifiCacheState *c = wifi_cache ();
+  std::lock_guard<std::mutex> lock (c->mu);
+  if (!c->has_snapshot || c->networks.empty ())
+    return FALSE;
+
+  const guint count = static_cast<guint> (c->networks.size ());
+  WinomeWifiNetwork *copy = static_cast<WinomeWifiNetwork *> (
+      calloc (count + 1, sizeof (WinomeWifiNetwork)));
+  if (copy == nullptr)
+    return FALSE;
+  memcpy (copy, c->networks.data (), count * sizeof (WinomeWifiNetwork));
+  *out = copy;
+  if (out_count != nullptr)
+    *out_count = count;
+  return TRUE;
+}
+
+void
+winome_wifi_warm_cache_async (void)
+{
+  if (!load_api ())
+    return;
+  WifiCacheState *c = wifi_cache ();
+  const gint64 now = g_get_monotonic_time ();
+  const gint64 last = c->last_warm_us.load (std::memory_order_acquire);
+  if (last != 0 && (now - last) < 5000000)
+    return;
+  bool expected = false;
+  if (!c->warm_in_flight.compare_exchange_strong (
+          expected, true, std::memory_order_acq_rel)) {
+    return;
+  }
+  std::thread ([] () {
+    WinomeWifiNetwork *nets = nullptr;
+    guint cnt = 0;
+    winome_wifi_query_snapshot_threadsafe (nullptr, &nets, &cnt, FALSE);
+    if (nets != nullptr)
+      winome_wifi_free_networks (nets);
+    WifiCacheState *cache = wifi_cache ();
+    cache->last_warm_us.store (g_get_monotonic_time (),
+                               std::memory_order_release);
+    cache->warm_in_flight.store (false, std::memory_order_release);
+  }).detach ();
+}
+
+void
+winome_wifi_set_cached_networks_for_test (const WinomeWifiNetwork *nets,
+                                          guint count)
+{
+  store_wifi_cache (nets, count, (nets != nullptr || count > 0));
 }
 
 void

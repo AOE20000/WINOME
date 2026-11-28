@@ -4,6 +4,7 @@
 
 #include "app-grid.h"
 #include "app-index.h"
+#include "background-apps.h"
 #include "config.h"
 #include "crash-dialog.h"
 #include "debug-runtime.h"
@@ -40,6 +41,7 @@
 #include "wifi-networks.h"
 #include "window-theming.h"
 #include "winrt-bridge.h"
+#include "ws-osd.h"
 
 #include <cmath>
 #include <zlib.h>
@@ -111,6 +113,8 @@ void test_config_roundtrip() {
   CHECK(def.live_wallpaper_mode == "live");
   CHECK(def.dash_isolate_workspaces == false);
   CHECK(def.auto_elevate == true);
+  CHECK(def.show_battery_percentage == false);
+  CHECK(def.tray_location == "panel");
   CHECK(def.unify_dark_titlebars == false);
   CHECK(def.unify_rounded_corners == false);
   CHECK(def.sync_windows_primary_display == false);
@@ -120,6 +124,7 @@ void test_config_roundtrip() {
   src.clock_format = "24h";
   src.clock_show_seconds = true;
   src.show_battery_percentage = true;
+  src.tray_location = "quick_settings";
   src.hot_corner_enabled = false;
   src.hot_corner_cooldown_ms = 1250;
   src.win_key_overview = false;
@@ -145,6 +150,7 @@ void test_config_roundtrip() {
   CHECK(dst.clock_format == src.clock_format);
   CHECK(dst.clock_show_seconds == src.clock_show_seconds);
   CHECK(dst.show_battery_percentage == src.show_battery_percentage);
+  CHECK(dst.tray_location == src.tray_location);
   CHECK(dst.hot_corner_enabled == src.hot_corner_enabled);
   CHECK(dst.hot_corner_cooldown_ms == src.hot_corner_cooldown_ms);
   CHECK(dst.win_key_overview == src.win_key_overview);
@@ -193,6 +199,7 @@ void test_config_sanitization_and_unknown_keys() {
     "future_obj": {"nested": [1, true, null, "x"]},
     "language": "fr",
     "clock_format": "99h",
+    "tray_location": "bottom_dock",
     "live_wallpaper_mode": "invalid_mode",
     "hot_corner_cooldown_ms": -50,
     "show_battery_percentage": true,
@@ -202,6 +209,7 @@ void test_config_sanitization_and_unknown_keys() {
   CHECK(winome::parse_config(json, &out));
   CHECK(out.language == "auto");
   CHECK(out.clock_format == "auto");
+  CHECK(out.tray_location == "panel");
   CHECK(out.live_wallpaper_mode == "live");
   CHECK(out.hot_corner_cooldown_ms == 100);
   CHECK(out.show_battery_percentage == true);
@@ -1162,7 +1170,7 @@ void test_ipc_dispatch_and_named_pipe_roundtrip() {
   CHECK(ping.find("\"ok\":true") != std::string::npos);
   CHECK(ping.find("\"pong\":true") != std::string::npos);
   CHECK(ping.find(std::string("\"version\":\"") + WINOME_VERSION + "\"") != std::string::npos);
-  CHECK(std::string(WINOME_VERSION) == "0.2.1");
+  CHECK(std::string(WINOME_VERSION) == "0.3.1");
 
   const std::string st = winome::ipc_dispatch_request_json("{\"cmd\":\"status\"}", cbs);
   CHECK(st.find("\"ok\":true") != std::string::npos);
@@ -2327,6 +2335,48 @@ void test_win_hotkey_passthrough_classification() {
         WinKeyComboAction::PassthroughWithVdHint);
   CHECK(winome::classify_win_key_combo(VK_F4, false, true, false, false, false) ==
         WinKeyComboAction::PassthroughWithVdHint);
+
+  // In-process resolution for Win+Ctrl+{Left,Right,D,F4}.
+  using winome::VdComboInProcessAction;
+  CHECK(winome::resolve_vd_combo_in_process_action(
+            VK_LEFT, false, false, false, false, true, true) ==
+        VdComboInProcessAction::SwitchPrev);
+  CHECK(winome::resolve_vd_combo_in_process_action(
+            VK_RIGHT, false, false, false, true, false, false) ==
+        VdComboInProcessAction::SwitchNext);
+  CHECK(winome::resolve_vd_combo_in_process_action(
+            VK_LEFT, false, false, false, false, false, true) ==
+        VdComboInProcessAction::Passthrough);
+
+  CHECK(winome::resolve_vd_combo_in_process_action(
+            'D', false, false, false, false, true, true) ==
+        VdComboInProcessAction::CreateAndSwitch);
+  CHECK(winome::resolve_vd_combo_in_process_action(
+            VK_F4, false, false, false, false, true, true) ==
+        VdComboInProcessAction::RemoveCurrent);
+  CHECK(winome::resolve_vd_combo_in_process_action(
+            'D', false, false, false, false, true, false) ==
+        VdComboInProcessAction::Passthrough);
+  CHECK(winome::resolve_vd_combo_in_process_action(
+            VK_F4, false, false, false, false, true, false) ==
+        VdComboInProcessAction::Passthrough);
+  CHECK(winome::resolve_vd_combo_in_process_action(
+            'D', false, false, false, true, false, false) ==
+        VdComboInProcessAction::CreateAndSwitch);
+  CHECK(winome::resolve_vd_combo_in_process_action(
+            VK_F4, false, false, false, true, false, false) ==
+        VdComboInProcessAction::RemoveCurrent);
+
+  // Extra modifiers or already-injected Win fall back to Passthrough.
+  CHECK(winome::resolve_vd_combo_in_process_action(
+            VK_LEFT, true, false, false, true, true, true) ==
+        VdComboInProcessAction::Passthrough);
+  CHECK(winome::resolve_vd_combo_in_process_action(
+            'D', false, true, false, true, true, true) ==
+        VdComboInProcessAction::Passthrough);
+  CHECK(winome::resolve_vd_combo_in_process_action(
+            VK_RIGHT, false, false, true, true, true, true) ==
+        VdComboInProcessAction::Passthrough);
 }
 
 void test_workarea_clamp_guard_and_fullscreen_hysteresis() {
@@ -2907,6 +2957,23 @@ void test_panel_overview_and_workspace_dots() {
     CHECK(std::fabs(r - 17.0 / 255.0) < 1e-6);
     CHECK(std::fabs(b - 19.0 / 255.0) < 1e-6);
     CHECK(std::fabs(a - 0.14) < 1e-6);
+  }
+
+  // 4. Lockstep panel progress cadence (60fps on Cairo/DComp, coarse on blocking GL).
+  {
+    // Non-blocking renderer (default GskCairoRenderer + DComp): smooth per-frame.
+    CHECK(winome::should_push_panel_overview_progress(0.05, 0.0, true, 0.032, false));
+    CHECK(winome::should_push_panel_overview_progress(0.15, 0.05, false, 0.10, false));
+    CHECK(winome::should_push_panel_overview_progress(0.32, 0.35, false, 0.08, false));
+    CHECK(!winome::should_push_panel_overview_progress(1.0, 1.0, true, 0.032, false));
+    CHECK(!winome::should_push_panel_overview_progress(1.0, 1.0, false, 1.0, false));
+    CHECK(winome::should_push_panel_overview_progress(1.0, 0.99995, false, 1.0, false));
+
+    // Blocking GL swap renderer: push frame 0, skip small mid-steps, push >=0.45 and end.
+    CHECK(winome::should_push_panel_overview_progress(0.05, 0.0, true, 0.032, true));
+    CHECK(!winome::should_push_panel_overview_progress(0.20, 0.05, false, 0.15, true));
+    CHECK(winome::should_push_panel_overview_progress(0.52, 0.05, false, 0.35, true));
+    CHECK(winome::should_push_panel_overview_progress(1.0, 0.90, false, 1.0, true));
   }
 }
 
@@ -3719,6 +3786,22 @@ void test_overlay_wndproc_chaining_no_recursion() {
   CHECK(DestroyWindow(hwnd) != FALSE);
 }
 
+void test_popover_occupies_top_band() {
+  // Active open popover always occupies the topmost band.
+  CHECK(winome::popover_occupies_top_band(true, false, false));
+  CHECK(winome::popover_occupies_top_band(true, false, true));
+  CHECK(winome::popover_occupies_top_band(true, true, true));
+
+  // Mid-fade popover still visible must stay above panel/overview so clicking
+  // empty space in Overview does not let Overview bury the fading menu.
+  CHECK(winome::popover_occupies_top_band(false, true, true));
+
+  // Hidden fading or idle popovers do not occupy the top band.
+  CHECK(!winome::popover_occupies_top_band(false, true, false));
+  CHECK(!winome::popover_occupies_top_band(false, false, true));
+  CHECK(!winome::popover_occupies_top_band(false, false, false));
+}
+
 int main() {
   ScopedTempConfigDir temp_dir;
   test_config_roundtrip();
@@ -3753,6 +3836,7 @@ int main() {
   test_overview_window_blacklist();
   test_winrt_safe_com_getter_and_notifications();
   test_win_hotkey_passthrough_classification();
+  test_popover_occupies_top_band();
 
   // Quick Settings secondary-monitor workspace mode visibility & cycling.
   CHECK(!winome::ws::should_show_quick_settings_ws_mode_toggle(0));
@@ -4077,6 +4161,363 @@ int main() {
       UnregisterClassW(L"GdkWin32GL", hinst);
     if (owner_atom != 0)
       UnregisterClassW(L"WinomeSanitizeOwnerTest", hinst);
+  }
+
+  // Test compute_panel_band_clamp blocks GDK panel position/height drifts
+  // such as (0,52 1920x32) and (0,0 1920x41) while allowing valid placements.
+  {
+    const RECT primary_mon{0, 0, 1920, 1080};
+    RECT want{};
+    CHECK(!winome::compute_panel_band_clamp(
+        RECT{0, 0, 1920, 32}, primary_mon, 32, true, false, &want));
+    CHECK(winome::compute_panel_band_clamp(
+        RECT{0, 52, 1920, 84}, primary_mon, 32, true, false, &want));
+    CHECK(want.left == 0 && want.top == 0 && want.right == 1920 && want.bottom == 32);
+    CHECK(winome::compute_panel_band_clamp(
+        RECT{0, 0, 1920, 41}, primary_mon, 32, true, false, &want));
+    CHECK(want.left == 0 && want.top == 0 && want.right == 1920 && want.bottom == 32);
+    CHECK(winome::compute_panel_band_clamp(
+        RECT{0, 0, 0, 0}, primary_mon, 32, false, false, &want));
+    CHECK(want.left == 0 && want.top == 0 && want.right == 1920 && want.bottom == 32);
+    // Secondary monitor top-bar move permitted when caller verified it matches.
+    CHECK(!winome::compute_panel_band_clamp(
+        RECT{1920, 0, 3840, 32}, primary_mon, 32, true, true, &want));
+
+    // Pure Z-order SetWindowPos (SWP_NOMOVE | SWP_NOSIZE) must resolve to the
+    // existing panel rect and avoid spurious move/resize clamps when un-drifted.
+    RECT eff{};
+    CHECK(winome::resolve_panel_windowpos_rect(
+        RECT{0, 0, 1920, 32}, true, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE, &eff));
+    CHECK(eff.left == 0 && eff.top == 0 && eff.right == 1920 && eff.bottom == 32);
+    CHECK(!winome::compute_panel_band_clamp(
+        eff, primary_mon, 32, true, false, &want));
+
+    // Real drift on SWP_NOMOVE | SWP_NOSIZE still triggers clamp repair.
+    CHECK(winome::resolve_panel_windowpos_rect(
+        RECT{0, 52, 1920, 84}, true, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE, &eff));
+    CHECK(eff.left == 0 && eff.top == 52 && eff.right == 1920 && eff.bottom == 84);
+    CHECK(winome::compute_panel_band_clamp(
+        eff, primary_mon, 32, true, false, &want));
+    CHECK(want.left == 0 && want.top == 0 && want.right == 1920 && want.bottom == 32);
+
+    // SWP_NOMOVE with a bad size clamps to 32px.
+    CHECK(winome::resolve_panel_windowpos_rect(
+        RECT{0, 0, 1920, 32}, true, 0, 0, 1920, 41, SWP_NOMOVE, &eff));
+    CHECK(eff.left == 0 && eff.top == 0 && eff.right == 1920 && eff.bottom == 41);
+    CHECK(winome::compute_panel_band_clamp(
+        eff, primary_mon, 32, true, false, &want));
+    CHECK(want.left == 0 && want.top == 0 && want.right == 1920 && want.bottom == 32);
+
+    // Missing current rect fails cleanly.
+    CHECK(!winome::resolve_panel_windowpos_rect(
+        RECT{}, false, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE, &eff));
+
+    // System Z-order overlay class filter skips OS higher-band chrome, not apps.
+    CHECK(winome::is_system_zorder_overlay_class(L"Shell_TrayWnd"));
+    CHECK(winome::is_system_zorder_overlay_class(L"IME"));
+    CHECK(winome::is_system_zorder_overlay_class(L"MSCTFIME UI"));
+    CHECK(winome::is_system_zorder_overlay_class(L"tooltips_class32"));
+    CHECK(winome::is_system_zorder_overlay_class(L"Windows.UI.Core.CoreWindow"));
+    CHECK(winome::is_system_zorder_overlay_class(L"XamlExplorerHostIslandWindow"));
+    CHECK(!winome::is_system_zorder_overlay_class(L"Chrome_WidgetWin_1"));
+    CHECK(!winome::is_system_zorder_overlay_class(L"CabinetWClass"));
+    CHECK(!winome::is_system_zorder_overlay_class(nullptr));
+    CHECK(!winome::is_system_zorder_overlay_class(L""));
+  }
+
+  // Test compute_overview_hwnd_rect keeps Overview strictly below the top bar
+  // so Overview and Panel HWNDs never overlap.
+  {
+    const RECT primary_mon{0, 0, 1920, 1080};
+    const RECT ov_primary = winome::compute_overview_hwnd_rect(primary_mon, 32);
+    CHECK(ov_primary.left == 0 && ov_primary.top == 32 &&
+          ov_primary.right == 1920 && ov_primary.bottom == 1080);
+    const RECT panel_primary{0, 0, 1920, 32};
+    RECT inter{};
+    CHECK(!IntersectRect(&inter, &ov_primary, &panel_primary));
+
+    const RECT sec_mon{1920, 0, 3840, 1080};
+    const RECT ov_sec = winome::compute_overview_hwnd_rect(sec_mon, 32);
+    CHECK(ov_sec.left == 1920 && ov_sec.top == 32 &&
+          ov_sec.right == 3840 && ov_sec.bottom == 1080);
+
+    const RECT ov_nopanel = winome::compute_overview_hwnd_rect(primary_mon, 0);
+    CHECK(ov_nopanel.left == 0 && ov_nopanel.top == 0 &&
+          ov_nopanel.right == 1920 && ov_nopanel.bottom == 1080);
+
+    const RECT ov_neg = winome::compute_overview_hwnd_rect(primary_mon, -10);
+    CHECK(ov_neg.top == 0 && ov_neg.bottom == 1080);
+
+    const RECT ov_huge = winome::compute_overview_hwnd_rect(primary_mon, 5000);
+    CHECK(ov_huge.top == 1079 && ov_huge.bottom == 1080);
+  }
+
+  // Test IPC pipe error classification, status PID/watchdog fields,
+  // inspect.panel callback wiring, and upgraded dev-channel grammar/help.
+  {
+    CHECK(std::string(winome::ctl::ctl_classify_pipe_error(2UL, false, false)) ==
+          "not_running");
+    CHECK(std::string(winome::ctl::ctl_classify_pipe_error(3UL, false, false)) ==
+          "not_running");
+    CHECK(std::string(winome::ctl::ctl_classify_pipe_error(5UL, false, false)) ==
+          "ipc_access_denied");
+    CHECK(std::string(winome::ctl::ctl_classify_pipe_error(1314UL, false, false)) ==
+          "ipc_access_denied");
+    CHECK(std::string(winome::ctl::ctl_classify_pipe_error(231UL, false, true)) ==
+          "ipc_pipe_busy_timeout");
+    CHECK(std::string(winome::ctl::ctl_classify_pipe_error(0UL, true, false)) ==
+          "ipc_reply_timeout");
+    CHECK(std::string(winome::ctl::ctl_classify_pipe_error(109UL, false, false)) ==
+          "ipc_error");
+
+    winome::IpcCallbacks cbs{};
+    cbs.watchdog_pid = []() -> DWORD { return 9876UL; };
+    cbs.inspect_panel_json = []() -> std::string {
+      return "{\"panel_count\":1,\"open_popover_count\":0}";
+    };
+    const std::string st_json =
+        winome::ipc_dispatch_request_json("{\"cmd\":\"status\"}", cbs);
+    CHECK(st_json.find("\"ok\":true") != std::string::npos);
+    CHECK(st_json.find("\"pid\":") != std::string::npos);
+    CHECK(st_json.find("\"watchdog_pid\":9876") != std::string::npos);
+
+    const std::string ip_json =
+        winome::ipc_dispatch_request_json("{\"cmd\":\"inspect.panel\"}", cbs);
+    CHECK(ip_json.find("\"panel_count\":1") != std::string::npos);
+
+    const std::string help_json = winome::dev_channel_help_json();
+    CHECK(help_json.find("gtk.node_at") != std::string::npos);
+    CHECK(help_json.find("gtk.redraw") != std::string::npos);
+    CHECK(help_json.find("fallback=mouse") != std::string::npos);
+    CHECK(help_json.find("action=replace|append|list|clear") != std::string::npos);
+
+    winome::DevOpRequest parsed;
+    std::string perr;
+    CHECK(winome::dev_parse_op_shorthand("gtk.css list", &parsed, &perr));
+    CHECK(parsed.op == "gtk.css" && parsed.args["action"] == "list");
+    CHECK(winome::dev_parse_op_shorthand("gtk.redraw 0x10A0", &parsed, &perr));
+    CHECK(parsed.op == "gtk.redraw" && parsed.args["window"] == "0x10A0");
+    CHECK(winome::dev_parse_op_shorthand(
+        "gtk.tree window=0 measure=true max_depth=4", &parsed, &perr));
+    CHECK(parsed.op == "gtk.tree" && parsed.args["measure"] == "true");
+    CHECK(winome::dev_parse_op_shorthand(
+        "gtk.node_at x=120 y=16 screen=true", &parsed, &perr));
+    CHECK(parsed.op == "gtk.node_at" && parsed.args["screen"] == "true");
+  }
+
+  // Test merge_gsk_debug_full_redraw (GTK 4.22.4 DComp Present1 workaround)
+  {
+    CHECK(winome::merge_gsk_debug_full_redraw(nullptr, "cairo", "1") ==
+          "full-redraw");
+    CHECK(winome::merge_gsk_debug_full_redraw("", "cairo", "1") ==
+          "full-redraw");
+    CHECK(winome::merge_gsk_debug_full_redraw("profile", "cairo", "1") ==
+          "profile,full-redraw");
+    CHECK(winome::merge_gsk_debug_full_redraw("full-redraw", "cairo", "1") ==
+          "full-redraw");
+    CHECK(winome::merge_gsk_debug_full_redraw(
+              "profile,full-redraw", "cairo", "1") == "profile,full-redraw");
+    CHECK(winome::merge_gsk_debug_full_redraw("all", "cairo", "1") == "all");
+    CHECK(winome::merge_gsk_debug_full_redraw(nullptr, "gl", "1") == "");
+    CHECK(winome::merge_gsk_debug_full_redraw(nullptr, "cairo", "0") == "");
+    CHECK(winome::merge_gsk_debug_full_redraw("profile", "cairo", "false") ==
+          "profile");
+  }
+
+  // Test Wi-Fi non-blocking AP snapshot cache (empty, populated copy, clear)
+  {
+    winome_wifi_set_cached_networks_for_test(nullptr, 0);
+    WinomeWifiNetwork* out = nullptr;
+    guint out_count = 99;
+    CHECK(!winome_wifi_get_cached_networks(&out, &out_count));
+    CHECK(out == nullptr && out_count == 0);
+
+    WinomeWifiNetwork seed[2]{};
+    std::snprintf(seed[0].ssid, sizeof(seed[0].ssid), "HomeNet");
+    seed[0].signal_quality = 88;
+    seed[0].connected = TRUE;
+    seed[0].secured = TRUE;
+    seed[0].connectable = TRUE;
+    std::snprintf(seed[1].ssid, sizeof(seed[1].ssid), "CafeGuest");
+    seed[1].signal_quality = 54;
+    seed[1].connected = FALSE;
+    seed[1].secured = FALSE;
+    seed[1].connectable = TRUE;
+
+    winome_wifi_set_cached_networks_for_test(seed, 2);
+    CHECK(winome_wifi_get_cached_networks(&out, &out_count));
+    CHECK(out != nullptr && out_count == 2);
+    CHECK(std::strcmp(out[0].ssid, "HomeNet") == 0 && out[0].signal_quality == 88);
+    CHECK(std::strcmp(out[1].ssid, "CafeGuest") == 0 && out[1].signal_quality == 54);
+    winome_wifi_free_networks(out);
+    out = nullptr;
+
+    winome_wifi_set_cached_networks_for_test(nullptr, 0);
+    CHECK(!winome_wifi_get_cached_networks(&out, &out_count));
+    CHECK(out == nullptr && out_count == 0);
+  }
+
+  // Test workspace-switcher OSD bottom-center geometry and Overview VD rescue helpers
+  {
+    const RECT primary{0, 0, 1920, 1080};
+    const RECT osd_1x =
+        winome::compute_ws_osd_hwnd_rect(primary, 124, 68, 60.0, 8.0, 1);
+    CHECK(osd_1x.right - osd_1x.left == 124);
+    CHECK(osd_1x.bottom - osd_1x.top == 68);
+    CHECK(osd_1x.left == (1920 - 124) / 2);
+    CHECK(osd_1x.top == 1080 - 52 - 68);
+    CHECK(osd_1x.left > 0 && osd_1x.top > 0);
+
+    const RECT osd_2x =
+        winome::compute_ws_osd_hwnd_rect(primary, 124, 68, 60.0, 8.0, 2);
+    CHECK(osd_2x.right - osd_2x.left == 248);
+    CHECK(osd_2x.bottom - osd_2x.top == 136);
+    CHECK(osd_2x.left == (1920 - 248) / 2);
+    CHECK(osd_2x.top == 1080 - 104 - 136);
+
+    const RECT secondary{1920, 0, 3840, 1080};
+    const RECT osd_sec =
+        winome::compute_ws_osd_hwnd_rect(secondary, 124, 68, 60.0, 8.0, 1);
+    CHECK(osd_sec.left == 1920 + (1920 - 124) / 2);
+    CHECK(osd_sec.bottom <= secondary.bottom);
+
+    const RECT oversized =
+        winome::compute_ws_osd_hwnd_rect(primary, 3000, 1500, 60.0, 8.0, 1);
+    CHECK(oversized.left == 0 && oversized.top == 0);
+
+    CHECK(winome::resolve_native_desktop_for_overview_rescue(
+              winome::ws::MultiMonitorWorkspaceMode::Independent, 3, 2) == 0);
+    CHECK(winome::resolve_native_desktop_for_overview_rescue(
+              winome::ws::MultiMonitorWorkspaceMode::Span, 2, 1) == 2);
+    CHECK(winome::resolve_native_desktop_for_overview_rescue(
+              winome::ws::MultiMonitorWorkspaceMode::PrimaryOnly, -1, 1) == 1);
+
+    constexpr DWORD kCloakApp = 0x1u;
+    constexpr DWORD kCloakShell = 0x2u;
+    CHECK(winome::should_rescue_overview_vd_cloak(kCloakShell, true, true));
+    CHECK(winome::should_rescue_overview_vd_cloak(
+        kCloakApp | kCloakShell, true, true));
+    CHECK(!winome::should_rescue_overview_vd_cloak(kCloakApp, true, true));
+    CHECK(!winome::should_rescue_overview_vd_cloak(0u, true, true));
+    CHECK(!winome::should_rescue_overview_vd_cloak(kCloakShell, false, true));
+    CHECK(!winome::should_rescue_overview_vd_cloak(kCloakShell, true, false));
+
+    // Alt+F2 Run Dialog exact monitor centering (primary and offset secondary).
+    {
+      const RECT rd_primary{0, 0, 1920, 1080};
+      const RECT rd1 = winome::compute_run_dialog_centered_rect(rd_primary, 408, 200);
+      CHECK(rd1.left == 756 && rd1.top == 440 && rd1.right == 1164 && rd1.bottom == 640);
+      const RECT rd_secondary{-1920, 0, 0, 1080};
+      const RECT rd2 = winome::compute_run_dialog_centered_rect(rd_secondary, 408, 200);
+      CHECK(rd2.left == -1164 && rd2.top == 440 && rd2.right == -756 && rd2.bottom == 640);
+    }
+
+    // Calendar 6-week lead padding policy matching gnome-shell calendar.js.
+    CHECK(winome::compute_calendar_grid_lead_days(0, 0) == 7);  // Nov 2026 Sun-start
+    CHECK(winome::compute_calendar_grid_lead_days(0, 1) == 6);  // Nov 2026 Mon-start
+    CHECK(winome::compute_calendar_grid_lead_days(1, 1) == 7);  // Feb 2010 Mon-start
+    CHECK(winome::compute_calendar_grid_lead_days(6, 0) == 6);  // Dec 2012 Sun-start
+
+    // Month-change day clamping.
+    CHECK(winome::clamp_day_for_month(2026, 2, 31) == 28);
+    CHECK(winome::clamp_day_for_month(2024, 2, 31) == 29);
+    CHECK(winome::clamp_day_for_month(2026, 4, 31) == 30);
+    CHECK(winome::clamp_day_for_month(2026, 11, 28) == 28);
+  }
+
+  // Background Apps + Tray App merge, dedupe, and localization helpers.
+  {
+    std::string detail;
+    CHECK(winome::compact_tray_title_and_detail("Clash Verge - Tun On\nProxy", "clash-verge", &detail) == "Clash Verge");
+    CHECK(detail == "Tun On Proxy");
+    CHECK(winome::compact_tray_title_and_detail("Steam", "steam", &detail) == "Steam");
+    CHECK(detail.empty());
+
+    CHECK(winome::format_background_app_subtitle(
+              winome::BackgroundAppKind::TrayApp, "Ready", true) ==
+          "\xE6\x89\x98\xE7\x9B\x98\xE5\xBA\x94\xE7\x94\xA8 \xC2\xB7 Ready");
+    CHECK(winome::format_background_app_subtitle(
+              winome::BackgroundAppKind::BackgroundApp, "", true) ==
+          "\xE5\x90\x8E\xE5\x8F\xB0\xE5\xBA\x94\xE7\x94\xA8");
+    CHECK(winome::format_background_apps_toggle_title(3, false) ==
+          "3 Background Apps");
+    CHECK(winome::format_background_apps_toggle_title(1, false) ==
+          "1 Background App");
+    CHECK(winome::format_background_apps_header_subtitle(2, 1, false) ==
+          "2 tray \xC2\xB7 1 background");
+
+    CHECK(winome::is_ignored_background_exe("explorer.exe"));
+    CHECK(winome::is_ignored_background_exe("winome.exe"));
+    CHECK(winome::is_ignored_background_exe("msedgewebview2.exe"));
+    CHECK(!winome::is_ignored_background_exe("spotify.exe"));
+
+    std::vector<winome::TrayIconEntry> tray_items;
+    winome::TrayIconEntry t1;
+    t1.id = 101;
+    t1.title = "Steam - Online";
+    t1.app_hint = "steam";
+    t1.target_hwnd = 0x1111;
+    tray_items.push_back(t1);
+
+    std::unordered_map<uint64_t, winome::TrayOwnerMeta> owners;
+    owners[101] = winome::TrayOwnerMeta{2001, "steam.exe"};
+
+    std::vector<winome::AppEntry> installed;
+    winome::AppEntry steam;
+    steam.id = "steam.exe";
+    steam.name = "Steam";
+    steam.name_lower = "steam";
+    steam.target_lower = "steam.exe";
+    installed.push_back(steam);
+
+    winome::AppEntry spotify;
+    spotify.id = "spotify.exe";
+    spotify.name = "Spotify";
+    spotify.name_lower = "spotify";
+    spotify.target_lower = "spotify.exe";
+    installed.push_back(spotify);
+
+    winome::AppEntry code;
+    code.id = "code.exe";
+    code.name = "VS Code";
+    code.name_lower = "vs code";
+    code.target_lower = "code.exe";
+    installed.push_back(code);
+
+    std::vector<winome::RawProcessInfo> procs = {
+        {1000, "winome.exe"},       // self PID ignored
+        {1001, "explorer.exe"},     // ignored system shell
+        {2001, "steam.exe"},        // owned by tray -> deduped from BG apps
+        {2002, "spotify.exe"},      // background process 1
+        {2003, "spotify.exe"},      // background process 2 (multi-PID grouped)
+        {2004, "code.exe"},         // has visible window -> excluded
+    };
+
+    std::vector<winome::RunningWindow> windows;
+    winome::RunningWindow code_win;
+    code_win.canonical_id = "code.exe";
+    code_win.exe_norm = "code.exe";
+    code_win.exe_base_lower = "code.exe";
+    windows.push_back(code_win);
+
+    // include_tray=true: Steam as TrayApp, Spotify as single grouped BackgroundApp.
+    const auto merged = winome::merge_background_and_tray_apps(
+        tray_items, owners, installed, procs, windows, true, 1000);
+    CHECK(merged.size() == 2);
+    CHECK(merged[0].kind == winome::BackgroundAppKind::TrayApp);
+    CHECK(merged[0].title == "Steam");
+    CHECK(merged[0].detail == "Online");
+    CHECK(merged[0].app_id == "steam.exe");
+    CHECK(merged[1].kind == winome::BackgroundAppKind::BackgroundApp);
+    CHECK(merged[1].title == "Spotify");
+    CHECK(merged[1].pids.size() == 2);
+
+    // include_tray=false: Tray items hidden from QS, Steam still not duplicated as BG.
+    const auto bg_only = winome::merge_background_and_tray_apps(
+        tray_items, owners, installed, procs, windows, false, 1000);
+    CHECK(bg_only.size() == 1);
+    CHECK(bg_only[0].kind == winome::BackgroundAppKind::BackgroundApp);
+    CHECK(bg_only[0].title == "Spotify");
   }
 
   if (g_failures == 0)

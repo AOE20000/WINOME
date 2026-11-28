@@ -170,7 +170,10 @@ winome_thumbs_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
         graphene_rect_init (&tex_rect, (float)wr.x, (float)wr.y, (float)wr.w,
                             (float)wr.h);
         gtk_snapshot_append_scaled_texture (
-            snapshot, self->wallpaper, GSK_SCALING_FILTER_LINEAR, &tex_rect);
+            snapshot, self->wallpaper,
+            has_transform ? GSK_SCALING_FILTER_NEAREST
+                          : GSK_SCALING_FILTER_LINEAR,
+            &tex_rect);
         drawn = true;
       }
     }

@@ -47,6 +47,7 @@
 #include "notifications.h"
 #include "settings-window.h"
 #include "systray.h"
+#include "background-apps.h"
 #include "system-status.h"
 #include "workspace-manager.h"
 #include "wifi-networks.h"
@@ -428,6 +429,8 @@ spawn_self_with_args (const wchar_t *extra_args)
   }
 }
 
+static std::atomic<DWORD> g_watchdog_pid{0};
+
 static void
 spawn_watchdog (void)
 {
@@ -448,6 +451,7 @@ spawn_watchdog (void)
   if (CreateProcessW (exe_path, cmd.data (), nullptr, nullptr, FALSE,
                       CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr,
                       &si, &pi)) {
+    g_watchdog_pid.store (pi.dwProcessId, std::memory_order_relaxed);
     CloseHandle (pi.hThread);
     CloseHandle (pi.hProcess);
   }
@@ -531,8 +535,13 @@ idle_log_gsk_probe (gpointer data)
 
   const char *type = G_OBJECT_TYPE_NAME (renderer);
   const char *want = g_getenv ("GSK_RENDERER");
-  g_print ("[gpu] GSK_RENDERER env=%s renderer=%s\n",
-           want != nullptr ? want : "(unset)", type);
+  const char *gsk_dbg = g_getenv ("GSK_DEBUG");
+  const char *dcomp = g_getenv ("GDK_WIN32_FORCE_DCOMP");
+  g_print ("[gpu] GDK_WIN32_FORCE_DCOMP=%s GSK_RENDERER=%s GSK_DEBUG=%s renderer=%s\n",
+           dcomp != nullptr ? dcomp : "(unset)",
+           want != nullptr ? want : "(unset)",
+           gsk_dbg != nullptr ? gsk_dbg : "(unset)",
+           type);
   winome::sanitize_gdk_gl_backing_windows ();
   return G_SOURCE_REMOVE;
 }
@@ -994,6 +1003,7 @@ on_activate (GtkApplication      *app,
 
   // Compatible system tray collector (classic toolbar + Win11 UIA).
   winome::systray_init ();
+  winome::background_apps_init ();
 
   // Event-driven WASAPI master volume & default audio endpoint monitor.
   winome::start_volume_monitor ();
@@ -1124,6 +1134,41 @@ on_activate (GtkApplication      *app,
   };
   g_main_ipc_cbs.plugin_list_json = winome::plugin_host_list_json;
   g_main_ipc_cbs.plugin_action = winome::plugin_host_action;
+  g_main_ipc_cbs.watchdog_pid = +[] () -> DWORD {
+    return g_watchdog_pid.load (std::memory_order_relaxed);
+  };
+  g_main_ipc_cbs.inspect_panel_json = +[] () -> std::string {
+    if (g_main_context_is_owner (g_main_context_default ()))
+      return winome_shell_panel_inspect_json ();
+    struct Box {
+      std::mutex mu;
+      std::condition_variable cv;
+      bool done = false;
+      std::string result;
+    };
+    auto b = std::make_shared<Box> ();
+    auto *h = new std::shared_ptr<Box> (b);
+    g_main_context_invoke_full (
+        g_main_context_default (), G_PRIORITY_HIGH_IDLE,
+        +[] (gpointer ud) -> gboolean {
+          auto *ptr = static_cast<std::shared_ptr<Box> *> (ud);
+          auto box = *ptr;
+          delete ptr;
+          if (box) {
+            box->result = winome_shell_panel_inspect_json ();
+            std::lock_guard<std::mutex> lk (box->mu);
+            box->done = true;
+            box->cv.notify_all ();
+          }
+          return G_SOURCE_REMOVE;
+        },
+        h, nullptr);
+    std::unique_lock<std::mutex> lk (b->mu);
+    if (!b->cv.wait_for (lk, std::chrono::milliseconds (3000),
+                         [&] { return b->done; }))
+      return "{\"error\":\"inspect_panel_timeout\"}";
+    return b->result;
+  };
   g_main_ipc_cbs.dev_test_action = +[] (const std::string &action,
                                         std::string *out_err) -> bool {
     if (action == "win_tap_os") {
@@ -1438,6 +1483,9 @@ on_activate (GtkApplication      *app,
     if (g_gtk_app != nullptr)
       g_application_quit (G_APPLICATION (g_gtk_app));
   };
+  run_cbs.close_popovers = +[] () {
+    winome_shell_panel_close_popovers ();
+  };
   winome::run_dialog_init (run_cbs);
 
   winome::LookingGlassCallbacks lg_cbs {};
@@ -1564,6 +1612,7 @@ on_shutdown (GtkApplication      *app G_GNUC_UNUSED,
   winome::stop_hot_corner ();
   winome::stop_fullscreen_watcher ();
   winome::app_index_stop_watch ();
+  winome::background_apps_shutdown ();
   winome::systray_shutdown ();
   winome::stop_volume_monitor ();
   winome_wifi_shutdown_notifications ();
@@ -1888,13 +1937,34 @@ main (int argc, char **argv)
   winome::start_win_event_hook ();
   winome::start_overview_trigger ();
 
-  // GTK 4.22+ on Win32 requires DirectComposition for both GskGLRenderer and
-  // GskVulkanRenderer ("OpenGL requires Direct Composition"), yet leaves
-  // DirectComposition disabled unless GDK_WIN32_FORCE_DCOMP is set — causing
-  // silent fallback to CPU GskCairoRenderer (halving Overview FPS to ~30fps).
-  // Enable DirectComposition by default while respecting explicit overrides.
+  // GTK 4.22+ on Win32 selects GskGLRenderer when GDK_WIN32_FORCE_DCOMP=1 is
+  // set without GSK_RENDERER. GskGLRenderer (and GskVulkanRenderer) use
+  // CreateSurfaceFromHwnd on auxiliary GdkWin32GL HWNDs without per-pixel alpha,
+  // producing opaque black rectangles around rounded windows (popovers,
+  // toasts, OSD, overview chrome), cold-open shader stalls (~566ms), and GL
+  // child HWND glitches. GskCairoRenderer with GDK_WIN32_FORCE_DCOMP=1 uses
+  // DXGI CreateSwapChainForComposition with DXGI_ALPHA_MODE_PREMULTIPLIED and
+  // holds 60fps with cached Cairo surfaces while respecting explicit overrides.
+  //
+  // Workaround for GTK 4.22.4 gdkcairocontext-win32.c:285: after ResizeBuffers()
+  // (e.g. expanding an inline QuickToggleMenu or resizing Overview Chrome),
+  // DXGI requires DirtyRectsCount == 0 on the next Present1(). GTK's Cairo
+  // context only clears dirty rects when painted covers the whole surface, so
+  // partial gsk_render_node_diff updates trigger permanent DXGI_ERROR_INVALID_CALL
+  // (-2005270527) freezes. Enabling GSK_DEBUG=full-redraw skips partial diffing
+  // so every frame presents the full surface cleanly.
   if (g_getenv ("GDK_WIN32_FORCE_DCOMP") == nullptr)
     g_setenv ("GDK_WIN32_FORCE_DCOMP", "1", FALSE);
+  if (g_getenv ("GSK_RENDERER") == nullptr)
+    g_setenv ("GSK_RENDERER", "cairo", FALSE);
+  const char *allow_partial = g_getenv ("WINOME_ALLOW_PARTIAL_REDRAW");
+  if (allow_partial == nullptr || std::strcmp (allow_partial, "1") != 0) {
+    const std::string gsk_dbg = winome::merge_gsk_debug_full_redraw (
+        g_getenv ("GSK_DEBUG"), g_getenv ("GSK_RENDERER"),
+        g_getenv ("GDK_WIN32_FORCE_DCOMP"));
+    if (!gsk_dbg.empty ())
+      g_setenv ("GSK_DEBUG", gsk_dbg.c_str (), TRUE);
+  }
 
   GtkApplication *app;
 

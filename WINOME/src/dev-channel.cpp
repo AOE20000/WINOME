@@ -9,6 +9,7 @@
 
 #include <gtk/gtk.h>
 #include <gdk/win32/gdkwin32.h>
+#include <dwmapi.h>
 #include <windows.h>
 
 #include <algorithm>
@@ -263,6 +264,54 @@ bool run_on_gtk_main_sync(std::function<void()> fn, int timeout_ms = 5000) {
                          [&] { return st->done; });
 }
 
+static std::string g_live_debug_css_text;
+
+HWND gtk_widget_hwnd(GtkWidget* w) {
+  if (w == nullptr || !GTK_IS_NATIVE(w))
+    return nullptr;
+  GdkSurface* surf = gtk_native_get_surface(GTK_NATIVE(w));
+  if (surf == nullptr)
+    return nullptr;
+  return static_cast<HWND>(gdk_win32_surface_get_handle(surf));
+}
+
+bool append_win32_hwnd_state_fields(HWND hwnd, std::string* out) {
+  if (hwnd == nullptr || !IsWindow(hwnd)) {
+    *out += "\"win32_visible\":false,\"cloaked\":false,\"topmost\":false,"
+            "\"minimized\":false,\"on_screen\":false";
+    return false;
+  }
+  const bool w32_vis = IsWindowVisible(hwnd) != FALSE;
+  BOOL cloaked_val = FALSE;
+  (void)DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked_val, sizeof(cloaked_val));
+  const bool cloaked = cloaked_val != FALSE;
+  const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+  const bool topmost = (ex & WS_EX_TOPMOST) != 0;
+  const bool minimized = IsIconic(hwnd) != FALSE;
+  RECT rc{};
+  const bool has_rect = GetWindowRect(hwnd, &rc) != FALSE;
+  const int rw = has_rect ? std::max(0L, rc.right - rc.left) : 0;
+  const int rh = has_rect ? std::max(0L, rc.bottom - rc.top) : 0;
+  const bool on_screen = w32_vis && !cloaked && !minimized && rw > 0 && rh > 0;
+  char buf[256];
+  std::snprintf(
+      buf, sizeof(buf),
+      "\"win32_visible\":%s,\"cloaked\":%s,\"topmost\":%s,\"minimized\":%s,"
+      "\"on_screen\":%s,\"exstyle\":\"0x%llX\","
+      "\"win32_rect\":{\"x\":%ld,\"y\":%ld,\"w\":%d,\"h\":%d}",
+      w32_vis ? "true" : "false",
+      cloaked ? "true" : "false",
+      topmost ? "true" : "false",
+      minimized ? "true" : "false",
+      on_screen ? "true" : "false",
+      static_cast<unsigned long long>(ex),
+      has_rect ? rc.left : 0L,
+      has_rect ? rc.top : 0L,
+      rw, rh);
+  *out += buf;
+  return on_screen;
+}
+
 GtkWidget* resolve_gtk_toplevel(const std::string& selector) {
   GListModel* toplevels = gtk_window_get_toplevels();
   if (toplevels == nullptr)
@@ -290,7 +339,30 @@ GtkWidget* resolve_gtk_toplevel(const std::string& selector) {
     return nullptr;
   }
 
+  // Support hex HWND matching (e.g. "0x120A4").
+  if (selector.size() > 2 && selector[0] == '0' &&
+      (selector[1] == 'x' || selector[1] == 'X')) {
+    char* endp = nullptr;
+    const uintptr_t want_hwnd =
+        static_cast<uintptr_t>(std::strtoull(selector.c_str(), &endp, 16));
+    if (want_hwnd != 0 && endp != nullptr && *endp == '\0') {
+      for (guint i = 0; i < n; ++i) {
+        gpointer obj = g_list_model_get_item(toplevels, i);
+        GtkWidget* w = GTK_IS_WIDGET(obj) ? GTK_WIDGET(obj) : nullptr;
+        const HWND hwnd = gtk_widget_hwnd(w);
+        if (obj != nullptr)
+          g_object_unref(obj);
+        if (hwnd != nullptr && reinterpret_cast<uintptr_t>(hwnd) == want_hwnd)
+          return w;
+      }
+      return nullptr;
+    }
+  }
+
+  // For name/title selectors, prefer visible+mapped windows over hidden ones.
   const std::string want = to_lower_ascii(selector);
+  GtkWidget* best = nullptr;
+  int best_score = -1;
   for (guint i = 0; i < n; ++i) {
     gpointer obj = g_list_model_get_item(toplevels, i);
     if (obj == nullptr)
@@ -309,11 +381,21 @@ GtkWidget* resolve_gtk_toplevel(const std::string& selector) {
           match = true;
       }
     }
+    int score = -1;
+    if (match) {
+      const bool vis = gtk_widget_get_visible(w) != FALSE;
+      const bool mapped = gtk_widget_get_mapped(w) != FALSE;
+      score = (vis && mapped) ? 2 : (vis ? 1 : 0);
+    }
     g_object_unref(obj);
-    if (match)
-      return w;
+    if (score > best_score) {
+      best = w;
+      best_score = score;
+      if (best_score == 2)
+        return best;
+    }
   }
-  return nullptr;
+  return best;
 }
 
 void dump_gtk_widget_json(GtkWidget* w,
@@ -321,6 +403,7 @@ void dump_gtk_widget_json(GtkWidget* w,
                           int depth,
                           int max_depth,
                           int* node_budget,
+                          bool include_measure,
                           std::string* out) {
   if (w == nullptr || *node_budget <= 0) {
     *out += "null";
@@ -331,6 +414,8 @@ void dump_gtk_widget_json(GtkWidget* w,
   const char* name = gtk_widget_get_name(w);
   const bool vis = gtk_widget_get_visible(w) != FALSE;
   const bool mapped = gtk_widget_get_mapped(w) != FALSE;
+  const bool sensitive = gtk_widget_get_sensitive(w) != FALSE;
+  const double opacity = gtk_widget_get_opacity(w);
   const int width = gtk_widget_get_width(w);
   const int height = gtk_widget_get_height(w);
   graphene_rect_t bounds{};
@@ -341,13 +426,38 @@ void dump_gtk_widget_json(GtkWidget* w,
   append_json_str(type_name ? type_name : "?", out);
   *out += ",\"name\":";
   append_json_str(name ? name : "", out);
-  char geom[160];
+  char geom[224];
   std::snprintf(
       geom, sizeof(geom),
-      ",\"visible\":%s,\"mapped\":%s,\"w\":%d,\"h\":%d,\"x\":%.1f,\"y\":%.1f",
-      vis ? "true" : "false", mapped ? "true" : "false", width, height,
+      ",\"visible\":%s,\"mapped\":%s,\"sensitive\":%s,\"opacity\":%.3f,"
+      "\"w\":%d,\"h\":%d,\"x\":%.1f,\"y\":%.1f",
+      vis ? "true" : "false", mapped ? "true" : "false",
+      sensitive ? "true" : "false", opacity,
+      width, height,
       has_bounds ? bounds.origin.x : 0.0f, has_bounds ? bounds.origin.y : 0.0f);
   *out += geom;
+
+  if (include_measure) {
+    int min_w = 0, nat_w = 0, min_h = 0, nat_h = 0;
+    gtk_widget_measure(w, GTK_ORIENTATION_HORIZONTAL, -1,
+                       &min_w, &nat_w, nullptr, nullptr);
+    gtk_widget_measure(w, GTK_ORIENTATION_VERTICAL, std::max(nat_w, 1),
+                       &min_h, &nat_h, nullptr, nullptr);
+    char m[128];
+    std::snprintf(m, sizeof(m),
+                  ",\"min_w\":%d,\"nat_w\":%d,\"min_h\":%d,\"nat_h\":%d",
+                  min_w, nat_w, min_h, nat_h);
+    *out += m;
+  }
+
+  if (GTK_IS_WINDOW(w)) {
+    const HWND hwnd = gtk_widget_hwnd(w);
+    char hbuf[48];
+    std::snprintf(hbuf, sizeof(hbuf), ",\"hwnd\":\"0x%llX\",",
+                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(hwnd)));
+    *out += hbuf;
+    append_win32_hwnd_state_fields(hwnd, out);
+  }
 
   char** classes = gtk_widget_get_css_classes(w);
   *out += ",\"classes\":[";
@@ -390,7 +500,8 @@ void dump_gtk_widget_json(GtkWidget* w,
         if (!first)
           out->push_back(',');
         first = false;
-        dump_gtk_widget_json(ch, root, depth + 1, max_depth, node_budget, out);
+        dump_gtk_widget_json(ch, root, depth + 1, max_depth, node_budget,
+                             include_measure, out);
         ch = gtk_widget_get_next_sibling(ch);
       }
       *out += "]";
@@ -798,22 +909,24 @@ bool exec_dev_op_inner(const DevOpRequest& req,
             const char* ttl = GTK_IS_WINDOW(w) ? gtk_window_get_title(GTK_WINDOW(w)) : "";
             GskRenderer* r = GTK_IS_NATIVE(w) ? gtk_native_get_renderer(GTK_NATIVE(w)) : nullptr;
             const char* rname = r != nullptr ? G_OBJECT_TYPE_NAME(r) : "(none)";
-            GdkSurface* surf = GTK_IS_NATIVE(w) ? gtk_native_get_surface(GTK_NATIVE(w)) : nullptr;
-            HWND hwnd = surf != nullptr
-                            ? static_cast<HWND>(gdk_win32_surface_get_handle(surf))
-                            : nullptr;
+            HWND hwnd = gtk_widget_hwnd(w);
             char head[256];
             std::snprintf(
                 head, sizeof(head),
-                "{\"index\":%u,\"visible\":%s,\"mapped\":%s,\"w\":%d,\"h\":%d,"
-                "\"scale\":%d,\"hwnd\":\"0x%llX\",\"renderer\":",
+                "{\"index\":%u,\"visible\":%s,\"mapped\":%s,\"sensitive\":%s,"
+                "\"opacity\":%.3f,\"w\":%d,\"h\":%d,"
+                "\"scale\":%d,\"hwnd\":\"0x%llX\",",
                 i,
                 gtk_widget_get_visible(w) ? "true" : "false",
                 gtk_widget_get_mapped(w) ? "true" : "false",
+                gtk_widget_get_sensitive(w) ? "true" : "false",
+                gtk_widget_get_opacity(w),
                 gtk_widget_get_width(w), gtk_widget_get_height(w),
                 gtk_widget_get_scale_factor(w),
                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(hwnd)));
             json += head;
+            append_win32_hwnd_state_fields(hwnd, &json);
+            json += ",\"renderer\":";
             append_json_str(rname, &json);
             json += ",\"name\":";
             append_json_str(nm ? nm : "", &json);
@@ -838,6 +951,7 @@ bool exec_dev_op_inner(const DevOpRequest& req,
     }
     const std::string win_sel = arg_str(req.args, "window", "0");
     const int max_depth = std::clamp(arg_int(req.args, "max_depth", 8), 1, 20);
+    const bool include_measure = arg_bool(req.args, "measure", false);
     std::string json;
     bool found = false;
     if (!run_on_gtk_main_sync([&] {
@@ -846,7 +960,8 @@ bool exec_dev_op_inner(const DevOpRequest& req,
             return;
           found = true;
           int budget = 400;
-          dump_gtk_widget_json(root, root, 0, max_depth, &budget, &json);
+          dump_gtk_widget_json(root, root, 0, max_depth, &budget,
+                               include_measure, &json);
         })) {
       *out_err = "GTK main-thread dispatch timed out";
       return false;
@@ -864,29 +979,252 @@ bool exec_dev_op_inner(const DevOpRequest& req,
       *out_err = "GTK is not initialized";
       return false;
     }
-    const bool clear = arg_bool(req.args, "clear", false);
+    const bool clear_flag = arg_bool(req.args, "clear", false);
+    std::string action = to_lower_ascii(arg_str(req.args, "action"));
+    if (clear_flag)
+      action = "clear";
+    else if (action.empty())
+      action = "replace";
     const std::string css = arg_str(req.args, "css");
+    if (action != "replace" && action != "append" &&
+        action != "list" && action != "clear") {
+      *out_err = "unknown gtk.css action: " + action;
+      return false;
+    }
+    std::string res_json;
     if (!run_on_gtk_main_sync([&] {
           GdkDisplay* disp = gdk_display_get_default();
-          if (disp == nullptr)
+          if (action == "list") {
+            char head[96];
+            std::snprintf(head, sizeof(head),
+                          "{\"action\":\"list\",\"active\":%s,\"bytes\":%zu,\"css\":",
+                          g_live_debug_css_provider != nullptr ? "true" : "false",
+                          g_live_debug_css_text.size());
+            res_json = head;
+            append_json_str(g_live_debug_css_text, &res_json);
+            res_json += "}";
             return;
-          if (g_live_debug_css_provider != nullptr) {
-            gtk_style_context_remove_provider_for_display(
-                disp, GTK_STYLE_PROVIDER(g_live_debug_css_provider));
-            g_clear_object(&g_live_debug_css_provider);
           }
-          if (!clear && !css.empty()) {
-            g_live_debug_css_provider = gtk_css_provider_new();
-            gtk_css_provider_load_from_string(g_live_debug_css_provider, css.c_str());
-            gtk_style_context_add_provider_for_display(
-                disp, GTK_STYLE_PROVIDER(g_live_debug_css_provider),
-                GTK_STYLE_PROVIDER_PRIORITY_USER);
+          if (action == "clear") {
+            g_live_debug_css_text.clear();
+          } else if (action == "append") {
+            if (!css.empty()) {
+              if (!g_live_debug_css_text.empty() && g_live_debug_css_text.back() != '\n')
+                g_live_debug_css_text.push_back('\n');
+              g_live_debug_css_text += css;
+            }
+          } else {
+            g_live_debug_css_text = css;
           }
+
+          if (disp != nullptr) {
+            if (g_live_debug_css_provider != nullptr) {
+              gtk_style_context_remove_provider_for_display(
+                  disp, GTK_STYLE_PROVIDER(g_live_debug_css_provider));
+              g_clear_object(&g_live_debug_css_provider);
+            }
+            if (!g_live_debug_css_text.empty()) {
+              g_live_debug_css_provider = gtk_css_provider_new();
+              gtk_css_provider_load_from_string(g_live_debug_css_provider,
+                                                g_live_debug_css_text.c_str());
+              gtk_style_context_add_provider_for_display(
+                  disp, GTK_STYLE_PROVIDER(g_live_debug_css_provider),
+                  GTK_STYLE_PROVIDER_PRIORITY_USER);
+            }
+          }
+          char buf[128];
+          std::snprintf(buf, sizeof(buf),
+                        "{\"action\":\"%s\",\"%s\":true,\"bytes\":%zu}",
+                        action.c_str(),
+                        g_live_debug_css_text.empty() ? "cleared" : "applied",
+                        g_live_debug_css_text.size());
+          res_json = buf;
         })) {
       *out_err = "GTK main-thread dispatch timed out";
       return false;
     }
-    *out_data_json = clear ? "{\"cleared\":true}" : "{\"applied\":true}";
+    *out_data_json = std::move(res_json);
+    return true;
+  }
+
+  if (op == "gtk.node_at") {
+    if (!gtk_is_initialized()) {
+      *out_err = "GTK is not initialized";
+      return false;
+    }
+    const std::string win_sel = arg_str(req.args, "window", "0");
+    const double req_x = std::atof(arg_str(req.args, "x", "0").c_str());
+    const double req_y = std::atof(arg_str(req.args, "y", "0").c_str());
+    const bool screen_coords = arg_bool(req.args, "screen", false);
+    std::string res_json;
+    std::string err;
+    if (!run_on_gtk_main_sync([&] {
+          GtkWidget* root = resolve_gtk_toplevel(win_sel);
+          if (root == nullptr) {
+            err = "GTK window not found: " + win_sel;
+            return;
+          }
+          double lx = req_x;
+          double ly = req_y;
+          if (screen_coords) {
+            HWND hwnd = gtk_widget_hwnd(root);
+            if (hwnd == nullptr || !IsWindow(hwnd)) {
+              err = "target window has no realized HWND for screen coords";
+              return;
+            }
+            POINT pt{static_cast<LONG>(std::lround(req_x)),
+                     static_cast<LONG>(std::lround(req_y))};
+            ScreenToClient(hwnd, &pt);
+            const int scale = std::max(gtk_widget_get_scale_factor(root), 1);
+            lx = static_cast<double>(pt.x) / static_cast<double>(scale);
+            ly = static_cast<double>(pt.y) / static_cast<double>(scale);
+          }
+          GtkWidget* picked = gtk_widget_pick(root, lx, ly, GTK_PICK_DEFAULT);
+          if (picked == nullptr) {
+            char b[128];
+            std::snprintf(b, sizeof(b),
+                          "{\"hit\":false,\"lx\":%.1f,\"ly\":%.1f,\"chain\":[]}",
+                          lx, ly);
+            res_json = b;
+            return;
+          }
+          std::vector<GtkWidget*> chain;
+          for (GtkWidget* cur = picked; cur != nullptr; cur = gtk_widget_get_parent(cur))
+            chain.push_back(cur);
+          std::reverse(chain.begin(), chain.end());
+
+          auto append_node_brief = [&](GtkWidget* nw, bool include_meas) {
+            const char* tn = G_OBJECT_TYPE_NAME(nw);
+            const char* nm = gtk_widget_get_name(nw);
+            const char* cn = gtk_widget_get_css_name(nw);
+            graphene_rect_t b{};
+            const bool hb = gtk_widget_compute_bounds(nw, root, &b) != FALSE;
+            res_json += "{\"type\":";
+            append_json_str(tn ? tn : "?", &res_json);
+            res_json += ",\"css_name\":";
+            append_json_str(cn ? cn : "", &res_json);
+            res_json += ",\"name\":";
+            append_json_str(nm ? nm : "", &res_json);
+            char g[192];
+            std::snprintf(g, sizeof(g),
+                          ",\"visible\":%s,\"sensitive\":%s,\"w\":%d,\"h\":%d,\"x\":%.1f,\"y\":%.1f",
+                          gtk_widget_get_visible(nw) ? "true" : "false",
+                          gtk_widget_get_sensitive(nw) ? "true" : "false",
+                          gtk_widget_get_width(nw), gtk_widget_get_height(nw),
+                          hb ? b.origin.x : 0.0f, hb ? b.origin.y : 0.0f);
+            res_json += g;
+            if (include_meas) {
+              int mw = 0, nw_sz = 0, mh = 0, nh = 0;
+              gtk_widget_measure(nw, GTK_ORIENTATION_HORIZONTAL, -1, &mw, &nw_sz, nullptr, nullptr);
+              gtk_widget_measure(nw, GTK_ORIENTATION_VERTICAL, std::max(nw_sz, 1), &mh, &nh, nullptr, nullptr);
+              char ms[96];
+              std::snprintf(ms, sizeof(ms),
+                            ",\"min_w\":%d,\"nat_w\":%d,\"min_h\":%d,\"nat_h\":%d",
+                            mw, nw_sz, mh, nh);
+              res_json += ms;
+            }
+            char** cls = gtk_widget_get_css_classes(nw);
+            res_json += ",\"classes\":[";
+            if (cls != nullptr) {
+              for (int i = 0; cls[i] != nullptr; ++i) {
+                if (i > 0) res_json.push_back(',');
+                append_json_str(cls[i], &res_json);
+              }
+              g_strfreev(cls);
+            }
+            res_json += "]}";
+          };
+
+          char hd[96];
+          std::snprintf(hd, sizeof(hd),
+                        "{\"hit\":true,\"lx\":%.1f,\"ly\":%.1f,\"target\":",
+                        lx, ly);
+          res_json = hd;
+          append_node_brief(picked, true);
+          res_json += ",\"chain\":[";
+          for (size_t i = 0; i < chain.size(); ++i) {
+            if (i > 0) res_json.push_back(',');
+            append_node_brief(chain[i], false);
+          }
+          res_json += "]}";
+        })) {
+      *out_err = "GTK main-thread dispatch timed out";
+      return false;
+    }
+    if (!err.empty()) {
+      *out_err = err;
+      return false;
+    }
+    *out_data_json = std::move(res_json);
+    return true;
+  }
+
+  if (op == "gtk.redraw") {
+    if (!gtk_is_initialized()) {
+      *out_err = "GTK is not initialized";
+      return false;
+    }
+    const std::string win_sel = arg_str(req.args, "window", "all");
+    std::string res_json;
+    std::string err;
+    if (!run_on_gtk_main_sync([&] {
+          auto redraw_widget = [](GtkWidget* w) {
+            gtk_widget_queue_allocate(w);
+            gtk_widget_queue_draw(w);
+            if (GTK_IS_WINDOW(w)) {
+              if (GtkWidget* ch = gtk_window_get_child(GTK_WINDOW(w)))
+                gtk_widget_queue_draw(ch);
+            }
+            HWND hwnd = gtk_widget_hwnd(w);
+            if (hwnd != nullptr && IsWindow(hwnd))
+              InvalidateRect(hwnd, nullptr, TRUE);
+          };
+          std::vector<std::string> hwnds;
+          if (to_lower_ascii(win_sel) == "all") {
+            GListModel* toplevels = gtk_window_get_toplevels();
+            const guint n = toplevels != nullptr ? g_list_model_get_n_items(toplevels) : 0;
+            for (guint i = 0; i < n; ++i) {
+              gpointer obj = g_list_model_get_item(toplevels, i);
+              GtkWidget* w = GTK_IS_WIDGET(obj) ? GTK_WIDGET(obj) : nullptr;
+              if (w != nullptr && gtk_widget_get_visible(w)) {
+                redraw_widget(w);
+                char hb[32];
+                std::snprintf(hb, sizeof(hb), "0x%llX",
+                              static_cast<unsigned long long>(
+                                  reinterpret_cast<uintptr_t>(gtk_widget_hwnd(w))));
+                hwnds.emplace_back(hb);
+              }
+              if (obj != nullptr)
+                g_object_unref(obj);
+            }
+          } else {
+            GtkWidget* root = resolve_gtk_toplevel(win_sel);
+            if (root == nullptr) {
+              err = "GTK window not found: " + win_sel;
+              return;
+            }
+            redraw_widget(root);
+            char hb[32];
+            std::snprintf(hb, sizeof(hb), "0x%llX",
+                          static_cast<unsigned long long>(
+                              reinterpret_cast<uintptr_t>(gtk_widget_hwnd(root))));
+            hwnds.emplace_back(hb);
+          }
+          res_json = "{\"redrawn\":" + std::to_string(hwnds.size()) + ",\"windows\":[";
+          for (size_t i = 0; i < hwnds.size(); ++i) {
+            if (i > 0) res_json.push_back(',');
+            append_json_str(hwnds[i], &res_json);
+          }
+          res_json += "]}";
+        })) {
+      *out_err = "GTK main-thread dispatch timed out";
+      return false;
+    }
+    if (!err.empty()) {
+      *out_err = err;
+      return false;
+    }
+    *out_data_json = std::move(res_json);
     return true;
   }
 
@@ -902,8 +1240,14 @@ bool exec_dev_op_inner(const DevOpRequest& req,
     const std::string prop = to_lower_ascii(arg_str(req.args, "prop"));
     const bool has_val = req.args.count("value") > 0;
     const std::string val = arg_str(req.args, "value");
+    const std::string fallback_str = to_lower_ascii(arg_str(req.args, "fallback"));
+    const bool fallback_mouse =
+        (fallback_str == "mouse") || arg_bool(req.args, "fallback", false);
     std::string res_json;
     std::string err;
+    bool need_mouse_fallback = false;
+    int click_screen_x = 0;
+    int click_screen_y = 0;
     if (!run_on_gtk_main_sync([&] {
           GtkWidget* root = resolve_gtk_toplevel(win_sel);
           if (root == nullptr) {
@@ -919,12 +1263,39 @@ bool exec_dev_op_inner(const DevOpRequest& req,
             return;
           }
           if (op == "gtk.click") {
+            const bool vis = gtk_widget_get_visible(target) != FALSE;
+            const bool sens = gtk_widget_get_sensitive(target) != FALSE;
+            if (!vis || !sens) {
+              res_json = std::string("{\"activated\":false,\"reason\":\"") +
+                         (!vis ? "widget_not_visible" : "widget_not_sensitive") + "\"}";
+              return;
+            }
             if (GTK_IS_BUTTON(target)) {
               g_signal_emit_by_name(target, "clicked");
-              res_json = "{\"emitted\":\"clicked\"}";
+              res_json = "{\"activated\":true,\"emitted\":\"clicked\"}";
             } else {
               gboolean ok = gtk_widget_activate(target);
-              res_json = std::string("{\"activated\":") + (ok ? "true" : "false") + "}";
+              if (ok) {
+                res_json = "{\"activated\":true}";
+              } else if (fallback_mouse) {
+                HWND hwnd = gtk_widget_hwnd(root);
+                graphene_rect_t bounds{};
+                if (hwnd == nullptr || !IsWindow(hwnd) ||
+                    !gtk_widget_compute_bounds(target, root, &bounds)) {
+                  res_json = "{\"activated\":false,\"reason\":\"mouse_fallback_unavailable\"}";
+                  return;
+                }
+                POINT pt{0, 0};
+                ClientToScreen(hwnd, &pt);
+                const int scale = std::max(gtk_widget_get_scale_factor(root), 1);
+                click_screen_x = pt.x + static_cast<int>(std::lround(
+                    (bounds.origin.x + bounds.size.width * 0.5) * scale));
+                click_screen_y = pt.y + static_cast<int>(std::lround(
+                    (bounds.origin.y + bounds.size.height * 0.5) * scale));
+                need_mouse_fallback = true;
+              } else {
+                res_json = "{\"activated\":false,\"reason\":\"widget_not_activatable_use_fallback_mouse\"}";
+              }
             }
           } else {
             if (prop == "visible") {
@@ -947,6 +1318,67 @@ bool exec_dev_op_inner(const DevOpRequest& req,
               const char* t = gtk_editable_get_text(GTK_EDITABLE(target));
               append_json_str(t ? t : "", &res_json);
               res_json += "}";
+            } else if (prop == "text" && GTK_IS_LABEL(target)) {
+              if (has_val) gtk_label_set_text(GTK_LABEL(target), val.c_str());
+              res_json = "{\"text\":";
+              const char* t = gtk_label_get_text(GTK_LABEL(target));
+              append_json_str(t ? t : "", &res_json);
+              res_json += "}";
+            } else if (prop == "classes") {
+              if (has_val && !val.empty()) {
+                if (val[0] == '+' && val.size() > 1)
+                  gtk_widget_add_css_class(target, val.c_str() + 1);
+                else if (val[0] == '-' && val.size() > 1)
+                  gtk_widget_remove_css_class(target, val.c_str() + 1);
+              }
+              char** cls = gtk_widget_get_css_classes(target);
+              res_json = "{\"classes\":[";
+              if (cls != nullptr) {
+                for (int i = 0; cls[i] != nullptr; ++i) {
+                  if (i > 0) res_json.push_back(',');
+                  append_json_str(cls[i], &res_json);
+                }
+                g_strfreev(cls);
+              }
+              res_json += "]}";
+            } else if (prop == "min_size" || prop == "measure") {
+              int min_w = 0, nat_w = 0, min_h = 0, nat_h = 0;
+              gtk_widget_measure(target, GTK_ORIENTATION_HORIZONTAL, -1,
+                                 &min_w, &nat_w, nullptr, nullptr);
+              gtk_widget_measure(target, GTK_ORIENTATION_VERTICAL, std::max(nat_w, 1),
+                                 &min_h, &nat_h, nullptr, nullptr);
+              char b[160];
+              std::snprintf(b, sizeof(b),
+                            "{\"min_w\":%d,\"nat_w\":%d,\"min_h\":%d,\"nat_h\":%d,\"w\":%d,\"h\":%d}",
+                            min_w, nat_w, min_h, nat_h,
+                            gtk_widget_get_width(target), gtk_widget_get_height(target));
+              res_json = b;
+            } else if (prop == "bounds") {
+              graphene_rect_t b{};
+              const bool hb = gtk_widget_compute_bounds(target, root, &b) != FALSE;
+              char buf[128];
+              std::snprintf(buf, sizeof(buf),
+                            "{\"x\":%.1f,\"y\":%.1f,\"w\":%d,\"h\":%d}",
+                            hb ? b.origin.x : 0.0f, hb ? b.origin.y : 0.0f,
+                            gtk_widget_get_width(target), gtk_widget_get_height(target));
+              res_json = buf;
+            } else if (prop == "css_name") {
+              const char* cn = gtk_widget_get_css_name(target);
+              res_json = "{\"css_name\":";
+              append_json_str(cn ? cn : "", &res_json);
+              res_json += "}";
+            } else if (prop == "margins" || prop == "margin_top" ||
+                       prop == "margin_bottom" || prop == "margin_start" ||
+                       prop == "margin_end") {
+              char buf[128];
+              std::snprintf(buf, sizeof(buf),
+                            "{\"margin_top\":%d,\"margin_bottom\":%d,"
+                            "\"margin_start\":%d,\"margin_end\":%d}",
+                            gtk_widget_get_margin_top(target),
+                            gtk_widget_get_margin_bottom(target),
+                            gtk_widget_get_margin_start(target),
+                            gtk_widget_get_margin_end(target));
+              res_json = buf;
             } else {
               err = "unsupported gtk.prop: " + prop;
             }
@@ -958,6 +1390,21 @@ bool exec_dev_op_inner(const DevOpRequest& req,
     if (!err.empty()) {
       *out_err = err;
       return false;
+    }
+    if (need_mouse_fallback) {
+      DWORD gle = 0;
+      send_mouse_abs_move(click_screen_x, click_screen_y, &gle);
+      Sleep(5);
+      const bool d_ok = send_mouse_button("left", true, &gle);
+      Sleep(15);
+      const bool u_ok = send_mouse_button("left", false, &gle);
+      char buf[160];
+      std::snprintf(buf, sizeof(buf),
+                    "{\"activated\":%s,\"fallback\":\"mouse\",\"x\":%d,\"y\":%d}",
+                    (d_ok && u_ok) ? "true" : "false",
+                    click_screen_x, click_screen_y);
+      *out_data_json = buf;
+      return d_ok && u_ok;
     }
     *out_data_json = std::move(res_json);
     return true;
@@ -1180,8 +1627,14 @@ bool dev_parse_op_shorthand(const std::string& text,
       else if (lop == "key.combo") out->args["keys"] = tok;
       else if (lop == "type") out->args["text"] = tok;
       else if (lop == "win.focus") out->args["hwnd"] = tok;
-      else if (lop == "gtk.tree") out->args["window"] = tok;
-      else if (lop == "gtk.css") out->args["css"] = tok;
+      else if (lop == "gtk.tree" || lop == "gtk.redraw") out->args["window"] = tok;
+      else if (lop == "gtk.css") {
+        const std::string ltok = to_lower_ascii(tok);
+        if (ltok == "list" || ltok == "clear" || ltok == "append" || ltok == "replace")
+          out->args["action"] = ltok;
+        else
+          out->args["css"] = tok;
+      }
       else out->args["action"] = tok;
     }
   }
@@ -1246,7 +1699,7 @@ std::string dev_channel_help_json() {
   return R"({"ok":true,"result":{"channel":"dev-universal","requires_developer_mode":true,"ops":{)"
          R"("input":["key.tap key=<name> [hold_ms=25]","key.down key=<name>","key.up key=<name>","key.combo keys=Win+Tab [hold_ms=30]","type text=<utf8>","mouse.pos","mouse.move x=<px> y=<px> [rel=false]","mouse.click [button=left|right|middle] [x=.. y=..] [double=false]","mouse.drag x1=.. y1=.. x2=.. y2=.. [steps=16 duration_ms=240]","mouse.wheel delta=-120 [horiz=false x=.. y=..]"],)"
          R"("window":["win.list","win.fg","win.focus hwnd=0x..","win.move hwnd=0x.. [x=.. y=.. w=.. h=..]","win.state hwnd=0x.. action=minimize|maximize|restore|show|hide|close","win.msg hwnd=0x.. msg=<num> [wparam=0 lparam=0 post=true]"],)"
-         R"("gtk":["gtk.windows","gtk.tree [window=0|<name>] [max_depth=8]","gtk.css css=<rules> | clear=true","gtk.click [window=0] [name=.. class=.. text=..]","gtk.prop [window=0] [name=.. class=..] prop=visible|opacity|sensitive|text [value=..]"],)"
+         R"("gtk":["gtk.windows","gtk.tree [window=0|<name>|0x<hwnd>] [max_depth=8] [measure=false]","gtk.css [action=replace|append|list|clear] [css=<rules>] [clear=true]","gtk.click [window=0] [name=.. class=.. text=..] [fallback=mouse]","gtk.prop [window=0] [name=.. class=..] prop=visible|opacity|sensitive|text|classes|min_size|bounds|css_name|margins [value=..]","gtk.node_at x=<px> y=<px> [window=0] [screen=false]","gtk.redraw [window=all|0|<name>|0x<hwnd>]"],)"
          R"("shell":["shell.overview action=open|close|toggle|grid|refresh|restack|invalidate_wallpaper|reposition","shell.panel action=reload_theme|close_popovers|inspect","shell.ws action=list|next|prev|switch|create|remove [index=N]","shell.dialog target=settings|looking_glass|run action=open|close|toggle [page=..]","shell.cache action=icon_clear|icon_trim|app_refresh|brightness_invalidate|systray_refresh [keep=64]","shell.config action=get|set|reload [key=.. value=..]","shell.flag name=zorder_trace|hotkey_trace|ipc_trace|frame_overlay value=true|false","shell.fullscreen action=eval","shell.win_tap"],)"
          R"("telemetry":["perf.snapshot","log.tail [count=40 tag=..]","log.clear","sleep ms=<N>"]}}})";
 }

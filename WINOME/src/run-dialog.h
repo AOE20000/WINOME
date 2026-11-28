@@ -7,10 +7,26 @@
 
 #pragma once
 
+#include <windows.h>
+
 #include <string>
 #include <vector>
 
 namespace winome {
+
+// Center a modal dialog rect directly within @monitor_rect (matching GNOME
+// Shell's MonitorConstraint + ModalDialog centering).
+inline RECT compute_run_dialog_centered_rect(const RECT& monitor_rect,
+                                             int width,
+                                             int height) {
+  const int mw = monitor_rect.right - monitor_rect.left;
+  const int mh = monitor_rect.bottom - monitor_rect.top;
+  const int w = width > 0 ? width : 1;
+  const int h = height > 0 ? height : 1;
+  const int x = monitor_rect.left + (mw - w) / 2;
+  const int y = monitor_rect.top + (mh - h) / 2;
+  return RECT{x, y, x + w, y + h};
+}
 
 enum class RunInternalAction {
   None = 0,
@@ -30,6 +46,7 @@ struct RunDialogCallbacks {
   bool (*reload_theme)() = nullptr;
   void (*restart_shell)() = nullptr;
   void (*quit_shell)() = nullptr;
+  void (*close_popovers)() = nullptr;
 };
 
 // Pure helpers covered independently by unit tests.

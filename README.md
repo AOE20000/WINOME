@@ -24,7 +24,7 @@
 └── LICENSE / README.md
 ```
 
-- **宿主进程**：`WINOME/src/`（C++17 + GTK4，单进程含配置、i18n、设置窗、系统托盘、`shell-ipc` 双向 Named Pipe、60s 会话结束确认弹窗、`window-theming` 可选 DWM 统一样式、`perf-metrics` 遥测/熔断、纯 Win32 崩溃恢复弹窗、`diagnostics-export` 一键排障压缩包导出、Looking Glass 控制台、`Alt+F2` 运行弹窗与 `plugin-host` 进程外插件宿主机）
+- **宿主进程**：`WINOME/src/`（C++17 + GTK4，单进程含配置、i18n、设置窗、系统托盘、`background-apps` 后台应用聚合与托盘可选合并、`shell-ipc` 双向 Named Pipe、60s 会话结束确认弹窗、`window-theming` 可选 DWM 统一样式、`perf-metrics` 遥测/熔断、纯 Win32 崩溃恢复弹窗、`diagnostics-export` 一键排障压缩包导出、Looking Glass 控制台、`Alt+F2` 运行弹窗与 `plugin-host` 进程外插件宿主机）
 - **非提权 CLI 控制端**：`WINOME/ctl/`（`winome-ctl.exe`，无 UAC 清单、无 GTK4 依赖，经 User-SID + Medium-IL Named Pipe DACL 与宿主实时交互）
 - **概览（Activities）**：`WINOME/src/overview*.cpp`（含多屏同时展开 `overview-secondary.cpp`）+ `live-wallpaper.cpp` + `app-index.cpp` + `app-grid.cpp`（搜索、第三方动态壁纸引擎无边框 WGC 混合同步、开始菜单 `start2.bin` 解密编组与 `Programs` 目录单向同步分页应用网格、默认黑名单过滤、Dash Favorites、DWM 缩略图与四向跨屏跨工作区拖拽）
 - **St CSS 引擎复刻**：`WINOME/st-compat/`（libcroco + st-theme-node，去 Clutter/Cogl）
@@ -44,7 +44,7 @@
 
 | 方案 | 配置 | 构建目录 | 说明 |
 |------|------|----------|------|
-| `release` 生产 | release + LTO + NDEBUG | `WINOME/build-release/` | 最小体积、最快指令（约 2.7–2.9MB） |
+| `release` 生产 | release + LTO + NDEBUG | `WINOME/build-release/` | 最小体积、最快指令（约 4.8MB） |
 | `test` 测试 | debugoptimized | `WINOME/build/` | 项目默认，保留 `g_print` 诊断日志 |
 | `debug` 调试 | debug（-O0 -g） | `WINOME/build-debug/` | GDB 友好 |
 
@@ -77,10 +77,10 @@ ninja -C build
 
 - [x] 宿主进程骨架 + 置顶全宽顶栏（Activities 圆点 + 时钟 + 状态区图标 + 悬停/点击动画）
 - [x] **崩溃自愈、任务栏兜底恢复与一键排障导出**：独立 `--watchdog` 看门狗、`--restore` 急救、`--safe-mode` 安全模式、`force_restore_all()` + `ABM_GETSTATE` 状态还原、`MiniDumpWriteDump` 转储、无 GTK4 依赖纯 Win32 崩溃恢复弹窗（`crash-dialog.cpp`，提供立即还原任务栏 / 安全重启 / 常规重启 / **一键导出排障压缩包** / 打开数据目录），并在设置页与崩溃弹窗内置 `diagnostics-export.{h,cpp}`（使用 `zlib` 原生打包版本、系统 Build、多屏拓扑、遥测/崩溃摘要、日志、配置与崩溃转储至桌面 `.zip` 并在资源管理器高亮选中），及经当前用户 SID + Medium-IL DACL 加固的双向 Named Pipe IPC（`\\.\pipe\WINOME_Shell_IPC`）与非提权 `winome-ctl.exe`
-- [x] **Developer Mode、Looking Glass 调试台与 GNOME `Alt+F2` 运行**：在 `Settings -> Behavior` 内通过 `Developer Mode`（`developer_mode`）开关启用控制台，支持无快捷键打开 Looking Glass 5 页控制台（Command / Logs / Inspector / Windows / Plugins & Flags）与 `user-debug.css` 热重载；`Alt+F2` 打开 GNOME `.run-dialog` 运行弹窗（支持历史记录、PATH 补全、`Ctrl+Enter` 终端运行与开发者内置指令 `lg`/`rt`/`r`/`debugexit`）
+- [x] **Developer Mode、Looking Glass 调试台、通用调试通道（`dev.*` / `test.*`）与 GNOME `Alt+F2` 运行**：在 `Settings -> Behavior` 内通过 `Developer Mode`（`developer_mode`）开关启用控制台，支持无快捷键打开 Looking Glass 5 页控制台与 `user-debug.css` 热重载；非提权 `winome-ctl.exe` 在开发者模式下提供 `dev` 通用调试通道（36 个 `input` / `window` / `gtk` / `shell` / `telemetry` 原语，含 `gtk.windows`、`gtk.tree` 测量、`gtk.node_at`、`gtk.redraw`、有状态 `gtk.css`、`gtk.click fallback=mouse`）、`test` 自动化测试流水线、`inspect panel` 完整状态查询、`status` PID/Watchdog PID 暴露以及区分 `not_running`/`ipc_access_denied`/管道超时的错误码；`Alt+F2` 打开 GNOME `.run-dialog` 运行弹窗（支持历史记录、PATH 补全、`Ctrl+Enter` 终端运行与开发者内置指令 `lg`/`rt`/`r`/`debugexit`）
 - [x] **进程外 stdio JSON 高可靠插件体系**：`plugin-host.{h,cpp}` 基于 Win32 Job Object 隔离、`%LOCALAPPDATA%\WINOME\plugins\<id>\manifest.json` 能力白名单（`topbar`/`quicksettings`/`notify`/`desktop.read`）、`30 msg/s` 限流与 60 秒 3 次崩溃自动熔断（`Tripped`），并在顶栏状态区与快速设置网格提供声明式扩展槽位（内置 Python 示例 `WINOME/examples/plugins/sysmon-sample/`）
 - [x] **EndSession 60 秒确认弹窗与 DWM 窗口外观统一（可选）**：重启/关机/注销前弹出 GNOME `.modal-dialog` 60 秒倒计时确认弹窗（支持 `config.json` `end_session_confirm` 开关与 `Esc` 取消）；`window-theming.cpp` 提供零注入可选 `unify_dark_titlebars` 与 `unify_rounded_corners` 统一样式
-- [x] 隐藏原生任务栏、事件钩子防重现、系统托盘兼容层（`systray.cpp` 结合 `ToolbarWindow32` 与 Win11 XAML `DesktopWindowContentBridge`/`NotifyItemIcon` 采集第三方托盘图标，采用动作/扫描双线程分离、`IUIAutomation2` 超时、`FindAllBuildCache` 作用域收窄、注册表真图标缓存、`ShowContextMenu()`/`Shift+F10` 右键菜单及非阻塞 `winome-ctl inspect tray`）
+- [x] 隐藏原生任务栏、事件钩子防重现、系统托盘兼容层与控制中心「后台应用」（`systray.cpp` 结合 `ToolbarWindow32` 与 Win11 XAML `DesktopWindowContentBridge`/`NotifyItemIcon` 采集第三方托盘图标，采用动作/扫描双线程分离、`IUIAutomation2` 超时、`FindAllBuildCache` 作用域收窄、注册表真图标缓存、`ShowContextMenu()`/`Shift+F10` 右键菜单及非阻塞 `winome-ctl inspect tray`；默认在顶栏提供独立托盘按钮（`tray_location = "panel"`），并在控制中心底部通过 `background-apps.cpp` 呈现 GNOME 风格「后台应用（Background Apps）」折叠栏，也可在设置中将托盘应用合并并入该折叠栏并明确区分「托盘应用」与「后台应用」）
 - [x] **概览触发与工作区快捷键**：**Win 键**单按开合 `WINDOW_PICKER`、**550ms 内双击 Win 键**丝滑进阶至 `APP_GRID`、**左上角热角**（`WH_MOUSE_LL`，全屏隐藏时自动卸钩）、`Win+PageUp/PageDown` 切换工作区、`Win+Shift+PageUp/PageDown` 移动活动窗口到相邻工作区并跟随，`Win+Tab` 打开开始菜单，其余不冲突快捷键（如 `Win+V` 剪贴板、`Win+E`、`Win+R`、`Win+Shift+S`、`Win+Ctrl+←/→` 等）通过单次原子 `SendInput` 序贯透传，均受 `config.json` 开关控制
 - [x] 概览显示**最小化窗口**、默认黑名单过滤（`overview_window_blacklist`，默认屏蔽“Windows 输入体验”与 `explorer.exe` 无名无画面窗，可在设置关闭）；面板与弹出窗位于概览之上；顶栏保留工作区；面板按显示器独立判断全屏自动隐藏；隐藏于 Alt-Tab（`WS_EX_TOOLWINDOW`）
 - [x] **完整 GNOME 多显示器、独立工作区引擎与多屏同时概览（v0.2.0）**：
@@ -123,6 +123,7 @@ ninja -C build
 
 - 开发环境与构建排障：[docs/build-and-env.md](docs/build-and-env.md)
 - 系统架构、概览与数据源：[docs/architecture.md](docs/architecture.md)
+- 开发者调试通道与 `winome-ctl` 指南：[docs/dev-channel.md](docs/dev-channel.md)
 - 主题管线、St 引擎与 UI 规范：[docs/theme-and-ui.md](docs/theme-and-ui.md)
 - 硬约束与踩坑备忘：[docs/pitfalls.md](docs/pitfalls.md)
 - 生产级开发计划与路线图：[docs/roadmap.md](docs/roadmap.md)

@@ -192,6 +192,47 @@ inline WinKeyComboAction classify_win_key_combo(unsigned vk,
   return WinKeyComboAction::PassthroughCombo;
 }
 
+enum class VdComboInProcessAction {
+  Passthrough,
+  SwitchPrev,
+  SwitchNext,
+  CreateAndSwitch,
+  RemoveCurrent,
+};
+
+// Decides whether a Win+Ctrl+{Left,Right,D,F4} hotkey should be handled
+// directly in-process via WINOME's workspace/VD COM backend instead of
+// re-injecting synthetic Win keystrokes toward Windows.
+inline VdComboInProcessAction resolve_vd_combo_in_process_action(
+    unsigned vk,
+    bool shift_held,
+    bool alt_held,
+    bool win_already_injected,
+    bool independent_mode,
+    bool native_vd_ready,
+    bool native_can_manage_desktops) {
+  if (win_already_injected || shift_held || alt_held)
+    return VdComboInProcessAction::Passthrough;
+  if (vk == 0x25 /* VK_LEFT */ || vk == 0x27 /* VK_RIGHT */) {
+    if (independent_mode || native_vd_ready) {
+      return (vk == 0x25) ? VdComboInProcessAction::SwitchPrev
+                          : VdComboInProcessAction::SwitchNext;
+    }
+    return VdComboInProcessAction::Passthrough;
+  }
+  if (vk == 'D') {
+    return (independent_mode || (native_vd_ready && native_can_manage_desktops))
+               ? VdComboInProcessAction::CreateAndSwitch
+               : VdComboInProcessAction::Passthrough;
+  }
+  if (vk == 0x73 /* VK_F4 */) {
+    return (independent_mode || (native_vd_ready && native_can_manage_desktops))
+               ? VdComboInProcessAction::RemoveCurrent
+               : VdComboInProcessAction::Passthrough;
+  }
+  return VdComboInProcessAction::Passthrough;
+}
+
 // Callback invoked (on the main thread) whenever the Activities overview opens
 // or closes. @monitor identifies the affected monitor (or nullptr when all
 // monitors transition together, e.g. linked open / close-all). Used e.g. by

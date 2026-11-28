@@ -261,6 +261,8 @@ void sanitize_config(WinomeConfig* cfg) {
   if (cfg->clock_format != "auto" && cfg->clock_format != "24h" &&
       cfg->clock_format != "12h")
     cfg->clock_format = "auto";
+  if (cfg->tray_location != "panel" && cfg->tray_location != "quick_settings")
+    cfg->tray_location = "panel";
   if (cfg->live_wallpaper_mode != "live" &&
       cfg->live_wallpaper_mode != "snapshot" &&
       cfg->live_wallpaper_mode != "off")
@@ -359,6 +361,8 @@ std::string serialize_config(const WinomeConfig& cfg) {
   out += cfg.clock_show_seconds ? "true" : "false";
   out += ",\n  \"show_battery_percentage\": ";
   out += cfg.show_battery_percentage ? "true" : "false";
+  out += ",\n  \"tray_location\": ";
+  append_escaped_json_string(cfg.tray_location, &out);
   out += ",\n  \"hot_corner_enabled\": ";
   out += cfg.hot_corner_enabled ? "true" : "false";
   out += ",\n  \"hot_corner_cooldown_ms\": ";
@@ -439,6 +443,8 @@ bool parse_config(const std::string& json, WinomeConfig* out) {
       ok = parse_json_bool(json, &pos, &cfg.clock_show_seconds);
     else if (key == "show_battery_percentage")
       ok = parse_json_bool(json, &pos, &cfg.show_battery_percentage);
+    else if (key == "tray_location")
+      ok = parse_json_string(json, &pos, &cfg.tray_location);
     else if (key == "hot_corner_enabled")
       ok = parse_json_bool(json, &pos, &cfg.hot_corner_enabled);
     else if (key == "hot_corner_cooldown_ms")

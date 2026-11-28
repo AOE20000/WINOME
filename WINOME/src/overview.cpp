@@ -1110,6 +1110,54 @@ pixbuf_to_opaque_rgb_texture (GdkPixbuf *pb)
   return tex;
 }
 
+static cairo_surface_t *g_wallpaper_cairo = nullptr;
+static cairo_surface_t *g_wallpaper_thumb_cairo = nullptr;
+
+static cairo_surface_t *
+texture_to_cairo_rgb24_surface (GdkTexture *tex)
+{
+  if (tex == nullptr)
+    return nullptr;
+  const int w = gdk_texture_get_width (tex);
+  const int h = gdk_texture_get_height (tex);
+  if (w <= 0 || h <= 0)
+    return nullptr;
+  cairo_surface_t *surf =
+      cairo_image_surface_create (CAIRO_FORMAT_RGB24, w, h);
+  if (cairo_surface_status (surf) != CAIRO_STATUS_SUCCESS) {
+    cairo_surface_destroy (surf);
+    return nullptr;
+  }
+  const int dst_stride = cairo_image_surface_get_stride (surf);
+  unsigned char *dst = cairo_image_surface_get_data (surf);
+  // gdk_texture_download() outputs B8G8R8A8_PREMULTIPLIED, which matches
+  // little-endian CAIRO_FORMAT_RGB24 (B, G, R, X bytes per pixel).
+  gdk_texture_download (tex, dst, static_cast<gsize> (dst_stride));
+  cairo_surface_mark_dirty (surf);
+  return surf;
+}
+
+static void
+clear_wallpaper_surfaces (void)
+{
+  if (g_wallpaper_cairo != nullptr) {
+    cairo_surface_destroy (g_wallpaper_cairo);
+    g_wallpaper_cairo = nullptr;
+  }
+  if (g_wallpaper_thumb_cairo != nullptr) {
+    cairo_surface_destroy (g_wallpaper_thumb_cairo);
+    g_wallpaper_thumb_cairo = nullptr;
+  }
+}
+
+static void
+sync_wallpaper_cairo_surfaces (GdkTexture *full_tex, GdkTexture *thumb_tex)
+{
+  clear_wallpaper_surfaces ();
+  g_wallpaper_cairo = texture_to_cairo_rgb24_surface (full_tex);
+  g_wallpaper_thumb_cairo = texture_to_cairo_rgb24_surface (thumb_tex);
+}
+
 void
 load_wallpaper (bool force = false)
 {
@@ -1202,6 +1250,7 @@ load_wallpaper (bool force = false)
         g_clear_object (&g_wallpaper_thumb);
         g_wallpaper = texture;
         g_wallpaper_thumb = thumb_tex;
+        sync_wallpaper_cairo_surfaces (g_wallpaper, g_wallpaper_thumb);
         g_wallpaper_cache = {path, mtime, file_size, target_w, target_h, true};
         return;
       }
@@ -1209,6 +1258,7 @@ load_wallpaper (bool force = false)
     }
   }
   g_wallpaper_cache = WallpaperCacheKey{};
+  clear_wallpaper_surfaces ();
   g_clear_object (&g_wallpaper);
   g_clear_object (&g_wallpaper_thumb);
 }
@@ -1318,6 +1368,7 @@ on_async_wallpaper_ready (gpointer user_data)
       g_clear_object (&g_wallpaper_thumb);
       g_wallpaper = full_tex;
       g_wallpaper_thumb = thumb_tex;
+      sync_wallpaper_cairo_surfaces (g_wallpaper, g_wallpaper_thumb);
       g_wallpaper_cache = res->key;
     } else {
       g_clear_object (&thumb_tex);
@@ -1465,6 +1516,23 @@ is_overview_chrome_or_panel_hwnd (HWND h)
           is_any_panel_hwnd (h));
 }
 
+static constexpr const wchar_t *kChromeHooksProp =
+    L"WinomeChromeHooksPtr";
+
+struct ChromeSurfaceHooks {
+  GtkWidget **window;
+  HWND *hwnd;
+  guint layout_idle;
+  guint reenable_idle;
+  guint reenable_fallback_timer;
+  bool pending_reenable;
+  GdkFrameClock *frame_clock;
+  gulong after_paint_id;
+  void (*apply_want) (void);
+  const RECT *want_rect = nullptr;
+  bool pending_uncloak = false;
+};
+
 static LRESULT CALLBACK
 chrome_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -1483,6 +1551,21 @@ chrome_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
   if (msg == WM_WINDOWPOSCHANGING && lParam != 0) {
     auto *wp = reinterpret_cast<WINDOWPOS *> (lParam);
     wp->flags |= SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    auto *hooks = reinterpret_cast<ChromeSurfaceHooks *> (
+        GetPropW (hwnd, kChromeHooksProp));
+    if (hooks != nullptr && hooks->want_rect != nullptr &&
+        (wp->flags & SWP_HIDEWINDOW) == 0) {
+      const RECT want = *hooks->want_rect;
+      const int want_w = want.right - want.left;
+      const int want_h = want.bottom - want.top;
+      if (want_w > 0 && want_h > 0) {
+        wp->x = want.left;
+        wp->y = want.top;
+        wp->cx = want_w;
+        wp->cy = want_h;
+        wp->flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
+      }
+    }
   }
   if ((msg == WM_ACTIVATE && LOWORD (wParam) != WA_INACTIVE) ||
       msg == WM_SETFOCUS) {
@@ -1490,18 +1573,20 @@ chrome_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     if (ov != nullptr && view_can_auto_focus_search (ov)) {
       HWND ov_hwnd = view_hwnd (ov);
       if (ov_hwnd != nullptr && IsWindow (ov_hwnd)) {
-        g_print ("[ov-focus] blocked chrome activation hwnd=%p msg=0x%x\n",
-                 static_cast<void *> (hwnd), msg);
-        if (GetForegroundWindow () != ov_hwnd)
+        if (GetForegroundWindow () != ov_hwnd) {
+          g_print ("[ov-focus] blocked chrome activation hwnd=%p msg=0x%x\n",
+                   static_cast<void *> (hwnd), msg);
           SetForegroundWindow (ov_hwnd);
-        else if (GetFocus () != ov_hwnd)
+        } else if (GetFocus () != ov_hwnd) {
           SetFocus (ov_hwnd);
+        }
         return 0;
       }
     }
   }
   if (msg == WM_NCDESTROY) {
     RemovePropW (hwnd, kChromeOrigProcProp);
+    RemovePropW (hwnd, kChromeHooksProp);
     if (orig != nullptr &&
         GetWindowLongPtrW (hwnd, GWLP_WNDPROC) ==
             reinterpret_cast<LONG_PTR> (chrome_subclass_wndproc)) {
@@ -1514,12 +1599,14 @@ chrome_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 }
 
 static void
-ensure_chrome_subclass (HWND hwnd)
+ensure_chrome_subclass (HWND hwnd, ChromeSurfaceHooks *hooks)
 {
-  if (hwnd == nullptr || !IsWindow (hwnd) ||
-      GetPropW (hwnd, kChromeOrigProcProp) != nullptr) {
+  if (hwnd == nullptr || !IsWindow (hwnd))
     return;
-  }
+  if (hooks != nullptr)
+    SetPropW (hwnd, kChromeHooksProp, reinterpret_cast<HANDLE> (hooks));
+  if (GetPropW (hwnd, kChromeOrigProcProp) != nullptr)
+    return;
   WNDPROC cur = reinterpret_cast<WNDPROC> (
       GetWindowLongPtrW (hwnd, GWLP_WNDPROC));
   if (cur != nullptr && cur != chrome_subclass_wndproc) {
@@ -1615,18 +1702,6 @@ chrome_window_apply_want (GtkWidget *win, HWND hwnd, const RECT &want,
   }
 }
 
-struct ChromeSurfaceHooks {
-  GtkWidget **window;
-  HWND *hwnd;
-  guint layout_idle;
-  guint reenable_idle;
-  guint reenable_fallback_timer;
-  bool pending_reenable;
-  GdkFrameClock *frame_clock;
-  gulong after_paint_id;
-  void (*apply_want) (void);
-};
-
 static void
 chrome_finish_reenable (ChromeSurfaceHooks *hooks)
 {
@@ -1639,6 +1714,13 @@ chrome_finish_reenable (ChromeSurfaceHooks *hooks)
     hooks->reenable_fallback_timer = 0;
   }
   hooks->pending_reenable = false;
+  if (hooks->pending_uncloak && hooks->hwnd != nullptr &&
+      *hooks->hwnd != nullptr && IsWindow (*hooks->hwnd) &&
+      hooks->window != nullptr && *hooks->window != nullptr &&
+      gtk_widget_get_visible (*hooks->window)) {
+    set_hwnd_cloaked (*hooks->hwnd, false);
+    hooks->pending_uncloak = false;
+  }
   if (hooks->hwnd != nullptr && *hooks->hwnd != nullptr &&
       IsWindow (*hooks->hwnd) && !IsWindowEnabled (*hooks->hwnd)) {
     EnableWindow (*hooks->hwnd, TRUE);
@@ -1687,6 +1769,16 @@ static void
 on_chrome_after_paint (GdkFrameClock *clock G_GNUC_UNUSED, gpointer user_data)
 {
   auto *hooks = static_cast<ChromeSurfaceHooks *> (user_data);
+  if (hooks->window != nullptr && *hooks->window != nullptr &&
+      gtk_widget_get_visible (*hooks->window)) {
+    if (hooks->apply_want != nullptr)
+      hooks->apply_want ();
+    if (hooks->pending_uncloak && hooks->hwnd != nullptr &&
+        *hooks->hwnd != nullptr && IsWindow (*hooks->hwnd)) {
+      set_hwnd_cloaked (*hooks->hwnd, false);
+      hooks->pending_uncloak = false;
+    }
+  }
   if (hooks->pending_reenable)
     chrome_schedule_reenable (hooks);
 }
@@ -1714,7 +1806,8 @@ chrome_surface_idle_cb (gpointer user_data)
 {
   auto *hooks = static_cast<ChromeSurfaceHooks *> (user_data);
   hooks->layout_idle = 0;
-  if (*hooks->window != nullptr && gtk_widget_get_visible (*hooks->window)) {
+  if (*hooks->window != nullptr && gtk_widget_get_visible (*hooks->window) &&
+      !hooks->pending_uncloak) {
     hooks->apply_want ();
     restack_locked ();
   }
@@ -1761,9 +1854,11 @@ chrome_present_window (ChromeSurfaceHooks *hooks)
     gtk_widget_realize (win);
   if (!gtk_widget_get_visible (win)) {
     // GDK4's Win32 backend defers ShowWindow(SW_SHOWNORMAL) to its frame-clock
-    // paint tick (GDK_PRIORITY_REDRAW = 120), which ignores WS_EX_NOACTIVATE.
-    // Keep WS_DISABLED across that frame-clock map and re-enable from
-    // GdkFrameClock::after-paint -> G_PRIORITY_DEFAULT_IDLE (or 160ms fallback).
+    // paint tick (GDK_PRIORITY_REDRAW = 120), which ignores WS_EX_NOACTIVATE
+    // and initially places the HWND using GDK's stale cached coordinates.
+    // Cloak across the first paint while keeping WS_DISABLED and pinning
+    // want_rect in WM_WINDOWPOSCHANGING, then apply_want + uncloak in
+    // after-paint so the close/icon/caption never flashes at a stale location.
     if (hooks->reenable_idle != 0) {
       g_source_remove (hooks->reenable_idle);
       hooks->reenable_idle = 0;
@@ -1774,15 +1869,36 @@ chrome_present_window (ChromeSurfaceHooks *hooks)
     }
     if (GdkSurface *surf = gtk_native_get_surface (GTK_NATIVE (win))) {
       HWND hwnd = static_cast<HWND> (gdk_win32_surface_get_handle (surf));
-      if (hwnd != nullptr && IsWindow (hwnd) && IsWindowEnabled (hwnd) != FALSE)
-        EnableWindow (hwnd, FALSE);
+      if (hooks->hwnd != nullptr)
+        *hooks->hwnd = hwnd;
+      if (hwnd != nullptr && IsWindow (hwnd)) {
+        chrome_apply_base_ex_styles (hwnd);
+        chrome_bind_owner (hwnd);
+        ensure_hwnd_topmost (hwnd);
+        set_hwnd_cloaked (hwnd, true);
+        hooks->pending_uncloak = true;
+        if (hooks->want_rect != nullptr) {
+          const RECT &wr = *hooks->want_rect;
+          if (wr.right > wr.left && wr.bottom > wr.top) {
+            SetWindowPos (hwnd, HWND_TOPMOST, wr.left, wr.top,
+                          wr.right - wr.left, wr.bottom - wr.top,
+                          SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER);
+          }
+        }
+        if (IsWindowEnabled (hwnd) != FALSE)
+          EnableWindow (hwnd, FALSE);
+      }
     }
     hooks->pending_reenable = true;
     hooks->reenable_fallback_timer =
         g_timeout_add (160, chrome_reenable_fallback_cb, hooks);
     gtk_widget_set_visible (win, TRUE);
+    gtk_widget_queue_draw (win);
     chrome_ensure_after_paint_hook (hooks);
+    return;
   }
+  if (hooks->pending_uncloak)
+    return;
   if (hooks->apply_want != nullptr)
     hooks->apply_want ();
 }
@@ -1798,9 +1914,10 @@ on_chrome_window_realize (GtkWidget *widget, gpointer user_data)
   *hooks->hwnd = hwnd;
   chrome_apply_base_ex_styles (hwnd);
   harden_shell_overlay_hwnd (hwnd);
-  ensure_chrome_subclass (hwnd);
+  ensure_chrome_subclass (hwnd, hooks);
   chrome_bind_owner (hwnd);
   ensure_hwnd_topmost (hwnd);
+  winome::vd::pin_window_async (hwnd);
   g_signal_connect (surface, "layout", G_CALLBACK (on_chrome_surface_layout),
                     hooks);
 }
@@ -1918,6 +2035,7 @@ struct SharedOpenSnapshot {
 static SharedOpenSnapshot
 capture_shared_open_snapshot (void)
 {
+  const gint64 snap_t0 = g_get_monotonic_time ();
   SharedOpenSnapshot snap{};
   snap.mode = ws::effective_mode ();
   if (snap.mode == ws::MultiMonitorWorkspaceMode::Independent)
@@ -1929,6 +2047,7 @@ capture_shared_open_snapshot (void)
   EnumContext ctx{nullptr, RECT{0, 0, 0, 0}, &raw_global, false, true,
                   winome::get_config ().overview_window_blacklist, false};
   EnumWindows (collect_windows, reinterpret_cast<LPARAM> (&ctx));
+  const gint64 snap_t_enum = g_get_monotonic_time ();
 
   std::vector<HWND> hwnds;
   hwnds.reserve (raw_global.size ());
@@ -1939,6 +2058,7 @@ capture_shared_open_snapshot (void)
   int active_idx = -1;
   std::vector<int> raw_desks;
   vd::query_desktops_and_windows_batch (hwnds, &ds, &active_idx, &raw_desks);
+  const gint64 snap_t_vd = g_get_monotonic_time ();
 
   std::vector<int> global_counts (ds.size (), 0);
   snap.global_windows.reserve (raw_global.size ());
@@ -1983,24 +2103,41 @@ capture_shared_open_snapshot (void)
     g_in_dynamic_ws_sync = false;
 
     if (changed) {
-      std::vector<HWND> kept_hwnds;
-      kept_hwnds.reserve (snap.global_windows.size ());
-      for (const OvWindowInfo &w : snap.global_windows)
-        kept_hwnds.push_back (w.hwnd);
-      std::vector<int> refreshed_desks;
-      vd::query_desktops_and_windows_batch (kept_hwnds, &ds, &active_idx,
-                                            &refreshed_desks);
-      if (!plan.remove_indices.empty () &&
-          refreshed_desks.size () == snap.window_desktops.size ()) {
-        snap.window_desktops = std::move (refreshed_desks);
-        snap.hwnd_desktop_map.clear ();
-        for (size_t i = 0; i < snap.global_windows.size (); ++i) {
-          if (snap.window_desktops[i] >= 0)
-            snap.hwnd_desktop_map[snap.global_windows[i].hwnd] =
-                snap.window_desktops[i];
+      if (plan.remove_indices.empty ()) {
+        // Pure trailing desktop creation only appends empty workspaces; no
+        // existing window's desktop index changed, so skip per-HWND RPCs.
+        std::vector<vd::DesktopInfo> refreshed = vd::desktops ();
+        if (!refreshed.empty ())
+          ds = std::move (refreshed);
+      } else {
+        std::vector<HWND> kept_hwnds;
+        kept_hwnds.reserve (snap.global_windows.size ());
+        for (const OvWindowInfo &w : snap.global_windows)
+          kept_hwnds.push_back (w.hwnd);
+        std::vector<int> refreshed_desks;
+        vd::query_desktops_and_windows_batch (kept_hwnds, &ds, &active_idx,
+                                              &refreshed_desks);
+        if (refreshed_desks.size () == snap.window_desktops.size ()) {
+          snap.window_desktops = std::move (refreshed_desks);
+          snap.hwnd_desktop_map.clear ();
+          for (size_t i = 0; i < snap.global_windows.size (); ++i) {
+            if (snap.window_desktops[i] >= 0)
+              snap.hwnd_desktop_map[snap.global_windows[i].hwnd] =
+                  snap.window_desktops[i];
+          }
         }
       }
     }
+  }
+  const gint64 snap_t_end = g_get_monotonic_time ();
+  const double total_ms = (snap_t_end - snap_t0) / 1000.0;
+  if (total_ms >= 35.0) {
+    g_print ("[ov-perf] shared_snap total=%.1fms enum=%.1fms vd=%.1fms "
+             "dyn=%.1fms win=%zu changed=%d\n",
+             total_ms, (snap_t_enum - snap_t0) / 1000.0,
+             (snap_t_vd - snap_t_enum) / 1000.0,
+             (snap_t_end - snap_t_vd) / 1000.0, raw_global.size (),
+             changed ? 1 : 0);
   }
 
   snap.desktops = std::move (ds);
@@ -2290,6 +2427,9 @@ struct OverviewView {
   bool m_want_focus_on_open = true;
   bool m_cloaked_for_open = false;
   bool m_pending_reveal = false;
+  bool m_uncloak_on_after_paint = false;
+  guint m_uncloak_fallback_timer = 0;
+  guint m_vd_cloak_guard_timer = 0;
   bool m_app_grid_mode = false;
   bool m_search_mode = false;
   bool m_folder_dialog_open = false;
@@ -2398,6 +2538,7 @@ struct OverviewView {
   RECT m_search_rect = {0, 0, 0, 0};
   RECT m_thumbs_rect = {0, 0, 0, 0};
   RECT m_ws_box = {0, 0, 0, 0};
+  RECT m_want_hwnd_rect = {0, 0, 0, 0};
 
   Animation m_anim;
   std::vector<SlotEntry> m_leaving;
@@ -2445,6 +2586,17 @@ struct OverviewView {
     return nullptr;
   }
 
+  int resolve_panel_inset () const
+  {
+    HWND ph = panel_hwnd_for_view ();
+    if (ph == nullptr || !IsWindow (ph))
+      return 0;
+    RECT pr{};
+    if (IsWindowVisible (ph) && GetWindowRect (ph, &pr) && pr.bottom > pr.top)
+      return pr.bottom - pr.top;
+    return std::max (winome_shell_panel_height (), 0);
+  }
+
   bool is_open () const
   {
     return m_window != nullptr && gtk_widget_get_visible (m_window) &&
@@ -2459,6 +2611,120 @@ struct OverviewView {
       set_hwnd_cloaked (m_hwnd, false);
       winome::sanitize_gdk_gl_backing_windows ();
     }
+  }
+
+  void cancel_uncloak_fallback ()
+  {
+    if (m_uncloak_fallback_timer != 0) {
+      g_source_remove (m_uncloak_fallback_timer);
+      m_uncloak_fallback_timer = 0;
+    }
+  }
+
+  void cancel_vd_cloak_guard ()
+  {
+    if (m_vd_cloak_guard_timer != 0) {
+      g_source_remove (m_vd_cloak_guard_timer);
+      m_vd_cloak_guard_timer = 0;
+    }
+  }
+
+  void ensure_overview_visible_on_active_desktop (int reported_active_index = -1)
+  {
+    if (m_hwnd == nullptr || !IsWindow (m_hwnd) || m_window == nullptr ||
+        !gtk_widget_get_visible (m_window) ||
+        m_target_state == ControlsState::HIDDEN) {
+      return;
+    }
+    winome::vd::pin_window_async (m_hwnd);
+    HWND chrome_layers[] = {g_chrome_hwnd, g_icon_hwnd, g_caption_hwnd,
+                            active_folder_hwnd ()};
+    for (HWND ch : chrome_layers) {
+      if (is_visible_hwnd (ch))
+        winome::vd::pin_window_async (ch);
+    }
+
+    DWORD cloaked = 0;
+    DwmGetWindowAttribute (m_hwnd, DWMWA_CLOAKED, &cloaked, sizeof (cloaked));
+    if (should_rescue_overview_vd_cloak (cloaked, true, true)) {
+      const auto snap = winome::vd::cached_snapshot ();
+      int target_vd = resolve_native_desktop_for_overview_rescue (
+          ws::effective_mode (), reported_active_index,
+          snap.valid ? snap.active_index : -1);
+      if (target_vd < 0)
+        target_vd = winome::vd::current_index ();
+      if (target_vd >= 0) {
+        winome::vd::move_window_to_desktop (m_hwnd, target_vd);
+        winome::vd::pin_window_async (m_hwnd);
+        for (HWND ch : chrome_layers) {
+          if (is_visible_hwnd (ch)) {
+            DWORD ch_cloak = 0;
+            DwmGetWindowAttribute (ch, DWMWA_CLOAKED, &ch_cloak,
+                                   sizeof (ch_cloak));
+            if ((ch_cloak & 0x2u /* DWM_CLOAKED_SHELL */) != 0) {
+              winome::vd::move_window_to_desktop (ch, target_vd);
+              winome::vd::pin_window_async (ch);
+            }
+          }
+        }
+        if (!m_cloaked_for_open) {
+          SetWindowPos (m_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                            SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+          restack_locked ();
+        }
+        g_print ("[ov] rescued shell-cloaked overview mon=%p hwnd=%p -> vd=%d\n",
+                 static_cast<void *> (m_monitor),
+                 static_cast<void *> (m_hwnd), target_vd);
+      }
+    }
+  }
+
+  void schedule_vd_cloak_guard (guint delay_ms)
+  {
+    cancel_vd_cloak_guard ();
+    m_vd_cloak_guard_timer =
+        g_timeout_add (delay_ms, vd_cloak_guard_static_cb, this);
+  }
+
+  void complete_open_uncloak ()
+  {
+    m_uncloak_on_after_paint = false;
+    cancel_uncloak_fallback ();
+    if (m_window == nullptr || !gtk_widget_get_visible (m_window) ||
+        m_target_state == ControlsState::HIDDEN) {
+      return;
+    }
+    uncloak_if_needed ();
+    ensure_overview_visible_on_active_desktop (m_desktop_active);
+    schedule_vd_cloak_guard (100);
+    HMONITOR mon = resolve_monitor ();
+    if (m_want_focus_on_open &&
+        winome_shell_panel_top_popover_hwnd_for_monitor (mon) == nullptr) {
+      focus_overview_window (false);
+    }
+    restack_locked ();
+    if (m_want_focus_on_open && can_auto_focus_overview_search ()) {
+      if (GetForegroundWindow () == m_hwnd)
+        ensure_search_entry_focus ();
+      else
+        schedule_focus_verify ();
+    }
+  }
+
+  void arm_uncloak_after_paint ()
+  {
+    m_uncloak_on_after_paint = true;
+    if (m_window != nullptr) {
+      if (GdkSurface *s = gtk_native_get_surface (GTK_NATIVE (m_window)))
+        ensure_after_paint_hook (gdk_surface_get_frame_clock (s));
+      gtk_widget_queue_draw (m_window);
+    }
+    if (m_ws_bg != nullptr)
+      gtk_widget_queue_draw (m_ws_bg);
+    cancel_uncloak_fallback ();
+    m_uncloak_fallback_timer =
+        g_timeout_add (120, uncloak_fallback_static_cb, this);
   }
 
   GdkTexture *active_wallpaper_texture () const
@@ -2490,6 +2756,18 @@ struct OverviewView {
   }
 
   // Static GTK/GLib callback trampolines forwarding to `this`.
+  static gboolean uncloak_fallback_static_cb (gpointer ud) {
+    auto *self = static_cast<OverviewView *> (ud);
+    self->m_uncloak_fallback_timer = 0;
+    self->complete_open_uncloak ();
+    return G_SOURCE_REMOVE;
+  }
+  static gboolean vd_cloak_guard_static_cb (gpointer ud) {
+    auto *self = static_cast<OverviewView *> (ud);
+    self->m_vd_cloak_guard_timer = 0;
+    self->ensure_overview_visible_on_active_desktop (-1);
+    return G_SOURCE_REMOVE;
+  }
   static gboolean hover_anim_tick_cb (GtkWidget *w, GdkFrameClock *c, gpointer ud) {
     return static_cast<OverviewView *> (ud)->hover_anim_tick (w, c, nullptr);
   }
@@ -3100,10 +3378,11 @@ apply_thumb_rect (SlotEntry &e, const RECT &rect, BYTE opacity, bool force = fal
 {
   if (e.thumb == nullptr)
     return;
+  const int ov_h = std::max (m_monitor_h - m_panel_height, 1);
   const bool on_screen =
       (m_monitor_w <= 0 ||
        (rect.right > 0 && rect.left < m_monitor_w && rect.bottom > 0 &&
-        rect.top < m_monitor_h));
+        rect.top < ov_h));
   const bool now_visible = (on_screen && opacity > 0);
   if (!force && e.thumb_applied) {
     if (!now_visible && !e.last_visible) {
@@ -3278,6 +3557,11 @@ on_overview_after_paint (GdkFrameClock *clock G_GNUC_UNUSED,
     m_open_perf_paint0_us = g_get_monotonic_time ();
   }
   flush_pending_dwm_frame ();
+  if (m_uncloak_on_after_paint && m_window != nullptr &&
+      gtk_widget_get_visible (m_window) &&
+      m_target_state != ControlsState::HIDDEN) {
+    complete_open_uncloak ();
+  }
 }
 
 void
@@ -3616,10 +3900,10 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
   // Picker container box (ControlsManagerLayout WINDOW_PICKER): the
   // thumbnails row sits between the search entry and the workspace box,
   // which yields to thumbnailsHeight + round(spacing * 0.4) on both edges.
-  int avail_bottom = panel_height + wa_h - dash_h - spacing;
+  int avail_bottom = wa_h - dash_h - spacing;
   RECT box;
   box.left = 0;
-  box.top = panel_height + search_total + thumb_adjust + thumbs_h +
+  box.top = search_total + thumb_adjust + thumbs_h +
             thumb_adjust_bottom;
   box.right = mw;
   box.bottom = avail_bottom;
@@ -3635,9 +3919,9 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
 
   // APP_GRID 15% workspace bar & AppGrid vertical band.
   // Note: search_total already includes .search-entry's CSS margin-top (24px)
-  // and margin-bottom (18px), so grid_ws_top starts directly at
-  // panel_height + search_total (overviewControls.js:126).
-  int grid_ws_top = panel_height + search_total;
+  // and margin-bottom (18px), so grid_ws_top starts directly at search_total
+  // in Overview client coordinates (y=0 sits immediately below the panel).
+  int grid_ws_top = search_total;
   int max_ws_h = std::max (72, avail_bottom - grid_ws_top - spacing - 320);
   int grid_ws_h =
       std::clamp ((int)(wa_h * kSmallWorkspaceRatio + 0.5), 72, max_ws_h);
@@ -3653,8 +3937,8 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
   out->search_w = search_w;
   out->search_h = search_h;
   out->search_x = (mw / scale - search_w) / 2;
-  out->search_y = panel_height / scale;
-  int sv_top = panel_height + search_total + spacing;
+  out->search_y = 0;
+  int sv_top = search_total + spacing;
   int sv_w = std::clamp (mw / scale - 48, 400, 1044);
   int sv_h = std::max ((avail_bottom - sv_top) / scale, 220);
   out->search_view_w = sv_w;
@@ -3662,18 +3946,18 @@ compute_geometry (HMONITOR monitor, const RECT &monitor_rect, int panel_height,
   out->search_view_x = (mw / scale - sv_w) / 2;
   out->search_view_y = sv_top / scale;
   out->dash_x = (mw - dash_w) / 2 / scale;
-  out->dash_y = (panel_height + wa_h - dash_h) / scale;
+  out->dash_y = (wa_h - dash_h) / scale;
   out->thumbs_h = thumbs_h;
   out->thumbs_x =
       thumbs_h > 0 ? (mw / scale - overview_thumbs_get_width (m_thumbs)) / 2
                    : 0;
-  out->thumbs_y = (panel_height + search_total + thumb_adjust) / scale;
+  out->thumbs_y = (search_total + thumb_adjust) / scale;
 
   m_monitor_w = mw;
   m_monitor_h = mh;
-  m_dash_top = panel_height + wa_h - dash_h;
+  m_dash_top = wa_h - dash_h;
 
-  m_bg_full = RECT{0, panel_height, mw, mh};
+  m_bg_full = RECT{0, 0, mw, wa_h};
   m_bg_picker = ws_box_picker;
   m_bg_grid = ws_box_grid;
   m_bg_final = m_app_grid_mode ? ws_box_grid : ws_box_picker;
@@ -3930,13 +4214,41 @@ apply_ex_styles (HWND hwnd)
     SetWindowLongPtrW (hwnd, GWL_EXSTYLE, want);
     swp_flags |= SWP_FRAMECHANGED;
   }
+  LONG_PTR st = GetWindowLongPtrW (hwnd, GWL_STYLE);
+  LONG_PTR want_st =
+      st & ~static_cast<LONG_PTR> (WS_CAPTION | WS_THICKFRAME | WS_BORDER |
+                                   WS_MAXIMIZEBOX | WS_MINIMIZEBOX);
+  if (want_st != st) {
+    SetWindowLongPtrW (hwnd, GWL_STYLE, want_st);
+    swp_flags |= SWP_FRAMECHANGED;
+  }
+  DWORD corner_pref = 1;  // DWMWCP_DONOTROUND
+  DwmSetWindowAttribute (hwnd, 33, &corner_pref, sizeof (corner_pref));
+  COLORREF border_none = 0xFFFFFFFEu;  // DWMWA_COLOR_NONE
+  DwmSetWindowAttribute (hwnd, 34, &border_none, sizeof (border_none));
   ensure_hwnd_topmost (hwnd);
   harden_shell_overlay_hwnd (hwnd);
   ensure_overview_subclass (hwnd, this);
 
   HWND panel = panel_hwnd_for_view ();
-  HWND after = (panel != nullptr && IsWindow (panel)) ? panel : HWND_TOPMOST;
-  SetWindowPos (hwnd, after, 0, 0, 0, 0, swp_flags);
+  HWND after =
+      (panel != nullptr && IsWindow (panel) && IsWindowVisible (panel) &&
+       (GetWindowLongPtrW (panel, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0)
+          ? panel
+          : HWND_TOPMOST;
+  HWND chrome_layers[] = {active_folder_hwnd (), g_chrome_hwnd, g_icon_hwnd,
+                          g_caption_hwnd};
+  for (HWND h : chrome_layers) {
+    if (is_visible_hwnd (h) &&
+        (GetWindowLongPtrW (h, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0) {
+      after = h;
+    }
+  }
+  HWND prev = GetWindow (hwnd, GW_HWNDPREV);
+  const bool need_z =
+      (after == HWND_TOPMOST) ? (prev != nullptr) : (prev != after);
+  if ((swp_flags & SWP_FRAMECHANGED) != 0 || need_z)
+    SetWindowPos (hwnd, after, 0, 0, 0, 0, swp_flags);
 }
 
 // Rebuild slots, thumbnails and widget positions for the current monitor.
@@ -3984,16 +4296,13 @@ place_overview_locked (bool opening, int switch_dir = 0,
                          : HWND_TOPMOST;
   int w = mi.rcMonitor.right - mi.rcMonitor.left;
   int h = mi.rcMonitor.bottom - mi.rcMonitor.top;
-  SetWindowPos (m_hwnd, place_after, mi.rcMonitor.left,
-                mi.rcMonitor.top, w, h,
+  int panel_height = resolve_panel_inset ();
+  RECT ov_rc = compute_overview_hwnd_rect (mi.rcMonitor, panel_height);
+  m_want_hwnd_rect = ov_rc;
+  int ov_h = ov_rc.bottom - ov_rc.top;
+  SetWindowPos (m_hwnd, place_after, ov_rc.left, ov_rc.top, w, ov_h,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
 
-  int panel_height = 0;
-  RECT pr;
-  if (panel_hwnd != nullptr && IsWindowVisible (panel_hwnd) &&
-      GetWindowRect (panel_hwnd, &pr)) {
-    panel_height = pr.bottom - pr.top;
-  }
   m_panel_height = panel_height;
   m_monitor_w = w;
   m_monitor_h = h;
@@ -4093,7 +4402,7 @@ place_overview_locked (bool opening, int switch_dir = 0,
   m_grid_y = (int)geo.app_grid_box.top / scale;
   if (m_app_grid != nullptr) {
     app_grid_set_host_bounds (m_app_grid, mi.rcMonitor.left, mi.rcMonitor.top,
-                              w, h, panel_height, m_dash_top);
+                              w, h, panel_height, panel_height + m_dash_top);
     if (m_app_grid_clip != nullptr) {
       gtk_fixed_move (GTK_FIXED (m_root), m_app_grid_clip, m_grid_x, m_grid_y);
       app_grid_clip_set_bounds (m_app_grid_clip, m_grid_w, m_grid_h);
@@ -4197,10 +4506,13 @@ place_overview_locked (bool opening, int switch_dir = 0,
       e.target = s.window.hwnd;
       e.thumb = nullptr;
       e.desktop_index = d;
-      e.canonical_start = s.window.rect;
+      RECT client_start = {s.window.rect.left, s.window.rect.top - panel_height,
+                           s.window.rect.right,
+                           s.window.rect.bottom - panel_height};
+      e.canonical_start = client_start;
       e.start = (d == active_ws)
-                    ? s.window.rect
-                    : remap_rect_between_boxes (s.window.rect, m_bg_full,
+                    ? client_start
+                    : remap_rect_between_boxes (client_start, m_bg_full,
                                                 ws_full_d);
       e.z_order = static_cast<int> (all_windows.size ());
       for (size_t wi = 0; wi < all_windows.size (); ++wi) {
@@ -4371,19 +4683,23 @@ place_overview_locked (bool opening, int switch_dir = 0,
       m_pending_reveal = true;
     } else {
       m_pending_reveal = false;
-      uncloak_if_needed ();
-      if (m_want_focus_on_open &&
-          winome_shell_panel_top_popover_hwnd_for_monitor (monitor) == nullptr) {
-        focus_overview_window (false);
-      }
-      restack_locked ();
-      if (m_want_focus_on_open && can_auto_focus_overview_search ()) {
-        if (GetForegroundWindow () == m_hwnd)
-          ensure_search_entry_focus ();
-        else
-          schedule_focus_verify ();
-      }
       start_state_transition (desired, kOpenMs);
+      if (m_cloaked_for_open) {
+        arm_uncloak_after_paint ();
+      } else {
+        ensure_overview_visible_on_active_desktop (m_desktop_active);
+        if (m_want_focus_on_open &&
+            winome_shell_panel_top_popover_hwnd_for_monitor (monitor) == nullptr) {
+          focus_overview_window (false);
+        }
+        restack_locked ();
+        if (m_want_focus_on_open && can_auto_focus_overview_search ()) {
+          if (GetForegroundWindow () == m_hwnd)
+            ensure_search_entry_focus ();
+          else
+            schedule_focus_verify ();
+        }
+      }
     }
   } else {
     m_ws_box = m_app_grid_mode ? m_bg_grid : m_bg_picker;
@@ -4490,6 +4806,20 @@ overview_place_opening_idle (gpointer user_data)
 
 // --- animation ---------------------------------------------------------------------
 
+bool
+panel_uses_blocking_gl_swap () const
+{
+  if (m_window == nullptr || !GTK_IS_NATIVE (m_window))
+    return false;
+  GskRenderer *renderer = gtk_native_get_renderer (GTK_NATIVE (m_window));
+  if (renderer == nullptr)
+    return false;
+  const char *type = G_OBJECT_TYPE_NAME (renderer);
+  return type != nullptr &&
+         (std::strstr (type, "GLRenderer") != nullptr ||
+          std::strstr (type, "NglRenderer") != nullptr);
+}
+
 gboolean
 anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
 {
@@ -4512,7 +4842,8 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
   // start_us on the first rendered frame so one-time map/GL setup time never
   // eats the opening third of the transition.
   gint64 now = gdk_frame_clock_get_frame_time (clock);
-  if (!anim.started) {
+  const bool first_frame = !anim.started;
+  if (first_frame) {
     anim.started = true;
     anim.start_us = now - 8000;
     m_anim_tick_cpu_max_us = 0;
@@ -4536,22 +4867,22 @@ anim_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer user_data)
 
   RECT bg = lerp_rect (anim.bg_from, anim.bg_to, e);
   m_bg_radius = anim.radius_from + (anim.radius_to - anim.radius_from) * e;
-  // Only push panel progress at animation endpoints and coarse mid-steps so
-  // the separate Panel Win32 OpenGL surface does not serialize a second VSync
-  // wglSwapBuffers on every single Overview animation frame (which halves FPS
-  // from 60fps to 30fps on Intel iGPUs).
+  // Drive panel backdrop (#000000 <-> #222226) and #panelActivities pill
+  // alpha at full 60fps in lockstep with the overview on non-blocking
+  // composition renderers (default GskCairoRenderer + DirectComposition).
+  // Only coarsen intermediate updates when an explicit Win32 GL swap
+  // renderer is forced (two wglSwapBuffers calls per frame serialize VSync).
   const double next_panel_p =
       std::clamp (anim.panel_from + (anim.panel_to - anim.panel_from) * e,
                   0.0, 1.0);
-  const bool panel_endpoint = (t <= 0.0 || t >= 1.0);
-  if (panel_endpoint || std::fabs (next_panel_p - m_panel_cur_progress) >= 0.45) {
-    if (std::fabs (next_panel_p - m_panel_cur_progress) > 1e-4 || panel_endpoint) {
-      m_panel_cur_progress = next_panel_p;
-      ++m_anim_panel_dirty_frames;
-      winome_shell_panel_set_overview_progress_for_monitor (
-          m_monitor != nullptr ? m_monitor : resolve_monitor (),
-          m_panel_cur_progress);
-    }
+  if (winome::should_push_panel_overview_progress (
+          next_panel_p, m_panel_cur_progress, first_frame, t,
+          panel_uses_blocking_gl_swap ())) {
+    m_panel_cur_progress = next_panel_p;
+    ++m_anim_panel_dirty_frames;
+    winome_shell_panel_set_overview_progress_for_monitor (
+        m_monitor != nullptr ? m_monitor : resolve_monitor (),
+        m_panel_cur_progress);
   }
   bool gtk_will_paint = false;
   if (!m_ws_anim_to_boxes.empty () &&
@@ -4965,7 +5296,7 @@ refresh_dash_in_place (void)
                             m_desktop_active);
   int dash_w = overview_dash_get_width (m_dash) * scale;
   int dash_h = std::min (overview_dash_get_height (m_dash) * scale, dash_max);
-  m_dash_top = m_panel_height + wa_h - dash_h;
+  m_dash_top = wa_h - dash_h;
   gtk_fixed_move (GTK_FIXED (m_root), m_dash, (mw - dash_w) / 2 / scale,
                   m_dash_top / scale);
   gtk_widget_set_visible (m_dash, TRUE);
@@ -4987,10 +5318,18 @@ switch_workspace_from_user (int target)
 {
   if (!ws::switch_to (resolve_monitor (), target))
     return false;
+  ensure_overview_visible_on_active_desktop (target);
+  schedule_vd_cloak_guard (60);
   switch_workspace_animated (target, true);
   if (ws::effective_mode () == ws::MultiMonitorWorkspaceMode::Span) {
     sync_sibling_views_workspace_switch (
         this, target, static_cast<int> (m_desktops.size ()));
+    for (auto &up : g_views) {
+      if (up && up.get () != this && up->is_open ()) {
+        up->ensure_overview_visible_on_active_desktop (target);
+        up->schedule_vd_cloak_guard (60);
+      }
+    }
   }
   return true;
 }
@@ -5301,7 +5640,8 @@ start_state_transition (ControlsState to_state, guint duration_ms)
   m_ws_hist2_boxes.clear ();
 
   restack_locked ();
-  if (to_state == ControlsState::HIDDEN) {
+  if (to_state == ControlsState::HIDDEN ||
+      prev_target != ControlsState::HIDDEN) {
     m_open_perf_pending = false;
   } else if (m_open_perf_pending && prev_target == ControlsState::HIDDEN &&
              m_open_perf_trans_us == 0) {
@@ -5318,7 +5658,9 @@ void
 finish_hide (void)
 {
   m_pending_reveal = false;
-  uncloak_if_needed ();
+  m_uncloak_on_after_paint = false;
+  cancel_uncloak_fallback ();
+  cancel_vd_cloak_guard ();
   m_panel_cur_progress = 0.0;
   winome_shell_panel_set_workspace_scroll_for_monitor (resolve_monitor (), -1, -1.0);
   if (g_live_wallpaper_owner == this) {
@@ -5342,6 +5684,7 @@ finish_hide (void)
       (m_hwnd != nullptr && GetForegroundWindow () == m_hwnd);
   if (m_window != nullptr && gtk_widget_get_visible (m_window))
     gtk_widget_set_visible (m_window, FALSE);
+  uncloak_if_needed ();
   winome::sanitize_gdk_gl_backing_windows ();
   winome_shell_panel_set_overview_progress_for_monitor (
       resolve_monitor (), 0.0);
@@ -5695,7 +6038,7 @@ on_drag_begin (GtkGestureDrag *drag, double x, double y,
   int scale = std::max (gtk_widget_get_scale_factor (m_window), 1);
   int px = (int)(x * scale);
   int py = (int)(y * scale);
-  if ((m_panel_height > 0 && py < m_panel_height) || py >= m_dash_top ||
+  if (py < 0 || py >= m_dash_top ||
       (px >= m_search_rect.left && px < m_search_rect.right &&
        py >= m_search_rect.top && py < m_search_rect.bottom) ||
       (m_thumbs_rect.right > m_thumbs_rect.left &&
@@ -6189,7 +6532,7 @@ on_click_released (GtkGestureClick *gesture, int n_press, double x, double y,
     return;
   }
 
-  if (m_panel_height > 0 && py < m_panel_height) {
+  if (py < 0) {
     g_print ("[ov] click (%d,%d) ignored (panel strip)\n", px, py);
     restack_locked ();
     return;
@@ -6385,6 +6728,7 @@ on_realize (GtkWidget *widget, gpointer user_data)
     HWND hwnd = static_cast<HWND> (gdk_win32_surface_get_handle (surface));
     m_hwnd = hwnd;
     apply_ex_styles (hwnd);
+    winome::vd::pin_window_async (hwnd);
     if (!m_overview_surface_hooked) {
       m_overview_surface_hooked = true;
       g_signal_connect (surface, "layout",
@@ -6580,6 +6924,8 @@ apply_pending_desktop_sync_if_any (void)
   int cur_idx = ws::active_for_monitor (mon);
   int cur_count = ws::count_for_monitor (mon);
   int desired = (cur_idx >= 0) ? cur_idx : target_ws;
+  ensure_overview_visible_on_active_desktop (desired);
+  schedule_vd_cloak_guard (60);
   if (desired >= 0 && desired != m_desktop_active)
     switch_workspace_animated (desired);
   else if (cur_count > 0 && cur_count != (int)m_desktops.size ())
@@ -7062,42 +7408,6 @@ on_overview_key_pressed (GtkEventControllerKey *controller,
 
 
 
-  // Match GdkMonitor for m_monitor so gtk_window_fullscreen_on_monitor opens
-  // directly on the target display with zero frame-0 flash on the OS primary.
-  static GdkMonitor *find_gdk_monitor_for_rect (const RECT &rc)
-  {
-    GdkDisplay *disp = gdk_display_get_default ();
-    if (disp == nullptr)
-      return nullptr;
-    GListModel *mons = gdk_display_get_monitors (disp);
-    if (mons == nullptr)
-      return nullptr;
-    const guint n = g_list_model_get_n_items (mons);
-    GdkMonitor *best = nullptr;
-    for (guint i = 0; i < n; ++i) {
-      auto *gm = static_cast<GdkMonitor *> (g_list_model_get_item (mons, i));
-      if (gm == nullptr)
-        continue;
-      GdkRectangle gr{};
-      gdk_monitor_get_geometry (gm, &gr);
-      const int sc = std::max (gdk_monitor_get_scale_factor (gm), 1);
-      const bool exact_phys =
-          (gr.x == rc.left && gr.y == rc.top &&
-           gr.width == (rc.right - rc.left) && gr.height == (rc.bottom - rc.top));
-      const bool exact_scaled =
-          (gr.x * sc == rc.left && gr.y * sc == rc.top &&
-           gr.width * sc == (rc.right - rc.left) &&
-           gr.height * sc == (rc.bottom - rc.top));
-      if (exact_phys || exact_scaled) {
-        best = gm;
-        g_object_unref (gm);
-        break;
-      }
-      g_object_unref (gm);
-    }
-    return best;
-  }
-
   void init_for_monitor (HMONITOR monitor)
   {
     m_monitor = monitor;
@@ -7109,14 +7419,14 @@ on_overview_key_pressed (GtkEventControllerKey *controller,
 
     MONITORINFO mi{};
     mi.cbSize = sizeof (mi);
-    GdkMonitor *gdk_mon =
-        (monitor != nullptr && GetMonitorInfoW (monitor, &mi))
-            ? find_gdk_monitor_for_rect (mi.rcMonitor)
-            : nullptr;
-    if (gdk_mon != nullptr)
-      gtk_window_fullscreen_on_monitor (GTK_WINDOW (m_window), gdk_mon);
-    else
-      gtk_window_fullscreen (GTK_WINDOW (m_window));
+    if (monitor != nullptr && GetMonitorInfoW (monitor, &mi)) {
+      RECT ov_rc = compute_overview_hwnd_rect (mi.rcMonitor,
+                                               resolve_panel_inset ());
+      gtk_window_set_default_size (
+          GTK_WINDOW (m_window),
+          std::max<int> (ov_rc.right - ov_rc.left, 1),
+          std::max<int> (ov_rc.bottom - ov_rc.top, 1));
+    }
 
     gtk_widget_add_css_class (m_window, "winome-overview");
     install_bundled_fonts (m_window);
@@ -7298,19 +7608,32 @@ on_overview_key_pressed (GtkEventControllerKey *controller,
 
   void start_deferred_open_animation ()
   {
-    uncloak_if_needed ();
-    if (!m_pending_reveal)
+    if (!m_pending_reveal) {
+      if (m_cloaked_for_open && is_open ())
+        arm_uncloak_after_paint ();
       return;
+    }
     m_pending_reveal = false;
     if (m_window == nullptr || !gtk_widget_get_visible (m_window) || !m_placed)
       return;
-    if (m_want_focus_on_open && can_auto_focus_overview_search ()) {
-      if (GetForegroundWindow () == m_hwnd)
-        ensure_search_entry_focus ();
-      else
-        schedule_focus_verify ();
-    }
     start_state_transition (m_pending_show_state, kOpenMs);
+    if (m_cloaked_for_open) {
+      arm_uncloak_after_paint ();
+    } else {
+      ensure_overview_visible_on_active_desktop (m_desktop_active);
+      HMONITOR monitor = resolve_monitor ();
+      if (m_want_focus_on_open &&
+          winome_shell_panel_top_popover_hwnd_for_monitor (monitor) == nullptr) {
+        focus_overview_window (false);
+      }
+      restack_locked ();
+      if (m_want_focus_on_open && can_auto_focus_overview_search ()) {
+        if (GetForegroundWindow () == m_hwnd)
+          ensure_search_entry_focus ();
+        else
+          schedule_focus_verify ();
+      }
+    }
   }
 
   void show_view (bool shift_to_grid, bool take_focus, bool defer_reveal = false,
@@ -7410,9 +7733,12 @@ on_overview_key_pressed (GtkEventControllerKey *controller,
           m_hwnd = h;
           set_hwnd_cloaked (h, true);
           m_cloaked_for_open = true;
-          SetWindowPos (h, HWND_TOPMOST, mi.rcMonitor.left, mi.rcMonitor.top,
-                        mi.rcMonitor.right - mi.rcMonitor.left,
-                        mi.rcMonitor.bottom - mi.rcMonitor.top,
+          const int panel_h = resolve_panel_inset ();
+          m_panel_height = panel_h;
+          const RECT ov_rc = compute_overview_hwnd_rect (mi.rcMonitor, panel_h);
+          m_want_hwnd_rect = ov_rc;
+          SetWindowPos (h, HWND_TOPMOST, ov_rc.left, ov_rc.top,
+                        ov_rc.right - ov_rc.left, ov_rc.bottom - ov_rc.top,
                         SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         }
       }
@@ -7439,9 +7765,16 @@ on_overview_key_pressed (GtkEventControllerKey *controller,
       }
     } else if (m_placed && m_target_state == ControlsState::HIDDEN) {
       uncloak_if_needed ();
+      const int cur_ws = ws::active_for_monitor (resolve_monitor ());
       if (!defer_reveal) {
         winome::evaluate_fullscreen_state ();
         start_state_transition (m_pending_show_state, kOpenMs);
+        if (cur_ws >= 0 && cur_ws != m_desktop_active) {
+          m_pending_desktop_sync = true;
+          m_pending_desktop_target = cur_ws;
+        }
+        ensure_overview_visible_on_active_desktop (cur_ws);
+        schedule_vd_cloak_guard (60);
         if (take_focus &&
             winome_shell_panel_top_popover_hwnd_for_monitor (m_monitor) == nullptr) {
           focus_overview_window (false);
@@ -7449,9 +7782,15 @@ on_overview_key_pressed (GtkEventControllerKey *controller,
         restack_locked ();
       } else {
         m_pending_reveal = true;
+        if (cur_ws >= 0 && cur_ws != m_desktop_active) {
+          m_pending_desktop_sync = true;
+          m_pending_desktop_target = cur_ws;
+        }
       }
     } else if (m_placed) {
       uncloak_if_needed ();
+      ensure_overview_visible_on_active_desktop (-1);
+      schedule_vd_cloak_guard (60);
       if (m_place_idle_source == 0) {
         m_place_idle_source = g_idle_add_full (
             G_PRIORITY_HIGH_IDLE, overview_place_idle_cb, this, nullptr);
@@ -7596,13 +7935,12 @@ on_overview_key_pressed (GtkEventControllerKey *controller,
     if (mon == nullptr || !GetMonitorInfoW (mon, &mi))
       return false;
     if (screen_pt.x < mi.rcMonitor.left || screen_pt.x >= mi.rcMonitor.right ||
-        screen_pt.y < mi.rcMonitor.top || screen_pt.y >= mi.rcMonitor.bottom) {
+        screen_pt.y < mi.rcMonitor.top + m_panel_height ||
+        screen_pt.y >= mi.rcMonitor.bottom) {
       return false;
     }
     const int px = screen_pt.x - mi.rcMonitor.left;
-    const int py = screen_pt.y - mi.rcMonitor.top;
-    if (m_panel_height > 0 && py < m_panel_height)
-      return false;
+    const int py = screen_pt.y - (mi.rcMonitor.top + m_panel_height);
     const int scale = std::max (gtk_widget_get_scale_factor (m_window), 1);
     int thumb_pill = -1;
     int peek_ws = -1;
@@ -7632,16 +7970,13 @@ on_overview_key_pressed (GtkEventControllerKey *controller,
     mi.cbSize = sizeof (mi);
     if (mon == nullptr || !GetMonitorInfoW (mon, &mi) ||
         screen_pt.x < mi.rcMonitor.left || screen_pt.x >= mi.rcMonitor.right ||
-        screen_pt.y < mi.rcMonitor.top || screen_pt.y >= mi.rcMonitor.bottom) {
+        screen_pt.y < mi.rcMonitor.top + m_panel_height ||
+        screen_pt.y >= mi.rcMonitor.bottom) {
       clear_external_drop_highlight ();
       return;
     }
     const int px = screen_pt.x - mi.rcMonitor.left;
-    const int py = screen_pt.y - mi.rcMonitor.top;
-    if (m_panel_height > 0 && py < m_panel_height) {
-      clear_external_drop_highlight ();
-      return;
-    }
+    const int py = screen_pt.y - (mi.rcMonitor.top + m_panel_height);
     const int scale = std::max (gtk_widget_get_scale_factor (m_window), 1);
     int thumb_pill = -1;
     int peek_ws = -1;
@@ -7677,9 +8012,13 @@ on_overview_key_pressed (GtkEventControllerKey *controller,
 
   void on_desktop_changed (HMONITOR monitor, int count, int active_index)
   {
-    if (!is_open () || !m_placed || !overview_active ())
+    if (!is_open () || !overview_active ())
       return;
     if (monitor != nullptr && monitor != resolve_monitor ())
+      return;
+    ensure_overview_visible_on_active_desktop (active_index);
+    schedule_vd_cloak_guard (60);
+    if (!m_placed)
       return;
     const bool count_changed = (count != (int)m_desktops.size ());
     const bool active_changed =
@@ -7728,6 +8067,9 @@ on_overview_key_pressed (GtkEventControllerKey *controller,
   void cleanup_on_destroy (GtkWidget *w)
   {
     m_pending_reveal = false;
+    m_uncloak_on_after_paint = false;
+    cancel_uncloak_fallback ();
+    cancel_vd_cloak_guard ();
     uncloak_if_needed ();
     clear_pending_dwm_frame ();
     disconnect_after_paint_hook ();
@@ -7868,7 +8210,40 @@ winome_workspace_bg_snapshot_impl (WinomeWorkspaceBg *self,
 
     bool painted_tex = false;
     GdkTexture *wp_tex = v->active_wallpaper_texture ();
-    if (wp_tex != nullptr) {
+    if (!g_using_live_wallpaper && wp_tex != nullptr &&
+        wp_tex == g_wallpaper && g_wallpaper_cairo != nullptr) {
+      const double tw = static_cast<double> (
+          cairo_image_surface_get_width (g_wallpaper_cairo));
+      const double th = static_cast<double> (
+          cairo_image_surface_get_height (g_wallpaper_cairo));
+      if (tw > 0.0 && th > 0.0) {
+        const double wa_h_px =
+            std::max<double> (v->m_bg_full.bottom - v->m_bg_full.top, 1.0);
+        const double panel_ratio =
+            (v->m_panel_height > 0)
+                ? (static_cast<double> (v->m_panel_height) / wa_h_px)
+                : 0.0;
+        WallpaperDrawRect wr = compute_workarea_wallpaper_draw_rect (
+            rx, ry, rw, rh, tw, th, panel_ratio);
+        if (wr.w > 0.0 && wr.h > 0.0) {
+          const bool animating =
+              v->m_anim.source != 0 || v->m_switch_source != 0 ||
+              v->m_drag_tick_source != 0 || v->m_drag_snapback_source != 0 ||
+              v->m_scale_anim_source != 0;
+          cairo_t *cr = gtk_snapshot_append_cairo (snapshot, &rect);
+          cairo_translate (cr, wr.x, wr.y);
+          cairo_scale (cr, wr.w / tw, wr.h / th);
+          cairo_set_source_surface (cr, g_wallpaper_cairo, 0.0, 0.0);
+          cairo_pattern_set_filter (
+              cairo_get_source (cr),
+              animating ? CAIRO_FILTER_FAST : CAIRO_FILTER_BILINEAR);
+          cairo_paint (cr);
+          cairo_destroy (cr);
+          painted_tex = true;
+        }
+      }
+    }
+    if (!painted_tex && wp_tex != nullptr) {
       double tw = gdk_texture_get_width (wp_tex);
       double th = gdk_texture_get_height (wp_tex);
       if (tw > 0 && th > 0) {
@@ -8119,7 +8494,7 @@ chrome_apply_want (void)
 }
 
 ChromeSurfaceHooks g_chrome_hooks{&g_chrome_window, &g_chrome_hwnd, 0, 0, 0, false,
-                                  nullptr, 0, chrome_apply_want};
+                                  nullptr, 0, chrome_apply_want, &g_chrome_want};
 
 static void
 chrome_hide (void)
@@ -8223,7 +8598,8 @@ chrome_show_at (OverviewView *v, const RECT &preview_rect)
   int btn_cx = (pad + std::max (btn_nat.width, fallback) / 2) * scale;
   int btn_cy = (pad + std::max (btn_nat.height, fallback) / 2) * scale;
   g_chrome_want.left = mi.rcMonitor.left + preview_rect.right - btn_cx;
-  g_chrome_want.top = mi.rcMonitor.top + preview_rect.top - btn_cy;
+  g_chrome_want.top =
+      mi.rcMonitor.top + v->m_panel_height + preview_rect.top - btn_cy;
   g_chrome_want.right = g_chrome_want.left + w;
   g_chrome_want.bottom = g_chrome_want.top + h;
 
@@ -8242,7 +8618,7 @@ icon_chrome_apply_want (void)
 }
 
 ChromeSurfaceHooks g_icon_hooks{&g_icon_window, &g_icon_hwnd, 0, 0, 0, false,
-                                nullptr, 0, icon_chrome_apply_want};
+                                nullptr, 0, icon_chrome_apply_want, &g_icon_want};
 
 static void
 icon_hide (void)
@@ -8318,7 +8694,8 @@ icon_show_at (OverviewView *v, const RECT &preview_rect, HWND target)
   double top = preview_rect.bottom - kIconOverlap * size;
 
   g_icon_want.left = mi.rcMonitor.left + (LONG)(cx - size / 2.0) - pad;
-  g_icon_want.top = mi.rcMonitor.top + (LONG)top - pad;
+  g_icon_want.top =
+      mi.rcMonitor.top + v->m_panel_height + (LONG)top - pad;
   g_icon_want.right = g_icon_want.left + size + 2 * pad;
   g_icon_want.bottom = g_icon_want.top + size + 2 * pad;
 
@@ -8348,7 +8725,7 @@ caption_chrome_apply_want (void)
 }
 
 ChromeSurfaceHooks g_caption_hooks{&g_caption_window, &g_caption_hwnd, 0, 0, 0, false,
-                                   nullptr, 0, caption_chrome_apply_want};
+                                   nullptr, 0, caption_chrome_apply_want, &g_caption_want};
 
 static void
 caption_hide (void)
@@ -8481,11 +8858,13 @@ caption_show_at (OverviewView *v, const RECT &preview_rect)
                    scale;
 
   LONG left = mi.rcMonitor.left + static_cast<LONG> (std::lround (cx - w / 2.0));
-  LONG top_px = mi.rcMonitor.top + static_cast<LONG> (std::lround (top));
+  LONG top_px =
+      mi.rcMonitor.top + v->m_panel_height + static_cast<LONG> (std::lround (top));
   LONG min_left = mi.rcMonitor.left + 8 * scale;
   LONG max_left = std::max (min_left, mi.rcMonitor.right - 8 * scale - w);
   left = std::clamp (left, min_left, max_left);
-  LONG max_top = std::max (mi.rcMonitor.top, mi.rcMonitor.bottom - 8 * scale - h);
+  LONG min_top = mi.rcMonitor.top + v->m_panel_height;
+  LONG max_top = std::max (min_top, mi.rcMonitor.bottom - 8 * scale - h);
   top_px = std::min (top_px, max_top);
 
   g_caption_want.left = left;
@@ -8537,16 +8916,31 @@ constexpr const wchar_t *kOverviewViewProp = L"WINOME_OverviewViewPtr";
 static LRESULT CALLBACK
 overview_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+  if (msg == WM_ERASEBKGND)
+    return 1;
+  if (msg == WM_STYLECHANGING && wParam == static_cast<WPARAM> (GWL_EXSTYLE) &&
+      lParam != 0) {
+    auto *ss = reinterpret_cast<STYLESTRUCT *> (lParam);
+    ss->styleNew = (static_cast<LONG_PTR> (ss->styleNew) | WS_EX_TOOLWINDOW) &
+                   ~(WS_EX_NOACTIVATE | WS_EX_APPWINDOW);
+  }
+
   OverviewView *v = reinterpret_cast<OverviewView *> (
       GetPropW (hwnd, kOverviewViewProp));
 
+  if (msg == WM_MOUSEACTIVATE && v != nullptr && overview_active () &&
+      v->m_target_state != ControlsState::HIDDEN &&
+      winome_shell_panel_top_popover_hwnd () != nullptr) {
+    return MA_NOACTIVATEANDEAT;
+  }
+
   if (msg == WM_WINDOWPOSCHANGING && lParam != 0) {
+    auto *wp = reinterpret_cast<WINDOWPOS *> (lParam);
     HWND active_panel = v != nullptr ? v->panel_hwnd_for_view () : g_panel_hwnd;
     if ((GetWindowLongPtrW (hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0 &&
         active_panel != nullptr && IsWindow (active_panel) &&
         IsWindowVisible (active_panel) &&
         (GetWindowLongPtrW (active_panel, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0) {
-      auto *wp = reinterpret_cast<WINDOWPOS *> (lParam);
       if ((wp->flags & SWP_NOZORDER) == 0) {
         HWND folder_hwnd = active_folder_hwnd ();
         HWND allowed_anchor = active_panel;
@@ -8567,6 +8961,39 @@ overview_subclass_wndproc (HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             !is_any_overview_view_hwnd (wp->hwndInsertAfter)) {
           wp->hwndInsertAfter = allowed_anchor;
           wp->flags |= SWP_NOOWNERZORDER;
+        }
+      }
+    }
+    if (v != nullptr && (wp->flags & SWP_HIDEWINDOW) == 0 &&
+        (IsWindowVisible (hwnd) || (wp->flags & SWP_SHOWWINDOW) != 0) &&
+        v->m_want_hwnd_rect.right > v->m_want_hwnd_rect.left &&
+        v->m_want_hwnd_rect.bottom > v->m_want_hwnd_rect.top) {
+      RECT cur_rect{};
+      const bool has_cur_rect = GetWindowRect (hwnd, &cur_rect) != FALSE;
+      RECT eff_rect{};
+      const bool has_eff_rect = winome::resolve_panel_windowpos_rect (
+          cur_rect, has_cur_rect, wp->x, wp->y, wp->cx, wp->cy, wp->flags,
+          &eff_rect);
+      if (!has_eff_rect || !EqualRect (&eff_rect, &v->m_want_hwnd_rect)) {
+        const RECT &want = v->m_want_hwnd_rect;
+        const int want_w = want.right - want.left;
+        const int want_h = want.bottom - want.top;
+        const bool need_move =
+            !has_cur_rect || (wp->flags & SWP_NOMOVE) == 0 ||
+            cur_rect.left != want.left || cur_rect.top != want.top;
+        const bool need_size =
+            !has_cur_rect || (wp->flags & SWP_NOSIZE) == 0 ||
+            (cur_rect.right - cur_rect.left) != want_w ||
+            (cur_rect.bottom - cur_rect.top) != want_h;
+        if (need_move) {
+          wp->x = want.left;
+          wp->y = want.top;
+          wp->flags &= ~SWP_NOMOVE;
+        }
+        if (need_size) {
+          wp->cx = want_w;
+          wp->cy = want_h;
+          wp->flags &= ~SWP_NOSIZE;
         }
       }
     }
@@ -8898,9 +9325,28 @@ zorder_drifted (const std::vector<HWND> &panels,
           is_any_overview_view_hwnd (prev))
         continue;
       if (IsWindowVisible (prev) && !is_cloaked (prev)) {
+        wchar_t cls[128] = L"";
+        if (GetClassNameW (prev, cls, 128) > 0 &&
+            winome::is_system_zorder_overlay_class (cls)) {
+          continue;
+        }
         RECT r{};
-        if (GetWindowRect (prev, &r) && r.right > r.left && r.bottom > r.top)
+        if (GetWindowRect (prev, &r) && r.right > r.left && r.bottom > r.top) {
+          if (overviews.empty ()) {
+            bool touches_panel = false;
+            for (HWND p : panels) {
+              RECT pr{};
+              RECT inter{};
+              if (GetWindowRect (p, &pr) && IntersectRect (&inter, &r, &pr)) {
+                touches_panel = true;
+                break;
+              }
+            }
+            if (!touches_panel)
+              continue;
+          }
           return true;
+        }
       }
     }
   }
@@ -8941,6 +9387,11 @@ restack_locked (void)
   for (HWND p : panels) {
     if (prev_hwnd == HWND_TOPMOST)
       ensure_hwnd_topmost (p);
+    if ((GetWindowLongPtrW (p, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0 &&
+        prev_hwnd != HWND_TOPMOST && GetWindow (p, GW_HWNDPREV) == prev_hwnd) {
+      prev_hwnd = p;
+      continue;
+    }
     SetWindowPos (p, prev_hwnd, 0, 0, 0, 0,
                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     prev_hwnd = p;
@@ -9145,8 +9596,16 @@ on_overview_desktop_changed_global (HMONITOR monitor, int count,
                                     int active_index,
                                     void *user_data G_GNUC_UNUSED)
 {
-  if (g_suppress_ws_change_rebuild)
+  if (g_suppress_ws_change_rebuild) {
+    for (auto &up : g_views) {
+      if (up && up->is_open () &&
+          (monitor == nullptr || monitor == up->resolve_monitor ())) {
+        up->ensure_overview_visible_on_active_desktop (active_index);
+        up->schedule_vd_cloak_guard (60);
+      }
+    }
     return;
+  }
   bool any_handled = false;
   for (auto &up : g_views) {
     if (up && up->is_open ()) {
@@ -9474,6 +9933,7 @@ overview_shutdown (void)
   live_wallpaper_stop ();
   g_using_live_wallpaper = false;
   g_wallpaper_cache = WallpaperCacheKey{};
+  clear_wallpaper_surfaces ();
   g_clear_object (&g_wallpaper);
   g_clear_object (&g_wallpaper_thumb);
   g_clear_object (&g_live_wallpaper);
@@ -9582,16 +10042,14 @@ overview_show_all_linked (HMONITOR focus_monitor)
     batch.push_back (fv);
   }
 
-  for (OverviewView *v : batch)
-    v->uncloak_if_needed ();
   winome::evaluate_fullscreen_state ();
-  if (fv != nullptr &&
-      winome_shell_panel_top_popover_hwnd_for_monitor (focus_mon) == nullptr) {
-    fv->focus_overview_window (false);
-  }
-  restack_locked ();
   for (OverviewView *v : batch)
     v->start_deferred_open_animation ();
+  if (fv != nullptr && !fv->m_cloaked_for_open) {
+    if (winome_shell_panel_top_popover_hwnd_for_monitor (focus_mon) == nullptr)
+      fv->focus_overview_window (false);
+    restack_locked ();
+  }
 }
 
 void

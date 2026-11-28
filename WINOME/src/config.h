@@ -14,6 +14,7 @@ struct WinomeConfig {
   std::string clock_format = "auto";  // "auto", "24h", "12h"
   bool clock_show_seconds = false;
   bool show_battery_percentage = false;
+  std::string tray_location = "panel";  // "panel", "quick_settings"
   bool hot_corner_enabled = true;
   int hot_corner_cooldown_ms = 500;
   bool win_key_overview = true;

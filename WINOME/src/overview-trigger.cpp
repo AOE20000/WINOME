@@ -89,6 +89,7 @@ DWORD g_swap_last_flags = 0;
 DWORD g_swap_last_time = 0;
 std::atomic<gint64> g_last_win_press_us{0};
 std::atomic<bool> g_win_key_overview_enabled{true};
+std::atomic<bool> g_native_vd_can_manage{false};
 
 constexpr UINT kMsgRefreshKeyboardHook = WM_APP + 42;
 
@@ -96,6 +97,8 @@ enum class TriggerActionKind {
   BareWinUp,
   OpenStartMenu,
   WorkspaceMove,
+  WorkspaceCreate,
+  WorkspaceRemoveCurrent,
   NotifyVdHint,
   ToggleRunDialog,
   UnfocusedEsc,
@@ -492,7 +495,14 @@ void open_start_menu() {
 
 namespace {
 
+enum class HotkeyDesktopOp {
+  Move,
+  CreateAndSwitch,
+  RemoveCurrent,
+};
+
 struct HotkeyDesktopTask {
+  HotkeyDesktopOp op = HotkeyDesktopOp::Move;
   int delta = 0;
   bool move_fg = false;
 };
@@ -549,10 +559,29 @@ void hotkey_worker_main() {
 
     HWND fg = GetForegroundWindow();
     HMONITOR target_mon = nullptr;
-    if (task.move_fg && is_eligible_window_for_move(fg))
+    if (task.op == HotkeyDesktopOp::Move && task.move_fg &&
+        is_eligible_window_for_move(fg)) {
       target_mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+    }
     if (target_mon == nullptr)
       target_mon = monitor_manager_active_monitor();
+
+    if (task.op == HotkeyDesktopOp::CreateAndSwitch) {
+      if (ws::create_workspace(target_mon)) {
+        const int new_count = ws::count_for_monitor(target_mon);
+        if (new_count > 0)
+          ws::switch_to(target_mon, new_count - 1);
+      }
+      continue;
+    }
+
+    if (task.op == HotkeyDesktopOp::RemoveCurrent) {
+      const int count = ws::count_for_monitor(target_mon);
+      const int cur = ws::active_for_monitor(target_mon);
+      if (count > 1 && cur >= 0)
+        ws::remove_workspace(target_mon, cur);
+      continue;
+    }
 
     const int count = ws::count_for_monitor(target_mon);
     const int cur = ws::active_for_monitor(target_mon);
@@ -647,6 +676,26 @@ void dispatch_worker_main() {
         case TriggerActionKind::WorkspaceMove:
           enqueue_desktop_hotkey(act.delta, act.move_fg);
           break;
+        case TriggerActionKind::WorkspaceCreate: {
+          std::lock_guard<std::mutex> lk(g_hotkey_worker.mu);
+          if (!g_hotkey_worker.stop && g_hotkey_worker.queue.size() < 8) {
+            HotkeyDesktopTask t{};
+            t.op = HotkeyDesktopOp::CreateAndSwitch;
+            g_hotkey_worker.queue.push(t);
+            g_hotkey_worker.cv.notify_one();
+          }
+          break;
+        }
+        case TriggerActionKind::WorkspaceRemoveCurrent: {
+          std::lock_guard<std::mutex> lk(g_hotkey_worker.mu);
+          if (!g_hotkey_worker.stop && g_hotkey_worker.queue.size() < 8) {
+            HotkeyDesktopTask t{};
+            t.op = HotkeyDesktopOp::RemoveCurrent;
+            g_hotkey_worker.queue.push(t);
+            g_hotkey_worker.cv.notify_one();
+          }
+          break;
+        }
         case TriggerActionKind::NotifyVdHint:
           vd::notify_change_hint_async();
           break;
@@ -842,7 +891,11 @@ void enqueue_desktop_hotkey(int delta, bool move_fg) {
   std::lock_guard<std::mutex> lk(g_hotkey_worker.mu);
   if (g_hotkey_worker.stop || g_hotkey_worker.queue.size() >= 8)
     return;
-  g_hotkey_worker.queue.push(HotkeyDesktopTask{delta, move_fg});
+  HotkeyDesktopTask t{};
+  t.op = HotkeyDesktopOp::Move;
+  t.delta = delta;
+  t.move_fg = move_fg;
+  g_hotkey_worker.queue.push(t);
   g_hotkey_worker.cv.notify_one();
 }
 
@@ -1009,18 +1062,32 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         }
 
         case WinKeyComboAction::PassthroughWithVdHint: {
-          // In Independent per-monitor workspace mode, intercept
-          // Win+Ctrl+Left/Right so switching stays per-monitor instead of
-          // jumping Windows onto the hidden parking desktop.
-          if (!g_win_injected &&
-              (state->vkCode == VK_LEFT || state->vkCode == VK_RIGHT) &&
-              ws::is_independent_active()) {
+          // Handle Win+Ctrl+Left/Right/D/F4 in-process via WINOME's workspace /
+          // VD COM worker whenever available so synthetic/rapid combos never get
+          // dropped by Explorer's native hotkey state machine.
+          const bool indep = ws::is_independent_active();
+          const bool native_ready = vd::cached_snapshot().valid;
+          const bool can_manage =
+              g_native_vd_can_manage.load(std::memory_order_acquire);
+          const VdComboInProcessAction vd_act =
+              resolve_vd_combo_in_process_action(
+                  state->vkCode, shift_held, alt_held, g_win_injected != FALSE,
+                  indep, native_ready, can_manage);
+          if (vd_act != VdComboInProcessAction::Passthrough) {
             g_swallowed_combo_vk = state->vkCode;
             g_combo_swallow_tick = GetTickCount64();
             TriggerAction act{};
-            act.kind = TriggerActionKind::WorkspaceMove;
-            act.delta = (state->vkCode == VK_LEFT) ? -1 : 1;
-            act.move_fg = false;
+            if (vd_act == VdComboInProcessAction::SwitchPrev) {
+              act.kind = TriggerActionKind::WorkspaceMove;
+              act.delta = -1;
+            } else if (vd_act == VdComboInProcessAction::SwitchNext) {
+              act.kind = TriggerActionKind::WorkspaceMove;
+              act.delta = 1;
+            } else if (vd_act == VdComboInProcessAction::CreateAndSwitch) {
+              act.kind = TriggerActionKind::WorkspaceCreate;
+            } else {
+              act.kind = TriggerActionKind::WorkspaceRemoveCurrent;
+            }
             enqueue_trigger_action(act);
             return 1;
           }
@@ -1100,6 +1167,10 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 void start_overview_trigger() {
   g_win_key_overview_enabled.store(get_config().win_key_overview,
                                    std::memory_order_release);
+  g_native_vd_can_manage.store(
+      vd::vtable_slots_for_build(vd::windows_build_number())
+          .can_manage_desktops,
+      std::memory_order_release);
   add_config_listener(on_trigger_config_changed, nullptr);
   start_hotkey_worker();
   start_dispatch_worker();

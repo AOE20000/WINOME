@@ -11,6 +11,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <vector>
 
 namespace winome {
@@ -102,5 +103,24 @@ WallpaperDrawRect compute_workarea_wallpaper_draw_rect(double card_x,
                                                        double tex_w,
                                                        double tex_h,
                                                        double panel_top_ratio);
+
+// Compute the Overview toplevel HWND screen rect strictly below the top
+// panel band so Overview and Panel are spatially disjoint (zero overlap)
+// and Windows DWM never promotes Overview as a fullscreen topmost window
+// over the top bar on focus changes.
+inline RECT compute_overview_hwnd_rect(const RECT &monitor_rect,
+                                       int panel_height) {
+  const int mw = monitor_rect.right - monitor_rect.left;
+  const int mh = monitor_rect.bottom - monitor_rect.top;
+  if (mw <= 0 || mh <= 0)
+    return RECT{};
+  const int inset = std::clamp(panel_height, 0, std::max(0, mh - 1));
+  return RECT{
+      monitor_rect.left,
+      monitor_rect.top + inset,
+      monitor_rect.right,
+      monitor_rect.bottom,
+  };
+}
 
 }  // namespace winome

@@ -9,7 +9,8 @@
 | 路径 | 说明 |
 |------|------|
 | `src/` | 宿主进程与各 UI / Win32 集成模块（产出 `winome.exe`） |
-| `src/theme/` | 上游 `gnome-shell-dark.css` 真源、Cantarell 字体、12 个内置 GNOME symbolic SVG 图标、日历/工作区占位 SVG 及 GResource 配置 |
+| `ctl/` | 非提权 Named Pipe 控制与开发者调试 CLI（产出 `winome-ctl.exe`） |
+| `src/theme/` | 上游 `gnome-shell-dark.css` 真源、Cantarell 字体、13 个内置 GNOME symbolic SVG 图标、日历/工作区占位 SVG 及 GResource 配置 |
 | `st-compat/` | 提取自 GNOME Shell / libcroco 的 St CSS 解析与属性求值引擎（去 Clutter/Cogl） |
 | `tools/` | St → GTK4 样式转换器（`convert-st-css.py`）、`st-css-eval` 及覆盖率/类名自检脚本 |
 | `tests/` | 单元测试（`test-main.cpp`）与 CSS 转换器回归测试（`test-css-converter.py`） |
@@ -34,6 +35,7 @@
 ## 文档延伸阅读
 
 - [系统架构与各子系统实现](../docs/architecture.md)
+- [开发者调试通道与 winome-ctl 指南](../docs/dev-channel.md)
 - [双 CSS 主题管线、动效层与快速设置规范](../docs/theme-and-ui.md)
 - [硬约束、Win32/GTK4 踩坑与开发约定](../docs/pitfalls.md)
 

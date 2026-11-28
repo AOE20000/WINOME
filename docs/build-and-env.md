@@ -44,7 +44,7 @@ C:\msys64\usr\bin\bash.exe -lc 'export PATH=/ucrt64/bin:$PATH && ...'
 ## 构建方案（`build.sh`）
 
 <!-- excerpt:start -->
-如果你想从源码编译或参与开发，只需准备 Windows 下的 MSYS2（UCRT64 + GTK4）环境，运行仓库根目录的 `./build.sh release` 即可一键编译约 2.8 MB 的发布版程序，并可通过 `./WINOME/package.sh` 直接打出完整绿色便携包。
+如果你想从源码编译或参与开发，只需准备 Windows 下的 MSYS2（UCRT64 + GTK4）环境，运行仓库根目录的 `./build.sh release` 即可一键编译约 4.8 MB 的发布版程序，并可通过 `./WINOME/package.sh` 直接打出完整绿色便携包。
 <!-- excerpt:end -->
 
 WINOME 主工程在 `WINOME/` 目录下，统一使用仓库根目录的交互式构建脚本 [build.sh](../build.sh)：
@@ -60,8 +60,8 @@ WINOME 主工程在 `WINOME/` 目录下，统一使用仓库根目录的交互�
 
 | 方案 | 配置 | 构建目录 | 实测产物基线 | 说明 |
 |------|------|----------|--------------|------|
-| `release` | `release` + LTO + `NDEBUG` | `WINOME/build-release/` | ~2.7–2.9MB | 最小体积、最快指令 |
-| `test` | `debugoptimized` | `WINOME/build/` | ~22MB | 项目默认，保留 `g_print` 诊断日志与断言 |
+| `release` | `release` + LTO + `NDEBUG` | `WINOME/build-release/` | ~4.8MB | 最小体积、最快指令 |
+| `test` | `debugoptimized` | `WINOME/build/` | ~43MB | 项目默认，保留 `g_print` 诊断日志与断言 |
 | `debug` | `debug` (`-O0 -g`) | `WINOME/build-debug/` | — | GDB 友好 |
 
 三方案使用**独立构建目录**，切换互不触发重编；LTO 安全（COM 接口走运行时 `vcall` 裸函数指针，链接器无法去虚拟化）。

@@ -6,6 +6,7 @@
 
 #include <windows.h>
 
+#include <cctype>
 #include <string>
 #include <vector>
 
@@ -117,5 +118,92 @@ void harden_shell_overlay_hwnd(HWND hwnd);
 // swapchain HWNDs (created when GDK_WIN32_FORCE_DCOMP=1) so owner DWM uncloak
 // or SetWindowPos/BringWindowToTop can never expose them fullscreen above UI.
 void sanitize_gdk_gl_backing_windows();
+
+// Merge "full-redraw" into GSK_DEBUG when running GskCairoRenderer on
+// Win32 DirectComposition (GDK_WIN32_FORCE_DCOMP=1) to work around GTK 4.22.4
+// gdkcairocontext-win32.c calling Present1 with DirtyRectsCount > 0 after
+// ResizeBuffers (which causes permanent DXGI_ERROR_INVALID_CALL freezes).
+inline std::string merge_gsk_debug_full_redraw(const char* current_gsk_debug,
+                                               const char* renderer,
+                                               const char* force_dcomp) {
+  auto eq_ascii_ci = [](const std::string& a, const char* b) {
+    size_t n = 0;
+    while (b[n] != '\0')
+      ++n;
+    if (a.size() != n)
+      return false;
+    for (size_t i = 0; i < n; ++i) {
+      if (std::tolower(static_cast<unsigned char>(a[i])) !=
+          std::tolower(static_cast<unsigned char>(b[i])))
+        return false;
+    }
+    return true;
+  };
+  const std::string cur = current_gsk_debug ? current_gsk_debug : "";
+  if (renderer == nullptr || !eq_ascii_ci(renderer, "cairo"))
+    return cur;
+  if (force_dcomp == nullptr || force_dcomp[0] == '\0')
+    return cur;
+  const std::string fd = force_dcomp;
+  if (fd == "0" || eq_ascii_ci(fd, "false"))
+    return cur;
+
+  bool has_any_token = false;
+  std::string tok;
+  auto flush_tok = [&](bool* found_full) {
+    if (tok.empty())
+      return;
+    has_any_token = true;
+    if (eq_ascii_ci(tok, "full-redraw") || eq_ascii_ci(tok, "all"))
+      *found_full = true;
+    tok.clear();
+  };
+  bool found_full = false;
+  for (unsigned char ch : cur) {
+    if (ch == ',' || ch == ':' || std::isspace(ch))
+      flush_tok(&found_full);
+    else
+      tok.push_back(static_cast<char>(ch));
+  }
+  flush_tok(&found_full);
+  if (found_full)
+    return cur;
+  if (!has_any_token)
+    return "full-redraw";
+  return cur + ",full-redraw";
+}
+
+// Upstream gnome-shell calendar.js 6-week padding policy:
+// @first_day_dow_sun0 and @week_start_sun0 are 0=Sunday..6=Saturday.
+// When a month starts on @week_start_sun0 (days_to_week_start == 0), pad one
+// full week before the 1st so balanced 6-week grids don't dump two trailing
+// rows of next-month days at the bottom.
+inline int compute_calendar_grid_lead_days(int first_day_dow_sun0,
+                                           int week_start_sun0) {
+  const int ws = ((week_start_sun0 % 7) + 7) % 7;
+  const int fd = ((first_day_dow_sun0 % 7) + 7) % 7;
+  const int days_to_week_start = (7 + fd - ws) % 7;
+  const int week_padding = (days_to_week_start == 0) ? 7 : 0;
+  return week_padding + days_to_week_start;
+}
+
+inline int days_in_calendar_month(int year, int month_1_based) {
+  static constexpr int kDays[12] = {
+      31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  const int m =
+      (month_1_based < 1) ? 1 : (month_1_based > 12 ? 12 : month_1_based);
+  if (m == 2) {
+    const bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    return leap ? 29 : 28;
+  }
+  return kDays[m - 1];
+}
+
+inline int clamp_day_for_month(int year, int month_1_based, int day) {
+  const int max_d = days_in_calendar_month(year, month_1_based);
+  if (day < 1)
+    return 1;
+  return day > max_d ? max_d : day;
+}
 
 }  // namespace winome

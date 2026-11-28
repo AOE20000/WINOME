@@ -9,6 +9,7 @@
 #include "host-utils.h"
 #include "i18n.h"
 #include "monitor-manager.h"
+#include "virtual-desktop.h"
 
 #include <dwmapi.h>
 #include <gdk/win32/gdkwin32.h>
@@ -31,7 +32,12 @@
 namespace winome {
 namespace {
 
-constexpr UINT kDwmUseImmersiveDarkMode = 20;
+constexpr DWORD kDwmNcRenderingPolicy = 2;      // DWMWA_NCRENDERING_POLICY
+constexpr DWORD kDwmNcrpDisabled = 1;           // DWMNCRP_DISABLED
+constexpr DWORD kDwmWindowCornerPref = 33;      // DWMWA_WINDOW_CORNER_PREFERENCE
+constexpr DWORD kDwmCornerDoNotRound = 1;       // DWMWCP_DONOTROUND
+constexpr DWORD kDwmBorderColor = 34;           // DWMWA_BORDER_COLOR
+constexpr DWORD kDwmColorNone = 0xFFFFFFFEu;    // suppress DWM 1px rectangular border
 constexpr size_t kMaxHistoryItems = 32;
 
 struct RunDialogState {
@@ -39,6 +45,13 @@ struct RunDialogState {
   GtkWidget* window = nullptr;
   GtkWidget* entry = nullptr;
   GtkWidget* desc_label = nullptr;
+  HWND hwnd = nullptr;
+  HMONITOR target_monitor = nullptr;
+  guint vd_guard_id = 0;
+  guint post_map_idle_id = 0;
+  int last_dlg_w = 0;
+  int last_dlg_h = 0;
+  bool vd_listener_added = false;
   std::vector<std::string> history;
   int history_cursor = -1;
   std::string draft_before_history;
@@ -49,6 +62,149 @@ struct RunDialogState {
 };
 
 RunDialogState g_run;
+
+constexpr const wchar_t* kRunDlgOrigProcProp = L"WINOME_RunDlgOrigProc";
+
+LRESULT CALLBACK run_dialog_subclass_wndproc(HWND hwnd, UINT msg,
+                                             WPARAM wParam, LPARAM lParam) {
+  if (msg == WM_STYLECHANGING && wParam == static_cast<WPARAM>(GWL_EXSTYLE) &&
+      lParam != 0) {
+    auto* ss = reinterpret_cast<STYLESTRUCT*>(lParam);
+    ss->styleNew = (static_cast<LONG_PTR>(ss->styleNew) | WS_EX_TOOLWINDOW) &
+                   ~WS_EX_APPWINDOW;
+  }
+
+  if (msg == WM_WINDOWPOSCHANGING && lParam != 0 &&
+      g_run.target_monitor != nullptr) {
+    auto* wp = reinterpret_cast<WINDOWPOS*>(lParam);
+    if ((wp->flags & SWP_HIDEWINDOW) == 0) {
+      MONITORINFO mi{};
+      mi.cbSize = sizeof(mi);
+      if (GetMonitorInfoW(g_run.target_monitor, &mi)) {
+        RECT cur{};
+        const bool has_cur = GetWindowRect(hwnd, &cur) != FALSE;
+        const int eff_w = (wp->flags & SWP_NOSIZE) == 0
+                              ? wp->cx
+                              : (has_cur ? (cur.right - cur.left) : 0);
+        const int eff_h = (wp->flags & SWP_NOSIZE) == 0
+                              ? wp->cy
+                              : (has_cur ? (cur.bottom - cur.top) : 0);
+        if (eff_w > 32 && eff_h > 32) {
+          const RECT want =
+              compute_run_dialog_centered_rect(mi.rcMonitor, eff_w, eff_h);
+          wp->x = want.left;
+          wp->y = want.top;
+          wp->flags &= ~SWP_NOMOVE;
+        }
+      }
+    }
+  }
+
+  WNDPROC orig =
+      reinterpret_cast<WNDPROC>(GetPropW(hwnd, kRunDlgOrigProcProp));
+  if (msg == WM_NCDESTROY) {
+    RemovePropW(hwnd, kRunDlgOrigProcProp);
+    if (orig != nullptr) {
+      if (GetWindowLongPtrW(hwnd, GWLP_WNDPROC) ==
+          reinterpret_cast<LONG_PTR>(run_dialog_subclass_wndproc)) {
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
+                          reinterpret_cast<LONG_PTR>(orig));
+      }
+      return CallWindowProcW(orig, hwnd, msg, wParam, lParam);
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+  }
+  return orig != nullptr ? CallWindowProcW(orig, hwnd, msg, wParam, lParam)
+                         : DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void ensure_run_dialog_subclass(HWND hwnd) {
+  if (hwnd == nullptr || !IsWindow(hwnd))
+    return;
+  if (GetPropW(hwnd, kRunDlgOrigProcProp) != nullptr)
+    return;
+  WNDPROC cur =
+      reinterpret_cast<WNDPROC>(GetWindowLongPtrW(hwnd, GWLP_WNDPROC));
+  if (cur != nullptr && cur != run_dialog_subclass_wndproc) {
+    SetPropW(hwnd, kRunDlgOrigProcProp, reinterpret_cast<HANDLE>(cur));
+    SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
+                      reinterpret_cast<LONG_PTR>(run_dialog_subclass_wndproc));
+  }
+}
+
+void unsubclass_run_dialog_hwnd(HWND hwnd) {
+  if (hwnd == nullptr || !IsWindow(hwnd))
+    return;
+  WNDPROC orig =
+      reinterpret_cast<WNDPROC>(GetPropW(hwnd, kRunDlgOrigProcProp));
+  WNDPROC cur =
+      reinterpret_cast<WNDPROC>(GetWindowLongPtrW(hwnd, GWLP_WNDPROC));
+  if (orig != nullptr && cur == run_dialog_subclass_wndproc)
+    SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(orig));
+  RemovePropW(hwnd, kRunDlgOrigProcProp);
+}
+
+void keep_run_dialog_visible_on_active_vd(int reported_active_index,
+                                          bool restore_focus) {
+  if (g_run.window == nullptr || !gtk_widget_get_visible(g_run.window))
+    return;
+  GdkSurface* surf = gtk_native_get_surface(GTK_NATIVE(g_run.window));
+  HWND hwnd = surf != nullptr
+                  ? static_cast<HWND>(gdk_win32_surface_get_handle(surf))
+                  : g_run.hwnd;
+  if (hwnd == nullptr || !IsWindow(hwnd))
+    return;
+
+  LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+  LONG_PTR want = (ex | WS_EX_TOOLWINDOW | WS_EX_TOPMOST) & ~WS_EX_APPWINDOW;
+  if (want != ex)
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want);
+
+  vd::pin_window_async(hwnd);
+
+  DWORD cloaked = 0;
+  DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+  if ((cloaked & 0x2u /* DWM_CLOAKED_SHELL */) != 0) {
+    int target_vd = reported_active_index;
+    if (target_vd < 0) {
+      const auto snap = vd::cached_snapshot();
+      target_vd = snap.valid ? snap.active_index : vd::current_index();
+    }
+    if (target_vd >= 0) {
+      vd::move_window_to_desktop(hwnd, target_vd);
+      vd::pin_window_async(hwnd);
+    }
+  }
+
+  SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+  if (restore_focus) {
+    SetForegroundWindow(hwnd);
+    gtk_window_present(GTK_WINDOW(g_run.window));
+    if (g_run.entry != nullptr)
+      gtk_widget_grab_focus(g_run.entry);
+  }
+}
+
+gboolean on_run_dialog_vd_guard_timeout(gpointer user_data G_GNUC_UNUSED) {
+  g_run.vd_guard_id = 0;
+  keep_run_dialog_visible_on_active_vd(-1, true);
+  return G_SOURCE_REMOVE;
+}
+
+void on_run_dialog_vd_changed(int count G_GNUC_UNUSED,
+                              int active_index,
+                              void* user_data G_GNUC_UNUSED) {
+  keep_run_dialog_visible_on_active_vd(active_index, true);
+  if (g_run.vd_guard_id != 0) {
+    g_source_remove(g_run.vd_guard_id);
+    g_run.vd_guard_id = 0;
+  }
+  if (g_run.window != nullptr) {
+    g_run.vd_guard_id =
+        g_timeout_add(90, on_run_dialog_vd_guard_timeout, nullptr);
+  }
+}
 
 std::string trim_copy(const std::string& s) {
   size_t b = 0;
@@ -122,6 +278,10 @@ void ensure_run_css() {
   static const char* kCss = R"(
 #winomeRunDialogWindow {
   background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: #ffffff;
+  font: 11pt "Cantarell";
 }
 .run-dialog-error-text {
   color: #ff7b72;
@@ -198,11 +358,7 @@ void save_history() {
 }
 
 std::string default_hint_text() {
-  if (get_config().developer_mode) {
-    return tr("Press ESC to close  (Dev Mode: lg / rt / r)",
-              "按 Esc 关闭（开发者内部指令已启用：lg / rt / r）");
-  }
-  return tr("Press ESC to close", "按 Esc 关闭");
+  return tr("Press ESC to close", "按 ESC 键关闭");
 }
 
 void set_description_status(const std::string& text, bool is_error) {
@@ -337,21 +493,60 @@ void position_run_dialog(GtkWidget* dlg, int dlg_w, int dlg_h) {
   if (hwnd == nullptr)
     return;
 
-  BOOL dark = TRUE;
-  DwmSetWindowAttribute(hwnd, kDwmUseImmersiveDarkMode, &dark, sizeof(dark));
+  if (g_run.target_monitor == nullptr)
+    g_run.target_monitor = monitor_manager_active_monitor();
+  g_run.last_dlg_w = dlg_w;
+  g_run.last_dlg_h = dlg_h;
+  g_run.hwnd = hwnd;
+  ensure_run_dialog_subclass(hwnd);
+  harden_shell_overlay_hwnd(hwnd);
+
+  DwmSetWindowAttribute(hwnd, kDwmNcRenderingPolicy, &kDwmNcrpDisabled,
+                        sizeof(kDwmNcrpDisabled));
+  DwmSetWindowAttribute(hwnd, kDwmWindowCornerPref, &kDwmCornerDoNotRound,
+                        sizeof(kDwmCornerDoNotRound));
+  DwmSetWindowAttribute(hwnd, kDwmBorderColor, &kDwmColorNone,
+                        sizeof(kDwmColorNone));
 
   LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
   SetWindowLongPtrW(hwnd, GWL_EXSTYLE,
                     (ex | WS_EX_TOOLWINDOW | WS_EX_TOPMOST) & ~WS_EX_APPWINDOW);
 
-  const RECT wa = monitor_manager_active_workarea();
+  RECT mon_rect = monitor_manager_active_workarea();
+  if (g_run.target_monitor != nullptr) {
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(g_run.target_monitor, &mi))
+      mon_rect = mi.rcMonitor;
+  }
+
   RECT wr{};
   GetWindowRect(hwnd, &wr);
   const int scale = std::max(1, gtk_widget_get_scale_factor(dlg));
   const int w = (wr.right - wr.left) > 32 ? (wr.right - wr.left) : dlg_w * scale;
   const int h = (wr.bottom - wr.top) > 32 ? (wr.bottom - wr.top) : dlg_h * scale;
-  const POINT pos = center_rect_in_bounds(wa, w, h, 1.0 / 3.0);
-  SetWindowPos(hwnd, HWND_TOPMOST, pos.x, pos.y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+  const RECT want = compute_run_dialog_centered_rect(mon_rect, w, h);
+  SetWindowPos(hwnd, HWND_TOPMOST, want.left, want.top, 0, 0,
+               SWP_NOSIZE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+  vd::pin_window_async(hwnd);
+}
+
+gboolean on_run_post_map_idle(gpointer ud G_GNUC_UNUSED) {
+  g_run.post_map_idle_id = 0;
+  if (g_run.window != nullptr && gtk_widget_get_visible(g_run.window)) {
+    position_run_dialog(g_run.window, g_run.last_dlg_w, g_run.last_dlg_h);
+    gtk_window_present(GTK_WINDOW(g_run.window));
+    if (g_run.entry != nullptr)
+      gtk_widget_grab_focus(g_run.entry);
+  }
+  return G_SOURCE_REMOVE;
+}
+
+void on_run_map(GtkWidget* w G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
+  if (g_run.post_map_idle_id != 0)
+    return;
+  g_run.post_map_idle_id =
+      g_idle_add_full(G_PRIORITY_HIGH_IDLE, on_run_post_map_idle, nullptr, nullptr);
 }
 
 void on_entry_changed(GtkEditable* ed G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
@@ -518,6 +713,25 @@ gboolean on_run_key_pressed(GtkEventControllerKey* ctrl G_GNUC_UNUSED,
 }
 
 void on_run_destroy(GtkWidget* w G_GNUC_UNUSED, gpointer ud G_GNUC_UNUSED) {
+  if (g_run.vd_listener_added) {
+    vd::remove_change_listener(on_run_dialog_vd_changed, nullptr);
+    g_run.vd_listener_added = false;
+  }
+  if (g_run.vd_guard_id != 0) {
+    g_source_remove(g_run.vd_guard_id);
+    g_run.vd_guard_id = 0;
+  }
+  if (g_run.post_map_idle_id != 0) {
+    g_source_remove(g_run.post_map_idle_id);
+    g_run.post_map_idle_id = 0;
+  }
+  if (g_run.hwnd != nullptr) {
+    unsubclass_run_dialog_hwnd(g_run.hwnd);
+    g_run.hwnd = nullptr;
+  }
+  g_run.target_monitor = nullptr;
+  g_run.last_dlg_w = 0;
+  g_run.last_dlg_h = 0;
   g_run.window = nullptr;
   g_run.entry = nullptr;
   g_run.desc_label = nullptr;
@@ -763,8 +977,12 @@ void run_dialog_init(const RunDialogCallbacks& cbs) {
 }
 
 void run_dialog_open() {
+  if (g_run.cbs.close_popovers != nullptr)
+    g_run.cbs.close_popovers();
+
   if (g_run.window != nullptr) {
     gtk_window_present(GTK_WINDOW(g_run.window));
+    keep_run_dialog_visible_on_active_vd(-1, true);
     if (g_run.entry != nullptr) {
       gtk_editable_set_text(GTK_EDITABLE(g_run.entry), "");
       gtk_widget_grab_focus(g_run.entry);
@@ -786,10 +1004,10 @@ void run_dialog_open() {
   install_bundled_fonts(dlg);
 
   GtkWidget* wrap = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-  gtk_widget_set_margin_top(wrap, 16);
-  gtk_widget_set_margin_bottom(wrap, 16);
-  gtk_widget_set_margin_start(wrap, 16);
-  gtk_widget_set_margin_end(wrap, 16);
+  gtk_widget_set_margin_top(wrap, 28);
+  gtk_widget_set_margin_bottom(wrap, 28);
+  gtk_widget_set_margin_start(wrap, 28);
+  gtk_widget_set_margin_end(wrap, 28);
 
   GtkWidget* box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class(box, "modal-dialog");
@@ -798,22 +1016,21 @@ void run_dialog_open() {
   GtkWidget* content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_add_css_class(content, "modal-dialog-content-box");
 
-  GtkWidget* msg_content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+  GtkWidget* msg_content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 18);
   gtk_widget_add_css_class(msg_content, "message-dialog-content");
 
   GtkWidget* title_lbl =
       gtk_label_new(tr("Run a Command", "运行命令"));
   gtk_widget_add_css_class(title_lbl, "message-dialog-title");
-  gtk_label_set_xalign(GTK_LABEL(title_lbl), 0.0f);
+  gtk_widget_set_halign(title_lbl, GTK_ALIGN_CENTER);
+  gtk_label_set_justify(GTK_LABEL(title_lbl), GTK_JUSTIFY_CENTER);
+  gtk_label_set_xalign(GTK_LABEL(title_lbl), 0.5f);
   gtk_box_append(GTK_BOX(msg_content), title_lbl);
 
   GtkWidget* entry = gtk_entry_new();
   g_run.entry = entry;
   gtk_widget_add_css_class(entry, "run-dialog-entry");
-  gtk_entry_set_placeholder_text(
-      GTK_ENTRY(entry),
-      tr("Type command, path, URL, or dev command (lg/rt/r)...",
-         "输入程序名、路径、网址或开发者指令 (lg/rt/r)..."));
+  gtk_widget_set_hexpand(entry, TRUE);
   g_signal_connect(entry, "changed", G_CALLBACK(on_entry_changed), nullptr);
   g_signal_connect(entry, "activate", G_CALLBACK(on_entry_activate), nullptr);
   gtk_box_append(GTK_BOX(msg_content), entry);
@@ -835,6 +1052,7 @@ void run_dialog_open() {
   g_signal_connect(key_ctrl, "key-pressed",
                    G_CALLBACK(on_run_key_pressed), nullptr);
   gtk_widget_add_controller(dlg, key_ctrl);
+  g_signal_connect(dlg, "map", G_CALLBACK(on_run_map), nullptr);
   g_signal_connect(dlg, "destroy", G_CALLBACK(on_run_destroy), nullptr);
 
   gtk_window_set_child(GTK_WINDOW(dlg), wrap);
@@ -851,6 +1069,10 @@ void run_dialog_open() {
 
   gtk_widget_realize(dlg);
   position_run_dialog(dlg, dlg_w, dlg_h);
+  if (!g_run.vd_listener_added) {
+    vd::add_change_listener(on_run_dialog_vd_changed, nullptr);
+    g_run.vd_listener_added = true;
+  }
   gtk_widget_set_visible(dlg, TRUE);
   gtk_window_present(GTK_WINDOW(dlg));
   gtk_widget_grab_focus(entry);
